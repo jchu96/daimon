@@ -225,8 +225,9 @@ async def resync_bound_repo(
     async with sessionmaker() as session:
         bindings = await binding_store.get_bindings_for_repo(session, repo_url=repo_full_name)
 
-    if http_client is not None:
-        # Caller-owned client (e.g. test injection) — use directly, don't close.
+    async def _resync_all(client: httpx.AsyncClient) -> None:
+        # Shared per-binding loop body (D-01): http_client is the only input
+        # that varies between the caller-owned and self-owned client paths.
         for binding in bindings:
             if not should_resync(ref, binding.default_branch):
                 _log.info(
@@ -243,33 +244,18 @@ async def resync_bound_repo(
                 repo_full_name=repo_full_name,
                 sessionmaker=sessionmaker,
                 fernet=fernet,
-                http_client=http_client,
+                http_client=client,
                 anthropic_client=anthropic_client,
                 github_settings=github_settings,
             )
+
+    if http_client is not None:
+        # Caller-owned client (e.g. test injection) — use directly, don't close.
+        await _resync_all(http_client)
     else:
         # Self-owned client — create and close around the full batch.
         async with httpx.AsyncClient(timeout=120.0) as owned_client:
-            for binding in bindings:
-                if not should_resync(ref, binding.default_branch):
-                    _log.info(
-                        "github.resync.branch_skipped",
-                        repo=repo_full_name,
-                        ref=ref,
-                        default_branch=binding.default_branch,
-                        tenant_id=str(binding.tenant_id),
-                        agent_id=str(binding.agent_id),
-                    )
-                    continue
-                await _resync_one_binding(
-                    binding=binding,
-                    repo_full_name=repo_full_name,
-                    sessionmaker=sessionmaker,
-                    fernet=fernet,
-                    http_client=owned_client,
-                    anthropic_client=anthropic_client,
-                    github_settings=github_settings,
-                )
+            await _resync_all(owned_client)
 
 
 async def _resync_one_binding(
@@ -321,7 +307,7 @@ async def _resync_one_binding(
                 # When github_settings is None, omit the kwarg so the safe
                 # sync_agent_skills default (50 MiB) applies.
                 if github_settings is not None:
-                    await sync_agent_skills(
+                    report = await sync_agent_skills(
                         principal_id=principal_id,
                         tenant_id=binding.tenant_id,
                         agent_name=agent_name,
@@ -334,7 +320,7 @@ async def _resync_one_binding(
                         max_tarball_bytes=github_settings.max_tarball_bytes,
                     )
                 else:
-                    await sync_agent_skills(
+                    report = await sync_agent_skills(
                         principal_id=principal_id,
                         tenant_id=binding.tenant_id,
                         agent_name=agent_name,
@@ -345,6 +331,12 @@ async def _resync_one_binding(
                         anthropic_client=anthropic_client,
                         credential_override=credential,
                     )
+                # SYNC-05: a partial failure (some skills failed to upload/attach)
+                # must not persist last_sync_error=None as if the sync were clean.
+                if report.failed_uploads:
+                    last_sync_error = "; ".join(
+                        f"{name}: {reason}" for name, reason in report.failed_uploads
+                    )
                 _log.info(
                     "github.resync.success",
                     repo=repo_full_name,
@@ -352,7 +344,7 @@ async def _resync_one_binding(
                     agent_id=str(binding.agent_id),
                     agent_name=agent_name,
                 )
-                return  # success path — finally block persists last_sync_error=None
+                return  # success path — finally block persists last_sync_error
 
             except (httpx.TransportError, httpx.HTTPStatusError) as err:
                 response = getattr(err, "response", None)

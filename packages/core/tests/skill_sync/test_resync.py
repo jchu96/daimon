@@ -165,8 +165,12 @@ async def test_resync_persists_last_sync_on_success(
     _, tarball_transport = _make_tarball_handler(tarball)
     http_client = httpx.AsyncClient(transport=tarball_transport)
 
+    # Combine the agent-CRUD fake with a skills fake so the skill upload this
+    # tarball drives actually succeeds — otherwise this is not a real "success"
+    # case (a masked upload failure would leave last_sync_error non-None per
+    # SYNC-05, since the discarded-report bug that used to hide this is fixed).
     ma_handler = make_fake_ma_handler()
-    anthropic_client = build_fake_anthropic(ma_handler)
+    anthropic_client = build_fake_anthropic(combine_handlers(_make_skills_handler(), ma_handler))
 
     # Create agent in fake MA so bridge resolution can find it
     ma_agent_id = await _setup_agent_in_ma(
@@ -801,4 +805,88 @@ async def test_resync_honors_github_settings_max_tarball_bytes_cap(
         "sync_agent_skills records an over-cap tarball as a skipped_repos entry, not a "
         "raised exception — the resync itself succeeds with the repo skipped, proving "
         "github_settings.max_tarball_bytes reached the fetcher on this edge"
+    )
+
+
+# --- SYNC-05: partial sync failures must not report a clean resync ---
+
+
+async def test_resync_persists_non_none_last_sync_error_on_partial_failure(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """sync_agent_skills returns with non-empty failed_uploads but raises nothing
+    (the success `return` path) — update_last_sync must still receive a non-None
+    last_sync_error naming the failed skill, not the initialized None."""
+    from daimon.core.stores.user_skills import upsert_user_skill
+
+    fernet = _make_fernet()
+    cli = await make_cli_principal(db_session, os_user="resync-partial-fail")
+    tenant_id = cli.tenant_id
+    repo_url = "owner/partial-fail-repo"
+
+    ma_handler = make_fake_ma_handler()
+    anthropic_client = build_fake_anthropic(ma_handler)
+    ma_agent_id = await _setup_agent_in_ma(
+        fake_ma_handler=ma_handler,
+        anthropic_client=anthropic_client,
+        tenant_id=tenant_id,
+        agent_name="resync-partial-fail",
+    )
+    agent_id = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+
+    await _setup_binding(db_session, tenant_id=tenant_id, agent_id=agent_id, repo_url=repo_url)
+    await db_session.commit()
+
+    # Seed an orphan user_skills row under the SAME agent-stable ledger key
+    # (resolved_agent_id, since the MA agent resolves) whose source repo is
+    # about to be fetched successfully with no skills — triggering the
+    # orphan-delete path, whose MA delete we fail below.
+    async with db_session_factory() as s, s.begin():
+        await upsert_user_skill(
+            s,
+            tenant_id=tenant_id,
+            principal_id=agent_id,
+            agent_name="resync-partial-fail",
+            name="doomed_orphan",
+            source_repo_url=repo_url,
+            source_repo_branch="main",
+            source_path="",
+            content_hash="hash",
+            anthropic_id="sk_doomed_partial",
+            anthropic_latest_version="1",
+        )
+
+    empty_tarball = _make_tarball({"r-main/README.md": b"no skills here"})
+
+    def ma_delete_fails(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE" and request.url.path == "/v1/skills/sk_doomed_partial":
+            return httpx.Response(
+                500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}}
+            )
+        raise NotHandled
+
+    anthropic_client = build_fake_anthropic(combine_handlers(ma_delete_fails, ma_handler))
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
+    )
+
+    await resync_bound_repo(
+        repo_full_name=repo_url,
+        ref="refs/heads/main",
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+    )
+
+    async with db_session_factory() as check_session:
+        row = await binding_store.get_binding(check_session, tenant_id=tenant_id, agent_id=agent_id)
+    assert row is not None, "binding row must still exist after the partially-failed resync"
+    assert row.last_sync_error is not None, (
+        "a partial failure (non-empty failed_uploads, no exception) must not persist "
+        "last_sync_error=None as if the sync were clean"
+    )
+    assert "doomed_orphan" in row.last_sync_error, (
+        f"last_sync_error must name the failed skill; got {row.last_sync_error!r}"
     )
