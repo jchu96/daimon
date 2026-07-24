@@ -35,6 +35,7 @@ from daimon.adapters.discord.vision import (
     is_vision_image_attachment,
 )
 from daimon.core.billing import is_over_cap
+from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import provision_tenant, reconcile_tenant_defaults
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet
@@ -78,12 +79,30 @@ _EMBED_COLOR = theme.COLOR_BLURPLE  # Blurple — repo standard (help.py D-FORMA
 # mid-stream.
 _DRAIN_GRACE_S: float = 60.0
 
-# Distinct from the MAResolverMissError "no longer exists" message so a
-# still-provisioning state is never confused with a genuine misconfiguration.
-_SETTING_UP_MESSAGE = "Daimon is setting up this server — try again in a moment."
-
 # Bounded concurrency for the on_ready re-seed sweep.
 _SWEEP_CONCURRENCY = 4
+
+
+def _resolve_bot_display_name(settings: Settings) -> str:
+    """Read the operator-configured bot presented name (SPEC req 9).
+
+    Defaults to "daimon" when Discord settings are unset — the same default
+    ``DiscordSettings.bot_display_name`` carries, kept here too so callers
+    that only have a bare ``Settings`` (discord block optional) never crash.
+    """
+    return settings.discord.bot_display_name if settings.discord is not None else "daimon"
+
+
+def _setting_up_message(bot_display_name: str) -> str:
+    """Distinct from the MAResolverMissError "no longer exists" message so a
+    still-provisioning state is never confused with a genuine misconfiguration."""
+    return f"{bot_display_name.capitalize()} is setting up this server — try again in a moment."
+
+
+def _credit_depleted_message(bot_display_name: str) -> str:
+    return (
+        f"This server's {bot_display_name} credit is depleted. An admin can top up with `/billing`."
+    )
 
 
 def _is_dead_session(state: TurnState) -> bool:
@@ -126,7 +145,7 @@ def _log_bg_task_exception(task: asyncio.Task[None]) -> None:
         log.error("bg_task_failed", task_name=task.get_name(), exc_info=exc)
 
 
-def _build_welcome_embed() -> discord.Embed:
+def _build_welcome_embed(bot_display_name: str) -> discord.Embed:
     """Immediate "⏳ setting up…" welcome. Pure — no I/O."""
     embed = discord.Embed(
         title="⏳ Setting up…",
@@ -138,7 +157,10 @@ def _build_welcome_embed() -> discord.Embed:
     )
     embed.add_field(
         name="Once ready",
-        value=("Mention `@daimon` anywhere to chat, or run `/agent-setup` to manage your agents."),
+        value=(
+            f"Mention `@{bot_display_name}` anywhere to chat, or run `/agent-setup` "
+            "to manage your agents."
+        ),
         inline=False,
     )
     return embed
@@ -369,7 +391,9 @@ class DaimonBot(commands.Bot):
                 status="pending",
                 clear_archive=True,  # #132: rejoined guilds must not stay archived
             )
-            await self._post_to_guild(guild, _build_welcome_embed())
+            await self._post_to_guild(
+                guild, _build_welcome_embed(_resolve_bot_display_name(self.runtime.settings))
+            )
             self._spawn(_bounded_seed(tenant_id=result.tenant_id, guild=guild))
 
         # Re-seed any listed tenant stuck in pending/failed; per-guild permission
@@ -429,7 +453,9 @@ class DaimonBot(commands.Bot):
                 status="pending",
                 clear_archive=True,  # #132: rejoined guilds must not stay archived
             )
-            await self._post_to_guild(guild, _build_welcome_embed())
+            await self._post_to_guild(
+                guild, _build_welcome_embed(_resolve_bot_display_name(self.runtime.settings))
+            )
             try:
                 guild_obj = discord.Object(id=guild.id)
                 # Keep the guild command scope empty — global commands already
@@ -478,6 +504,7 @@ class DaimonBot(commands.Bot):
         assert message.guild is not None
         guild = message.guild
         guild_id = str(guild.id)
+        bot_display_name = _resolve_bot_display_name(self.runtime.settings)
 
         # --- Unified non-ready self-heal gate through turn completion,
         # guarded end-to-end. A DB hiccup or an unclassified bug
@@ -492,15 +519,15 @@ class DaimonBot(commands.Bot):
             if tr is None or tr.archived_at is not None:
                 # Unprovisioned OR archived → provision + un-archive + seed in background.
                 await self._ensure_provisioning(guild)
-                await message.channel.send(_SETTING_UP_MESSAGE)
+                await message.channel.send(_setting_up_message(bot_display_name))
                 return
             if tr.provision_status == "failed":
                 # Self-heal: re-seed if idle (in-flight guard). NEVER show "failed" to the user.
                 self._spawn(self._seed_tenant_defaults(tenant_id=tr.id, guild=guild))
-                await message.channel.send(_SETTING_UP_MESSAGE)
+                await message.channel.send(_setting_up_message(bot_display_name))
                 return
             if tr.provision_status == "pending":
-                await message.channel.send(_SETTING_UP_MESSAGE)
+                await message.channel.send(_setting_up_message(bot_display_name))
                 return
             # Only 'ready' proceeds.
 
@@ -883,7 +910,7 @@ class DaimonBot(commands.Bot):
             log.info("turn.skipped.over_balance", guild_id=guild_id, tenant_id=str(tenant_id))
             target = thread or message.channel
             await target.send(
-                "This server's daimon credit is depleted. An admin can top up with `/billing`."
+                _credit_depleted_message(_resolve_bot_display_name(self.runtime.settings))
             )
             return
 
@@ -1148,6 +1175,7 @@ class DaimonBot(commands.Bot):
                     trigger=message,
                     after_message_id=int(watermark),
                     bot_user_id=self.user.id if self.user else None,
+                    bot_display_name=discord_settings.bot_display_name,
                 )
             else:
                 user_message, _ = await build_context_xml(
@@ -1155,6 +1183,7 @@ class DaimonBot(commands.Bot):
                     trigger=message,
                     limit=100,
                     bot_user_id=self.user.id if self.user else None,
+                    bot_display_name=discord_settings.bot_display_name,
                 )
         else:
             if content_override is not None:
@@ -1164,6 +1193,7 @@ class DaimonBot(commands.Bot):
                     message.channel,
                     trigger=message,
                     bot_user_id=self.user.id if self.user else None,
+                    bot_display_name=discord_settings.bot_display_name,
                 )
             else:
                 # Forum/voice channels: fall back to raw message content
@@ -1278,6 +1308,7 @@ class DaimonBot(commands.Bot):
                 trigger=message,
                 limit=100,
                 bot_user_id=self.user.id if self.user else None,
+                bot_display_name=discord_settings.bot_display_name,
             )
             if synthetic_prefix:
                 user_message = synthetic_prefix + "\n" + user_message

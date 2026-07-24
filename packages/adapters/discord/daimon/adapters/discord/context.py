@@ -18,11 +18,13 @@ import discord
 CHANNEL_BACKFILL_LIMIT = 25
 
 
-def _strip_bot_mention(content: str, bot_user_id: int | None) -> str:
-    """Replace ``<@bot_id>`` and ``<@!bot_id>`` with ``@daimon``."""
+def _strip_bot_mention(
+    content: str, bot_user_id: int | None, *, bot_display_name: str = "daimon"
+) -> str:
+    """Replace ``<@bot_id>`` and ``<@!bot_id>`` with ``@{bot_display_name}``."""
     if bot_user_id is None:
         return content
-    return re.sub(rf"<@!?{bot_user_id}>", "@daimon", content)
+    return re.sub(rf"<@!?{bot_user_id}>", f"@{bot_display_name}", content)
 
 
 def _render_location(thread: discord.Thread) -> list[str]:
@@ -40,7 +42,9 @@ def _render_location(thread: discord.Thread) -> list[str]:
     ]
 
 
-def _render_message(msg: discord.Message, bot_user_id: int | None) -> list[str]:
+def _render_message(
+    msg: discord.Message, bot_user_id: int | None, *, bot_display_name: str = "daimon"
+) -> list[str]:
     """Render a single message as XML lines."""
     attrs = (
         f" author_name={quoteattr(msg.author.display_name)}"
@@ -48,7 +52,9 @@ def _render_message(msg: discord.Message, bot_user_id: int | None) -> list[str]:
         f" is_bot={quoteattr(str(msg.author.bot).lower())}"
         f" timestamp={quoteattr(msg.created_at.isoformat())}"
     )
-    content = escape(_strip_bot_mention(msg.content, bot_user_id))
+    content = escape(
+        _strip_bot_mention(msg.content, bot_user_id, bot_display_name=bot_display_name)
+    )
 
     if not msg.attachments:
         return [f"<message{attrs}>{content}</message>"]
@@ -73,6 +79,7 @@ async def build_context_xml(
     *,
     limit: int = 100,
     bot_user_id: int | None = None,
+    bot_display_name: str = "daimon",
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context from thread history for the turn driver.
 
@@ -117,7 +124,7 @@ async def build_context_xml(
         "<thread_history>",
     ]
     for msg in messages:
-        lines.extend(_render_message(msg, bot_user_id))
+        lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
     lines.append("</thread_history>")
     lines.append("</context>")
 
@@ -127,7 +134,9 @@ async def build_context_xml(
         f" user_id={quoteattr(str(trigger.author.id))}"
         f" timestamp={quoteattr(trigger.created_at.isoformat())}"
     )
-    trigger_content = escape(_strip_bot_mention(trigger.content, bot_user_id))
+    trigger_content = escape(
+        _strip_bot_mention(trigger.content, bot_user_id, bot_display_name=bot_display_name)
+    )
     lines.append("")
     lines.append(f"<user_query{trigger_attrs}>{trigger_content}</user_query>")
 
@@ -140,6 +149,7 @@ async def build_delta_xml(
     *,
     after_message_id: int | None,
     bot_user_id: int | None = None,
+    bot_display_name: str = "daimon",
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context for a continuation turn (delta since watermark).
 
@@ -166,7 +176,9 @@ async def build_delta_xml(
     snapshot.
     """
     if after_message_id is None:
-        return await build_context_xml(thread, trigger, bot_user_id=bot_user_id)
+        return await build_context_xml(
+            thread, trigger, bot_user_id=bot_user_id, bot_display_name=bot_display_name
+        )
 
     after_obj = discord.Object(id=after_message_id)
     messages = [m async for m in thread.history(after=after_obj, oldest_first=True)]
@@ -188,7 +200,7 @@ async def build_delta_xml(
         "<thread_delta>",
     ]
     for msg in messages:
-        lines.extend(_render_message(msg, bot_user_id))
+        lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
     lines.append("</thread_delta>")
     lines.append("</context>")
 
@@ -197,7 +209,9 @@ async def build_delta_xml(
         f" user_id={quoteattr(str(trigger.author.id))}"
         f" timestamp={quoteattr(trigger.created_at.isoformat())}"
     )
-    trigger_content = escape(_strip_bot_mention(trigger.content, bot_user_id))
+    trigger_content = escape(
+        _strip_bot_mention(trigger.content, bot_user_id, bot_display_name=bot_display_name)
+    )
     lines.append("")
     lines.append(f"<user_query{trigger_attrs}>{trigger_content}</user_query>")
 
@@ -210,6 +224,7 @@ async def build_channel_context_xml(
     *,
     limit: int = CHANNEL_BACKFILL_LIMIT,
     bot_user_id: int | None = None,
+    bot_display_name: str = "daimon",
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context from parent channel history for a channel-mention turn.
 
@@ -233,7 +248,7 @@ async def build_channel_context_xml(
 
     lines: list[str] = [f'<channel_context count="{len(messages)}">']
     for msg in messages:
-        lines.extend(_render_message(msg, bot_user_id))
+        lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
     lines.append("</channel_context>")
 
     trigger_attrs = (
@@ -241,7 +256,9 @@ async def build_channel_context_xml(
         f" user_id={quoteattr(str(trigger.author.id))}"
         f" timestamp={quoteattr(trigger.created_at.isoformat())}"
     )
-    trigger_content = escape(_strip_bot_mention(trigger.content, bot_user_id))
+    trigger_content = escape(
+        _strip_bot_mention(trigger.content, bot_user_id, bot_display_name=bot_display_name)
+    )
     lines.append("")
     lines.append(f"<user_query{trigger_attrs}>{trigger_content}</user_query>")
 
