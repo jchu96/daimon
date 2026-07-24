@@ -32,6 +32,8 @@ def _make_preview(**overrides: Any) -> PurgePreview:
         "github_oauth_states": PurgePreviewRow(count=0, example=None),
         "mcp_tokens": PurgePreviewRow(count=0, example=None),
         "agent_github_binding": PurgePreviewRow(count=0, example=None),
+        "slack_user_tokens": PurgePreviewRow(count=0, example=None),
+        "slack_turn_contexts": PurgePreviewRow(count=0, example=None),
     }
     base.update(overrides)
     return PurgePreview(**base)
