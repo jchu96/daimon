@@ -12,6 +12,7 @@ from typing import cast
 
 import structlog
 from anthropic import AsyncAnthropic
+from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.core.agent_guidance import apply_credential_guidance
 from daimon.core.defaults.ma_index import find_agents_by_daimon_tag
 from daimon.core.defaults.mcp_merge import (
@@ -32,6 +33,7 @@ from daimon.core.defaults.spec_merge import (
     merge_skills_with_ma,
     merge_tools_with_ma,
 )
+from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.specs import AgentSpec, dump_agent_spec
 
 _log = structlog.get_logger(__name__)
@@ -147,27 +149,39 @@ async def reconcile_agent(
             )
         if dry_run:
             return ResourceOutcome(kind="agent", name=spec.name, action=Action.UPDATED)
+
         # Merge spec entries with MA's current state so user-attached MCPs and
         # skills (e.g. a context7 server pinned to the daimon agent via SDK)
         # survive `defaults apply`. Spec wins on name/skill_id collision.
-        merged_servers = merge_mcp_servers_with_ma(spec.mcp_servers, ma_match)
-        spec_mcp_names = {s.get("name") for s in (spec.mcp_servers or [])}
-        preserved_mcp_names = {
-            entry.name for entry in ma_match.mcp_servers if entry.name not in spec_mcp_names
-        }
-        merged_tools = merge_tools_with_ma(
-            spec.tools, ma_match, preserved_mcp_names=preserved_mcp_names
-        )
-        if merged_servers is not spec.mcp_servers or merged_tools is not spec.tools:
-            spec = spec.model_copy(update={"mcp_servers": merged_servers, "tools": merged_tools})
-        merged_skills = merge_skills_with_ma(resolved_skills, ma_match)
-        updated = await client.beta.agents.update(
-            ma_match.id,
-            version=ma_match.version,
-            **dump_agent_spec(spec),
-            skills=merged_skills,
-            metadata=cast("dict[str, str | None]", metadata),
-        )
+        # These merges — and the update call itself — live inside `_apply` so
+        # a version-conflict retry recomputes them against the freshly-
+        # retrieved agent, never the stale `ma_match` read above (Pitfall 2):
+        # a naive retry against `ma_match` would silently drop or duplicate a
+        # concurrent writer's skills/MCP-server changes.
+        async def _apply(fresh: BetaManagedAgentsAgent) -> BetaManagedAgentsAgent:
+            local_spec = spec
+            merged_servers = merge_mcp_servers_with_ma(local_spec.mcp_servers, fresh)
+            spec_mcp_names = {s.get("name") for s in (local_spec.mcp_servers or [])}
+            preserved_mcp_names = {
+                entry.name for entry in fresh.mcp_servers if entry.name not in spec_mcp_names
+            }
+            merged_tools = merge_tools_with_ma(
+                local_spec.tools, fresh, preserved_mcp_names=preserved_mcp_names
+            )
+            if merged_servers is not local_spec.mcp_servers or merged_tools is not local_spec.tools:
+                local_spec = local_spec.model_copy(
+                    update={"mcp_servers": merged_servers, "tools": merged_tools}
+                )
+            merged_skills = merge_skills_with_ma(resolved_skills, fresh)
+            return await client.beta.agents.update(
+                fresh.id,
+                version=fresh.version,
+                **dump_agent_spec(local_spec),
+                skills=merged_skills,
+                metadata=cast("dict[str, str | None]", metadata),
+            )
+
+        updated = await update_agent_with_version_retry(client, ma_match.id, _apply)
         return ResourceOutcome(
             kind="agent", name=spec.name, action=Action.UPDATED, anthropic_id=updated.id
         )

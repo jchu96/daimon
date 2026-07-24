@@ -49,11 +49,29 @@ def _full_router(
     environments: list[dict[str, Any]] | None = None,
     agents: list[dict[str, Any]] | None = None,
 ) -> MARouter:
-    """Build a router with GET list routes for all three resource kinds."""
+    """Build a router with GET list routes for all three resource kinds.
+
+    Also registers a per-id agent retrieve route: `reconcile_agent`'s update
+    path goes through `update_agent_with_version_retry`, which retrieves the
+    agent by id before applying the update, in addition to the list call.
+    """
     router = MARouter()
     router.add("GET", r"/v1/skills", lambda req, _m: list_response(list(skills or [])))
     router.add("GET", r"/v1/environments", lambda req, _m: list_response(list(environments or [])))
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response(list(agents or [])))
+    agents_list = list(agents or [])
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response(agents_list))
+
+    def _retrieve_agent(req: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        agent_id = match.group(1)
+        for agent in agents_list:
+            if agent["id"] == agent_id:
+                return httpx.Response(200, json=agent)
+        return httpx.Response(
+            404,
+            json={"type": "error", "error": {"type": "not_found_error", "message": "not found"}},
+        )
+
+    router.add("GET", r"/v1/agents/([^/]+)", _retrieve_agent)
     return router
 
 

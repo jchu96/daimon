@@ -279,6 +279,7 @@ async def test_agents_update_passes_version(
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
+    router.add("GET", r"/v1/agents/ag_01", lambda req, m: httpx.Response(200, json=agent_data))
     router.add("POST", r"/v1/agents/ag_01", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)
@@ -330,6 +331,7 @@ async def test_agents_update_keeps_guild_account_stamp(
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
+    router.add("GET", r"/v1/agents/ag_guild", lambda req, m: httpx.Response(200, json=agent_data))
     router.add("POST", r"/v1/agents/ag_guild", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)
@@ -408,6 +410,7 @@ async def test_agents_update_preserves_inherited_mcp_toolset_when_yaml_omits_it(
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
+    router.add("GET", r"/v1/agents/ag_mcp", lambda req, m: httpx.Response(200, json=agent_data))
     router.add("POST", r"/v1/agents/ag_mcp", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)

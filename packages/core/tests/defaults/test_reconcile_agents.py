@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
 import httpx
+from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent, SkillListResponse
 from daimon.core.agent_guidance import (
     CREDENTIAL_GUIDANCE_BLOCK,
@@ -83,8 +85,28 @@ def _tagged_agent(
 
 
 def _router_with_agents(agents: list[dict[str, Any]]) -> MARouter:
+    """Router with the list route plus a per-id retrieve route.
+
+    `reconcile_agent`'s update path now goes through
+    `update_agent_with_version_retry`, which retrieves the agent by id before
+    applying the update (in addition to the `find_agents_by_daimon_tag` list
+    call). Registering both here means every existing update-path test keeps
+    working without change; only a real 409 needs its own bespoke router.
+    """
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response(agents))
+
+    def _retrieve(req: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        agent_id = match.group(1)
+        for agent in agents:
+            if agent["id"] == agent_id:
+                return httpx.Response(200, json=agent)
+        return httpx.Response(
+            404,
+            json={"type": "error", "error": {"type": "not_found_error", "message": "not found"}},
+        )
+
+    router.add("GET", r"/v1/agents/([^/]+)", _retrieve)
     return router
 
 
@@ -1115,3 +1137,80 @@ async def test_reconcile_agent_stays_skipped_when_hash_matches_and_mcp_healthy()
     )
     assert outcome.anthropic_id == "ag_healthy"
     assert not update_called, "agents.update must NOT have been called for healthy agent"
+
+
+async def test_reconcile_agent_retries_once_on_version_conflict() -> None:
+    """SYNC-03: reconcile_agent retries once via update_agent_with_version_retry
+    on an MA 409 version conflict instead of failing the sync (Pitfall 2): the
+    retried update's mcp_servers/skills must reflect the SECOND retrieve, not
+    the first, so a concurrent writer's changes aren't dropped or duplicated.
+    """
+    spec = _agent_spec()
+    first_agent = _tagged_agent(id_="ag_conflict", name=spec.name, tenant_id=TENANT_ID, version=2)
+    # The second retrieve (post-conflict) reflects a concurrent writer's
+    # attached MCP server that the first ma_match read never saw.
+    second_agent = {
+        **_tagged_agent(id_="ag_conflict", name=spec.name, tenant_id=TENANT_ID, version=3),
+        "mcp_servers": [
+            {"name": "concurrent-mcp", "type": "url", "url": "https://concurrent.example/mcp"}
+        ],
+    }
+
+    retrieve_count = 0
+    update_count = 0
+    updated_payload: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal retrieve_count, update_count
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return httpx.Response(200, json={"data": [first_agent], "next_page": None})
+        if request.method == "GET" and request.url.path == "/v1/agents/ag_conflict":
+            retrieve_count += 1
+            return httpx.Response(200, json=first_agent if retrieve_count == 1 else second_agent)
+        if request.method == "POST" and request.url.path == "/v1/agents/ag_conflict":
+            update_count += 1
+            if update_count == 1:
+                return httpx.Response(
+                    409,
+                    json={
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": (
+                                "Concurrent modification detected. "
+                                "Please fetch the latest version and retry."
+                            ),
+                        },
+                    },
+                )
+            updated_payload.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json=_tagged_agent(
+                    id_="ag_conflict", name=spec.name, tenant_id=TENANT_ID, version=4
+                ),
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    # max_retries=0: the SDK auto-retries 409 by default; disable so
+    # update_agent_with_version_retry's own retry logic is exercised in isolation.
+    no_retry_client = AsyncAnthropic(
+        api_key="test",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://api.anthropic.com"
+        ),
+        max_retries=0,
+    )
+
+    outcome = await reconcile_agent(no_retry_client, spec, tenant_id=TENANT_ID, dry_run=False)
+
+    assert outcome.action is Action.UPDATED, "reconcile must succeed after the retry, not raise"
+    assert outcome.anthropic_id == "ag_conflict"
+    assert retrieve_count == 2, "beta.agents.retrieve must fire twice (initial + after conflict)"
+    assert update_count == 2, "beta.agents.update must be attempted twice (conflict + retry)"
+    sent_mcp = updated_payload.get("mcp_servers", [])
+    names = [m.get("name") for m in sent_mcp]
+    assert "concurrent-mcp" in names, (
+        "retried merge must be recomputed against the SECOND retrieve — a concurrent writer's "
+        f"MCP server must not be dropped; got mcp_servers={sent_mcp!r}"
+    )
