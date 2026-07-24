@@ -205,20 +205,63 @@ async def _purge_principal_in_session(
     )
 
 
+class PrincipalPurgeResult(BaseModel):
+    """Return type of purge_principal: DB report paired with upstream session deletion report."""
+
+    model_config = ConfigDict(frozen=True)
+
+    db: PurgeReport
+    sessions: SessionDeletionReport = Field(default_factory=SessionDeletionReport)
+
+
 async def purge_principal(
     *,
     sm: async_sessionmaker[AsyncSession],
     principal_id: uuid.UUID,
     kind: Literal["cli", "platform"],
-) -> PurgeReport:
-    """Delete every row for `(principal_id, kind)`. Idempotent on re-run."""
+    anthropic: AsyncAnthropic | None = None,
+) -> PrincipalPurgeResult:
+    """Delete every row for `(principal_id, kind)`. Idempotent on re-run.
+
+    When `anthropic` is provided, attempts upstream hard-deletion of every MA
+    session tagged for the principal's account_id, under its tenant_id, AFTER
+    the DB transaction commits (the DB purge is never rolled back by an
+    upstream failure).
+    """
     async with sm() as session, session.begin():
         principal = await identity_store.get_principal_by_id(
             session, principal_id=principal_id, kind=kind
         )
         if principal is None:
-            return PurgeReport()
-        return await _purge_principal_in_session(session, principal=principal)
+            return PrincipalPurgeResult(db=PurgeReport())
+        db_report = await _purge_principal_in_session(session, principal=principal)
+        # Capture before the `async with` block closes the session.
+        tenant_id = principal.tenant_id
+        account_id = principal.account_id
+
+    # DB transaction committed. Upstream deletion is best-effort — a single
+    # call, since one principal belongs to exactly one tenant/account.
+    # Deliberate boundary catch mirroring purge_account: the DB purge has
+    # already committed, so an upstream APIError must NOT propagate.
+    if anthropic is not None:
+        try:
+            sessions_report = await delete_sessions_for_account(
+                anthropic, tenant_id=tenant_id, account_id=account_id
+            )
+        except APIError as err:
+            log.warning(
+                "purge.upstream_sessions_failed",
+                principal_id=str(principal_id),
+                tenant_id=str(tenant_id),
+                account_id=str(account_id),
+                error=str(err),
+            )
+            return PrincipalPurgeResult(
+                db=db_report, sessions=SessionDeletionReport(upstream_error=True)
+            )
+        return PrincipalPurgeResult(db=db_report, sessions=sessions_report)
+
+    return PrincipalPurgeResult(db=db_report)
 
 
 async def purge_account(

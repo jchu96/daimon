@@ -28,7 +28,13 @@ from daimon.core._models import (
     TenantConfig,
     UserConfig,
 )
-from daimon.core.purge import AccountPurgeResult, PurgeReport, purge_account, purge_principal
+from daimon.core.purge import (
+    AccountPurgeResult,
+    PrincipalPurgeResult,
+    PurgeReport,
+    purge_account,
+    purge_principal,
+)
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import routines as routines_store
@@ -100,13 +106,13 @@ async def test_purge_principal_removes_all_principal_scoped_rows(
 
     report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
 
-    assert report.routines == 2, "should delete both routines for platform principal"
-    assert report.principal_links == 1, "should delete the cli<->platform link"
-    assert report.platform_principals == 1, "should delete the platform principal row"
-    assert report.cli_principals == 0, (
+    assert report.db.routines == 2, "should delete both routines for platform principal"
+    assert report.db.principal_links == 1, "should delete the cli<->platform link"
+    assert report.db.platform_principals == 1, "should delete the platform principal row"
+    assert report.db.cli_principals == 0, (
         "cli principal must remain when purging only the platform side"
     )
-    assert report.accounts == 0, "account-level deletes are out of scope for purge_principal"
+    assert report.db.accounts == 0, "account-level deletes are out of scope for purge_principal"
 
     # DB-level assertions: targeted rows gone, unrelated rows survive.
     pp_row = (
@@ -180,10 +186,10 @@ async def test_purge_principal_idempotent_on_rerun(
     await db_session.commit()
 
     first = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
-    assert first.platform_principals == 1, "first call deletes the principal row"
+    assert first.db.platform_principals == 1, "first call deletes the principal row"
 
     second = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
-    assert second == PurgeReport(), "rerun on missing principal returns all-zero report"
+    assert second.db == PurgeReport(), "rerun on missing principal returns all-zero report"
 
 
 async def test_purge_principal_leaves_other_users_routines(
@@ -220,7 +226,7 @@ async def test_purge_principal_leaves_other_users_routines(
     await db_session.commit()
 
     report = await purge_principal(sm=db_session_factory, principal_id=pp_a.id, kind="platform")
-    assert report.routines == 1, "only user-a's routine deleted"
+    assert report.db.routines == 1, "only user-a's routine deleted"
 
     surviving = (
         (await db_session.execute(select(Routine).where(Routine.created_by_user_id == "user-b")))
@@ -798,9 +804,9 @@ async def test_purge_principal_platform_deletes_all_three_new_tables(
 
     report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
 
-    assert report.user_skills == 1, "must delete the user_skills row"
-    assert report.github_credentials == 1, "must delete the github_credentials row"
-    assert report.github_oauth_states == 1, "must delete the oauth-state row"
+    assert report.db.user_skills == 1, "must delete the user_skills row"
+    assert report.db.github_credentials == 1, "must delete the github_credentials row"
+    assert report.db.github_oauth_states == 1, "must delete the oauth-state row"
 
     # Other principal's rows must survive.
     other_login = await github_credentials_store.get_credential_login_by_principal(
@@ -846,7 +852,7 @@ async def test_purge_principal_ghost_row_deleted_across_tenant_ids(
 
     report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
 
-    assert report.user_skills == 1, (
+    assert report.db.user_skills == 1, (
         "ghost row under stale tenant_id must be deleted — tenant-agnostic predicate"
     )
 
@@ -880,12 +886,12 @@ async def test_purge_principal_cli_deletes_all_three_new_tables(
 
     report = await purge_principal(sm=db_session_factory, principal_id=cli.id, kind="cli")
 
-    assert report.user_skills == 1, "CLI principal's user_skills must be deleted"
-    assert report.github_credentials == 1, "CLI principal's github_credentials must be deleted"
-    assert report.github_oauth_states == 1, (
+    assert report.db.user_skills == 1, "CLI principal's user_skills must be deleted"
+    assert report.db.github_credentials == 1, "CLI principal's github_credentials must be deleted"
+    assert report.db.github_oauth_states == 1, (
         "CLI principal's ('cli', os_user) oauth-state row must be deleted"
     )
-    assert report.cli_principals == 1, "CLI principal row itself must be deleted"
+    assert report.db.cli_principals == 1, "CLI principal row itself must be deleted"
 
 
 async def test_purge_principal_cli_oauth_states_does_not_delete_same_os_user_in_other_tenant(
@@ -924,7 +930,7 @@ async def test_purge_principal_cli_oauth_states_does_not_delete_same_os_user_in_
 
     report = await purge_principal(sm=db_session_factory, principal_id=cli_a.id, kind="cli")
 
-    assert report.github_oauth_states == 1, (
+    assert report.db.github_oauth_states == 1, (
         "only tenant A's ('cli', 'ubuntu') handshake row must be deleted"
     )
     surviving = await github_oauth_states_store.count_states_for_platform_user(
@@ -1093,7 +1099,9 @@ async def test_purge_principal_slack_deletes_slack_user_token(
 
     report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
 
-    assert report.slack_user_tokens == 1, "must delete the target principal's slack_user_tokens row"
+    assert report.db.slack_user_tokens == 1, (
+        "must delete the target principal's slack_user_tokens row"
+    )
 
     target_row = await slack_user_tokens_store.get_slack_user_token(
         db_session, team_id="T_PURGE_01", slack_user_id="U_PURGE_TARGET"
@@ -1120,7 +1128,7 @@ async def test_purge_principal_cli_skips_slack_user_tokens(
 
     report = await purge_principal(sm=db_session_factory, principal_id=cli.id, kind="cli")
 
-    assert report.slack_user_tokens == 0, "CLI principals must not touch slack_user_tokens"
+    assert report.db.slack_user_tokens == 0, "CLI principals must not touch slack_user_tokens"
 
 
 async def test_purge_principal_discord_skips_slack_user_tokens(
@@ -1141,7 +1149,7 @@ async def test_purge_principal_discord_skips_slack_user_tokens(
 
     report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
 
-    assert report.slack_user_tokens == 0, "discord principals must not touch slack_user_tokens"
+    assert report.db.slack_user_tokens == 0, "discord principals must not touch slack_user_tokens"
 
 
 async def test_purge_account_deletes_slack_turn_contexts(
@@ -1187,3 +1195,195 @@ async def test_purge_account_deletes_slack_turn_contexts(
         cutoff=datetime(2020, 1, 1, tzinfo=UTC),
     )
     assert surviving == frozenset({"C2"}), "other account's turn-context row must survive"
+
+
+# ---------------------------------------------------------------------------
+# SYNC-07: purge_principal upstream MA session cleanup (D-08)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_anthropic_with_sessions_for_principal(
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    sessions_count: int,
+) -> Any:
+    """Build a fake AsyncAnthropic serving `sessions_count` sessions tagged for
+    `account_id`, all belonging to a single agent tagged for `tenant_id`."""
+    from datetime import UTC, datetime
+    from typing import Any as _Any
+
+    from anthropic.types.beta import (
+        BetaManagedAgentsAgent,
+        BetaManagedAgentsModelConfig,
+        BetaManagedAgentsSession,
+    )
+    from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
+    from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
+    from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
+
+    now = datetime.now(UTC)
+
+    agent = BetaManagedAgentsAgent(
+        id="agent_principal_test",
+        archived_at=None,
+        created_at=now,
+        description=None,
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id)},
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
+        name="test-agent",
+        skills=[],
+        system=None,
+        tools=[],
+        type="agent",
+        updated_at=now,
+        version=1,
+    )
+    agent_dict: dict[str, _Any] = agent.model_dump(mode="json")
+
+    session_dicts: list[dict[str, _Any]] = []
+    for i in range(sessions_count):
+        sid = f"sesn_principal_target{i}"
+        s = BetaManagedAgentsSession(
+            outcome_evaluations=[],
+            id=sid,
+            agent=BetaManagedAgentsSessionAgent(
+                id="agent_principal_test",
+                description=None,
+                mcp_servers=[],
+                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
+                name="test-agent",
+                skills=[],
+                system=None,
+                tools=[],
+                type="agent",
+                version=1,
+            ),
+            archived_at=None,
+            created_at=now,
+            environment_id="env_test1",
+            metadata={"daimon_account": str(account_id)},
+            resources=[],
+            stats=BetaManagedAgentsSessionStats(),
+            status="idle",
+            title=None,
+            type="session",
+            updated_at=now,
+            usage=BetaManagedAgentsSessionUsage(),
+            vault_ids=[],
+        )
+        session_dicts.append(s.model_dump(mode="json"))
+
+    router = MARouter()
+
+    def handle_agents_list(request: httpx.Request, match: Any) -> httpx.Response:
+        return list_response([agent_dict])
+
+    def handle_sessions_list(request: httpx.Request, match: Any) -> httpx.Response:
+        return list_response(session_dicts)
+
+    def handle_session_delete(request: httpx.Request, match: Any) -> httpx.Response:
+        session_id = match.group(1)
+        return httpx.Response(200, json={"id": session_id, "type": "session_deleted"})
+
+    router.add("GET", r"/v1/agents", handle_agents_list)
+    router.add("GET", r"/v1/sessions", handle_sessions_list)
+    router.add("DELETE", r"/v1/sessions/([^/]+)", handle_session_delete)
+    return build_fake_anthropic(router.dispatch)
+
+
+async def test_purge_principal_with_anthropic_deletes_upstream_sessions(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """purge_principal(anthropic=...) fires a session-delete request for the
+    principal's tenant/account after the DB purge commits."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="user-ma-cleanup",
+        tenant=tenant,
+        account=account,
+    )
+    await db_session.commit()
+
+    client = _make_fake_anthropic_with_sessions_for_principal(
+        tenant.id, account.id, sessions_count=2
+    )
+
+    result = await purge_principal(
+        sm=db_session_factory, principal_id=pp.id, kind="platform", anthropic=client
+    )
+
+    assert isinstance(result, PrincipalPurgeResult), "must return PrincipalPurgeResult"
+    assert result.db.platform_principals == 1, "DB purge must still delete the principal row"
+    assert result.sessions.deleted == 2, "2 tagged MA sessions must be deleted upstream"
+    assert result.sessions.failed == 0, "no upstream failures expected"
+    assert result.sessions.upstream_error is False, "no upstream failure expected"
+
+
+async def test_purge_principal_without_anthropic_skips_upstream_cleanup(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """purge_principal(anthropic=None) (default) is DB-only — no MA call attempted."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="user-no-cleanup",
+        tenant=tenant,
+        account=account,
+    )
+    await db_session.commit()
+
+    result = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
+
+    assert isinstance(result, PrincipalPurgeResult), (
+        "must return PrincipalPurgeResult even without anthropic"
+    )
+    assert result.db.platform_principals == 1, "DB purge must still delete the principal row"
+    assert result.sessions.deleted == 0, "no upstream attempt when anthropic=None"
+    assert result.sessions.failed == 0, "no upstream attempt when anthropic=None"
+    assert result.sessions.upstream_error is False
+
+
+async def test_purge_principal_upstream_failure_after_commit_reports_upstream_error(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An APIError during upstream session enumeration must NOT propagate.
+
+    The DB transaction has already committed; purge_principal returns
+    normally with sessions.upstream_error=True instead of raising.
+    """
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="user-ma-uperr",
+        tenant=tenant,
+        account=account,
+    )
+    await db_session.commit()
+
+    def raise_connect_error(request: httpx.Request, match: Any) -> httpx.Response:
+        raise httpx.ConnectError("upstream unreachable", request=request)
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", raise_connect_error)
+    client = build_fake_anthropic(router.dispatch)
+
+    result = await purge_principal(
+        sm=db_session_factory, principal_id=pp.id, kind="platform", anthropic=client
+    )
+
+    assert result.db.platform_principals == 1, "DB purge must commit despite the upstream failure"
+    assert result.sessions.upstream_error is True, (
+        "post-commit upstream APIError must be folded into sessions.upstream_error"
+    )
+    assert result.sessions.deleted == 0, "no sessions were deleted before the failure"
