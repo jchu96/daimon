@@ -161,7 +161,6 @@ async def add_external_mcp_credential(
     now: dt.datetime,
     mcp_server_url: str,
     token: str,
-    session_context: object | None = None,  # deprecated/ignored — 88-04 will remove call sites
 ) -> None:
     """Create or replace a `static_bearer` credential in the caller's
     per-agent vault for an external (user-supplied) MCP server.
@@ -174,13 +173,7 @@ async def add_external_mcp_credential(
     whose ``auth.mcp_server_url`` matches ``mcp_server_url``, then creates the
     new one. Mirrors ``add_github_copilot_credential`` but accepts the URL as
     a parameter (per-user MCP servers each have distinct URLs).
-
-    ``session_context`` is accepted but ignored (deprecated).
-    The ``ensure_agent_mcp_vault`` bootstrap no longer accepts it — the vault
-    credential is identity-stable and requires no per-call re-stamp.
-    Call-site removal is deferred.
     """
-    del session_context  # accepted-but-ignored; see docstring
     display_name = f"daimon-mcp:{account_id}:{agent_id}"
     matching = [v async for v in client.beta.vaults.list() if v.display_name == display_name]
     if matching:

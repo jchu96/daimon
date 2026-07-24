@@ -23,7 +23,7 @@ from daimon.adapters.cli.sessions_bootstrap import (
 from daimon.adapters.cli.tenant import discover_tenant
 from daimon.core.config import load_settings
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.sessions import SessionContext, create_session
+from daimon.core.sessions import create_session
 from daimon.core.stores.identity import get_or_create_cli_principal
 from rich.console import Console
 
@@ -91,7 +91,6 @@ async def sessions_create(
         environment=env_row,
         mcp_settings=rt.settings.mcp,
         agent_uuid=agent_uuid,
-        session_context=SessionContext(is_admin=False),
         github_fallback_pat=(
             rt.settings.github.fallback_pat.get_secret_value()
             if rt.settings.github.fallback_pat is not None

@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
-import jwt as pyjwt
 import pytest
 from anthropic.types.beta import (
     BetaEnvironment,
@@ -20,7 +19,6 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.config import McpSettings
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, upsert_credential_encrypted
-from daimon.core.session_context import SessionContext
 from daimon.core.sessions import create_session
 from daimon.core.stores import agent_github_binding as github_binding_store
 from daimon.core.stores import agent_repo_binding as repo_binding_store
@@ -359,102 +357,6 @@ def _vault_cold_handler(
         raise AssertionError(f"unexpected call: {request.method} {request.url}")
 
     return _handler
-
-
-async def test_create_session_with_session_context_threads_to_vault() -> None:
-    agent = _make_agent(anthropic_id="ag_ctx")
-    env = _make_env(anthropic_id="env_ctx")
-    account_id = uuid.UUID("00000000-0000-0000-0000-000000000077")
-    agent_uuid = uuid.UUID("00000000-0000-0000-0000-000000000002")
-    secret = "x" * 32
-    public_url = "https://mcp.example.com/mcp"
-
-    captured: list[dict[str, Any]] = []
-    client = build_fake_anthropic_http(
-        _vault_cold_handler(
-            account_id=account_id,
-            agent_uuid=agent_uuid,
-            public_url=public_url,
-            captured_credential_bodies=captured,
-            session_id="sess_ctx",
-        )
-    )
-
-    await create_session(
-        client,
-        agent=agent,
-        environment=env,
-        account_id=account_id,
-        agent_uuid=agent_uuid,
-        mcp_settings=McpSettings(
-            jwt_secret=SecretStr(secret),
-            public_url=HttpUrl(public_url),
-        ),
-        session_context=SessionContext(is_admin=False),
-    )
-
-    assert len(captured) == 1, "exactly one credential POST"
-    token = captured[0]["auth"]["token"]
-    # Inspect-only: signature verification is the MCP verifier's job; here we assert claim shape.
-    claims = pyjwt.decode(token, secret.encode(), algorithms=["HS256"])
-    assert "platform" not in claims, "session_context no longer threads platform as a wire claim"
-    assert "guild_id" not in claims, "session_context no longer threads guild_id as a wire claim"
-
-
-async def test_create_session_without_session_context_is_back_compat_claimless() -> None:
-    agent = _make_agent(anthropic_id="ag_no_ctx")
-    env = _make_env(anthropic_id="env_no_ctx")
-    account_id = uuid.UUID("00000000-0000-0000-0000-000000000078")
-    agent_uuid = uuid.UUID("00000000-0000-0000-0000-000000000003")
-    secret = "x" * 32
-    public_url = "https://mcp.example.com/mcp"
-
-    captured: list[dict[str, Any]] = []
-    client = build_fake_anthropic_http(
-        _vault_cold_handler(
-            account_id=account_id,
-            agent_uuid=agent_uuid,
-            public_url=public_url,
-            captured_credential_bodies=captured,
-            session_id="sess_no_ctx",
-        )
-    )
-
-    await create_session(
-        client,
-        agent=agent,
-        environment=env,
-        account_id=account_id,
-        agent_uuid=agent_uuid,
-        mcp_settings=McpSettings(
-            jwt_secret=SecretStr(secret),
-            public_url=HttpUrl(public_url),
-        ),
-        session_context=None,
-    )
-
-    assert len(captured) == 1
-    token = captured[0]["auth"]["token"]
-    # Inspect-only: signature verification is the MCP verifier's job; here we assert claim shape.
-    claims = pyjwt.decode(token, secret.encode(), algorithms=["HS256"])
-    assert "platform" not in claims, "back-compat: claim-less when context is None"
-    assert "guild_id" not in claims, "back-compat: claim-less when context is None"
-
-
-async def test_create_session_existing_callers_still_work_without_session_context_kwarg() -> None:
-    """The 4 existing call sites in this file + oauth_github.py:263 must keep compiling."""
-    agent = _make_agent(anthropic_id="ag_existing")
-    env = _make_env(anthropic_id="env_existing")
-    client = build_fake_anthropic_http(_session_create_handler("sess_existing"))
-
-    # Existing call shape: no session_context kwarg at all.
-    result = await create_session(
-        client,
-        agent=agent,
-        environment=env,
-    )
-    assert isinstance(result, BetaManagedAgentsSession)
-    assert result.id == "sess_existing"
 
 
 # --- .env resource mount threading ---
@@ -1187,8 +1089,8 @@ def _warm_vault_copilot_handler(
     """Warm-vault handler that captures vault credential POSTs + session create.
 
     The existing vault already carries the daimon-mcp credential at ``public_url``
-    (so ``ensure_agent_mcp_vault`` does NOT rebind with session_context=None) and
-    NO Copilot credential yet — so the only credential POST is the Copilot one.
+    (so ``ensure_agent_mcp_vault`` does NOT rebind) and NO Copilot credential
+    yet — so the only credential POST is the Copilot one.
     Also serves the memory-store endpoints (the unconditional memory attach).
     """
     display = f"daimon-mcp:{account_id}:{agent_uuid}"

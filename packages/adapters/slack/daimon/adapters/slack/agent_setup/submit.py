@@ -1128,7 +1128,6 @@ async def run_add_mcp_submission(
                 import datetime as dt
 
                 from daimon.core.mcp_vault import add_external_mcp_credential
-                from daimon.core.session_context import SessionContext
 
                 agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(ma_agent.id))
                 jwt_secret = mcp.jwt_secret.get_secret_value().encode()
@@ -1141,7 +1140,6 @@ async def run_add_mcp_submission(
                     mcp_server_url=mcp_url,
                     token=token,
                     now=dt.datetime.now(dt.UTC),
-                    session_context=SessionContext(is_admin=True),
                 )
 
         log.info(

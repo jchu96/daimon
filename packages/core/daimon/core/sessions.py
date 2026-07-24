@@ -27,14 +27,13 @@ from daimon.core.github_repo_auth import resolve_clone_token
 from daimon.core.mcp_vault import add_github_copilot_credential, ensure_agent_mcp_vault
 from daimon.core.memory_resource import ensure_memory_store_and_mount
 from daimon.core.repo_resource import build_repo_resource
-from daimon.core.session_context import SessionContext
 from daimon.core.stores.agent_repo_binding import get_binding
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = structlog.get_logger(__name__)
 
-__all__ = ["SessionContext", "create_session"]
+__all__ = ["create_session"]
 
 
 async def create_session(
@@ -44,7 +43,6 @@ async def create_session(
     environment: BetaEnvironment,
     mcp_settings: McpSettings | None = None,
     account_id: uuid.UUID | None = None,
-    session_context: SessionContext | None = None,
     tenant_id: uuid.UUID | None = None,
     agent_uuid: uuid.UUID | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
@@ -61,11 +59,6 @@ async def create_session(
     ``vaults.list()`` call) and the per-agent vault id is attached to the session.
     Both ``account_id`` and ``agent_uuid`` are required in that case — no fallback
     to an account-scoped vault.
-
-    ``session_context`` is accepted but no longer threaded into
-    ``ensure_agent_mcp_vault`` (deprecated — the vault
-    credential is identity-stable and requires no per-turn re-stamp).
-    Call-site removal in ``bot.py`` is deferred.
 
     When ``tenant_id``, ``agent_uuid``, and ``session_factory`` are all
     provided, the agent's tenant-scoped secrets are assembled into a ``.env``
