@@ -725,7 +725,10 @@ def _vault_handler(
 
 @pytest.mark.asyncio
 async def test_add_mcp_modal_writes_vault_credential_after_reconcile(
-    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Happy path: after reconcile succeeds, the modal POSTs a static_bearer
     credential to the per-agent vault carrying the submitted URL and token.
@@ -760,7 +763,11 @@ async def test_add_mcp_modal_writes_vault_credential_after_reconcile(
 
     selected = _entry("a", mcp_servers=[])
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
-    runtime = _runtime_for_view(anthropic=build_stub_anthropic(handler), tenant_id=tenant_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(handler),
+        tenant_id=tenant_id,
+        sessionmaker=db_session_factory,
+    )
 
     modal = AddMcpModal(state, runtime=runtime, allowed_user_id=42)
     submitted_url = "https://ga4.example.com/mcp"
@@ -830,7 +837,10 @@ async def test_add_mcp_modal_does_not_write_vault_when_reconcile_fails(
 
 @pytest.mark.asyncio
 async def test_add_mcp_modal_resubmit_replaces_prior_vault_credential(
-    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Idempotent resubmit: second submission with the same URL DELETEs the
     prior static_bearer credential and POSTs a fresh one. Two POSTs total
@@ -862,7 +872,11 @@ async def test_add_mcp_modal_resubmit_replaces_prior_vault_credential(
 
     selected = _entry("a", mcp_servers=[])
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
-    runtime = _runtime_for_view(anthropic=build_stub_anthropic(handler), tenant_id=tenant_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(handler),
+        tenant_id=tenant_id,
+        sessionmaker=db_session_factory,
+    )
 
     url = "https://ga4.example.com/mcp"
 

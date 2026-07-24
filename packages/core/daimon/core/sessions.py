@@ -57,8 +57,18 @@ async def create_session(
     When ``mcp_settings`` has both ``public_url`` and ``jwt_secret``,
     ``ensure_agent_mcp_vault()`` runs first (idempotent — warm path is a single
     ``vaults.list()`` call) and the per-agent vault id is attached to the session.
-    Both ``account_id`` and ``agent_uuid`` are required in that case — no fallback
-    to an account-scoped vault.
+    Both ``account_id``, ``agent_uuid``, and ``session_factory`` are required in
+    that case — no fallback to an account-scoped vault. The vault get-or-create
+    is serialized per (account_id, agent_id) via a blocking Postgres advisory
+    lock (SYNC-01) so concurrent session creations can never orphan a
+    duplicate credentialed vault.
+
+    When a per-agent GitHub PAT is resolvable and the vault was ensured, a
+    GitHub Copilot MCP credential is mirrored into the vault
+    (``add_github_copilot_credential``). This is degrade-not-block: a transient
+    ``anthropic.APIError`` on that call is logged and swallowed rather than
+    propagated (SYNC-04) — the session still gets created, just without the
+    Copilot credential mounted that turn.
 
     When ``tenant_id``, ``agent_uuid``, and ``session_factory`` are all
     provided, the agent's tenant-scoped secrets are assembled into a ``.env``
@@ -101,6 +111,10 @@ async def create_session(
             raise ValueError(
                 "agent_uuid is required when mcp_settings has public_url and jwt_secret"
             )
+        if session_factory is None:
+            raise ValueError(
+                "session_factory is required when mcp_settings has public_url and jwt_secret"
+            )
         vault_id = await ensure_agent_mcp_vault(
             anthropic,
             account_id=account_id,
@@ -108,6 +122,7 @@ async def create_session(
             jwt_secret=mcp_settings.jwt_secret.get_secret_value().encode(),
             public_url=str(mcp_settings.public_url),
             now=dt.datetime.now(dt.UTC),
+            session_factory=session_factory,
         )
 
     # Dev-agent port: resolve the per-agent GitHub PAT once. It feeds BOTH the
@@ -129,7 +144,17 @@ async def create_session(
     # vault already attached to the session via vault_ids. Bound to the REAL
     # per-agent identity only — the operator fallback PAT is never mirrored here.
     if vault_id is not None and per_agent_pat is not None:
-        await add_github_copilot_credential(anthropic, vault_id=vault_id, token=per_agent_pat)
+        # Degrade-not-block: a transient MA failure on this optional credential
+        # must not kill the turn. Mirrors the memory-store mount pattern below.
+        try:
+            await add_github_copilot_credential(anthropic, vault_id=vault_id, token=per_agent_pat)
+        except anthropic_pkg.APIError as exc:
+            _log.warning(
+                "copilot_credential.mount_failed",
+                vault_id=vault_id,
+                agent_uuid=str(agent_uuid) if agent_uuid is not None else None,
+                error=str(exc),
+            )
 
     resources: list[Resource] = []
     if tenant_id is not None and agent_uuid is not None and session_factory is not None:

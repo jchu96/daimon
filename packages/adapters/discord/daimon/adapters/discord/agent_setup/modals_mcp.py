@@ -170,6 +170,7 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
                 mcp_server_url=url,
                 token=token,
                 now=dt.datetime.now(dt.UTC),
+                session_factory=self.runtime.sessionmaker,
             )
             _log.info(
                 "mcp_add.vault_credential_written",

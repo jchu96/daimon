@@ -91,6 +91,7 @@ async def sessions_create(
         environment=env_row,
         mcp_settings=rt.settings.mcp,
         agent_uuid=agent_uuid,
+        session_factory=rt.sessionmaker,
         github_fallback_pat=(
             rt.settings.github.fallback_pat.get_secret_value()
             if rt.settings.github.fallback_pat is not None

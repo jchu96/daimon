@@ -238,6 +238,7 @@ async def _seed_tenant_and_account(session: AsyncSession) -> tuple[uuid.UUID, uu
 
 async def test_discord_turn_creates_session_with_discord_guild_id_scope(
     db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id, account_id = await _seed_tenant_and_account(db_session)
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_discord")
@@ -261,6 +262,7 @@ async def test_discord_turn_creates_session_with_discord_guild_id_scope(
             jwt_secret=SecretStr(SECRET.decode()),
             public_url=HttpUrl(PUBLIC_URL),
         ),
+        session_factory=db_session_factory,
     )
 
     assert len(captured) == 1, "exactly one credential POST on cold path"
@@ -272,6 +274,7 @@ async def test_discord_turn_creates_session_with_discord_guild_id_scope(
 
 async def test_discord_turn_with_existing_matching_url_vault_skips_rebind(
     db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Existing vault with credential at the current URL: no DELETE, no new credential POST.
 
@@ -302,6 +305,7 @@ async def test_discord_turn_with_existing_matching_url_vault_skips_rebind(
             jwt_secret=SecretStr(SECRET.decode()),
             public_url=HttpUrl(PUBLIC_URL),
         ),
+        session_factory=db_session_factory,
     )
 
     delete_calls = [c for c in call_log if c[0] == "DELETE"]
@@ -342,6 +346,7 @@ async def test_minted_jwt_resolves_to_discord_scoped_identity(
             jwt_secret=SecretStr(SECRET.decode()),
             public_url=HttpUrl(PUBLIC_URL),
         ),
+        session_factory=db_session_factory,
     )
 
     assert len(captured) == 1

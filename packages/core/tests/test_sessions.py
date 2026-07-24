@@ -213,7 +213,9 @@ async def test_create_session_skips_vault_when_public_url_is_none() -> None:
     )
 
 
-async def test_create_session_calls_ensure_agent_mcp_vault_when_public_url_set() -> None:
+async def test_create_session_calls_ensure_agent_mcp_vault_when_public_url_set(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     import uuid
 
     agent = _make_agent(anthropic_id="ag_vault")
@@ -285,6 +287,7 @@ async def test_create_session_calls_ensure_agent_mcp_vault_when_public_url_set()
             jwt_secret=SecretStr("x" * 32),
             public_url=HttpUrl("https://mcp.example.com/mcp"),
         ),
+        session_factory=db_session_factory,
     )
 
     assert isinstance(result, BetaManagedAgentsSession), (
@@ -1262,6 +1265,135 @@ async def test_create_session_skips_copilot_when_no_pat(
 
     assert len(cred_bodies) == 0, "no Copilot credential POST when there is no PAT"
     assert len(session_bodies) == 1
+
+
+def _warm_vault_copilot_500_handler(
+    *,
+    account_id: uuid.UUID,
+    agent_uuid: uuid.UUID,
+    public_url: str,
+    session_create_bodies: list[dict[str, Any]],
+    session_id: str,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Like ``_warm_vault_copilot_handler``, but the Copilot credential POST
+    500s — models a transient MA APIError on that optional mount."""
+    display = f"daimon-mcp:{account_id}:{agent_uuid}"
+    memory_handler = make_fake_memory_store_handler()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        try:
+            return memory_handler(request)
+        except NotHandled:
+            pass
+        if request.method == "GET" and request.url.path == "/v1/vaults":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "vlt_existing",
+                            "type": "vault",
+                            "display_name": display,
+                            "metadata": None,
+                            "archived_at": None,
+                            "created_at": "2026-04-01T00:00:00Z",
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/vaults/vlt_existing/credentials":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "vcrd_daimon_mcp",
+                            "type": "credential",
+                            "vault_id": "vlt_existing",
+                            "auth": {"type": "static_bearer", "mcp_server_url": public_url},
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/vaults/vlt_existing/credentials":
+            return httpx.Response(
+                500,
+                json={"type": "error", "error": {"type": "api_error", "message": "boom"}},
+            )
+        if request.method == "POST" and request.url.path.endswith("/v1/sessions"):
+            body = json.loads(request.content)
+            session_create_bodies.append(body)
+            return httpx.Response(
+                200,
+                json=_session_body(
+                    session_id=session_id,
+                    agent_id=body["agent"],
+                    environment_id=body["environment_id"],
+                ),
+            )
+        raise AssertionError(f"unexpected call: {request.method} {request.url.path}")
+
+    return _handler
+
+
+async def test_create_session_degrades_when_copilot_credential_mount_fails(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """SYNC-04: a transient anthropic.APIError on the Copilot credential POST
+    must not raise out of create_session — the session is still created, and
+    a stable-keyed structured warning fires (Phase 04 consumes these keys)."""
+    tenant = await make_tenant(db_session)
+    agent_uuid = uuid.uuid4()
+    account_id = uuid.UUID("00000000-0000-0000-0000-0000000000c2")
+    public_url = "https://mcp.example.com/mcp"
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+    await _seed_repo_binding_with_pat(
+        db_session,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        fernet=fernet,
+        db_session_factory=db_session_factory,
+        plaintext_token="ghp_copilot_pat",
+    )
+
+    agent = _make_agent(anthropic_id="ag_copilot_fail")
+    env = _make_env(anthropic_id="env_copilot_fail")
+    session_bodies: list[dict[str, Any]] = []
+    client = build_fake_anthropic_http(
+        _warm_vault_copilot_500_handler(
+            account_id=account_id,
+            agent_uuid=agent_uuid,
+            public_url=public_url,
+            session_create_bodies=session_bodies,
+            session_id="sess_copilot_fail",
+        )
+    )
+
+    import structlog.testing
+
+    with structlog.testing.capture_logs() as logs:
+        session = await create_session(
+            client,
+            agent=agent,
+            environment=env,
+            account_id=account_id,
+            mcp_settings=McpSettings(
+                jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)
+            ),
+            tenant_id=tenant.id,
+            agent_uuid=agent_uuid,
+            session_factory=db_session_factory,
+            fernet=fernet,
+        )
+
+    assert session is not None, "a transient Copilot-credential APIError must degrade, not raise"
+    assert len(session_bodies) == 1, "session-create must still happen after the degrade"
+    assert any(e.get("event") == "copilot_credential.mount_failed" for e in logs), (
+        "must emit the stable copilot_credential.mount_failed warning key"
+    )
 
 
 # --- Operator fallback PAT for public-repo clones (quick task 260616-45k) -----

@@ -1140,6 +1140,7 @@ async def run_add_mcp_submission(
                     mcp_server_url=mcp_url,
                     token=token,
                     now=dt.datetime.now(dt.UTC),
+                    session_factory=runtime.sessionmaker,
                 )
 
         log.info(

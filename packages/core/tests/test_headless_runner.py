@@ -470,7 +470,9 @@ async def test_run_turn_propagates_httpx_error() -> None:
         )
 
 
-async def test_run_turn_attaches_vault_when_mcp_settings() -> None:
+async def test_run_turn_attaches_vault_when_mcp_settings(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """Cold-path: ensure_agent_mcp_vault performs vaults.list → vaults.create, then
     run_turn passes the new per-agent vault id into beta.sessions.create as vault_ids.
     """
@@ -564,6 +566,7 @@ async def test_run_turn_attaches_vault_when_mcp_settings() -> None:
         ),
         account_id=account_id,
         agent_uuid=agent_uuid,
+        session_factory=db_session_factory,
     )
 
     assert tail == "ok"
