@@ -1313,6 +1313,243 @@ async def test_orphan_delete_retries_and_succeeds_on_second_sync(
     assert row_after_second is None, "row must be gone after the retry succeeds"
 
 
+async def test_orphan_delete_404_treated_as_already_deleted(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """MA delete returns 404 → treated as already-deleted success (SYNC-02).
+
+    A permanent 404 must converge exactly like a successful MA delete: the
+    local row is removed, report.deleted increments, and NO failed_uploads
+    entry is recorded (otherwise the stale anthropic_id lingers forever and
+    poisons the attach step's row_ids union on every subsequent sync).
+    """
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
+
+    async with db_session_factory() as s, s.begin():
+        await upsert_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="gone_orphan",
+            source_repo_url="https://github.com/o/r1",
+            source_repo_branch="main",
+            source_path="",
+            content_hash="hash_r1",
+            anthropic_id="sk_gone",
+            anthropic_latest_version="1",
+        )
+
+    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
+    )
+
+    router = MARouter()
+    router.add(
+        "DELETE",
+        r"/v1/skills/sk_gone",
+        lambda req, _m: httpx.Response(
+            404,
+            json={
+                "type": "error",
+                "error": {"type": "not_found_error", "message": "skill not found"},
+            },
+        ),
+    )
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    report = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r1", branch="main", split=True)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+    )
+
+    assert report.deleted == 1, "a 404 must be treated as already-deleted (report.deleted += 1)"
+    assert report.failed_uploads == [], (
+        f"a 404 must NOT be recorded as a failure, got {report.failed_uploads}"
+    )
+
+    async with db_session_factory() as s, s.begin():
+        row = await load_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="gone_orphan",
+        )
+    assert row is None, "local row must be removed after a 404 (no more lingering anthropic_id)"
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "skill_sync.orphan_delete_already_gone" in combined, (
+        f"the already-gone info log must be emitted; captured={combined!r}"
+    )
+
+
+async def test_orphan_delete_transient_failure_retains_row_without_poisoning_attach(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """MA delete returns 500 (transient) with a live attach step → sync does not crash.
+
+    The orphan row is retained (pre-existing convergent-retry behavior for
+    genuinely transient failures, unchanged by the 404 fix) and its stale
+    anthropic_id flows into the attach step's row_ids union — this pins that
+    the attach step tolerates it (agents.update succeeds) rather than the
+    whole sync raising.
+    """
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
+
+    ledger_key = derive_agent_uuid(tenant_id=cli.tenant_id, ma_agent_id="ag_transient")
+
+    async with db_session_factory() as s, s.begin():
+        await upsert_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=ledger_key,
+            agent_name="agent",
+            name="transient_orphan",
+            source_repo_url="https://github.com/o/r1",
+            source_repo_branch="main",
+            source_path="",
+            content_hash="hash_r1",
+            anthropic_id="sk_transient",
+            anthropic_latest_version="1",
+        )
+
+    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
+    )
+
+    from anthropic.types.beta.beta_managed_agents_agent_toolset20260401 import (
+        BetaManagedAgentsAgentToolset20260401,
+    )
+    from anthropic.types.beta.beta_managed_agents_agent_toolset_default_config import (
+        BetaManagedAgentsAgentToolsetDefaultConfig,
+    )
+    from anthropic.types.beta.beta_managed_agents_always_allow_policy import (
+        BetaManagedAgentsAlwaysAllowPolicy,
+    )
+
+    _base_toolset = BetaManagedAgentsAgentToolset20260401(
+        type="agent_toolset_20260401",
+        configs=[],
+        default_config=BetaManagedAgentsAgentToolsetDefaultConfig(
+            enabled=True,
+            permission_policy=BetaManagedAgentsAlwaysAllowPolicy(type="always_allow"),
+        ),
+    )
+
+    agent_payload = BetaManagedAgentsAgent(
+        id="ag_transient",
+        type="agent",
+        name="agent",
+        model={"id": "claude-opus-4-7"},
+        metadata={
+            "daimon_tenant": str(cli.tenant_id),
+            "daimon_name": "agent",
+        },
+        description=None,
+        created_at="2026-04-21T00:00:00Z",
+        updated_at="2026-04-21T00:00:00Z",
+        version=3,
+        mcp_servers=[],
+        skills=[],
+        tools=[_base_toolset],
+        system=None,
+    ).model_dump(mode="json")
+
+    update_calls: list[dict[str, object]] = []
+
+    def on_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        update_calls.append(json.loads(req.content))
+        return httpx.Response(
+            200,
+            json=BetaManagedAgentsAgent(
+                id="ag_transient",
+                type="agent",
+                name="agent",
+                model={"id": "claude-opus-4-7"},
+                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
+                description=None,
+                created_at="2026-04-21T00:00:00Z",
+                updated_at="2026-04-21T00:00:00Z",
+                version=4,
+                mcp_servers=[],
+                skills=[
+                    BetaManagedAgentsCustomSkill(
+                        skill_id="sk_transient", type="custom", version="1"
+                    )
+                ],
+                tools=[],
+                system=None,
+            ).model_dump(mode="json"),
+        )
+
+    router = MARouter()
+    router.add(
+        "DELETE",
+        r"/v1/skills/sk_transient",
+        lambda req, _m: httpx.Response(
+            500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}}
+        ),
+    )
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent_payload]))
+    router.add(
+        "GET",
+        r"/v1/agents/ag_transient",
+        lambda req, _m: httpx.Response(200, json=agent_payload),
+    )
+    router.add("POST", r"/v1/agents/ag_transient", on_update)
+    anthropic_client = _build_anthropic(router)
+
+    report = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r1", branch="main", split=True)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+    )
+
+    assert report.deleted == 0, "a transient (non-404) failure must not increment deleted"
+    assert any(name == "transient_orphan" for name, _ in report.failed_uploads), (
+        f"the transient failure must still be recorded, got {report.failed_uploads}"
+    )
+    assert len(update_calls) == 1, (
+        f"the attach step must still run and call agents.update once, got {len(update_calls)}"
+    )
+
+    async with db_session_factory() as s, s.begin():
+        row = await load_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=ledger_key,
+            agent_name="agent",
+            name="transient_orphan",
+        )
+    assert row is not None, "row must be RETAINED for a transient (non-404) failure"
+    assert row.anthropic_id == "sk_transient"
+
+
 async def test_orphan_delete_lingering_row_dedups_readded_skill(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
