@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from daimon.core._models import SlackEventDedup
-from sqlalchemy import CursorResult
+from sqlalchemy import CursorResult, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,3 +39,16 @@ async def insert_if_new(
     result = await session.execute(stmt)
     await session.flush()
     return cast(CursorResult[Any], result).rowcount == 1
+
+
+async def delete_event_dedup_for_team(session: AsyncSession, *, team_id: str) -> int:
+    """Delete every slack_event_dedup row for a workspace. Idempotent.
+
+    Returns rowcount; never raises on 0. Used by the Slack uninstall teardown.
+    """
+    result = await session.execute(
+        delete(SlackEventDedup).where(SlackEventDedup.team_id == team_id)
+    )
+    rowcount = cast(CursorResult[Any], result).rowcount
+    await session.flush()
+    return rowcount

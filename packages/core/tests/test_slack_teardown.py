@@ -18,6 +18,8 @@ from daimon.core.defaults.provisioning import (
 )
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token, upsert_slack_bot_token
+from daimon.core.stores.slack_connect_prompts import mark_connect_prompted, was_connect_prompted
+from daimon.core.stores.slack_event_dedup import insert_if_new
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -106,6 +108,35 @@ async def test_archive_tenant_sets_archived_at_for_existing_tenant(
     assert tenant_row.archived_at == _NOW, (
         "archive_tenant must set archived_at to the injected now parameter"
     )
+
+
+async def test_teardown_slack_install_deletes_connect_prompts_and_event_dedup(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """teardown_slack_install must also clear slack_connect_prompts and slack_event_dedup rows."""
+    team_id = "T_TEARDOWN_02"
+
+    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+
+    await mark_connect_prompted(db_session, team_id=team_id, slack_user_id="U1", now=_NOW)
+    was_new = await insert_if_new(db_session, team_id=team_id, channel="C1", event_ts="1.1")
+    assert was_new, "precondition: dedup row must be a genuine first insert"
+    await db_session.flush()
+
+    assert await was_connect_prompted(db_session, team_id=team_id, slack_user_id="U1"), (
+        "precondition: connect prompt row must exist before teardown"
+    )
+
+    await teardown_slack_install(db_session_factory, team_id=team_id, now=_NOW)
+
+    assert not await was_connect_prompted(db_session, team_id=team_id, slack_user_id="U1"), (
+        "teardown_slack_install must delete the slack_connect_prompts row"
+    )
+    # Re-inserting the same triple after teardown must succeed as a genuine
+    # first insert — proof the slack_event_dedup row is really gone.
+    was_new_after = await insert_if_new(db_session, team_id=team_id, channel="C1", event_ts="1.1")
+    assert was_new_after, "teardown_slack_install must delete the slack_event_dedup row"
 
 
 async def test_archive_tenant_is_noop_for_unknown_tenant(
