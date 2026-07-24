@@ -32,6 +32,8 @@ from daimon.core.purge import AccountPurgeResult, PurgeReport, purge_account, pu
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import routines as routines_store
+from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
+from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
 from daimon.core.stores import user_skills as user_skills_store
 from daimon.testing.factories import (
     link_principals,
@@ -1048,3 +1050,140 @@ async def test_purge_account_rolls_back_new_table_rows_on_failure(
         db_session, platform="discord", platform_user_id="user-rb-new"
     )
     assert surviving_oauth_states == 1, "oauth-state row must survive rolled-back purge"
+
+
+# ---------------------------------------------------------------------------
+# SYNC-06 principal-scoped leg (slack_user_tokens) + D-07 (slack_turn_contexts)
+# ---------------------------------------------------------------------------
+
+
+async def test_purge_principal_slack_deletes_slack_user_token(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Purging a Slack platform principal deletes its slack_user_tokens row.
+
+    Keyed by the runtime-resolved (team_id=Tenant.external_id, slack_user_id).
+    """
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_PURGE_01")
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="slack",
+        external_id="U_PURGE_TARGET",
+        tenant=tenant,
+        account=account,
+    )
+    await slack_user_tokens_store.upsert_slack_user_token(
+        db_session,
+        team_id="T_PURGE_01",
+        slack_user_id="U_PURGE_TARGET",
+        encrypted_token=b"tok",
+        scopes="identity.basic",
+    )
+    # An unrelated Slack user in the same workspace must survive.
+    await slack_user_tokens_store.upsert_slack_user_token(
+        db_session,
+        team_id="T_PURGE_01",
+        slack_user_id="U_OTHER",
+        encrypted_token=b"other-tok",
+        scopes="identity.basic",
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
+
+    assert report.slack_user_tokens == 1, "must delete the target principal's slack_user_tokens row"
+
+    target_row = await slack_user_tokens_store.get_slack_user_token(
+        db_session, team_id="T_PURGE_01", slack_user_id="U_PURGE_TARGET"
+    )
+    assert target_row is None, "target's slack_user_tokens row must be gone"
+
+    other_row = await slack_user_tokens_store.get_slack_user_token(
+        db_session, team_id="T_PURGE_01", slack_user_id="U_OTHER"
+    )
+    assert other_row is not None, "unrelated user's slack_user_tokens row must survive"
+
+
+async def test_purge_principal_cli_skips_slack_user_tokens(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CLI principals have no slack_user_id — the Slack leg must be a no-op."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    cli = await make_cli_principal(
+        db_session, os_user="cli-noslack", tenant=tenant, account=account
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=cli.id, kind="cli")
+
+    assert report.slack_user_tokens == 0, "CLI principals must not touch slack_user_tokens"
+
+
+async def test_purge_principal_discord_skips_slack_user_tokens(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Non-Slack platform principals must not attempt a slack_user_tokens delete."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="user-discord",
+        tenant=tenant,
+        account=account,
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
+
+    assert report.slack_user_tokens == 0, "discord principals must not touch slack_user_tokens"
+
+
+async def test_purge_account_deletes_slack_turn_contexts(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """purge_account deletes slack_turn_contexts rows keyed by (tenant_id, account_id)."""
+    from datetime import UTC, datetime
+
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_TURNCTX_01")
+    account = await make_account(db_session, tenant=tenant)
+    await make_cli_principal(db_session, os_user="cli-turnctx", tenant=tenant, account=account)
+
+    # Another account's turn context in the same tenant must survive.
+    other_account = await make_account(db_session, tenant=tenant)
+
+    await slack_turn_contexts_store.create_slack_turn_context(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=account.id,
+        channel_id="C1",
+        thread_ts="1.1",
+        started_at=datetime.now(tz=UTC),
+    )
+    await slack_turn_contexts_store.create_slack_turn_context(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=other_account.id,
+        channel_id="C2",
+        thread_ts="2.2",
+        started_at=datetime.now(tz=UTC),
+    )
+    await db_session.commit()
+
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert report.db.slack_turn_contexts == 1, "must delete the target account's turn-context row"
+
+    surviving = await slack_turn_contexts_store.get_slack_turn_channels(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=other_account.id,
+        cutoff=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    assert surviving == frozenset({"C2"}), "other account's turn-context row must survive"

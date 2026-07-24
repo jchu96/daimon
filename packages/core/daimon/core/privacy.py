@@ -22,6 +22,9 @@ from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
 from daimon.core.stores import routines as routines_store
+from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
+from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
+from daimon.core.stores import tenants as tenants_store
 from daimon.core.stores import user_skills as user_skills_store
 from daimon.core.stores.domain import CliPrincipalRow, PlatformPrincipalRow
 from pydantic import BaseModel, ConfigDict
@@ -59,6 +62,8 @@ class PurgePreview(BaseModel):
     github_oauth_states: PurgePreviewRow
     mcp_tokens: PurgePreviewRow
     agent_github_binding: PurgePreviewRow
+    slack_user_tokens: PurgePreviewRow
+    slack_turn_contexts: PurgePreviewRow
 
 
 def _format_platform_principal(p: PlatformPrincipalRow) -> str:
@@ -217,6 +222,43 @@ async def collect_purge_preview(
             )
         agent_github_binding = PurgePreviewRow(count=agent_github_binding_total, example=None)
 
+        # 11. slack_user_tokens — Slack platform principals only, 0 or 1 per
+        # principal (PK is (team_id, slack_user_id)), mirroring the
+        # github_credentials loop. team_id = Tenant.external_id resolved via
+        # the principal's tenant_id.
+        slack_user_tokens_total = 0
+        tenant_cache: dict[uuid.UUID, str | None] = {}
+        for pp in pp_list:
+            if pp.platform != "slack":
+                continue
+            if pp.tenant_id not in tenant_cache:
+                tenant_row = await tenants_store.get_tenant(session, pp.tenant_id)
+                tenant_cache[pp.tenant_id] = (
+                    tenant_row.external_id if tenant_row is not None else None
+                )
+            team_id = tenant_cache[pp.tenant_id]
+            if team_id is None:
+                continue
+            token = await slack_user_tokens_store.get_slack_user_token(
+                session, team_id=team_id, slack_user_id=pp.external_id
+            )
+            if token is not None:
+                slack_user_tokens_total += 1
+        slack_user_tokens = PurgePreviewRow(count=slack_user_tokens_total, example=None)
+
+        # 12. slack_turn_contexts — account-scoped (tenant_id, account_id),
+        # summed over every distinct tenant any principal belongs to, mirroring
+        # purge_account's loop.
+        distinct_tenant_ids = {p.tenant_id for p in (*cli_list, *pp_list)}
+        slack_turn_contexts_total = 0
+        for tenant_id in distinct_tenant_ids:
+            slack_turn_contexts_total += (
+                await slack_turn_contexts_store.count_turn_contexts_for_account(
+                    session, tenant_id=tenant_id, account_id=account_id
+                )
+            )
+        slack_turn_contexts = PurgePreviewRow(count=slack_turn_contexts_total, example=None)
+
     return PurgePreview(
         linked_principals=linked_principals,
         principal_links=principal_links,
@@ -228,4 +270,6 @@ async def collect_purge_preview(
         github_oauth_states=github_oauth_states,
         mcp_tokens=mcp_tokens,
         agent_github_binding=agent_github_binding,
+        slack_user_tokens=slack_user_tokens,
+        slack_turn_contexts=slack_turn_contexts,
     )

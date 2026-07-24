@@ -32,6 +32,8 @@ from daimon.core.stores import agent_github_binding as agent_github_binding_stor
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
 from daimon.core.stores import routines as routines_store
+from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
+from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
 from daimon.core.stores import user_skills as user_skills_store
 from daimon.testing.factories import (
     link_principals,
@@ -346,6 +348,53 @@ async def test_collect_purge_preview_cli_oauth_states_excludes_same_os_user_in_o
     )
 
 
+async def test_collect_purge_preview_counts_slack_user_tokens_and_turn_contexts(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Preview counts slack_user_tokens (Slack principal) + slack_turn_contexts
+    (account-scoped) and agrees with purge_account's actual deletion counts."""
+    from datetime import UTC, datetime
+
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="PV_SLACK_01")
+    account = await make_account(db_session, tenant=tenant)
+    await make_platform_principal(
+        db_session,
+        platform="slack",
+        external_id="U_PV_TARGET",
+        tenant=tenant,
+        account=account,
+    )
+    await slack_user_tokens_store.upsert_slack_user_token(
+        db_session,
+        team_id="PV_SLACK_01",
+        slack_user_id="U_PV_TARGET",
+        encrypted_token=b"tok",
+        scopes="identity.basic",
+    )
+    await slack_turn_contexts_store.create_slack_turn_context(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=account.id,
+        channel_id="C1",
+        thread_ts="1.1",
+        started_at=datetime.now(tz=UTC),
+    )
+    await db_session.commit()
+
+    preview = await collect_purge_preview(sm=db_session_factory, account_id=account.id)
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert preview.slack_user_tokens.count == 1, "must count the Slack principal's token row"
+    assert preview.slack_user_tokens.count == report.db.slack_user_tokens, (
+        "preview and purge must agree on slack_user_tokens"
+    )
+    assert preview.slack_turn_contexts.count == 1, "must count the account's turn-context row"
+    assert preview.slack_turn_contexts.count == report.db.slack_turn_contexts, (
+        "preview and purge must agree on slack_turn_contexts"
+    )
+
+
 async def test_collect_purge_preview_matches_purge_account_coverage_field_for_field() -> None:
     """If `PurgeReport` grows a new int field, `PurgePreview` MUST mirror it.
 
@@ -371,6 +420,8 @@ async def test_collect_purge_preview_matches_purge_account_coverage_field_for_fi
         "github_oauth_states": "github_oauth_states",
         "mcp_tokens": "mcp_tokens",
         "agent_github_binding": "agent_github_binding",
+        "slack_user_tokens": "slack_user_tokens",
+        "slack_turn_contexts": "slack_turn_contexts",
     }
 
     uncovered = report_fields - set(mapping.keys())

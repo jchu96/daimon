@@ -51,6 +51,9 @@ from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
 from daimon.core.stores import routines as routines_store
+from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
+from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
+from daimon.core.stores import tenants as tenants_store
 from daimon.core.stores import user_skills as user_skills_store
 from daimon.core.stores.domain import CliPrincipalRow, PlatformPrincipalRow
 from pydantic import BaseModel, ConfigDict, Field
@@ -77,6 +80,8 @@ class PurgeReport(BaseModel):
     github_oauth_states: int = 0
     mcp_tokens: int = 0
     agent_github_binding: int = 0
+    slack_user_tokens: int = 0
+    slack_turn_contexts: int = 0
 
     def merge(self, other: PurgeReport) -> PurgeReport:
         return PurgeReport(
@@ -91,6 +96,8 @@ class PurgeReport(BaseModel):
             github_oauth_states=self.github_oauth_states + other.github_oauth_states,
             mcp_tokens=self.mcp_tokens + other.mcp_tokens,
             agent_github_binding=self.agent_github_binding + other.agent_github_binding,
+            slack_user_tokens=self.slack_user_tokens + other.slack_user_tokens,
+            slack_turn_contexts=self.slack_turn_contexts + other.slack_turn_contexts,
         )
 
 
@@ -139,7 +146,8 @@ async def _purge_principal_in_session(
         kind = "cli"
         # The CLI auth flow writes oauth-state rows with platform="cli",
         # platform_user_id=<os_user> (adapters/cli/commands/auth.py). Both
-        # both principal kinds where the table permits — CLI principals are included.
+        # principal kinds own rows in the tables where the schema permits it —
+        # CLI principals are included.
         # tenant_id scoping is a deliberate carve-out: os_user is NOT
         # globally unique (two unrelated people can both be `ubuntu`), so a
         # tenant-agnostic delete would erase another account's handshake rows.
@@ -165,6 +173,18 @@ async def _purge_principal_in_session(
         session, principal_id=principal.id
     )
 
+    # slack_user_tokens is keyed by (team_id, slack_user_id), not principal_id.
+    # team_id = Tenant.external_id (the folded workspace_id) resolved at
+    # runtime via principal.tenant_id — derive_tenant_uuid can't be reversed.
+    # Gated to Slack platform principals; CLI principals never own this row.
+    slack_user_tokens_count = 0
+    if isinstance(principal, PlatformPrincipalRow) and principal.platform == "slack":
+        tenant = await tenants_store.get_tenant(session, principal.tenant_id)
+        if tenant is not None:
+            slack_user_tokens_count = await slack_user_tokens_store.delete_slack_user_token(
+                session, team_id=tenant.external_id, slack_user_id=principal.external_id
+            )
+
     links_count = await identity_store.delete_principal_links_for_principal(
         session, principal_id=principal.id, kind=kind
     )
@@ -181,6 +201,7 @@ async def _purge_principal_in_session(
         github_credentials=github_credentials_count,
         github_oauth_states=oauth_states_count,
         agent_github_binding=agent_github_binding_count,
+        slack_user_tokens=slack_user_tokens_count,
     )
 
 
@@ -241,6 +262,16 @@ async def purge_account(
         mcp_tokens_count = await mcp_tokens_store.delete_tokens_for_account(
             session, account_id=account_id
         )
+        # slack_turn_contexts (D-07): keyed by (tenant_id, account_id), not
+        # principal_id. Loop every tenant the account's principals belong to —
+        # mirrors the upstream session-deletion loop below.
+        slack_turn_contexts_count = 0
+        for tenant_id in tenant_ids:
+            slack_turn_contexts_count += (
+                await slack_turn_contexts_store.delete_turn_contexts_for_account(
+                    session, tenant_id=tenant_id, account_id=account_id
+                )
+            )
         user_cfg_count = await accounts_store.delete_user_config_for_account(
             session, account_id=account_id
         )
@@ -250,6 +281,7 @@ async def purge_account(
                 mcp_tokens=mcp_tokens_count,
                 user_configs=user_cfg_count,
                 accounts=account_count,
+                slack_turn_contexts=slack_turn_contexts_count,
             )
         )
 

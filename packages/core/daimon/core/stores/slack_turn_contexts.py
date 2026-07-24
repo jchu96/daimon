@@ -12,7 +12,7 @@ from typing import Any, cast
 
 from daimon.core._models import SlackTurnContext
 from daimon.core.stores.domain import SlackTurnContextRow
-from sqlalchemy import CursorResult, delete, select
+from sqlalchemy import CursorResult, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -45,6 +45,45 @@ async def delete_slack_turn_context(session: AsyncSession, *, id: uuid.UUID) -> 
     rowcount = cast(CursorResult[Any], result).rowcount
     await session.flush()
     return rowcount
+
+
+async def delete_turn_contexts_for_account(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+) -> int:
+    """Delete every slack_turn_contexts row for an account. Idempotent.
+
+    Returns rowcount; never raises on 0. Used by the GDPR purge orchestrator.
+    """
+    result = await session.execute(
+        delete(SlackTurnContext).where(
+            SlackTurnContext.tenant_id == tenant_id,
+            SlackTurnContext.account_id == account_id,
+        )
+    )
+    rowcount = cast(CursorResult[Any], result).rowcount
+    await session.flush()
+    return rowcount
+
+
+async def count_turn_contexts_for_account(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+) -> int:
+    """Read-only count for the purge-cascade preview."""
+    result = await session.execute(
+        select(func.count())
+        .select_from(SlackTurnContext)
+        .where(
+            SlackTurnContext.tenant_id == tenant_id,
+            SlackTurnContext.account_id == account_id,
+        )
+    )
+    return result.scalar_one()
 
 
 async def get_slack_turn_channels(
