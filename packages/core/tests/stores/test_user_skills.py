@@ -10,7 +10,6 @@ from daimon.core.stores.user_skills import (
     delete_user_skills_for_principal,
     delete_user_skills_for_repo,
     get_first_user_skill_for_principal,
-    list_user_skill_repos_for_agent,
     list_user_skills_for_agent,
     list_user_skills_for_repo,
     load_user_skill,
@@ -413,56 +412,6 @@ async def _seed_repo_skill(
         content_hash=f"hash-{name}",
         anthropic_id=f"skill_{name}",
         anthropic_latest_version="1",
-    )
-
-
-async def test_list_user_skill_repos_for_agent_returns_distinct_sorted_urls(
-    db_session: AsyncSession,
-) -> None:
-    """Distinct repos for an agent, across principals — the de-facto repo list."""
-    tenant = await make_tenant(db_session)
-    repo_a = "https://github.com/a/one"
-    repo_b = "https://github.com/b/two"
-    # Two skills from repo_b under one principal, one from repo_a under another.
-    await _seed_repo_skill(
-        db_session,
-        tenant_id=tenant.id,
-        principal_id=uuid.uuid4(),
-        agent_name="agent",
-        name="x",
-        repo_url=repo_b,
-    )
-    await _seed_repo_skill(
-        db_session,
-        tenant_id=tenant.id,
-        principal_id=uuid.uuid4(),
-        agent_name="agent",
-        name="y",
-        repo_url=repo_b,
-    )
-    await _seed_repo_skill(
-        db_session,
-        tenant_id=tenant.id,
-        principal_id=uuid.uuid4(),
-        agent_name="agent",
-        name="z",
-        repo_url=repo_a,
-    )
-    # A different agent's repo must not leak in.
-    await _seed_repo_skill(
-        db_session,
-        tenant_id=tenant.id,
-        principal_id=uuid.uuid4(),
-        agent_name="other",
-        name="w",
-        repo_url="https://github.com/c/three",
-    )
-
-    repos = await list_user_skill_repos_for_agent(
-        db_session, tenant_id=tenant.id, agent_name="agent"
-    )
-    assert repos == [repo_a, repo_b], (
-        "must return the agent's distinct repos, sorted, with no other agent's repo"
     )
 
 

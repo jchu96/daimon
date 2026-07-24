@@ -135,29 +135,6 @@ async def delete_user_skill(
     await session.execute(stmt)
 
 
-async def list_user_skill_repos_for_agent(
-    session: AsyncSession,
-    *,
-    tenant_id: uuid.UUID,
-    agent_name: str,
-) -> list[str]:
-    """Return the distinct ``source_repo_url`` values tracked for an agent.
-
-    Keyed on (tenant_id, agent_name) only — NOT principal_id. The user_skills
-    ledger is per-agent (CR-01), and rows for one agent can carry different
-    ledger principal_ids across history (pre-CR-01 rows, public-repo fallback).
-    This is the de-facto "which repos has this agent ever synced" list — used to
-    populate the remove-repo UI. Sorted for deterministic display.
-    """
-    stmt = (
-        select(UserSkill.source_repo_url)
-        .where(UserSkill.tenant_id == tenant_id, UserSkill.agent_name == agent_name)
-        .distinct()
-        .order_by(UserSkill.source_repo_url)
-    )
-    return list((await session.execute(stmt)).scalars())
-
-
 async def list_user_skills_for_repo(
     session: AsyncSession,
     *,

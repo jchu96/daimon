@@ -11,11 +11,9 @@ from daimon.core._models import (
     PlatformPrincipal,
     PrincipalLink,
 )
-from daimon.core.errors import StoreError
 from daimon.core.stores.domain import (
     CliPrincipalRow,
     PlatformPrincipalRow,
-    PrincipalLinkRow,
 )
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.engine import CursorResult
@@ -96,70 +94,6 @@ async def find_platform_principal(
     return None if orm is None else PlatformPrincipalRow.model_validate(orm)
 
 
-async def set_active_agent_name(
-    session: AsyncSession,
-    *,
-    principal_id: uuid.UUID,
-    agent_name: str | None,
-) -> None:
-    """Set or clear the per-principal active agent (daimon-tag string).
-
-    Storage is the daimon-tag (not the MA UUID) so the value survives MA archive
-    cycles the same way routines do. Empty string is normalized to None.
-    Calling with an unknown principal_id is a no-op (idempotency contract,
-    same shape as `delete_for_principal`).
-    """
-    normalized = agent_name if agent_name else None
-    orm = await session.get(PlatformPrincipal, principal_id)
-    if orm is None:
-        return
-    orm.active_agent_name = normalized
-    await session.flush()
-
-
-async def create_principal_link(
-    session: AsyncSession,
-    *,
-    cli_principal_id: uuid.UUID,
-    platform_principal_id: uuid.UUID,
-) -> PrincipalLinkRow:
-    """Insert the `(cli, platform)` edge. Caller validates existence upstream."""
-    link = PrincipalLink(
-        cli_principal_id=cli_principal_id,
-        platform_principal_id=platform_principal_id,
-    )
-    session.add(link)
-    await session.flush()
-    return PrincipalLinkRow.model_validate(link)
-
-
-async def list_links_for_cli(
-    session: AsyncSession, *, cli_principal_id: uuid.UUID
-) -> list[PrincipalLinkRow]:
-    stmt = select(PrincipalLink).where(PrincipalLink.cli_principal_id == cli_principal_id)
-    rows = (await session.execute(stmt)).scalars().all()
-    return [PrincipalLinkRow.model_validate(r) for r in rows]
-
-
-async def delete_principal_link(
-    session: AsyncSession,
-    *,
-    cli_principal_id: uuid.UUID,
-    platform_principal_id: uuid.UUID,
-) -> None:
-    stmt = delete(PrincipalLink).where(
-        PrincipalLink.cli_principal_id == cli_principal_id,
-        PrincipalLink.platform_principal_id == platform_principal_id,
-    )
-    result = await session.execute(stmt)
-    if cast(CursorResult[Any], result).rowcount == 0:
-        raise StoreError(
-            f"no link between cli_principal={cli_principal_id} and "
-            f"platform_principal={platform_principal_id}"
-        )
-    await session.flush()
-
-
 async def delete_for_principal(
     session: AsyncSession,
     *,
@@ -189,18 +123,6 @@ async def delete_principal_links_for_principal(
     rowcount = cast(CursorResult[Any], result).rowcount
     await session.flush()
     return rowcount
-
-
-async def count_principal_links_for_principal(
-    session: AsyncSession,
-    *,
-    principal_id: uuid.UUID,
-    kind: Literal["cli", "platform"],
-) -> int:
-    """Count principal_link rows that `delete_principal_links_for_principal` would delete."""
-    col = PrincipalLink.cli_principal_id if kind == "cli" else PrincipalLink.platform_principal_id
-    stmt = select(func.count()).select_from(PrincipalLink).where(col == principal_id)
-    return int((await session.execute(stmt)).scalar_one())
 
 
 async def count_principal_links_for_account(
@@ -298,33 +220,3 @@ async def get_slack_principal_for_account(
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
-
-
-async def resolve_linked_platform_principal(
-    session: AsyncSession,
-    *,
-    cli_principal_id: uuid.UUID,
-    platform: str,
-    external_id: str,
-) -> PlatformPrincipalRow | None:
-    """Return the platform principal iff `cli_principal_id` has a link to it.
-
-    This is the authoritative check for `--as <platform>:<external_id>` — no
-    link, no impersonation.
-    """
-    stmt = (
-        select(PlatformPrincipal)
-        .join(
-            PrincipalLink,
-            PrincipalLink.platform_principal_id == PlatformPrincipal.id,
-        )
-        .where(
-            PrincipalLink.cli_principal_id == cli_principal_id,
-            PlatformPrincipal.platform == platform,
-            PlatformPrincipal.external_id == external_id,
-        )
-    )
-    orm = (await session.execute(stmt)).scalar_one_or_none()
-    if orm is None:
-        return None
-    return PlatformPrincipalRow.model_validate(orm)

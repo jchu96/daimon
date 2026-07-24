@@ -94,33 +94,6 @@ async def test_record_idempotent_on_replay(
     )
 
 
-async def test_cost_for_user_in_tenant_sums_against_current_pricing(
-    db_session: AsyncSession,
-    tenant_id: uuid.UUID,
-) -> None:
-    await usage_events.record(
-        db_session,
-        tenant_id=tenant_id,
-        platform_user_id="u1",
-        managed_session_id="s1",
-        model="claude-opus-4-7",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1_000_000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
-        event_id="evt_1",
-    )
-    cost = await usage_events.cost_for_user_in_tenant(
-        db_session,
-        tenant_id=tenant_id,
-        platform_user_id="u1",
-    )
-    # claude-opus-4-7 input rate = $15.00 per 1M tokens.
-    assert cost == 15.0, "1M input tokens at opus rate should sum to $15.00"
-
-
 async def test_cost_for_user_in_tenant_since_filters_by_occurred_at(
     db_session: AsyncSession,
     tenant_id: uuid.UUID,
@@ -158,32 +131,6 @@ async def test_cost_for_user_in_tenant_since_filters_by_occurred_at(
         since=past,
     )
     assert cost_past == 15.0, "since filter in the past should match all rows"
-
-
-async def test_cost_for_tenant_aggregates_all_users_in_tenant(
-    db_session: AsyncSession,
-    tenant_id: uuid.UUID,
-) -> None:
-    for user_id, event_id in [("u1", "evt_1"), ("u2", "evt_2")]:
-        await usage_events.record(
-            db_session,
-            tenant_id=tenant_id,
-            platform_user_id=user_id,
-            managed_session_id=f"s_{user_id}",
-            model="claude-opus-4-7",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                input_tokens=1_000_000,
-                output_tokens=0,
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-            ),
-            event_id=event_id,
-        )
-    tenant_cost = await usage_events.cost_for_tenant(
-        db_session,
-        tenant_id=tenant_id,
-    )
-    assert tenant_cost == 30.0, "tenant rollup should sum across all users in the tenant"
 
 
 async def test_turn_count_for_user_in_tenant_since_returns_zero_when_no_rows(
