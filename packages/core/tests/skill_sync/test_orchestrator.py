@@ -1137,12 +1137,12 @@ async def test_orphan_delete_skipped_when_repo_fetch_failed(
     assert row is not None, "row tied to a transient-outage repo must be preserved"
 
 
-async def test_orphan_delete_local_row_removed_even_when_ma_delete_fails(
+async def test_orphan_delete_local_row_survives_when_ma_delete_fails(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """MA delete returns 500 → warning logged, failed_uploads recorded, local row still removed."""
+    """MA delete returns 500 → warning logged, failed_uploads recorded, local row RETAINED."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
     fernet = _make_fernet()
@@ -1196,7 +1196,7 @@ async def test_orphan_delete_local_row_removed_even_when_ma_delete_fails(
         anthropic_client=anthropic_client,
     )
 
-    assert report.deleted == 1, "deleted counter increments even when MA delete fails"
+    assert report.deleted == 0, "deleted counter must not increment when MA delete fails"
     assert len(delete_calls) >= 1, "MA delete must have been attempted (SDK may retry on 5xx)"
     assert any(name == "doomed_orphan" for name, _ in report.failed_uploads), (
         f"MA-delete failure must be recorded, got {report.failed_uploads}"
@@ -1210,12 +1210,174 @@ async def test_orphan_delete_local_row_removed_even_when_ma_delete_fails(
             agent_name="agent",
             name="doomed_orphan",
         )
-    assert row is None, "local row must be removed even when MA delete fails"
+    assert row is not None, "local row must be RETAINED when MA delete fails (convergent retry)"
+    assert row.anthropic_id == "sk_doomed", "surviving row keeps its anthropic_id for dedup reuse"
 
     captured = capsys.readouterr()
     combined = captured.out + captured.err
     assert "skill_sync.orphan_delete_ma_failed" in combined, (
         f"MA-delete failure warning must be emitted; captured={combined!r}"
+    )
+
+
+async def test_orphan_delete_retries_and_succeeds_on_second_sync(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """First sync: MA delete fails, row survives. Second sync: MA delete succeeds, row gone."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
+
+    async with db_session_factory() as s, s.begin():
+        await upsert_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="retry_orphan",
+            source_repo_url="https://github.com/o/r1",
+            source_repo_branch="main",
+            source_path="",
+            content_hash="hash_r1",
+            anthropic_id="sk_retry",
+            anthropic_latest_version="1",
+        )
+
+    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
+    )
+
+    # First attempt: MA delete fails.
+    router1 = MARouter()
+    router1.add(
+        "DELETE",
+        r"/v1/skills/sk_retry",
+        lambda req, _m: httpx.Response(
+            500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}}
+        ),
+    )
+    router1.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client_1 = _build_anthropic(router1)
+
+    report1 = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r1", branch="main", split=True)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client_1,
+    )
+    assert report1.deleted == 0
+
+    async with db_session_factory() as s, s.begin():
+        row_after_first = await load_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="retry_orphan",
+        )
+    assert row_after_first is not None, "row must survive the first (failed) attempt"
+
+    # Second attempt: MA delete succeeds.
+    router2 = MARouter()
+    router2.add("DELETE", r"/v1/skills/sk_retry", lambda req, _m: httpx.Response(204))
+    router2.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client_2 = _build_anthropic(router2)
+
+    report2 = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r1", branch="main", split=True)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client_2,
+    )
+    assert report2.deleted == 1, "second sync must complete the orphan-delete"
+
+    async with db_session_factory() as s, s.begin():
+        row_after_second = await load_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="retry_orphan",
+        )
+    assert row_after_second is None, "row must be gone after the retry succeeds"
+
+
+async def test_orphan_delete_lingering_row_dedups_readded_skill(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """While a row lingers (MA delete failed), re-adding the same-named skill reuses anthropic_id."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
+
+    async with db_session_factory() as s, s.begin():
+        await upsert_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="collision_skill",
+            source_repo_url="https://github.com/o/r1",
+            source_repo_branch="main",
+            source_path="",
+            content_hash="hash_r1",
+            anthropic_id="sk_collision",
+            anthropic_latest_version="1",
+        )
+
+    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
+    )
+
+    # MA delete fails, so the row (with its anthropic_id) lingers.
+    router = MARouter()
+    router.add(
+        "DELETE",
+        r"/v1/skills/sk_collision",
+        lambda req, _m: httpx.Response(
+            500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}}
+        ),
+    )
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r1", branch="main", split=True)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+    )
+
+    async with db_session_factory() as s, s.begin():
+        row = await load_user_skill(
+            s,
+            tenant_id=cli.tenant_id,
+            principal_id=cli.id,
+            agent_name="agent",
+            name="collision_skill",
+        )
+    assert row is not None
+    assert row.anthropic_id == "sk_collision", (
+        "lingering row must retain its anthropic_id so a re-added skill of the "
+        "same name reuses the MA resource instead of creating a duplicate"
     )
 
 

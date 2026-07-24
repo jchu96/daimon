@@ -546,10 +546,9 @@ async def sync_agent_skills(
             continue
         if row.name in pending:
             continue
-        # Best-effort MA delete; failure is recorded but does not block local
-        # row removal (the user_skills row exists to track our view of MA;
-        # if MA still has the skill, leaving the local row would cause a
-        # stale dedup mismatch on the next sync).
+        # MA delete must succeed before the local row is removed: the row
+        # intentionally survives an MA-delete failure so it is re-selected as
+        # an orphan on the next sync (convergent retry, no new state).
         if row.anthropic_id is not None:
             try:
                 await anthropic_client.beta.skills.delete(row.anthropic_id)
@@ -562,6 +561,7 @@ async def sync_agent_skills(
                 )
                 async with report_lock:
                     report.failed_uploads.append((row.name, str(err)))
+                continue
         async with sessionmaker() as session, session.begin():
             await delete_user_skill(
                 session,
