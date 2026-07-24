@@ -3,8 +3,6 @@
 Covers:
 - do_propagate persists agent_name at the scope (set_fields); second call returns prior name
 - do_unpropagate clears the agent_name (unset_fields)
-- resolve_account_display renders <@U…> for an account with a Slack principal
-- resolve_account_display falls back to account {first8} when no Slack principal exists
 - mask_tail covers the full-length and short-string cases
 """
 
@@ -18,12 +16,10 @@ from daimon.adapters.slack.agent_setup.write import (
     do_propagate,
     do_unpropagate,
     mask_tail,
-    resolve_account_display,
 )
 from daimon.core._models import Account, Tenant
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.scope import TenantScopeRef
-from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.scoped_config_read import get_scope
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -181,57 +177,3 @@ async def test_do_unpropagate_clears_agent_name_at_scope(
         assert row is None, (
             "do_unpropagate should leave the scope empty (row deleted or agent_name None)"
         )
-
-
-# ---------------------------------------------------------------------------
-# resolve_account_display — audit display with Slack principal join
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_account_display_returns_slack_mention_when_principal_exists(
-    db_session: AsyncSession,
-) -> None:
-    """resolve_account_display returns <@U…> for an account with a Slack principal."""
-    tenant_id = await _seed_tenant(db_session)
-    account_id = await _seed_account(db_session, tenant_id)
-
-    slack_user_id = "U01TESTSLACK"
-    await get_or_create_platform_principal(
-        db_session,
-        tenant_id=tenant_id,
-        platform="slack",
-        external_id=slack_user_id,
-    )
-    # The above creates a new account; we need one linked to our account.
-    # Use the identity store directly for the principal tied to our account_id.
-    from daimon.core._models import PlatformPrincipal
-
-    existing_principal = PlatformPrincipal(
-        tenant_id=tenant_id,
-        platform="slack",
-        external_id=f"U_UNIQUE_{account_id.hex[:8]}",
-        account_id=account_id,
-    )
-    db_session.add(existing_principal)
-    await db_session.flush()
-
-    result = await resolve_account_display(db_session, account_id=account_id)
-    expected_mention = f"<@U_UNIQUE_{account_id.hex[:8]}>"
-    assert result == expected_mention, (
-        "resolve_account_display should render <@U…> for an account with a Slack principal"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_account_display_falls_back_to_account_prefix_when_no_principal(
-    db_session: AsyncSession,
-) -> None:
-    """resolve_account_display returns account {first8} when no Slack principal exists."""
-    tenant_id = await _seed_tenant(db_session)
-    account_id = await _seed_account(db_session, tenant_id)
-
-    result = await resolve_account_display(db_session, account_id=account_id)
-    assert result == f"account {str(account_id)[:8]}", (
-        "resolve_account_display should fall back to 'account {first8}' when no Slack principal"
-    )

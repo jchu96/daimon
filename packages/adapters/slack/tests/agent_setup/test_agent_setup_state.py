@@ -1,18 +1,15 @@
 """Wave 0 state tests for agent_setup/state.py.
 
 Tests the private_metadata round-trip (L1/L2/L3), the < 3000-char budget,
-the rename-forbidden reducer shape, and the remove_*_at reducers.
+and the rename-forbidden reducer shape.
 
 No I/O, no DB, no mocks — pure unit assertions.
 """
 
 from daimon.adapters.slack.agent_setup.state import (
     apply_agent_modal,
-    apply_mcp_modal,
     decode_private_metadata,
     encode_private_metadata,
-    remove_mcp_at,
-    remove_skill_at,
 )
 
 # ---------------------------------------------------------------------------
@@ -185,79 +182,3 @@ def test_apply_agent_modal_returns_only_provided_fields() -> None:
     result = apply_agent_modal(model_id="claude-3-5-haiku-20241022", system_prompt=None)
     assert "model" in result, "apply_agent_modal should include model when provided"
     assert "system" not in result, "apply_agent_modal should omit system when system_prompt is None"
-
-
-# ---------------------------------------------------------------------------
-# apply_mcp_modal
-# ---------------------------------------------------------------------------
-
-
-def test_apply_mcp_modal_returns_expected_shape() -> None:
-    result = apply_mcp_modal(name="my-server", endpoint="https://mcp.example.com", has_token=True)
-    assert result["name"] == "my-server", "apply_mcp_modal should include name"
-    assert result["url"] == "https://mcp.example.com", "apply_mcp_modal should include url"
-    assert result["has_token"] is True, "apply_mcp_modal should include has_token"
-
-
-# ---------------------------------------------------------------------------
-# remove_skill_at
-# ---------------------------------------------------------------------------
-
-
-def test_remove_skill_at_drops_indexed_element() -> None:
-    skills = ["skill-a", "skill-b", "skill-c"]
-    result = remove_skill_at(skills, 1)
-    assert result == ["skill-a", "skill-c"], (
-        "remove_skill_at should drop the element at the given index"
-    )
-
-
-def test_remove_skill_at_out_of_range_returns_list_unchanged() -> None:
-    skills = ["skill-a", "skill-b"]
-    result = remove_skill_at(skills, 5)
-    assert result == skills, (
-        "remove_skill_at with out-of-range index should return the list unchanged"
-    )
-
-
-def test_remove_skill_at_negative_index_returns_list_unchanged() -> None:
-    skills = ["skill-a", "skill-b"]
-    result = remove_skill_at(skills, -1)
-    assert result == skills, "remove_skill_at with negative index should return the list unchanged"
-
-
-def test_remove_skill_at_does_not_mutate_original() -> None:
-    skills = ["skill-a", "skill-b"]
-    _ = remove_skill_at(skills, 0)
-    assert skills == ["skill-a", "skill-b"], "remove_skill_at must not mutate the original list"
-
-
-# ---------------------------------------------------------------------------
-# remove_mcp_at
-# ---------------------------------------------------------------------------
-
-
-def test_remove_mcp_at_drops_indexed_element() -> None:
-    mcps = ["mcp-alpha", "mcp-beta", "mcp-gamma"]
-    result = remove_mcp_at(mcps, 0)
-    assert result == ["mcp-beta", "mcp-gamma"], (
-        "remove_mcp_at should drop the element at the given index"
-    )
-
-
-def test_remove_mcp_at_out_of_range_returns_list_unchanged() -> None:
-    mcps = ["mcp-alpha", "mcp-beta"]
-    result = remove_mcp_at(mcps, 10)
-    assert result == mcps, "remove_mcp_at with out-of-range index should return the list unchanged"
-
-
-def test_remove_mcp_at_negative_index_returns_list_unchanged() -> None:
-    mcps = ["mcp-alpha", "mcp-beta"]
-    result = remove_mcp_at(mcps, -1)
-    assert result == mcps, "remove_mcp_at with negative index should return the list unchanged"
-
-
-def test_remove_mcp_at_does_not_mutate_original() -> None:
-    mcps = ["mcp-alpha", "mcp-beta"]
-    _ = remove_mcp_at(mcps, 0)
-    assert mcps == ["mcp-alpha", "mcp-beta"], "remove_mcp_at must not mutate the original list"

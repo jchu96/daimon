@@ -21,7 +21,6 @@ import httpx
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core.constants import ALLOWED_MODEL_IDS
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     find_agents_by_daimon_tag,
@@ -52,8 +51,7 @@ from daimon.core.specs import (
     merge_default_agent_toolset,
 )
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
-from daimon.core.stores.identity import get_slack_principal_for_account
-from daimon.core.stores.scoped_config_read import get_scope, list_propagations_for_tenant
+from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields, unset_fields
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,14 +69,6 @@ _FORK_COPY_FIELDS: Final = frozenset(
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-
-def validate_model_id(model: str) -> str | None:
-    """Return an error message if ``model`` is not in the allow-list; None if valid."""
-    if model not in ALLOWED_MODEL_IDS:
-        allowed = ", ".join(ALLOWED_MODEL_IDS)
-        return f"Model `{model}` is not allowed. Choose one of: {allowed}"
-    return None
 
 
 def mask_tail(secret: str) -> str:
@@ -151,36 +141,6 @@ async def do_unpropagate(
     await unset_fields(
         session, scope=scope, fields=["agent_name"], actor_account_id=actor_account_id
     )
-
-
-async def list_workspace_propagations(
-    session: AsyncSession,
-    *,
-    tenant_id: uuid.UUID,
-) -> tuple[TenantConfigRow | None, list[ChannelConfigRow]]:
-    """Thin adapter-tier wrapper over the core store's cross-tenant scan.
-
-    Exists so panel handlers have a stable adapter-local name; the raw ORM
-    query lives behind the store boundary.
-    """
-    return await list_propagations_for_tenant(session, tenant_id=tenant_id)
-
-
-async def resolve_account_display(
-    session: AsyncSession,
-    *,
-    account_id: uuid.UUID,
-) -> str:
-    """Canonical attribution-handle resolver for audit display.
-
-    On hit: ``<@{slack_external_id}>`` (renders as a Slack mention).
-    On miss: ``account {first8_of_uuid}``. This is the single place that joins
-    audit account_id to a display string.
-    """
-    external_id = await get_slack_principal_for_account(session, account_id=account_id)
-    if external_id is not None:
-        return f"<@{external_id}>"
-    return f"account {str(account_id)[:8]}"
 
 
 # ---------------------------------------------------------------------------

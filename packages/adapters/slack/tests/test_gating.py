@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from daimon.adapters.slack.gating import (
-    is_app_mention,
     is_external_interactive,
     is_slack_connect_external,
 )
@@ -27,23 +26,6 @@ class TestIsExternalInteractive:
         assert is_external_interactive({"user": {"id": "U1"}, "team": {}}) is False, (
             "absent team fields must not spuriously flag external (fail-open to "
             "normal handling; other guards still apply)"
-        )
-
-
-class TestIsAppMention:
-    def test_returns_true_when_event_type_is_app_mention(self) -> None:
-        assert is_app_mention({"type": "app_mention", "text": "<@U1> hello"}) is True, (
-            "is_app_mention should return True for app_mention events"
-        )
-
-    def test_returns_false_when_event_type_is_message(self) -> None:
-        assert is_app_mention({"type": "message", "text": "hello"}) is False, (
-            "is_app_mention should return False for non-app_mention events"
-        )
-
-    def test_returns_false_when_event_has_no_type(self) -> None:
-        assert is_app_mention({}) is False, (
-            "is_app_mention should return False when event has no type field"
         )
 
 
