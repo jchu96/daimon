@@ -19,3 +19,24 @@ jobs:
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=debug-claims")
           # Print only the decoded payload (claims), never the signed token itself.
           echo "$RESP" | jq -r '.value' | cut -d. -f2 | base64 -d 2>/dev/null | jq 'del(.jti)'
+
+  prod-rejection-test:
+    name: Staging-scoped token must be rejected by prod WIF provider
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Attempt prod auth (expected to fail)
+        id: prodauth
+        continue-on-error: true
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/1043507076324/locations/global/workloadIdentityPools/production-daimon-gh/providers/production-daimon-gh-oidc
+          service_account: production-daimon-deploy@pymc-daimon-prod.iam.gserviceaccount.com
+      - name: Assert rejection
+        run: |
+          if [ "${{ steps.prodauth.outcome }}" = "failure" ]; then
+            echo "PASS: prod WIF provider rejected the staging-environment token."
+          else
+            echo "FAIL: prod WIF provider ACCEPTED a staging-environment token." >&2
+            exit 1
+          fi
