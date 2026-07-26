@@ -5,6 +5,13 @@ name: Promote
 # already soaked on staging. Rollback is the same operation pointed at an
 # older SHA. The `production` GitHub Environment enforces the required
 # reviewers before any deploy authority is granted.
+#
+# Promotion is COMMIT-level, not artifact-level: the production deploy
+# rebuilds images from source at the promoted SHA (docker builds are not
+# reproducible — mutable base tags, network state at build time), so the
+# bytes that reach production are not the bytes that soaked on staging.
+# The validate job's image-exists check proves the commit passed the CI
+# test+build pipeline and had a staging image to soak — nothing more.
 on:
   workflow_dispatch:
     inputs:
