@@ -107,6 +107,10 @@ jobs:
               cd /etc/daimon
               sudo -E docker compose -f compose.worker.yml pull
               sudo -E docker compose -f compose.worker.yml up -d --remove-orphans
+              # Prune superseded image tags after the new ones are in use —
+              # each deploy leaves a ~1GB tag behind, and a full root disk
+              # breaks IAP SSH key writes (breaking this very refresh step).
+              sudo docker image prune -af || true
             '
 
       - name: Refresh notebook-host VM container (recreate in place)
@@ -125,6 +129,8 @@ jobs:
               cd /etc/daimon
               sudo -E docker compose -f compose.notebook.yml pull
               sudo -E docker compose -f compose.notebook.yml up -d --remove-orphans
+              # Same prune as the workers refresh (see comment there).
+              sudo docker image prune -af || true
             '
 
       - name: Health gate
