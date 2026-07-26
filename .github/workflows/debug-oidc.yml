@@ -1,0 +1,21 @@
+name: Debug OIDC claims
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  dump-claims:
+    name: Dump OIDC token claims (staging environment)
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Decode and print token claims
+        run: |
+          RESP=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=debug-claims")
+          # Print only the decoded payload (claims), never the signed token itself.
+          echo "$RESP" | jq -r '.value' | cut -d. -f2 | base64 -d 2>/dev/null | jq 'del(.jti)'
