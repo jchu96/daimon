@@ -78,7 +78,11 @@ jobs:
       - name: Compute image tags
         id: tags
         run: |
-          SHA=$(git rev-parse --short HEAD)
+          # Deterministic 7-char truncation, NOT `git rev-parse --short`:
+          # --short honors core.abbrev=auto and grows with the object count,
+          # which would silently change the tag scheme and break promote.yml's
+          # image-exists check (it truncates the input SHA to 7 chars).
+          SHA=$(git rev-parse HEAD | cut -c1-7)
           BASE=${{ env.AR_HOST }}/${{ vars.GCP_PROJECT_ID }}/${{ env.REPO }}
           echo "daimon=$BASE/daimon:$SHA" >> "$GITHUB_OUTPUT"
           echo "notebook=$BASE/notebook-host:$SHA" >> "$GITHUB_OUTPUT"
