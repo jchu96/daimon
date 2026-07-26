@@ -153,6 +153,14 @@ class DiscordSettings(BaseModel):
     )
     bot_display_name: str = Field(
         default="daimon",
+        # Constrained because the value flows into user-facing surfaces with
+        # hard limits: slash-command descriptions carry fixed copy around the
+        # name and must stay under Discord's 100-char cap (hence 32), and the
+        # excluded characters are regex-replacement / Discord-markdown /
+        # mention metacharacters that would corrupt those render sites.
+        min_length=1,
+        max_length=32,
+        pattern=r"^[^\\`@#:]+$",
         description=(
             "The bot's presented name across user-facing Discord render sites "
             "(@mentions, setup messages, help text, privacy panel copy). Defaults "

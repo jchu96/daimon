@@ -24,7 +24,10 @@ def _strip_bot_mention(
     """Replace ``<@bot_id>`` and ``<@!bot_id>`` with ``@{bot_display_name}``."""
     if bot_user_id is None:
         return content
-    return re.sub(rf"<@!?{bot_user_id}>", f"@{bot_display_name}", content)
+    # Callable repl, not a replacement string: a plain f-string here would let
+    # a backslash or \g<...> in the configured name raise re.error (or expand
+    # group refs) on every mention in every guild.
+    return re.sub(rf"<@!?{bot_user_id}>", lambda _: f"@{bot_display_name}", content)
 
 
 def _render_location(thread: discord.Thread) -> list[str]:
