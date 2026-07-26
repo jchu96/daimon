@@ -5,6 +5,13 @@ name: Promote
 # already soaked on staging. Rollback is the same operation pointed at an
 # older SHA. The `production` GitHub Environment enforces the required
 # reviewers before any deploy authority is granted.
+#
+# Promotion is COMMIT-level, not artifact-level: the production deploy
+# rebuilds images from source at the promoted SHA (docker builds are not
+# reproducible — mutable base tags, network state at build time), so the
+# bytes that reach production are not the bytes that soaked on staging.
+# The validate job's image-exists check proves the commit passed the CI
+# test+build pipeline and had a staging image to soak — nothing more.
 on:
   workflow_dispatch:
     inputs:
@@ -33,15 +40,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      # inputs.sha is free-text; always pass it through `env` so the shell
+      # sees it as data — inline `${{ }}` interpolation in `run:` would let a
+      # crafted input execute in a job holding id-token: write.
       - name: Assert full 40-hex SHA
+        env:
+          SHA: ${{ inputs.sha }}
         run: |
-          echo "${{ inputs.sha }}" | grep -Eq '^[0-9a-f]{40}$' \
-            || { echo "Input '${{ inputs.sha }}' is not a full 40-char lowercase hex SHA" >&2; exit 1; }
+          echo "$SHA" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "Input '$SHA' is not a full 40-char lowercase hex SHA" >&2; exit 1; }
 
       - name: Assert SHA is an ancestor of main
+        env:
+          SHA: ${{ inputs.sha }}
         run: |
-          git merge-base --is-ancestor "${{ inputs.sha }}" origin/main \
-            || { echo "SHA ${{ inputs.sha }} is not an ancestor of origin/main — refusing to promote" >&2; exit 1; }
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "SHA $SHA is not an ancestor of origin/main — refusing to promote" >&2; exit 1; }
 
       - id: auth
         uses: google-github-actions/auth@v2
@@ -52,11 +66,14 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Assert soaked image exists for this SHA
+        env:
+          SHA: ${{ inputs.sha }}
         run: |
-          # ci.yml tags images with `git rev-parse --short HEAD` (7 chars);
-          # truncate the full input SHA to match that scheme. A missing image
-          # means the SHA never passed the test+build pipeline — fail closed.
-          SHORT=$(echo "${{ inputs.sha }}" | cut -c1-7)
+          # deploy.yml tags images with the first 7 chars of the full commit
+          # SHA (a fixed `cut -c1-7`, matching this truncation exactly). A
+          # missing image means the SHA never passed the test+build pipeline —
+          # fail closed.
+          SHORT=$(echo "$SHA" | cut -c1-7)
           IMAGE="${{ env.AR_HOST }}/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_AR_REPO }}/daimon:$SHORT"
           gcloud artifacts docker images describe "$IMAGE" \
             || { echo "No image at $IMAGE — SHA was never built by CI" >&2; exit 1; }
