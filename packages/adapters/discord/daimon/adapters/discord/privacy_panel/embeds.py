@@ -13,7 +13,7 @@ import discord
 
 
 def build_post_delete_container(
-    result: AccountPurgeResult,
+    result: AccountPurgeResult, *, bot_display_name: str = "daimon"
 ) -> discord.ui.Container[discord.ui.LayoutView]:
     """Green-accent V2 container shown after a successful purge. Controls-less."""
     rows: list[str] = []
@@ -68,7 +68,9 @@ def build_post_delete_container(
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container(
         layout.header(
             "✅ Deleted",
-            subtext="Your daimon data has been deleted. Re-onboarding starts from scratch.",
+            subtext=(
+                f"Your {bot_display_name} data has been deleted. Re-onboarding starts from scratch."
+            ),
         ),
         layout.hairline(),
         discord.ui.TextDisplay(checklist),

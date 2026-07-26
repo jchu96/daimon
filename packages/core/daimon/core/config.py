@@ -151,6 +151,16 @@ class DiscordSettings(BaseModel):
             "legacy fallback, not recommended for production."
         ),
     )
+    bot_display_name: str = Field(
+        default="daimon",
+        description=(
+            "The bot's presented name across user-facing Discord render sites "
+            "(@mentions, setup messages, help text, privacy panel copy). Defaults "
+            "to 'daimon' so unset deployments render byte-identical output. Set "
+            "to a distinct name (e.g. 'daimon-staging') so a non-production "
+            "deployment is visibly distinct in-channel."
+        ),
+    )
 
 
 class SlackSettings(BaseModel):

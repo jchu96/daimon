@@ -37,8 +37,17 @@ def _summary_line(preview: PurgePreview) -> str:
     return ", ".join(parts) if parts else "nothing visible to you yet"
 
 
+def _export_placeholder_message(bot_display_name: str) -> str:
+    return (
+        "📤 **Export** is not yet implemented.\n\n"
+        f"When ready, this will produce a JSON dump of every {bot_display_name}-side row "
+        "tied to your identity and either attach it here or DM you a 7-day "
+        "signed URL."
+    )
+
+
 def build_privacy_main_container(
-    preview: PurgePreview, *, user_name: str
+    preview: PurgePreview, *, user_name: str, bot_display_name: str = "daimon"
 ) -> discord.ui.Container[discord.ui.LayoutView]:
     """Main panel V2 container — no accent, three trust-model groups.
 
@@ -67,7 +76,7 @@ def build_privacy_main_container(
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container(
         layout.header(
             "🔒 Privacy",
-            subtext=f"for **{user_name}** — daimon holds: {_summary_line(preview)}",
+            subtext=f"for **{user_name}** — {bot_display_name} holds: {_summary_line(preview)}",
         ),
         layout.hairline(),
         discord.ui.TextDisplay("\n".join(body_rows)),
@@ -91,6 +100,11 @@ class PrivacyPanelView(discord.ui.LayoutView):
         self.allowed_user_id = allowed_user_id
         self.user_name = user_name
         self._preview = preview
+        self._bot_display_name = (
+            runtime.settings.discord.bot_display_name
+            if runtime.settings.discord is not None
+            else "daimon"
+        )
 
         # Programmatic buttons — decorator pattern does not work on LayoutView subclasses
         policy_btn: discord.ui.Button[PrivacyPanelView] = discord.ui.Button(
@@ -119,17 +133,16 @@ class PrivacyPanelView(discord.ui.LayoutView):
         action_row: discord.ui.ActionRow[PrivacyPanelView] = discord.ui.ActionRow(
             policy_btn, export_btn, delete_btn, done_btn
         )
-        container = build_privacy_main_container(preview, user_name=user_name)
+        container = build_privacy_main_container(
+            preview, user_name=user_name, bot_display_name=self._bot_display_name
+        )
         container.add_item(layout.hairline())
         container.add_item(action_row)
         self.add_item(container)
 
     async def _on_export(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
-            "📤 **Export** is not yet implemented.\n\n"
-            "When ready, this will produce a JSON dump of every daimon-side row "
-            "tied to your identity and either attach it here or DM you a 7-day "
-            "signed URL.",
+            _export_placeholder_message(self._bot_display_name),
             ephemeral=True,
         )
 
@@ -158,7 +171,9 @@ class PrivacyPanelView(discord.ui.LayoutView):
         # Controls-less re-render (view=None empties a V2 message).
         await interaction.response.edit_message(
             view=layout.static_view(
-                build_privacy_main_container(self._preview, user_name=self.user_name)
+                build_privacy_main_container(
+                    self._preview, user_name=self.user_name, bot_display_name=self._bot_display_name
+                )
             ),
             allowed_mentions=discord.AllowedMentions.none(),
         )

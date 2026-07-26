@@ -12,8 +12,11 @@ discord.py evaluates parameter annotations at import time to extract
 slash command parameter metadata.
 """
 
+from typing import cast
+
 from daimon.adapters.discord import layout
 from daimon.adapters.discord.checks import require_registered_guild
+from daimon.adapters.discord.runtime import DiscordRuntime
 
 import discord
 from discord import Interaction, app_commands
@@ -21,7 +24,9 @@ from discord.ext import commands
 
 BotInteraction = Interaction[commands.Bot]
 
-_BODY = """\
+
+def _body(bot_display_name: str) -> str:
+    return f"""\
 **Agent management**
 -# /agent-setup — Manage this server's agents
 
@@ -32,29 +37,35 @@ _BODY = """\
 -# /billing — Show your billing usage (admins see per-member breakdown)
 
 **Privacy**
--# /privacy — See, export, or delete what daimon stores about you
+-# /privacy — See, export, or delete what {bot_display_name} stores about you
 
 **Meta**
 -# /help — List commands and the @bot conversational entrypoint\
 """
 
-_CONVERSATIONAL = """\
+
+def _conversational(bot_display_name: str) -> str:
+    return f"""\
 💬 **Or just talk to your agent**
--# @daimon help me set up
--# @daimon make a routine that runs daily\
+-# @{bot_display_name} help me set up
+-# @{bot_display_name} make a routine that runs daily\
 """
 
 
-def build_help_view() -> discord.ui.LayoutView:
-    """Build the static /help V2 LayoutView. Pure — no I/O, zero args."""
+def build_help_view(bot_display_name: str = "daimon") -> discord.ui.LayoutView:
+    """Build the static /help V2 LayoutView. Pure — no I/O."""
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container(
         layout.header("📖 Commands", subtext="only you can see this"),
         layout.hairline(),
-        discord.ui.TextDisplay(_BODY),
+        discord.ui.TextDisplay(_body(bot_display_name)),
         layout.hairline(),
-        discord.ui.TextDisplay(_CONVERSATIONAL),
+        discord.ui.TextDisplay(_conversational(bot_display_name)),
     )
     return layout.static_view(container)
+
+
+def _get_runtime(interaction: BotInteraction) -> DiscordRuntime:
+    return cast(DiscordRuntime, interaction.client.runtime)  # type: ignore[attr-defined]  # DaimonBot.runtime not on Bot type
 
 
 @app_commands.guild_only()
@@ -70,4 +81,12 @@ class HelpCog(commands.Cog):
     )
     @require_registered_guild
     async def help(self, interaction: BotInteraction) -> None:
-        await interaction.response.send_message(view=build_help_view(), ephemeral=True)
+        runtime = _get_runtime(interaction)
+        bot_display_name = (
+            runtime.settings.discord.bot_display_name
+            if runtime.settings.discord is not None
+            else "daimon"
+        )
+        await interaction.response.send_message(
+            view=build_help_view(bot_display_name), ephemeral=True
+        )

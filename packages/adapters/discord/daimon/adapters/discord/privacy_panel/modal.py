@@ -94,7 +94,14 @@ class DeleteConfirmModal(discord.ui.Modal, title="Confirm delete"):
             sessions_deleted=result.sessions.deleted,
             sessions_failed=result.sessions.failed,
         )
+        bot_display_name = (
+            self.runtime.settings.discord.bot_display_name
+            if self.runtime.settings.discord is not None
+            else "daimon"
+        )
         await interaction.edit_original_response(
-            view=layout.static_view(build_post_delete_container(result)),
+            view=layout.static_view(
+                build_post_delete_container(result, bot_display_name=bot_display_name)
+            ),
             allowed_mentions=discord.AllowedMentions.none(),
         )
