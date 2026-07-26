@@ -17,11 +17,17 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "GitHub Environment to deploy (staging or production)"
+        description: "GitHub Environment to deploy"
         required: true
-        type: string
+        # choice, not string: a free-text typo (Production, prod) would create
+        # an implicit GitHub Environment with no protection rules that falls
+        # back to repo-level vars and deploys with no reviewer gate at all.
+        type: choice
+        options:
+          - staging
+          - production
       sha:
-        description: "Full commit SHA to deploy"
+        description: "Full 40-char commit SHA to deploy"
         required: true
         type: string
 
@@ -43,6 +49,17 @@ jobs:
       ZONE: ${{ vars.GCP_ZONE }}
       NOTEBOOK_DOMAIN: ${{ vars.NOTEBOOK_DOMAIN }}
     steps:
+      # Guard both entry points: ci.yml/promote.yml pass a full github.sha,
+      # but workflow_dispatch is free text — reject branch names, short SHAs,
+      # and anything else that isn't a pinned 40-hex commit. Passed via env so
+      # the input is data, never shell code.
+      - name: Assert full 40-hex SHA
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          echo "$SHA" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "Input '$SHA' is not a full 40-char lowercase hex SHA" >&2; exit 1; }
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha }}
