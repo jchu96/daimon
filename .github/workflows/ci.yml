@@ -209,7 +209,7 @@ jobs:
         run: docker build -t daimon:ci .
 
   deploy-gcp:
-    name: Deploy to GCP (production)
+    name: Deploy to GCP (staging)
     needs: [lint, pytest-core, pytest-mcp, pytest-discord, pytest-slack, pytest-notebook-host, docker-build]
     # vars.GCP_WIF_PROVIDER doubles as the deploy switch: repository variables
     # don't propagate to forks/clones, so a repo with no GCP config skips this
@@ -217,112 +217,14 @@ jobs:
     # enable push-to-main deploys by setting GCP_WIF_PROVIDER, GCP_DEPLOY_SA,
     # and GCP_PROJECT_ID in repo settings — no workflow edit needed. Partial
     # config (provider set, SA/project missing) fails loudly by design.
+    #
+    # A push to main deploys STAGING. Production deploys only through
+    # promote.yml (workflow_dispatch behind the production reviewer gate).
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-    concurrency:
-      group: deploy-gcp-production
-      cancel-in-progress: false
-    env:
-      REGION: ${{ vars.GCP_REGION }}
-      AR_HOST: ${{ vars.GCP_REGION }}-docker.pkg.dev
-      REPO: ${{ vars.GCP_AR_REPO }}
-      ZONE: ${{ vars.GCP_ZONE }}
-      NOTEBOOK_DOMAIN: ${{ vars.NOTEBOOK_DOMAIN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: auth
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SA }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
-
-      - name: Compute image tags
-        id: tags
-        run: |
-          SHA=$(git rev-parse --short HEAD)
-          BASE=${{ env.AR_HOST }}/${{ vars.GCP_PROJECT_ID }}/${{ env.REPO }}
-          echo "daimon=$BASE/daimon:$SHA" >> "$GITHUB_OUTPUT"
-          echo "notebook=$BASE/notebook-host:$SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Build + push daimon image
-        run: |
-          docker build -t "${{ steps.tags.outputs.daimon }}" -f Dockerfile .
-          docker push "${{ steps.tags.outputs.daimon }}"
-
-      - name: Build + push notebook-host image
-        run: |
-          docker build -t "${{ steps.tags.outputs.notebook }}" -f apps/notebook-host/Dockerfile .
-          docker push "${{ steps.tags.outputs.notebook }}"
-
-      - name: Run migrations (blocking gate)
-        run: |
-          gcloud run jobs update ${{ vars.GCP_AR_REPO }}-migrate --region "$REGION" \
-            --image "${{ steps.tags.outputs.daimon }}"
-          gcloud run jobs execute ${{ vars.GCP_AR_REPO }}-migrate --region "$REGION" --wait
-
-      - name: Deploy mcp revision
-        run: |
-          gcloud run services update ${{ vars.GCP_AR_REPO }}-mcp --region "$REGION" \
-            --image "${{ steps.tags.outputs.daimon }}"
-
-      - name: Refresh worker VM containers (recreate in place)
-        run: |
-          # Skip the refresh when the workers VM is stopped (nothing to recreate).
-          STATUS=$(gcloud compute instances describe ${{ vars.GCP_AR_REPO }}-workers \
-            --zone "$ZONE" --format='value(status)')
-          if [ "$STATUS" != "RUNNING" ]; then
-            echo "workers VM is $STATUS — skipping container refresh"
-            exit 0
-          fi
-          gcloud compute ssh ${{ vars.GCP_AR_REPO }}-workers --zone "$ZONE" \
-            --tunnel-through-iap --command '
-              export DAIMON_IMAGE="${{ steps.tags.outputs.daimon }}"
-              # sudo -E keeps the SSH user HOME, so docker would look for
-              # Artifact Registry credentials in ~/.docker (none there). Point
-              # at root docker config, where the boot startup script ran
-              # `gcloud auth configure-docker`.
-              export DOCKER_CONFIG=/root/.docker
-              cd /etc/daimon
-              sudo -E docker compose -f compose.worker.yml pull
-              sudo -E docker compose -f compose.worker.yml up -d --remove-orphans
-            '
-
-      - name: Refresh notebook-host VM container (recreate in place)
-        run: |
-          gcloud compute ssh ${{ vars.GCP_AR_REPO }}-notebook --zone "$ZONE" \
-            --tunnel-through-iap --command '
-              export NOTEBOOK_IMAGE="${{ steps.tags.outputs.notebook }}"
-              # Caddy fronts notebook-host with TLS on this domain; the compose
-              # file interpolates NOTEBOOK_DOMAIN + NOTEBOOK_PUBLIC_URL_BASE
-              # (the compose file and Caddyfile live in the operator private infra repo).
-              export NOTEBOOK_DOMAIN="${{ env.NOTEBOOK_DOMAIN }}"
-              export NOTEBOOK_PUBLIC_URL_BASE="https://${{ env.NOTEBOOK_DOMAIN }}"
-              # Same DOCKER_CONFIG redirect as the workers refresh: use root
-              # docker config (has the Artifact Registry credential helper).
-              export DOCKER_CONFIG=/root/.docker
-              cd /etc/daimon
-              sudo -E docker compose -f compose.notebook.yml pull
-              sudo -E docker compose -f compose.notebook.yml up -d --remove-orphans
-            '
-
-      - name: Health gate
-        run: |
-          URL=$(gcloud run services describe ${{ vars.GCP_AR_REPO }}-mcp --region "$REGION" \
-            --format='value(status.url)')
-          # /healthz is intercepted by Google Front End on run.app domains (404s
-          # before reaching the container); /readyz passes through and also
-          # verifies DB connectivity.
-          for i in $(seq 1 10); do
-            if curl -sfI "$URL/readyz" >/dev/null; then echo "healthy"; exit 0; fi
-            sleep 6
-          done
-          echo "mcp did not become healthy" >&2; exit 1
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      sha: ${{ github.sha }}

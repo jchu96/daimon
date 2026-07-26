@@ -1,0 +1,73 @@
+name: Promote
+
+# Production promote/rollback path. The ONLY way code reaches production:
+# an operator dispatches this workflow with a full commit SHA that has
+# already soaked on staging. Rollback is the same operation pointed at an
+# older SHA. The `production` GitHub Environment enforces the required
+# reviewers before any deploy authority is granted.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-char commit SHA to promote to production"
+        required: true
+        type: string
+
+jobs:
+  validate:
+    name: Validate promote SHA
+    runs-on: ubuntu-latest
+    # Uses the STAGING Environment: after the CI flip, every main push builds
+    # images into staging's registry, so staging AR is where a soaked image
+    # lives (prod AR is only populated by the promote deploy itself). This
+    # also runs validation before the production reviewer gate — a bad SHA
+    # fails fast without paging reviewers.
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AR_HOST: ${{ vars.GCP_REGION }}-docker.pkg.dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert full 40-hex SHA
+        run: |
+          echo "${{ inputs.sha }}" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "Input '${{ inputs.sha }}' is not a full 40-char lowercase hex SHA" >&2; exit 1; }
+
+      - name: Assert SHA is an ancestor of main
+        run: |
+          git merge-base --is-ancestor "${{ inputs.sha }}" origin/main \
+            || { echo "SHA ${{ inputs.sha }} is not an ancestor of origin/main — refusing to promote" >&2; exit 1; }
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Assert soaked image exists for this SHA
+        run: |
+          # ci.yml tags images with `git rev-parse --short HEAD` (7 chars);
+          # truncate the full input SHA to match that scheme. A missing image
+          # means the SHA never passed the test+build pipeline — fail closed.
+          SHORT=$(echo "${{ inputs.sha }}" | cut -c1-7)
+          IMAGE="${{ env.AR_HOST }}/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_AR_REPO }}/daimon:$SHORT"
+          gcloud artifacts docker images describe "$IMAGE" \
+            || { echo "No image at $IMAGE — SHA was never built by CI" >&2; exit 1; }
+
+  deploy:
+    name: Promote to production
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      sha: ${{ inputs.sha }}
