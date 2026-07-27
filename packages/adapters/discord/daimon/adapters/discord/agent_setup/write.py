@@ -15,6 +15,7 @@ import httpx
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
+from cryptography.fernet import Fernet
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core import agent_lifecycle
 from daimon.core.constants import ALLOWED_MODEL_IDS
@@ -428,7 +429,7 @@ async def fork_agent(
     await agent_lifecycle.copy_credential_and_repo_binding(
         anthropic=runtime.anthropic,
         sessionmaker=runtime.sessionmaker,
-        fernet=_build_runtime_fernet(runtime),
+        fernet=_build_fork_fernet(runtime),
         oauth_scopes=tuple(runtime.settings.github.oauth_scopes),
         tenant_id=tenant_id,
         source_agent_uuid=source_agent_uuid,
@@ -455,6 +456,22 @@ def _build_runtime_fernet(runtime: DiscordRuntime) -> MultiFernet:
     """Build a MultiFernet from `runtime.settings.crypto.keys`."""
     keys = tuple(secret.get_secret_value() for secret in runtime.settings.crypto.keys)
     return build_multifernet(keys)
+
+
+def _build_fork_fernet(runtime: DiscordRuntime) -> MultiFernet:
+    """Build the fernet `copy_credential_and_repo_binding` requires, tolerating
+    an unconfigured deployment (`settings.crypto.keys == ()`).
+
+    `copy_credential_and_repo_binding` only reads/writes through `fernet` when
+    the source has an `inline-pat:` binding — which cannot exist in a
+    deployment with no crypto keys configured (storing one requires crypto
+    too, via `store_inline_pat`). The anon:/unbound-source paths never touch
+    the value, so a throwaway single-use key keeps the primitives-only
+    interface satisfied without forcing every fork to require crypto config.
+    """
+    if not runtime.settings.crypto.keys:
+        return build_multifernet((Fernet.generate_key().decode(),))
+    return _build_runtime_fernet(runtime)
 
 
 async def store_inline_pat(
