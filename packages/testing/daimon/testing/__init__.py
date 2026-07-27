@@ -1,5 +1,18 @@
 # Re-export the most commonly used symbols.
 # For module-specific imports, use daimon.testing.ma / .db / .factories directly.
+from daimon.testing.factories import (
+    make_agent_github_binding,
+    make_agent_memory_store,
+    make_agent_repo_binding,
+    make_ledger_entry,
+    make_mcp_token,
+    make_routine,
+    make_slack_user_token,
+    make_tenant_config,
+    make_tenant_user_cap,
+    make_thread_session,
+    make_usage_event,
+)
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     EMPTY_SESSION_STATS,
@@ -28,7 +41,18 @@ __all__ = [
     "combine_handlers",
     "json_body",
     "list_response",
+    "make_agent_github_binding",
+    "make_agent_memory_store",
+    "make_agent_repo_binding",
     "make_fake_ma_handler",
+    "make_ledger_entry",
+    "make_mcp_token",
+    "make_routine",
+    "make_slack_user_token",
+    "make_tenant_config",
+    "make_tenant_user_cap",
+    "make_thread_session",
+    "make_usage_event",
     "send_events_response",
     "sse_response",
     "stub_anthropic",

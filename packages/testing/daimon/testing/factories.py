@@ -12,16 +12,52 @@ ORM access for test setup.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
 
+from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
+    BetaManagedAgentsSpanModelUsage,
+)
 from daimon.core._models import (
     Account,
+    AgentMemoryStore,
     CliPrincipal,
     PlatformPrincipal,
     PrincipalLink,
     Tenant,
+    TenantLedger,
+    UsageEvent,
 )
 from daimon.core.ma_identity import derive_tenant_uuid
-from daimon.core.stores.domain import Platform
+from daimon.core.scope import TenantConfigRow, TenantScopeRef
+from daimon.core.stores import (
+    agent_github_binding,
+    agent_repo_binding,
+    mcp_tokens,
+    routines,
+    scoped_config_read,
+    scoped_config_write,
+    slack_user_tokens,
+    tenant_user_caps,
+    thread_sessions,
+    usage_events,
+)
+from daimon.core.stores.agent_memory_stores import insert_memory_store
+from daimon.core.stores.domain import (
+    AgentGithubBindingRow,
+    AgentMemoryStoreRow,
+    AgentRepoBindingRow,
+    McpTokenRow,
+    Platform,
+    RoutineRow,
+    SlackUserTokenRow,
+    TenantLedgerRow,
+    TenantUserCapRow,
+    ThreadSessionRow,
+    UsageEventRow,
+)
+from daimon.core.stores.tenant_ledger import insert_entry
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -106,3 +142,317 @@ async def link_principals(
     session.add(link)
     await session.flush()
     return link
+
+
+async def make_routine(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    created_by_user_id: str | None = None,
+    agent_id: str = "agent-1",
+    agent_name: str = "Agent One",
+    cron_expr: str = "0 * * * *",
+    timezone_: str = "UTC",
+    trigger_message: str = "hello",
+    enabled: bool = True,
+    next_fire_at: datetime | None = None,
+) -> RoutineRow:
+    """Create a Routine row via the real routines store, returning RoutineRow."""
+    tenant = tenant or await make_tenant(session)
+    return await routines.create_routine(
+        session,
+        tenant_id=tenant.id,
+        created_by_user_id=created_by_user_id,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        cron_expr=cron_expr,
+        timezone_=timezone_,
+        trigger_message=trigger_message,
+        enabled=enabled,
+        next_fire_at=next_fire_at,
+    )
+
+
+async def make_tenant_config(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    agent_name: str | None = "agent-1",
+    environment_name: str | None = None,
+    mode: scoped_config_write.PropagationMode | None = None,
+    actor_account_id: uuid.UUID | None = None,
+) -> TenantConfigRow:
+    """Upsert a tenant-scope config row via `scoped_config_write.set_fields` (D-07).
+
+    Defaults `agent_name` so a bare call always has at least one field set
+    (set_fields raises if none are given). Read back via `scoped_config_read.get_scope`
+    rather than raw ORM, since set_fields itself returns None.
+    """
+    tenant = tenant or await make_tenant(session)
+    await scoped_config_write.set_fields(
+        session,
+        scope=TenantScopeRef(tenant_id=tenant.id),
+        tenant_id=tenant.id,
+        agent_name=agent_name,
+        environment_name=environment_name,
+        mode=mode,
+        actor_account_id=actor_account_id,
+    )
+    row = await scoped_config_read.get_scope(session, scope=TenantScopeRef(tenant_id=tenant.id))
+    assert isinstance(row, TenantConfigRow), (
+        "set_fields on a TenantScopeRef must upsert TenantConfig"
+    )
+    return row
+
+
+async def make_usage_event(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    platform_user_id: str | None = "test-user",
+    managed_session_id: str | None = None,
+    model: str = "claude-sonnet-5",
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    event_id: str | None = None,
+) -> UsageEventRow:
+    """Record a usage event via `usage_events.record`, wrapping raw token ints into
+    the SDK-typed `BetaManagedAgentsSpanModelUsage` (constructed inline, no
+    model_construct per guideline:testing). Supports `platform_user_id=None`
+    for the NULL-attribution edge case.
+
+    `record` is idempotent-insert-only (no RETURNING), so the row is read back
+    by (managed_session_id, event_id) — the same uniqueness key the store upserts on.
+    """
+    tenant = tenant or await make_tenant(session)
+    managed_session_id = managed_session_id or f"sess_{uuid.uuid4()}"
+    event_id = event_id or f"evt_{uuid.uuid4()}"
+    model_usage = BetaManagedAgentsSpanModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+    )
+    await usage_events.record(
+        session,
+        tenant_id=tenant.id,
+        platform_user_id=platform_user_id,
+        managed_session_id=managed_session_id,
+        model=model,
+        model_usage=model_usage,
+        event_id=event_id,
+    )
+    orm = (
+        await session.execute(
+            select(UsageEvent).where(
+                UsageEvent.managed_session_id == managed_session_id,
+                UsageEvent.event_id == event_id,
+            )
+        )
+    ).scalar_one()
+    return UsageEventRow.model_validate(orm, from_attributes=True)
+
+
+async def make_ledger_entry(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    delta_usd: Decimal = Decimal("10"),
+    reason: str = "topup",
+    idempotency_key: str | None = None,
+    payment_event_id: str | None = None,
+    payment_intent: str | None = None,
+) -> TenantLedgerRow:
+    """Insert a tenant_ledger row via `tenant_ledger.insert_entry`.
+
+    `insert_entry` returns only a bool (inserted vs conflict no-op), so the row
+    is read back by `idempotency_key`, the natural-identity uniqueness key.
+    """
+    tenant = tenant or await make_tenant(session)
+    idempotency_key = idempotency_key or f"test-{uuid.uuid4()}"
+    await insert_entry(
+        session,
+        tenant_id=tenant.id,
+        delta_usd=delta_usd,
+        reason=reason,
+        idempotency_key=idempotency_key,
+        payment_event_id=payment_event_id,
+        payment_intent=payment_intent,
+    )
+    orm = (
+        await session.execute(
+            select(TenantLedger).where(TenantLedger.idempotency_key == idempotency_key)
+        )
+    ).scalar_one()
+    return TenantLedgerRow.model_validate(orm, from_attributes=True)
+
+
+async def make_slack_user_token(
+    session: AsyncSession,
+    *,
+    team_id: str | None = None,
+    slack_user_id: str = "U123",
+    encrypted_token: bytes = b"encrypted-token",
+    scopes: str = "chat:write",
+    expires_at: datetime | None = None,
+    encrypted_refresh_token: bytes | None = None,
+) -> SlackUserTokenRow:
+    """Upsert a slack_user_tokens row via `slack_user_tokens.upsert_slack_user_token`."""
+    team_id = team_id if team_id is not None else str(uuid.uuid4())
+    return await slack_user_tokens.upsert_slack_user_token(
+        session,
+        team_id=team_id,
+        slack_user_id=slack_user_id,
+        encrypted_token=encrypted_token,
+        scopes=scopes,
+        expires_at=expires_at,
+        encrypted_refresh_token=encrypted_refresh_token,
+    )
+
+
+async def make_tenant_user_cap(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    user_id: str | None = None,
+    amount: Decimal = Decimal("5"),
+) -> TenantUserCapRow:
+    """Upsert a tenant_user_caps row via `tenant_user_caps.set_default` /
+    `set_override`. `user_id=None` (the default) creates the tenant-wide
+    default cap; passing `user_id` creates a per-user override.
+    """
+    tenant = tenant or await make_tenant(session)
+    if user_id is None:
+        return await tenant_user_caps.set_default(session, tenant_id=tenant.id, amount=amount)
+    return await tenant_user_caps.set_override(
+        session, tenant_id=tenant.id, user_id=user_id, amount=amount
+    )
+
+
+async def make_agent_memory_store(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    agent_id: uuid.UUID | None = None,
+    memory_store_id: str | None = None,
+) -> AgentMemoryStoreRow:
+    """Bind an agent memory store via the race-safe `insert_memory_store`.
+
+    `insert_memory_store` returns only the winning `memory_store_id` string
+    (by design — it's the race-safe half of lazy provisioning), so the full
+    row is read back via a PK lookup on the same composite key.
+    """
+    tenant = tenant or await make_tenant(session)
+    agent_id = agent_id if agent_id is not None else uuid.uuid4()
+    memory_store_id = memory_store_id or f"memstore_{uuid.uuid4().hex[:12]}"
+    await insert_memory_store(
+        session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        memory_store_id=memory_store_id,
+    )
+    orm = await session.get(AgentMemoryStore, (tenant.id, agent_id))
+    assert orm is not None, "insert_memory_store must leave a resolvable binding row"
+    return AgentMemoryStoreRow.model_validate(orm, from_attributes=True)
+
+
+async def make_agent_github_binding(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID | None = None,
+    principal_id: uuid.UUID | None = None,
+) -> AgentGithubBindingRow:
+    """Upsert an agent_github_binding row. Defaults `principal_id=agent_id` per
+    the per-agent credential model (each agent gets its own isolated row).
+    """
+    agent_id = agent_id if agent_id is not None else uuid.uuid4()
+    principal_id = principal_id if principal_id is not None else agent_id
+    return await agent_github_binding.set_agent_github_binding(
+        session, agent_id=agent_id, principal_id=principal_id
+    )
+
+
+async def make_agent_repo_binding(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    agent_id: uuid.UUID | None = None,
+    repo_url: str = "owner/repo",
+    default_branch: str = "main",
+    ma_secret_ref: str | None = None,
+) -> AgentRepoBindingRow:
+    """Upsert an agent_repo_binding row via `agent_repo_binding.set_binding`."""
+    tenant = tenant or await make_tenant(session)
+    agent_id = agent_id if agent_id is not None else uuid.uuid4()
+    ma_secret_ref = ma_secret_ref or f"secret-{uuid.uuid4().hex[:8]}"
+    return await agent_repo_binding.set_binding(
+        session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url=repo_url,
+        default_branch=default_branch,
+        ma_secret_ref=ma_secret_ref,
+    )
+
+
+async def make_thread_session(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    account: Account | None = None,
+    platform: str = "discord",
+    thread_id: str | None = None,
+    ma_session_id: str | None = None,
+    watermark_message_id: str | None = None,
+    created_at: datetime | None = None,
+) -> ThreadSessionRow:
+    """Insert a thread_sessions row via `thread_sessions.create_thread_session`."""
+    tenant = tenant or await make_tenant(session)
+    account = account or await make_account(session, tenant=tenant)
+    thread_id = thread_id if thread_id is not None else str(uuid.uuid4())
+    ma_session_id = ma_session_id or f"sess_{uuid.uuid4()}"
+    return await thread_sessions.create_thread_session(
+        session,
+        tenant_id=tenant.id,
+        platform=platform,
+        thread_id=thread_id,
+        account_id=account.id,
+        ma_session_id=ma_session_id,
+        watermark_message_id=watermark_message_id,
+        created_at=created_at,
+    )
+
+
+async def make_mcp_token(
+    session: AsyncSession,
+    *,
+    tenant: Tenant | None = None,
+    account: Account | None = None,
+    agent_id: str = "agent-1",
+    label: str | None = None,
+    jti: uuid.UUID | None = None,
+    created_at: datetime | None = None,
+) -> McpTokenRow:
+    """Insert an mcp_tokens row via `mcp_tokens.create_mcp_token_row`.
+
+    `create_mcp_token_row` returns None, so the row is read back via
+    `mcp_tokens.get_mcp_token` on the same `jti` PK.
+    """
+    tenant = tenant or await make_tenant(session)
+    account = account or await make_account(session, tenant=tenant)
+    jti = jti if jti is not None else uuid.uuid4()
+    created_at = created_at if created_at is not None else datetime.now(UTC)
+    await mcp_tokens.create_mcp_token_row(
+        session,
+        jti=jti,
+        account_id=account.id,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        label=label,
+        created_at=created_at,
+    )
+    row = await mcp_tokens.get_mcp_token(session, jti=jti)
+    assert row is not None, "create_mcp_token_row must leave a resolvable row"
+    return row
