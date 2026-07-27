@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -132,7 +133,9 @@ async def test_turn_context_row_lives_exactly_during_run_turn(
     event_ts = thread_ts
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
 
-    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
     async with db_session_factory() as s:
         principal = await get_or_create_platform_principal(
             s, tenant_id=tenant_id, platform="slack", external_id="U_TURN_CTX"
@@ -216,7 +219,9 @@ async def test_turn_context_row_deleted_when_run_turn_raises(
     event_ts = thread_ts
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
 
-    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
     async with db_session_factory() as s:
         principal = await get_or_create_platform_principal(
             s, tenant_id=tenant_id, platform="slack", external_id="U_TURN_CTX_RAISE"

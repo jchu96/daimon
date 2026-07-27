@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -249,7 +250,9 @@ async def test_orchestrate_continues_when_nudge_store_call_raises_sqlalchemy_err
     event_ts = thread_ts
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
 
-    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
 
     app = _make_orchestrate_app_with_nudge_enabled(db_session_factory)
 

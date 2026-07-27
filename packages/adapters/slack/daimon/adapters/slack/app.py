@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import time
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -80,6 +81,7 @@ from daimon.adapters.slack.vision import (
     download_as_image_blocks,
     is_vision_image,
 )
+from daimon.core.billing import is_over_cap
 from daimon.core.defaults.provisioning import reconcile_tenant_defaults, teardown_slack_install
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, decrypt_token
@@ -91,6 +93,7 @@ from daimon.core.ma_resolver import (
     resolve_environment,
 )
 from daimon.core.observability import capture_exception_with_scope
+from daimon.core.pricing import MODEL_PRICING
 from daimon.core.scope import ScopeContext
 from daimon.core.sessions import create_session
 from daimon.core.slack_oauth import build_slack_connect_url
@@ -109,8 +112,10 @@ from daimon.core.stores.thread_sessions import (
     get_live_thread_session,
     update_watermark,
 )
+from daimon.core.tenant_balance import is_over_balance
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.gating import should_admit_turn
+from daimon.core.usage_recording import record_turn_usage
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.async_client import AsyncBaseSocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -857,7 +862,10 @@ class SlackApp:
                 files=_collect_files([event]),
             )
             # Drain loop: new events may arrive during the drain turn; they land
-            # in _pending and are picked up by the next iteration.
+            # in _pending and are picked up by the next iteration. Each drained
+            # turn independently re-hits _run_thread_turn's admission gates
+            # (over-balance / over-cap) — intentional, matches Discord's
+            # per-turn gating model.
             while queued := self._pending.pop(thread_id, []):
                 composite = _compose_queued_content(queued)
                 representative = queued[0]
@@ -937,6 +945,10 @@ class SlackApp:
         # the full app wiring (registry, model info for reused sessions) lands.
         _lc_agent_name: str = ""
         _lc_model_id: str = ""
+        # Bound below in the new-session path (agent/model info is unavailable for a
+        # reused session until the placeholder above is resolved by full app wiring);
+        # a reused-session turn is therefore not billed today — a tracked follow-up.
+        usage_record: Callable[..., Coroutine[Any, Any, None]] | None = None
 
         if existing is not None:
             ma_session_id = existing.ma_session_id
@@ -1052,6 +1064,53 @@ class SlackApp:
             _lc_agent_name = agent.name
             _lc_model_id = agent.model.id
             env = await self.runtime.anthropic.beta.environments.retrieve(env_id)
+
+            # --- Admission gate: per-tenant balance — independent of Stripe config ---
+            if await is_over_balance(sessionmaker=self.runtime.sessionmaker, tenant_id=tenant_id):
+                log.info(
+                    "turn.skipped.over_balance",
+                    tenant_id=str(tenant_id),
+                    team_id=team_id,
+                    channel_id=channel,
+                    thread_id=thread_id,
+                )
+                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                    channel=channel,
+                    thread_ts=thread_id,
+                    text=(
+                        "This workspace's daimon credit is depleted. "
+                        "An admin can top up with `/billing`."
+                    ),
+                )
+                return
+
+            # --- Admission gate: monthly usage cap ---
+            over_cap = await is_over_cap(
+                billing_config=self.runtime.billing_config,
+                sessionmaker=self.runtime.sessionmaker,
+                tenant_id=tenant_id,
+                user_id=str(event.get("user") or ""),
+                now=datetime.now(UTC),
+            )
+            if over_cap:
+                log.info(
+                    "turn.skipped.over_cap",
+                    tenant_id=str(tenant_id),
+                    user_id=str(event.get("user") or ""),
+                    team_id=team_id,
+                    channel_id=channel,
+                    thread_id=thread_id,
+                )
+                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                    channel=channel,
+                    thread_ts=thread_id,
+                    text=(
+                        "Monthly usage cap reached for this workspace. "
+                        "An admin can adjust the cap with `/billing` (when available)."
+                    ),
+                )
+                return
+
             ma_session = await create_session(
                 self.runtime.anthropic,
                 agent=agent,
@@ -1074,6 +1133,16 @@ class SlackApp:
                 ),
             )
             ma_session_id = ma_session.id
+            usage_record = functools.partial(
+                record_turn_usage,
+                sessionmaker=self.runtime.sessionmaker,
+                platform_user_id=str(event.get("user") or ""),
+                managed_session_id=ma_session_id,
+                model_id=agent.model.id,
+                tenant_id=tenant_id,
+                markup=self.runtime.settings.billing.markup,
+                pricing=MODEL_PRICING.get(agent.model.id),
+            )
 
             async with self.runtime.sessionmaker() as s:
                 row = await create_thread_session(
@@ -1214,6 +1283,7 @@ class SlackApp:
                 cancel=cancel_event,
                 render_interval_s=2.0,
                 image_blocks=image_blocks or None,
+                usage_record=usage_record,
             )
         finally:
             # Leak-policy bookkeeping only — a delete failure must not mask the
