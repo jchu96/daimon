@@ -11,12 +11,12 @@ import dataclasses
 import uuid
 from typing import TYPE_CHECKING, Final
 
-import anthropic
 import httpx
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core import agent_lifecycle
 from daimon.core.constants import ALLOWED_MODEL_IDS
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
@@ -37,12 +37,10 @@ from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import (
     build_multifernet,
     get_github_login,
-    get_pat,
     upsert_credential_encrypted,
 )
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.memory_resource import archive_memory_store_for_agent
 from daimon.core.skill_sync import SyncReport, sync_agent_skills
 from daimon.core.specs import (
     AgentSpec,
@@ -51,7 +49,6 @@ from daimon.core.specs import (
     merge_default_agent_toolset,
 )
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
-from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from pydantic import ValidationError
 
 from .state import PanelState, RosterEntry
@@ -428,82 +425,15 @@ async def fork_agent(
 
     fork_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(created.id))
     source_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(source.id))
-    await _copy_credential_and_repo_binding(
-        runtime,
+    await agent_lifecycle.copy_credential_and_repo_binding(
+        anthropic=runtime.anthropic,
+        sessionmaker=runtime.sessionmaker,
+        fernet=_build_runtime_fernet(runtime),
+        oauth_scopes=tuple(runtime.settings.github.oauth_scopes),
         tenant_id=tenant_id,
         source_agent_uuid=source_agent_uuid,
         fork_agent_uuid=fork_agent_uuid,
     )
-
-
-async def _copy_credential_and_repo_binding(
-    runtime: DiscordRuntime,
-    *,
-    tenant_id: uuid.UUID,
-    source_agent_uuid: uuid.UUID,
-    fork_agent_uuid: uuid.UUID,
-) -> None:
-    """Re-key the source's per-agent GitHub credential onto the fork and copy
-    its repo binding.
-
-    Generic per-server copy: today the only credential-backed MCP
-    server mechanism is the per-agent GitHub PAT overlay driving the repo
-    clone at session-create time; this helper is the single place that
-    mechanism is re-keyed, so adding a second credential-backed kind later is
-    additive here rather than a new github-specific branch in `fork_agent`.
-
-    The fork's credential is written under `principal_id=fork_agent_uuid`
-    — never aliased to the source principal — mirroring `store_inline_pat`.
-    The repo binding is copied with `ma_secret_ref` rewritten to the
-    fork's own `inline-pat:` ref for private repos; `anon:` (and any other
-    non-inline-pat ref) is copied verbatim.
-    A source binding backed by `inline-pat:` with no resolvable/
-    decryptable source credential fails the fork loud.
-    """
-    async with runtime.sessionmaker() as session:
-        source_binding = await get_binding(session, tenant_id=tenant_id, agent_id=source_agent_uuid)
-    if source_binding is None:
-        return
-
-    if source_binding.ma_secret_ref.startswith("inline-pat:"):
-        fernet = _build_runtime_fernet(runtime)
-        source_pat = await get_pat(
-            principal_id=source_agent_uuid,
-            agent_id=source_agent_uuid,
-            sessionmaker=runtime.sessionmaker,
-            fernet=fernet,
-        )
-        if source_pat is None:
-            raise DaimonError(
-                "Fork failed: the source agent's github git-proxy has no resolvable "
-                "credential to copy — reconnect GitHub on the source agent and try again."
-            )
-        await upsert_credential_encrypted(
-            sessionmaker=runtime.sessionmaker,
-            fernet=fernet,
-            principal_id=fork_agent_uuid,
-            github_login="(inline-pat)",
-            plaintext_token=source_pat,
-            scopes=tuple(runtime.settings.github.oauth_scopes),
-        )
-        async with runtime.sessionmaker.begin() as session:
-            await set_agent_github_binding(
-                session, agent_id=fork_agent_uuid, principal_id=fork_agent_uuid
-            )
-        fork_secret_ref = f"inline-pat:{fork_agent_uuid}"
-    else:
-        # anon: (or any other non-per-agent-secret ref) carries no secret — copy verbatim.
-        fork_secret_ref = source_binding.ma_secret_ref
-
-    async with runtime.sessionmaker.begin() as session:
-        await set_binding(
-            session,
-            tenant_id=tenant_id,
-            agent_id=fork_agent_uuid,
-            repo_url=source_binding.repo_url,
-            default_branch=source_binding.default_branch,
-            ma_secret_ref=fork_secret_ref,
-        )
 
 
 async def delete_agent(runtime: DiscordRuntime, *, tenant_id: uuid.UUID, name: str) -> None:
@@ -512,24 +442,13 @@ async def delete_agent(runtime: DiscordRuntime, *, tenant_id: uuid.UUID, name: s
     if agent is None:
         raise DaimonError(f"No agent named **{name}** found.")
     await runtime.anthropic.beta.agents.archive(agent.id)
-    try:
-        await archive_memory_store_for_agent(
-            runtime.anthropic,
-            runtime.sessionmaker,
-            tenant_id=tenant_id,
-            agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
-        )
-    except anthropic.APIError:
-        # Best-effort degrade: the agent is already archived and the retry path
-        # is dead (archived agents are filtered from lookup), so a transient
-        # memory-store archive failure must not strand the agent in a failed
-        # state — mirrors the mount-side policy in memory_resource.py.
-        _log.warning(
-            "delete_agent.memory_store_archive_failed",
-            tenant_id=str(tenant_id),
-            agent_name=name,
-            ma_agent_id=agent.id,
-        )
+    await agent_lifecycle.archive_memory_store_best_effort(
+        anthropic=runtime.anthropic,
+        sessionmaker=runtime.sessionmaker,
+        tenant_id=tenant_id,
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
+        log_context={"tenant_id": str(tenant_id), "agent_name": name, "ma_agent_id": agent.id},
+    )
 
 
 def _build_runtime_fernet(runtime: DiscordRuntime) -> MultiFernet:
