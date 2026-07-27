@@ -106,16 +106,18 @@ class DiscordTurnLifecycle:
         agent_name: str,
         model_id: str,
         cancel_view: discord.ui.View | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._send = send
         self._edit = edit
         self._agent_name = agent_name
         self._model_id = model_id
+        self._clock = clock
         self._state = EmbedState(
             phase=TurnPhase.THINKING,
             trail=(),
             agent_name=agent_name,
-            started_at=time.monotonic(),
+            started_at=self._clock(),
         )
         self._message_ref: Any | None = None
         self._last_flush: float = 0.0
@@ -152,7 +154,7 @@ class DiscordTurnLifecycle:
         """Post or edit the embeds, subject to debounce. No-op after terminal."""
         if self._terminal:
             return
-        now = time.monotonic()
+        now = self._clock()
         if self._message_ref is None:
             # First post — immediate, no debounce
             self._message_ref = await self._send(
@@ -199,7 +201,7 @@ class DiscordTurnLifecycle:
         """Unconditionally flush terminal state as a single collapsed embed,
         bypassing debounce. ``embeds=[...]`` also drops the preview embed."""
         self._terminal = True
-        now = time.monotonic()
+        now = self._clock()
         data = to_embed_data(self._state, now=now)
         embed = build_discord_embed(data)
         if self._message_ref is None:
