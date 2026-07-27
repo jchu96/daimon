@@ -123,7 +123,7 @@ forbidden_modules = ["daimon"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
-testpaths = ["packages/core/tests", "packages/adapters/cli/tests", "packages/adapters/mcp/tests", "packages/adapters/discord/tests", "packages/adapters/scheduler/tests", "packages/adapters/slack/tests", "packages/testing/tests", "tests/integration", "apps/notebook-host/tests"]
+testpaths = ["packages/core/tests", "packages/adapters/cli/tests", "packages/adapters/mcp/tests", "packages/adapters/discord/tests", "packages/adapters/scheduler/tests", "packages/adapters/slack/tests", "packages/testing/tests", "tests/integration", "tests/parity", "apps/notebook-host/tests"]
 addopts = "--import-mode=importlib -m 'not contract and not slow'"
 markers = [
     "contract: live MA API tests -- opt-in only, never gate CI",
