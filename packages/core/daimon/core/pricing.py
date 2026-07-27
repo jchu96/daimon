@@ -28,6 +28,7 @@ class ModelRates:
 
 # USD per 1M tokens. Sourced from https://www.anthropic.com/pricing (2026-04-19).
 MODEL_PRICING: dict[str, ModelRates] = {
+    "claude-opus-5": ModelRates(input=5.0, output=25.0, cache_write=6.25, cache_read=0.50),
     "claude-opus-4-8": ModelRates(input=5.0, output=25.0, cache_write=6.25, cache_read=0.50),
     "claude-opus-4-7": ModelRates(input=15.0, output=75.0, cache_write=18.75, cache_read=1.50),
     "claude-sonnet-5": ModelRates(input=3.0, output=15.0, cache_write=3.75, cache_read=0.30),
