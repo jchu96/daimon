@@ -11,7 +11,6 @@ from daimon.adapters.cli.commands.config import (
     _config_propagate_entry,
     _parse_scope,
 )
-from daimon.core._models import Account
 from daimon.core.scope import (
     ChannelScopeRef,
     DeploymentDefault,
@@ -19,7 +18,7 @@ from daimon.core.scope import (
     UserScopeRef,
 )
 from daimon.core.stores.scoped_config_write import set_fields
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from rich.console import Console
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -75,9 +74,7 @@ def test_parse_scope_channel_bad_discord_format_raises() -> None:
 @pytest.mark.asyncio
 async def test_config_get_effective_shows_provenance(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     await set_fields(
         db_session,
@@ -105,9 +102,7 @@ async def test_config_get_effective_shows_provenance(db_session: AsyncSession) -
 @pytest.mark.asyncio
 async def test_config_get_raw_scope(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     await set_fields(
         db_session,
@@ -134,9 +129,7 @@ async def test_config_get_raw_scope(db_session: AsyncSession) -> None:
 @pytest.mark.asyncio
 async def test_config_get_three_tier_with_channel(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     await set_fields(
         db_session,
@@ -164,9 +157,7 @@ async def test_config_get_three_tier_with_channel(db_session: AsyncSession) -> N
 @pytest.mark.asyncio
 async def test_config_propagate_empty_source(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
     await _config_propagate_entry(
@@ -200,9 +191,7 @@ async def test_set_scope_tenant(db_session: AsyncSession) -> None:
     from daimon.core.stores.scoped_config_read import get_scope  # noqa: PLC0415
 
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
     await _config_set_entry(
@@ -229,9 +218,7 @@ async def test_set_scope_channel_writes_channel_config(db_session: AsyncSession)
     from daimon.core.stores.scoped_config_read import get_scope  # noqa: PLC0415
 
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     channel_id = "chan-123"
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
@@ -297,9 +284,7 @@ async def test_get_scope_deployment(db_session: AsyncSession) -> None:
     from daimon.core.scope import DeploymentDefault  # noqa: PLC0415
 
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
     # After Plan 06, _config_get_entry intercepts scope_str="deployment" before _parse_scope

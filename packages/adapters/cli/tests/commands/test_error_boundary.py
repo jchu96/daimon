@@ -12,17 +12,14 @@ bound to the loop that opened them.
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse
 
 import httpx
 import pytest
-import pytest_asyncio
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_model_config import (
@@ -33,24 +30,12 @@ from daimon.adapters.cli.commands import agents as agents_cmd
 from daimon.adapters.cli.commands import config as config_cmd
 from daimon.adapters.cli.commands import environments as environments_cmd
 from daimon.adapters.cli.runtime import CliRuntime
-from daimon.core._models import Base
 from daimon.core.config import Settings
 from daimon.core.stores.identity import get_or_create_cli_principal
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from typer.testing import CliRunner
-
-
-def _require_test_dsn() -> str:
-    url = os.environ.get("DAIMON_DATABASE__TEST_URL")
-    if not url:
-        raise RuntimeError("DAIMON_DATABASE__TEST_URL must be set to run these tests.")
-    if "test" not in urlparse(url).path:
-        raise RuntimeError("Refusing to run destructive fixtures against a non-test DB.")
-    return url
 
 
 def _settings() -> Settings:
@@ -118,33 +103,6 @@ def _write_agent_spec(tmp_path: Path, name: str) -> Path:
         )
     )
     return spec
-
-
-@pytest_asyncio.fixture
-async def schema_sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Fresh schema + a sessionmaker bound to it."""
-    dsn = _require_test_dsn()
-    schema = f"test_{uuid.uuid4().hex}"
-    engine = create_async_engine(dsn, poolclass=NullPool)
-
-    async with engine.connect() as conn:
-        await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
-        conn2 = await conn.execution_options(schema_translate_map={None: schema})
-        await conn2.run_sync(Base.metadata.create_all)
-        await conn.commit()
-
-    sessionmaker = async_sessionmaker(
-        engine.execution_options(schema_translate_map={None: schema}),
-        expire_on_commit=False,
-        class_=AsyncSession,
-    )
-    try:
-        yield sessionmaker
-    finally:
-        async with engine.connect() as conn:
-            await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-            await conn.commit()
-        await engine.dispose()
 
 
 def test_agents_create_api_conflict_exits_1_without_traceback(

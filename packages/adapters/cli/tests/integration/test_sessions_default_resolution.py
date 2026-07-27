@@ -27,6 +27,7 @@ from daimon.core.defaults.loader import parse_deployment_default
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ScopeContext
 from daimon.core.stores.scoped_config_read import resolve as resolve_config
+from daimon.core.stores.tenants import list_all_tenant_ids
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     EMPTY_SESSION_STATS,
@@ -35,7 +36,6 @@ from daimon.testing.ma import (
     list_response,
 )
 from rich.console import Console
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -267,11 +267,7 @@ async def test_sessions_create_resolves_system_default_after_apply(
     # (no config rows) resolves to daimon/default via the injected DeploymentDefault.
     default = parse_deployment_default(tmp_path)
     async with db_session_factory() as s:
-        from daimon.core._models import Tenant
-
-        row = await s.execute(select(Tenant).limit(1))
-        tenant = row.scalar_one()
-        tenant_id = tenant.id
+        tenant_id = next(iter(await list_all_tenant_ids(s)))
         context = ScopeContext(account_id=uuid.uuid4(), tenant_id=tenant_id)
         cfg = await resolve_config(s, context=context, default=default)
     assert cfg.agent_name == "daimon"
@@ -321,10 +317,7 @@ async def test_sessions_create_resolves_via_resolver_after_archive(
     )
 
     async with db_session_factory() as s:
-        from daimon.core._models import Tenant
-
-        row = await s.execute(select(Tenant).limit(1))
-        tenant_id = row.scalar_one().id
+        tenant_id = next(iter(await list_all_tenant_ids(s)))
 
     # The CLI bootstrap passes cached_id=None to the resolver, so the resolver
     # path is: tag lookup -> live id. We stage the live tag-matching agent /

@@ -11,10 +11,9 @@ import uuid
 
 from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
-from daimon.core._models import Account
 from daimon.core.mcp_auth import mint_jwt
 from daimon.core.stores.domain import Role
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -54,26 +53,13 @@ async def seed_tenant(session: AsyncSession, *, workspace_id: str | None = None)
     return tenant.id
 
 
-async def seed_account(
-    session: AsyncSession,
-    *,
-    tenant_id: uuid.UUID,
-    role: str = "user",
-) -> uuid.UUID:
-    """Insert an Account row belonging to the given tenant and return its id."""
-    account = Account(tenant_id=tenant_id, role=role)
-    session.add(account)
-    await session.flush()
-    return account.id
-
-
 async def seed_tenant_and_account(
     session: AsyncSession,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     """Insert a Tenant + Account and return (tenant_id, account_id)."""
-    tid = await seed_tenant(session)
-    aid = await seed_account(session, tenant_id=tid)
-    return tid, aid
+    tenant = await make_tenant(session, platform="discord")
+    account = await make_account(session, tenant=tenant)
+    return tenant.id, account.id
 
 
 def make_ma_agent(**overrides: object) -> BetaManagedAgentsAgent:

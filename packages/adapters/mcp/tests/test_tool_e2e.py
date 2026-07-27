@@ -15,14 +15,13 @@ import pytest
 from anthropic.types.beta import SkillListResponse
 from daimon.adapters.mcp.middleware.mcp_identity import ClaimResolver
 from daimon.adapters.mcp.server import create_mcp_app
-from daimon.core._models import Account
 from daimon.core.config import (
     AnthropicSettings,
     DatabaseSettings,
     McpSettings,
     Settings,
 )
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp import Client
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -154,9 +153,7 @@ async def test_list_agents_isolates_tenants_end_to_end(
     """Two tenants — each sees only their own agents."""
     tenant_a_id, account_a_id = await seed_tenant_and_account(db_session)
     tenant_b = await make_tenant(db_session, platform="discord", workspace_id="guild-e2e-b")
-    account_b = Account(tenant_id=tenant_b.id)
-    db_session.add(account_b)
-    await db_session.flush()
+    account_b = await make_account(db_session, tenant=tenant_b)
     tenant_b_id = tenant_b.id
     account_b_id = account_b.id
     await db_session.commit()

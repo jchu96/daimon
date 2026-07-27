@@ -18,14 +18,12 @@ from __future__ import annotations
 import datetime as dt
 import os
 import uuid
-from collections.abc import AsyncIterator
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_model_config import (
@@ -57,9 +55,8 @@ from daimon.adapters.scheduler.main import (
     _acquire_advisory_lock,  # pyright: ignore[reportPrivateUsage]  # named test seam for advisory-lock contention
 )
 from daimon.adapters.scheduler.main import run as scheduler_run
-from daimon.core._models import Base
 from daimon.core.config import Settings
-from daimon.core.db import build_engine, build_session_factory
+from daimon.core.db import build_engine
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores import tenant_ledger
 from daimon.core.stores.routines import create_routine, get_routine
@@ -109,61 +106,6 @@ def _test_dsn() -> str:
     if not url:
         pytest.skip("DAIMON_DATABASE__TEST_URL must be set for integration tests")
     return url
-
-
-@pytest_asyncio.fixture
-async def schema_engine() -> AsyncIterator[
-    tuple[AsyncEngine, async_sessionmaker[AsyncSession], uuid.UUID]
-]:
-    """Engine + sessionmaker scoped to a per-test schema.
-
-    The engine is configured with ``schema_translate_map`` so all DDL +
-    DML lands in ``test_<uuid>``; the schema is created here and dropped
-    on teardown. The scheduler's ``run`` is invoked with this engine via
-    ``_engine_override`` so it shares the per-test schema with the test
-    body's seed/verify code.
-    """
-    raw_engine = build_engine(_test_dsn())
-    schema = f"test_{uuid.uuid4().hex}"
-    async with raw_engine.connect() as conn:
-        await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
-        mapped = await conn.execution_options(schema_translate_map={None: schema})
-        await mapped.run_sync(Base.metadata.create_all)
-        await mapped.commit()
-    await raw_engine.dispose()
-
-    # Build the *real* engine the test body and the scheduler will share.
-    # `execution_options(schema_translate_map=...)` returns a wrapper engine
-    # whose checked-out connections all carry the translate map.
-    engine = build_engine(_test_dsn()).execution_options(
-        schema_translate_map={None: schema},
-    )
-    sm = build_session_factory(engine)
-
-    # Seed a Tenant — the routine row's tenant_id FK points at it.
-    # Seed a positive balance so the admission gate (is_over_balance)
-    # does not block scheduled fires — these e2e tests exercise the fire path, not the gate.
-    async with sm() as s, s.begin():
-        tenant = await make_tenant(s, platform="discord", workspace_id="e2e-guild-a")
-        tenant_id = tenant.id
-        await tenant_ledger.insert_entry(
-            s,
-            tenant_id=tenant_id,
-            delta_usd=Decimal("100"),
-            reason="test-seed",
-            idempotency_key=f"test-seed:{tenant_id}",
-        )
-
-    try:
-        yield engine, sm, tenant_id
-    finally:
-        await engine.dispose()
-        # Teardown — drop schema on a fresh raw engine.
-        cleanup_engine = build_engine(_test_dsn())
-        async with cleanup_engine.connect() as conn:
-            await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-            await conn.commit()
-        await cleanup_engine.dispose()
 
 
 def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:

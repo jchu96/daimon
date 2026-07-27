@@ -24,7 +24,6 @@ import httpx
 import jwt as pyjwt
 import pytest
 from daimon.adapters.mcp.server import create_mcp_app
-from daimon.core._models import Account
 from daimon.core.config import (
     AnthropicSettings,
     DatabaseSettings,
@@ -32,7 +31,9 @@ from daimon.core.config import (
     McpSettings,
     Settings,
 )
-from daimon.testing.factories import make_platform_principal, make_tenant
+from daimon.core.stores import accounts
+from daimon.core.stores.domain import Role
+from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp, Message
@@ -144,9 +145,8 @@ async def test_claimless_token_drives_routines_and_discord_tools(
     # The LEFT JOIN in get_account_with_tenant requires a PlatformPrincipal row
     # so platform_user_id is recoverable from the token's sub alone.
     tenant = await make_tenant(db_session, platform="discord", workspace_id="guild-claimless")
-    account = Account(tenant_id=tenant.id, role="admin")
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
+    await accounts.set_role(db_session, account.id, Role.ADMIN)
     await make_platform_principal(
         db_session,
         platform="discord",

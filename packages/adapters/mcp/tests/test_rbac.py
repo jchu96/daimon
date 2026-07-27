@@ -18,14 +18,15 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 from daimon.adapters.mcp.server import create_mcp_app
-from daimon.core._models import Account
 from daimon.core.config import (
     AnthropicSettings,
     DatabaseSettings,
     McpSettings,
     Settings,
 )
-from daimon.testing.factories import make_tenant
+from daimon.core.stores import accounts
+from daimon.core.stores.domain import Role
+from daimon.testing.factories import make_account, make_tenant
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp, Message
@@ -144,12 +145,9 @@ async def _seed_admin_and_user(
     """
     async with sessionmaker() as s, s.begin():
         tenant = await make_tenant(s, platform="discord", workspace_id="guild-rbac-test")
-        admin_account = Account(tenant_id=tenant.id, role="admin")
-        s.add(admin_account)
-        await s.flush()
-        user_account = Account(tenant_id=tenant.id, role="user")
-        s.add(user_account)
-        await s.flush()
+        admin_account = await make_account(s, tenant=tenant)
+        await accounts.set_role(s, admin_account.id, Role.ADMIN)
+        user_account = await make_account(s, tenant=tenant)
         admin_token = make_jwt(account_id=admin_account.id)
         user_token = make_jwt(account_id=user_account.id)
     return admin_token, user_token
@@ -321,9 +319,7 @@ async def test_discord_vault_token_is_admin_claim_without_internal_denied_admin_
     internal discriminator claim (emitted only by mint_internal_mcp_token)."""
     async with sessionmaker() as s, s.begin():
         tenant = await make_tenant(s, platform="discord", workspace_id="guild-isadmin-test")
-        user_account = Account(tenant_id=tenant.id, role="user")
-        s.add(user_account)
-        await s.flush()
+        user_account = await make_account(s, tenant=tenant)
         # Discord vault token: is_admin=True but no internal claim
         guild_admin_token = make_jwt(account_id=user_account.id, is_admin=True)
     app = _make_app(sessionmaker)

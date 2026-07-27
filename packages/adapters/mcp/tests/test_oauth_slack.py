@@ -32,7 +32,6 @@ from daimon.adapters.mcp.oauth_slack import (
     build_oauth_slack_routes,
 )
 from daimon.adapters.mcp.server import create_mcp_app
-from daimon.core._models import SlackBotToken
 from daimon.core.config import (
     AnthropicSettings,
     CryptoSettings,
@@ -44,13 +43,12 @@ from daimon.core.config import (
 from daimon.core.github_credentials import build_multifernet
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.slack_oauth import SLACK_USER_SCOPES, mint_state
-from daimon.core.stores.slack_bot_tokens import get_slack_bot_token
+from daimon.core.stores.slack_bot_tokens import count_slack_bot_tokens, get_slack_bot_token
 from daimon.core.stores.slack_user_tokens import get_slack_user_token
 from daimon.core.stores.tenant_ledger import get_balance
 from daimon.core.stores.tenants import list_tenants_by_platform
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -574,9 +572,7 @@ async def test_enterprise_install_rejected_stores_nothing(
 
     # Zero token rows AND zero slack tenant rows.
     async with sessionmaker() as session:
-        token_count = (
-            await session.execute(select(func.count()).select_from(SlackBotToken))
-        ).scalar_one()
+        token_count = await count_slack_bot_tokens(session)
     slack_tenants = await list_tenants_by_platform(sessionmaker, platform="slack")
     assert token_count == 0, "no slack_bot_tokens row should be stored for enterprise install"
     assert len(slack_tenants) == 0, "no slack tenant should be created for enterprise install"

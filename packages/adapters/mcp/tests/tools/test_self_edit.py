@@ -31,15 +31,13 @@ from daimon.adapters.mcp.tools.self_edit import (
     _set_repo_binding_impl,  # pyright: ignore[reportPrivateUsage]
     register_self_edit_tools,
 )
-from daimon.core._models import AgentRepoBinding  # test-only ORM access escape hatch
 from daimon.core.broker.errors import NoBindingError, ProviderConfigError
 from daimon.core.scope import DeploymentDefault
-from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.domain import Role
 from factories import seed_tenant
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.asyncio
@@ -399,12 +397,8 @@ async def test_set_repo_binding_writes_row_with_new_cred_id(
         runtime, auth, repo_url="https://github.com/o/r", default_branch="main"
     )
 
-    # Test-only ORM access (escape hatch — the projection strips ma_secret_ref).
-    stmt = select(AgentRepoBinding).where(
-        AgentRepoBinding.tenant_id == tenant_id,
-        AgentRepoBinding.agent_id == agent_id,
-    )
-    row = (await db_session.execute(stmt)).scalar_one()
+    row = await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id)
+    assert row is not None, "binding row must exist"
     assert row.ma_secret_ref == new_id, (
         "DB row's ma_secret_ref must equal the cred id returned by vault.create"
     )
@@ -481,11 +475,7 @@ async def test_clear_repo_binding_removes_row_and_calls_vault_delete(
         f"/v1/vaults/{_VAULT_ID}/credentials/cred_to_delete",
     ) in methods_paths, "must call vault credentials.delete with the seeded cred id"
 
-    stmt = select(AgentRepoBinding).where(
-        AgentRepoBinding.tenant_id == tenant_id,
-        AgentRepoBinding.agent_id == agent_id,
-    )
-    assert (await db_session.execute(stmt)).scalar_one_or_none() is None, (
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
         "DB row must be removed after clear"
     )
 
@@ -530,11 +520,7 @@ async def test_clear_repo_binding_swallows_vault_delete_failure(
     result = await _clear_repo_binding_impl(runtime, auth)
 
     assert result == {"cleared": True}, "vault delete failure must not block DB cleanup"
-    stmt = select(AgentRepoBinding).where(
-        AgentRepoBinding.tenant_id == tenant_id,
-        AgentRepoBinding.agent_id == agent_id,
-    )
-    assert (await db_session.execute(stmt)).scalar_one_or_none() is None, (
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
         "DB row must still be removed even when vault delete fails"
     )
     assert "vault_delete_failed" in capsys.readouterr().out, (
@@ -569,11 +555,7 @@ async def test_set_repo_binding_vault_failure_leaves_no_row(
             service="github",
         )
 
-    stmt = select(AgentRepoBinding).where(
-        AgentRepoBinding.tenant_id == tenant_id,
-        AgentRepoBinding.agent_id == agent_id,
-    )
-    assert (await db_session.execute(stmt)).scalar_one_or_none() is None, (
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
         "vault upload failure must leave no binding row — upload-first ordering"
     )
 
@@ -631,11 +613,7 @@ async def test_set_repo_binding_db_failure_deletes_new_vault_cred(
     )
 
     # Assert 2: no AgentRepoBinding row was left behind.
-    stmt = select(AgentRepoBinding).where(
-        AgentRepoBinding.tenant_id == tenant_id,
-        AgentRepoBinding.agent_id == agent_id,
-    )
-    assert (await db_session.execute(stmt)).scalar_one_or_none() is None, (
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
         "DB write failure must leave no binding row (the set_binding raise prevented commit)"
     )
 
@@ -801,11 +779,8 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     )
 
     # The DB row's ma_secret_ref must now point at the new cred.
-    stmt = select(AgentRepoBinding).where(
-        AgentRepoBinding.tenant_id == tenant_id,
-        AgentRepoBinding.agent_id == agent_id,
-    )
-    row = (await db_session.execute(stmt)).scalar_one()
+    row = await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id)
+    assert row is not None, "binding row must exist"
     assert row.ma_secret_ref == new_id, (
         "after rebind, DB row's ma_secret_ref must point at the new credential id"
     )

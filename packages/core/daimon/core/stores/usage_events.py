@@ -282,3 +282,13 @@ async def delete_all_for_user(
     rowcount = cast(CursorResult[Any], result).rowcount
     await session.flush()
     return rowcount
+
+
+async def count_all(session: AsyncSession) -> int:
+    """Return the total number of usage_events rows, unscoped by tenant.
+
+    Read-only. Intended for regression tests asserting "no usage_events row
+    was written anywhere" (e.g. a CLI path that must never bill) — production
+    code should prefer the tenant-scoped helpers above.
+    """
+    return int((await session.execute(select(func.count()).select_from(UsageEvent))).scalar_one())

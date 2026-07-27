@@ -12,7 +12,6 @@ import httpx
 import pytest
 import stripe
 from daimon.adapters.mcp.server import create_mcp_app
-from daimon.core._models import PaymentEvent
 from daimon.core.billing import BillingConfig
 from daimon.core.config import (
     AnthropicSettings,
@@ -24,7 +23,6 @@ from daimon.core.stores import payment_events, tenant_ledger
 from daimon.testing.factories import make_tenant
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 
@@ -179,8 +177,8 @@ async def test_valid_signature_writes_dedup_row_returns_200(
     assert r.status_code == 200, "valid signature + checkout.session.completed -> 200"
 
     async with sessionmaker() as s:
-        result = await s.execute(select(PaymentEvent).where(PaymentEvent.id == "evt_valid"))
-        row = result.scalar_one()
+        row = await payment_events.get(s, "evt_valid")
+    assert row is not None, "dedup row should have been written"
     assert row.amount_usd == Decimal("10"), "dedup row should record amount_usd from amount_total"
     assert row.credited_at is not None, "try_claim_credit should have stamped credited_at"
 
@@ -209,11 +207,8 @@ async def test_replay_is_idempotent_returns_200_no_new_row(
     assert r2.status_code == 200, "replay returns 200"
 
     async with sessionmaker() as s:
-        result = await s.execute(
-            select(func.count()).select_from(PaymentEvent).where(PaymentEvent.id == "evt_replay")
-        )
-        count = result.scalar_one()
-    assert count == 1, "replay must not create a second row"
+        row = await payment_events.get(s, "evt_replay")
+    assert row is not None, "replay must not create a second row"
 
 
 async def test_unhandled_event_type_returns_200_noop(
@@ -238,8 +233,8 @@ async def test_unhandled_event_type_returns_200_noop(
     assert r.status_code == 200, "non-checkout events must ack with 200"
 
     async with sessionmaker() as s:
-        result = await s.execute(select(PaymentEvent).where(PaymentEvent.id == "evt_other"))
-        assert result.scalar_one_or_none() is None, "non-checkout events write no DB row"
+        row = await payment_events.get(s, "evt_other")
+        assert row is None, "non-checkout events write no DB row"
 
 
 async def test_missing_metadata_returns_200_logs_warn(
@@ -264,8 +259,8 @@ async def test_missing_metadata_returns_200_logs_warn(
     assert r.status_code == 200, "missing metadata must NOT trigger Stripe retry — 200 ack"
 
     async with sessionmaker() as s:
-        result = await s.execute(select(PaymentEvent).where(PaymentEvent.id == "evt_no_meta"))
-        assert result.scalar_one_or_none() is None, "no row when metadata missing"
+        row = await payment_events.get(s, "evt_no_meta")
+        assert row is None, "no row when metadata missing"
 
 
 # ---------------------------------------------------------------------------

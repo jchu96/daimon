@@ -31,7 +31,6 @@ from daimon.adapters.mcp.server import create_mcp_app
 from daimon.adapters.mcp.services.audio import TTS_MODEL
 from daimon.adapters.mcp.services.image import IMAGE_MODEL
 from daimon.adapters.mcp.tools.media import register_media_tools
-from daimon.core._models import UsageEvent
 from daimon.core.config import (
     AnthropicSettings,
     DatabaseSettings,
@@ -40,7 +39,7 @@ from daimon.core.config import (
     Settings,
 )
 from daimon.core.pricing import MODEL_PRICING, cost_of
-from daimon.core.stores import tenant_ledger
+from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import Role
 from daimon.core.tenant_balance import debit_amount
 from fastmcp import Client, FastMCP
@@ -49,7 +48,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from google.genai import types
 from pydantic import HttpUrl, PostgresDsn, SecretStr
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp, Message
 
@@ -238,11 +236,7 @@ async def test_generate_image_billed_success_writes_usage_row_and_debits_ledger(
         result = await client.call_tool("generate_image", {"prompt": "a cat", "title": "kitty"})
     assert not result.is_error, f"billed success should not error: {result!r}"
 
-    rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant_id)))
-        .scalars()
-        .all()
-    )
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(rows) == 1, "billed success should write exactly one usage_events row"
     row = rows[0]
     assert row.input_tokens == 100, "input_tokens should map prompt_token_count"
@@ -293,11 +287,7 @@ async def test_generate_image_failed_call_writes_no_row_no_debit(
         with pytest.raises(ToolError, match="Gemini API server error"):
             await client.call_tool("generate_image", {"prompt": "a cat", "title": "kitty"})
 
-    rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant_id)))
-        .scalars()
-        .all()
-    )
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(rows) == 0, "a failed Gemini call must write no usage_events row"
     balance = await tenant_ledger.get_balance(db_session, tenant_id=tenant_id)
     assert balance == Decimal("10.00"), "a failed Gemini call must write no ledger debit"
@@ -332,11 +322,7 @@ async def test_trusted_path_writes_no_row_no_debit(
         result = await client.call_tool("generate_image", {"prompt": "a cat", "title": "kitty"})
     assert not result.is_error, f"trusted path should succeed: {result!r}"
 
-    rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant_id)))
-        .scalars()
-        .all()
-    )
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(rows) == 0, "trusted (platform_user_id=None) path must write no usage row"
     balance = await tenant_ledger.get_balance(db_session, tenant_id=tenant_id)
     assert balance == Decimal("0"), "trusted path must write no ledger debit"
@@ -402,11 +388,7 @@ async def test_generate_audio_multi_segment_writes_one_aggregated_row(
     assert not result.is_error, f"multi-segment audio should succeed: {result!r}"
     assert call_count == 2, "TTS should run once per segment"
 
-    rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant_id)))
-        .scalars()
-        .all()
-    )
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(rows) == 1, "multi-segment audio should write one aggregated row per invocation"
     row = rows[0]
     assert row.input_tokens == 20, "input_tokens should sum both segments' prompt tokens"
@@ -556,9 +538,5 @@ async def test_full_pipeline_denies_with_terminal_error_on_depleted_ledger(
     )
     assert "/billing" in message_text, f"deny message should name /billing: {payload!r}"
 
-    rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant_id)))
-        .scalars()
-        .all()
-    )
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(rows) == 0, "a denied call must write no usage_events row"

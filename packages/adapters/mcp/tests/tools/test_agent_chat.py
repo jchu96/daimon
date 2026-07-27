@@ -51,10 +51,10 @@ from daimon.adapters.mcp.tools.agent_chat import (
     _start_turn_impl,
     register_agent_chat_tools,
 )
-from daimon.core._models import Tenant  # test-only ORM access escape hatch
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     MARouter,
@@ -924,8 +924,7 @@ async def test_describe_agent_returns_bound_repo_url_for_bound_agent(
     auth = _auth()
 
     async with db_session_factory() as session, session.begin():
-        session.add(Tenant(id=_TENANT_ID, platform="discord", external_id=str(_TENANT_ID)))
-        await session.flush()
+        await make_tenant(session, platform="discord", workspace_id=str(_TENANT_ID), id=_TENANT_ID)
         await set_binding(
             session,
             tenant_id=_TENANT_ID,

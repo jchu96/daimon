@@ -8,13 +8,13 @@ import pytest
 from anthropic import AsyncAnthropic
 from daimon.adapters.cli.commands.tenants import tenants_delete, tenants_list
 from daimon.adapters.cli.runtime import CliRuntime
-from daimon.core._models import TenantConfig
 from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.errors import StoreError
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
-from daimon.core.scope import DeploymentDefault
+from daimon.core.scope import DeploymentDefault, TenantScopeRef
+from daimon.core.stores import scoped_config_write
 from daimon.core.stores.tenants import get_tenant
 from daimon.testing.factories import make_tenant
 from rich.console import Console
@@ -88,7 +88,12 @@ async def test_tenants_delete_refuses_when_dependents_exist_without_cascade(
     tenant_id = result.tenant_id
 
     async with db_session_factory() as s, s.begin():
-        s.add(TenantConfig(tenant_id=tenant_id, agent_name="a1"))
+        await scoped_config_write.set_fields(
+            s,
+            scope=TenantScopeRef(tenant_id=tenant_id),
+            tenant_id=tenant_id,
+            agent_name="a1",
+        )
 
     with pytest.raises(StoreError, match="dependents"):
         await tenants_delete(
@@ -119,7 +124,12 @@ async def test_tenants_delete_cascade_deletes_tenant_when_dependents_exist(
     tenant_id = result.tenant_id
 
     async with db_session_factory() as s, s.begin():
-        s.add(TenantConfig(tenant_id=tenant_id, agent_name="a1"))
+        await scoped_config_write.set_fields(
+            s,
+            scope=TenantScopeRef(tenant_id=tenant_id),
+            tenant_id=tenant_id,
+            agent_name="a1",
+        )
 
     await tenants_delete(
         rt=rt,

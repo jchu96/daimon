@@ -187,15 +187,11 @@ async def test_verified_token_carries_platform_and_external_id_claims(
     into AccessToken.claims. This test proves the injection works by verifying the
     request is accepted (verifier returned AccessToken not None → 200).
     """
-    from daimon.testing.factories import make_platform_principal, make_tenant
+    from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 
     async with sessionmaker() as s, s.begin():
         tenant = await make_tenant(s, platform="discord", workspace_id="guild-test-1234")
-        from daimon.core._models import Account
-
-        account = Account(tenant_id=tenant.id)
-        s.add(account)
-        await s.flush()
+        account = await make_account(s, tenant=tenant)
         account_id = account.id
         await make_platform_principal(
             s,

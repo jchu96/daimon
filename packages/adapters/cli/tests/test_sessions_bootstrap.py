@@ -15,7 +15,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, TenantScopeRef, UserScopeRef
 from daimon.core.stores.scoped_config_write import set_fields
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import EMPTY_CLOUD_CONFIG, MARouter, build_stub_anthropic, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -222,12 +222,8 @@ async def test_resolve_ignores_user_scope_and_falls_to_tenant_system(
     it — the cascade is channel→workspace→tenant_system. With only a user-scoped
     and a tenant_system config set, resolution falls to tenant_system.
     """
-    from daimon.core._models import Account
-
     tenant = await make_tenant(db_session)
-    account = Account(tenant_id=tenant.id)
-    db_session.add(account)
-    await db_session.flush()
+    account = await make_account(db_session, tenant=tenant)
 
     await set_fields(
         db_session,

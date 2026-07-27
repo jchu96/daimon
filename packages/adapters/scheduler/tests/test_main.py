@@ -28,7 +28,6 @@ from daimon.adapters.scheduler.main import (
     _CapsAdapter,  # pyright: ignore[reportPrivateUsage]  # named test seam for cap wiring
     _validate_mcp_settings,  # pyright: ignore[reportPrivateUsage]  # boot-validation seam
 )
-from daimon.core._models import PlatformPrincipal
 from daimon.core.billing import BillingConfig
 from daimon.core.config import Settings
 from daimon.core.ma_resolver import new_resolver_cache
@@ -37,11 +36,11 @@ from daimon.core.scheduler import run_one_tick
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores import tenant_ledger, tenant_user_caps, usage_events
 from daimon.core.stores.domain import RoutineRow
+from daimon.core.stores.identity import find_platform_principal
 from daimon.core.stores.routines import create_routine, get_routine
 from daimon.core.usage_recording import record_turn_usage
 from daimon.testing.factories import make_tenant
 from pydantic import SecretStr
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _TEST_BILLING = BillingConfig(
@@ -371,20 +370,16 @@ async def test_fire_resolves_principal_using_tenant_platform_not_hardcoded_disco
         await fire(row)
 
     async with db_session_factory() as s:
-        principals = (
-            (
-                await s.execute(
-                    select(PlatformPrincipal).where(PlatformPrincipal.external_id == "U_SLACK_FIRE")
-                )
-            )
-            .scalars()
-            .all()
+        slack_principal = await find_platform_principal(
+            s, tenant_id=tenant.id, platform="slack", external_id="U_SLACK_FIRE"
+        )
+        discord_principal = await find_platform_principal(
+            s, tenant_id=tenant.id, platform="discord", external_id="U_SLACK_FIRE"
         )
 
-    platforms = {p.platform for p in principals}
-    assert platforms == {"slack"}, (
+    assert slack_principal is not None and discord_principal is None, (
         "fire must resolve the principal on the tenant's platform (slack), "
-        f"never hardcoded discord; got platforms={platforms}"
+        f"never hardcoded discord; got slack={slack_principal!r} discord={discord_principal!r}"
     )
 
     await fake_client.close()

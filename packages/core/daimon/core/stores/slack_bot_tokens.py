@@ -14,7 +14,7 @@ from typing import Any, cast
 
 from daimon.core._models import SlackBotToken
 from daimon.core.stores.domain import SlackBotTokenRow
-from sqlalchemy import CursorResult, delete
+from sqlalchemy import CursorResult, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,6 +59,12 @@ async def get_slack_bot_token(
     if orm is None:
         return None
     return SlackBotTokenRow.model_validate(orm)
+
+
+async def count_slack_bot_tokens(session: AsyncSession) -> int:
+    """Return the total number of slack_bot_tokens rows. Read-only."""
+    stmt = select(func.count()).select_from(SlackBotToken)
+    return int((await session.execute(stmt)).scalar_one())
 
 
 async def delete_slack_bot_token(

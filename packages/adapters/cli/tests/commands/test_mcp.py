@@ -4,22 +4,18 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any, cast
-from urllib.parse import urlparse
 
 import httpx
 import jwt as pyjwt
 import pytest
-import pytest_asyncio
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsVault
 from daimon.adapters.cli import main as main_mod
 from daimon.adapters.cli.commands.mcp import mcp_sweep_credentials, mcp_url, mint_token
 from daimon.adapters.cli.runtime import CliRuntime
-from daimon.core._models import Base
 from daimon.core.config import (
     AnthropicSettings,
     CLISettings,
@@ -31,19 +27,8 @@ from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from rich.console import Console
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from typer.testing import CliRunner
-
-
-def _require_test_dsn() -> str:
-    url = os.environ.get("DAIMON_DATABASE__TEST_URL")
-    if not url:
-        raise RuntimeError("DAIMON_DATABASE__TEST_URL must be set to run these tests.")
-    if "test" not in urlparse(url).path:
-        raise RuntimeError("Refusing to run destructive fixtures against a non-test DB.")
-    return url
 
 
 def _build_settings(
@@ -66,32 +51,6 @@ def _build_settings(
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
-
-
-@pytest_asyncio.fixture
-async def schema_sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    dsn = _require_test_dsn()
-    schema = f"test_{uuid.uuid4().hex}"
-    engine = create_async_engine(dsn, poolclass=NullPool)
-
-    async with engine.connect() as conn:
-        await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
-        conn2 = await conn.execution_options(schema_translate_map={None: schema})
-        await conn2.run_sync(Base.metadata.create_all)
-        await conn.commit()
-
-    sessionmaker = async_sessionmaker(
-        engine.execution_options(schema_translate_map={None: schema}),
-        expire_on_commit=False,
-        class_=AsyncSession,
-    )
-    try:
-        yield sessionmaker
-    finally:
-        async with engine.connect() as conn:
-            await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-            await conn.commit()
-        await engine.dispose()
 
 
 def _make_rt(

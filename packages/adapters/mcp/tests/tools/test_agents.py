@@ -37,7 +37,6 @@ from daimon.adapters.mcp.tools.agents import (
     _update_agent_impl,
     register_agent_tools,
 )
-from daimon.core._models import Tenant
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
 from daimon.core.ma_identity import derive_agent_uuid
@@ -45,6 +44,7 @@ from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec, SkillRef, SkillRepo
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
 from factories import make_ma_agent
 from fastmcp import FastMCP
@@ -868,7 +868,6 @@ async def test_archive_agent_impl_succeeds_when_store_archive_fails(
     from lookup). _archive_agent_impl degrades best-effort instead.
     """
     from daimon.core.stores.agent_memory_stores import insert_memory_store
-    from daimon.testing.factories import make_tenant
 
     tenant = await make_tenant(db_session)
     account_id = uuid.uuid4()
@@ -1337,8 +1336,7 @@ async def test_fork_agent_impl_rekeys_source_credential_onto_fork(
     re-keyed under the fork's OWN principal."""
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
-    db_session.add(Tenant(id=tenant_id, platform="discord", external_id=str(tenant_id)))
-    await db_session.flush()
+    await make_tenant(db_session, platform="discord", workspace_id=str(tenant_id), id=tenant_id)
     source_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_src_cred")
     fork_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_fork_cred")
 
@@ -1400,8 +1398,7 @@ async def test_fork_agent_impl_raises_tool_error_on_undecryptable_source_credent
     ToolError (the core DaimonError converted at the MCP call site)."""
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
-    db_session.add(Tenant(id=tenant_id, platform="discord", external_id=str(tenant_id)))
-    await db_session.flush()
+    await make_tenant(db_session, platform="discord", workspace_id=str(tenant_id), id=tenant_id)
     source_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_src_nocred")
 
     # Binding exists (inline-pat:) but no github_credentials row backs it.

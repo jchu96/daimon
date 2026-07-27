@@ -26,12 +26,11 @@ from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
 )
 from daimon.adapters.cli.run.command import run_conversation
 from daimon.adapters.cli.runtime import CliRuntime
-from daimon.core._models import UsageEvent
 from daimon.core.config import Settings
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault
+from daimon.core.stores import usage_events
 from daimon.testing.ma import MARouter, build_fake_anthropic, send_events_response, sse_response
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.asyncio
@@ -94,5 +93,5 @@ async def test_cli_turn_writes_no_usage_events(
 
     await run_conversation(rt=rt, session_id="test-session-abc", user_message="hello")
 
-    count = await db_session.scalar(select(func.count()).select_from(UsageEvent))
+    count = await usage_events.count_all(db_session)
     assert count == 0, "CLI turn must write zero usage_events rows"
