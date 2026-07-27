@@ -47,6 +47,14 @@ def summary_line(preview: PurgePreview) -> str:
         parts.append(f"{preview.github_credentials.count} GitHub credential(s)")
     if preview.github_oauth_states.count > 0:
         parts.append(f"{preview.github_oauth_states.count} OAuth handshake record(s)")
+    if preview.mcp_tokens.count > 0:
+        parts.append(f"{preview.mcp_tokens.count} MCP token(s)")
+    if preview.agent_github_binding.count > 0:
+        parts.append(f"{preview.agent_github_binding.count} per-agent GitHub link(s)")
+    if preview.slack_user_tokens.count > 0:
+        parts.append(f"{preview.slack_user_tokens.count} Slack user token(s)")
+    if preview.slack_turn_contexts.count > 0:
+        parts.append(f"{preview.slack_turn_contexts.count} Slack turn context(s)")
     return ", ".join(parts) if parts else "nothing visible to you yet"
 
 
@@ -83,6 +91,19 @@ def _cascade_blocks(preview: PurgePreview) -> list[dict[str, Any]]:
     if preview.github_oauth_states.count > 0:
         will_happen_lines.append(
             f"• 🤝 Remove *{preview.github_oauth_states.count}* GitHub OAuth handshake record(s)"
+        )
+    if preview.mcp_tokens.count > 0:
+        will_happen_lines.append(f"• 🎫 Revoke *{preview.mcp_tokens.count}* per-agent MCP token(s)")
+    if preview.agent_github_binding.count > 0:
+        n = preview.agent_github_binding.count
+        will_happen_lines.append(f"• 🤖 Remove *{n}* per-agent GitHub credential link(s)")
+    if preview.slack_user_tokens.count > 0:
+        will_happen_lines.append(
+            f"• 🔐 Remove *{preview.slack_user_tokens.count}* Slack user token(s)"
+        )
+    if preview.slack_turn_contexts.count > 0:
+        will_happen_lines.append(
+            f"• 💬 Remove *{preview.slack_turn_contexts.count}* Slack turn context(s)"
         )
     if preview.account.count > 0:
         will_happen_lines.append("• 🪪 Remove the account row itself")

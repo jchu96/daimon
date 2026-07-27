@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 import pytest
@@ -17,8 +18,10 @@ from daimon.adapters.slack.privacy_panel.read import load_purge_preview, resolve
 from daimon.adapters.slack.privacy_panel.views import (
     build_delete_modal,
     build_privacy_main_container,
+    summary_line,
 )
 from daimon.core._models import PlatformPrincipal
+from daimon.core.privacy import PurgePreview, PurgePreviewRow
 from daimon.core.stores import routines as routines_store
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from sqlalchemy import func, select
@@ -291,6 +294,96 @@ async def test_build_delete_modal_has_correct_callback_id_input_and_metadata(
     assert "view_id" in meta, "private_metadata must contain view_id"
     assert meta["user_name"] == "alice", "private_metadata user_name must match the argument"
     assert meta["view_id"] == "V_MAIN_PRIV_01", "private_metadata view_id must match the argument"
+
+
+def _make_preview(**overrides: Any) -> PurgePreview:
+    """Build a PurgePreview with sensible defaults; override any field via kwargs."""
+    base: dict[str, Any] = {
+        "linked_principals": PurgePreviewRow(count=0, example=None),
+        "principal_links": PurgePreviewRow(count=0, example=None),
+        "routines": PurgePreviewRow(count=0, example=None),
+        "user_configs": PurgePreviewRow(count=0, example=None),
+        "account": PurgePreviewRow(count=1, example=None),
+        "user_skills": PurgePreviewRow(count=0, example=None),
+        "github_credentials": PurgePreviewRow(count=0, example=None),
+        "github_oauth_states": PurgePreviewRow(count=0, example=None),
+        "mcp_tokens": PurgePreviewRow(count=0, example=None),
+        "agent_github_binding": PurgePreviewRow(count=0, example=None),
+        "slack_user_tokens": PurgePreviewRow(count=0, example=None),
+        "slack_turn_contexts": PurgePreviewRow(count=0, example=None),
+    }
+    base.update(overrides)
+    return PurgePreview(**base)
+
+
+def test_summary_line_includes_mcp_tokens_agent_github_binding_slack_categories() -> None:
+    """summary_line reflects all 4 newly-added categories when non-zero (PAR-05)."""
+    preview = _make_preview(
+        mcp_tokens=PurgePreviewRow(count=2, example=None),
+        agent_github_binding=PurgePreviewRow(count=1, example=None),
+        slack_user_tokens=PurgePreviewRow(count=1, example=None),
+        slack_turn_contexts=PurgePreviewRow(count=4, example=None),
+    )
+    text = summary_line(preview)
+    assert "MCP token" in text, "summary must mention mcp_tokens"
+    assert "GitHub link" in text, "summary must mention agent_github_binding"
+    assert "Slack user token" in text, "summary must mention slack_user_tokens"
+    assert "Slack turn context" in text, "summary must mention slack_turn_contexts"
+
+
+def test_cascade_blocks_render_mcp_tokens_row_when_nonzero() -> None:
+    """mcp_tokens row appears in the cascade preview when count > 0 (PAR-05)."""
+    preview = _make_preview(mcp_tokens=PurgePreviewRow(count=3, example=None))
+    view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V1")
+    joined = _extract_text(view)
+    assert "3" in joined, "mcp_tokens count must appear in the cascade"
+    assert "MCP token" in joined, "mcp_tokens row must mention MCP token(s)"
+
+
+def test_cascade_blocks_render_agent_github_binding_row_when_nonzero() -> None:
+    """agent_github_binding row appears in the cascade preview when count > 0 (PAR-05)."""
+    preview = _make_preview(agent_github_binding=PurgePreviewRow(count=2, example=None))
+    view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V2")
+    joined = _extract_text(view)
+    assert "2" in joined, "agent_github_binding count must appear in the cascade"
+    assert "per-agent GitHub credential link" in joined, (
+        "agent_github_binding row must mention the per-agent GitHub credential link"
+    )
+
+
+def test_cascade_blocks_render_slack_user_tokens_row_when_nonzero() -> None:
+    """slack_user_tokens row appears in the cascade preview when count > 0 (PAR-05)."""
+    preview = _make_preview(slack_user_tokens=PurgePreviewRow(count=1, example=None))
+    view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V3")
+    joined = _extract_text(view)
+    assert "1" in joined, "slack_user_tokens count must appear in the cascade"
+    assert "Slack user token" in joined, "slack_user_tokens row must mention Slack user token(s)"
+
+
+def test_cascade_blocks_render_slack_turn_contexts_row_when_nonzero() -> None:
+    """slack_turn_contexts row appears in the cascade preview when count > 0 (PAR-05)."""
+    preview = _make_preview(slack_turn_contexts=PurgePreviewRow(count=5, example=None))
+    view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V4")
+    joined = _extract_text(view)
+    assert "5" in joined, "slack_turn_contexts count must appear in the cascade"
+    assert "Slack turn context" in joined, (
+        "slack_turn_contexts row must mention Slack turn context(s)"
+    )
+
+
+def test_cascade_blocks_zero_count_categories_omit_new_rows() -> None:
+    """D-PREVIEW-FMT-01 parity: zero-count new categories must NOT render a row."""
+    preview = _make_preview()
+    view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V5")
+    joined = _extract_text(view).lower()
+    assert "mcp token" not in joined, "zero-count mcp_tokens must NOT render a row"
+    assert "per-agent github credential link" not in joined, (
+        "zero-count agent_github_binding must NOT render a row"
+    )
+    assert "slack user token" not in joined, "zero-count slack_user_tokens must NOT render a row"
+    assert "slack turn context" not in joined, (
+        "zero-count slack_turn_contexts must NOT render a row"
+    )
 
 
 # ---------------------------------------------------------------------------
