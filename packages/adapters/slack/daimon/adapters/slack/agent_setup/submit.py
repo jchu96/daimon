@@ -32,7 +32,10 @@ from typing import Any
 
 import anthropic
 import structlog
-from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.admin import (
+    _dev_allow_all_admin,  # pyright: ignore[reportPrivateUsage]
+    resolve_is_admin,
+)
 from daimon.adapters.slack.agent_setup.state import decode_private_metadata
 from daimon.adapters.slack.agent_setup.write import (
     call_reconcile_for_panel,
@@ -548,12 +551,6 @@ def _allowed_model_ids() -> frozenset[str]:
 # ---------------------------------------------------------------------------
 # Background run helpers
 # ---------------------------------------------------------------------------
-
-
-def _dev_allow_all_admin(runtime: SlackRuntime) -> bool:
-    """Read the testing-only admin-gate override from settings (default False)."""
-    slack = runtime.settings.slack
-    return slack is not None and slack.dev_allow_all_admin
 
 
 async def _refuse_non_admin(

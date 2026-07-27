@@ -24,7 +24,10 @@ from typing import Any
 import anthropic
 import structlog
 from cryptography.fernet import InvalidToken
-from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.admin import (
+    _dev_allow_all_admin,  # pyright: ignore[reportPrivateUsage]
+    resolve_is_admin,
+)
 from daimon.adapters.slack.interactions import resolve_web_client
 from daimon.adapters.slack.routines_panel.read import load_routines
 from daimon.adapters.slack.routines_panel.state import RoutinesPanelState, picker_label
@@ -46,12 +49,6 @@ from slack_sdk.errors import SlackApiError
 from sqlalchemy.exc import SQLAlchemyError
 
 log = structlog.get_logger()
-
-
-def _dev_allow_all_admin(runtime: SlackRuntime) -> bool:
-    """Read the testing-only admin-gate override from settings (default False)."""
-    slack = runtime.settings.slack
-    return slack is not None and slack.dev_allow_all_admin
 
 
 async def handle_routines_command(runtime: SlackRuntime, payload: dict[str, Any]) -> None:

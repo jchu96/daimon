@@ -25,7 +25,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
 import structlog
-from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.admin import (
+    _dev_allow_all_admin,  # pyright: ignore[reportPrivateUsage]
+    resolve_is_admin,
+)
 from daimon.adapters.slack.routines_panel.read import load_routines
 from daimon.adapters.slack.routines_panel.state import RoutinesPanelState
 from daimon.adapters.slack.routines_panel.views import build_content_view
@@ -158,12 +161,6 @@ def evaluate_routines_create_submission(payload: dict[str, Any]) -> RoutinesCrea
 # ---------------------------------------------------------------------------
 # Background run helpers
 # ---------------------------------------------------------------------------
-
-
-def _dev_allow_all_admin(runtime: SlackRuntime) -> bool:
-    """Read the testing-only admin-gate override from settings (default False)."""
-    slack = runtime.settings.slack
-    return slack is not None and slack.dev_allow_all_admin
 
 
 async def _refuse_non_admin(

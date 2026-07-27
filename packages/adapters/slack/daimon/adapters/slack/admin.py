@@ -11,13 +11,24 @@ The caller resolves once per interaction; no cross-interaction cache.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
+if TYPE_CHECKING:
+    from daimon.adapters.slack.runtime import SlackRuntime
+
 log = structlog.get_logger()
+
+
+def _dev_allow_all_admin(  # pyright: ignore[reportUnusedFunction]  # used cross-module by every run_* call site
+    runtime: SlackRuntime,
+) -> bool:
+    """Read the testing-only admin-gate override from settings (default False)."""
+    slack = runtime.settings.slack
+    return slack is not None and slack.dev_allow_all_admin
 
 
 def _is_admin_signal(user: dict[str, Any]) -> bool:

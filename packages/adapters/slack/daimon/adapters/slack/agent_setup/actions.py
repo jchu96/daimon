@@ -37,7 +37,10 @@ import anthropic
 import jwt as pyjwt
 import structlog
 from cryptography.fernet import InvalidToken
-from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.admin import (
+    _dev_allow_all_admin,  # pyright: ignore[reportPrivateUsage]
+    resolve_is_admin,
+)
 from daimon.adapters.slack.agent_setup.read import (
     load_agent_channel_ids,
     load_scope_hint,
@@ -102,12 +105,6 @@ log = structlog.get_logger()
 def _new_request_id() -> str:
     """Generate a short opaque request ID for error cross-referencing."""
     return str(uuid.uuid4())[:8]
-
-
-def _dev_allow_all_admin(runtime: SlackRuntime) -> bool:
-    """Read the testing-only admin-gate override from settings (default False)."""
-    slack = runtime.settings.slack
-    return slack is not None and slack.dev_allow_all_admin
 
 
 # ---------------------------------------------------------------------------
