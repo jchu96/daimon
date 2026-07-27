@@ -93,4 +93,8 @@ jobs:
         if: always()
         env:
           DAIMON_ANTHROPIC__API_KEY: ${{ env.DAIMON_TEST_ANTHROPIC_API_KEY }}
+          # Point at the migrated test DB — the job-level DAIMON_DATABASE__URL
+          # names the service container's default `daimon` database, which
+          # never receives migrations in this job.
+          DAIMON_DATABASE__URL: ${{ env.DAIMON_DATABASE__TEST_URL }}
         run: uv run daimon defaults apply
