@@ -166,6 +166,7 @@ def _build_runtime(handler: Any, db_session_factory: Any) -> SlackRuntime:
         settings=settings,
         anthropic=build_fake_anthropic(handler),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 

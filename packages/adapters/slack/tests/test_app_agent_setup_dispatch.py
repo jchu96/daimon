@@ -55,6 +55,7 @@ def _make_app() -> SlackApp:
         settings=settings,
         anthropic=MagicMock(spec=AsyncAnthropic),
         sessionmaker=MagicMock(),
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
     return SlackApp(runtime=runtime)

@@ -39,6 +39,7 @@ async def test_resolve_web_client_returns_none_for_unknown_team_id(
         settings=settings,
         anthropic=MagicMock(spec=AsyncAnthropic),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
@@ -70,6 +71,7 @@ async def test_resolve_web_client_returns_async_web_client_with_decrypted_token(
         settings=settings,
         anthropic=MagicMock(spec=AsyncAnthropic),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 

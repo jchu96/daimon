@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import httpx
 from anthropic import AsyncAnthropic
+from daimon.core.billing import BillingConfig, load_billing_config
 from daimon.core.config import Settings
 from daimon.core.db import build_engine, build_session_factory
 from daimon.core.defaults.loader import parse_deployment_default
@@ -20,6 +21,7 @@ class SlackRuntime:
     settings: Settings
     anthropic: AsyncAnthropic
     sessionmaker: async_sessionmaker[AsyncSession]
+    billing_config: BillingConfig | None
     http_client: httpx.AsyncClient
     # Bottom tier of the channel→tenant→deployment config cascade. Defaults to
     # empty (no deployment fallback) so existing construction sites stay valid;
@@ -44,6 +46,7 @@ async def build_runtime(settings: Settings) -> AsyncIterator[SlackRuntime]:
                 settings=settings,
                 anthropic=anthropic,
                 sessionmaker=sm,
+                billing_config=load_billing_config(),
                 http_client=http_client,
                 deployment_default=deployment_default,
             )

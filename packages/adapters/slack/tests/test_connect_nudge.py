@@ -58,6 +58,7 @@ def _make_nudge_app(sessionmaker: async_sessionmaker[AsyncSession]) -> SlackApp:
         settings=settings,
         anthropic=MagicMock(),
         sessionmaker=sessionmaker,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
         deployment_default=DeploymentDefault(agent_name="daimon", environment_name="default"),
     )
@@ -226,6 +227,7 @@ def _make_orchestrate_app_with_nudge_enabled(
         settings=settings,
         anthropic=build_fake_anthropic(_make_agent_env_handler()),
         sessionmaker=sessionmaker,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
         deployment_default=DeploymentDefault(agent_name="daimon", environment_name="default"),
     )

@@ -158,6 +158,7 @@ def _make_app(
         settings=settings,
         anthropic=MagicMock(spec=AsyncAnthropic),
         sessionmaker=sessionmaker,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
     return SlackApp(runtime=runtime)
@@ -536,6 +537,7 @@ def _make_orchestrate_app(
         settings=settings,
         anthropic=anthropic_client,
         sessionmaker=sessionmaker,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
         deployment_default=(
             deployment_default

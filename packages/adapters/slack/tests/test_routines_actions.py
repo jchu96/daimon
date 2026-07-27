@@ -64,6 +64,7 @@ def _build_runtime(fernet_key: str, db_factory: async_sessionmaker[AsyncSession]
         settings=settings,
         anthropic=build_fake_anthropic(make_fake_ma_handler()),
         sessionmaker=db_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 

@@ -28,10 +28,11 @@ class TestSlackRuntime:
             "settings",
             "anthropic",
             "sessionmaker",
+            "billing_config",
             "http_client",
             "deployment_default",
         }, (
-            "expected exactly settings/anthropic/sessionmaker/http_client/"
+            "expected exactly settings/anthropic/sessionmaker/billing_config/http_client/"
             f"deployment_default fields, got {fields}"
         )
 
@@ -41,6 +42,7 @@ class TestSlackRuntime:
             settings=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub for structural test
             anthropic=MagicMock(),  # pyright: ignore[reportArgumentType]
             sessionmaker=MagicMock(),  # pyright: ignore[reportArgumentType]
+            billing_config=None,
             http_client=MagicMock(),  # pyright: ignore[reportArgumentType]
         )
         with pytest.raises(dataclasses.FrozenInstanceError):

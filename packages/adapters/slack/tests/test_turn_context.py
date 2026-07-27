@@ -83,6 +83,7 @@ def _make_orchestrate_app(
         settings=settings,
         anthropic=build_fake_anthropic(_make_agent_env_handler()),
         sessionmaker=sessionmaker,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
         deployment_default=DeploymentDefault(agent_name="daimon", environment_name="default"),
     )

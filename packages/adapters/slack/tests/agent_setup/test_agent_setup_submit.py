@@ -99,6 +99,7 @@ def _build_runtime_no_db(fernet_key: str = "dummy") -> SlackRuntime:
         settings=settings,
         anthropic=build_fake_anthropic(make_fake_ma_handler()),
         sessionmaker=async_sessionmaker(),  # pyright: ignore[reportArgumentType]
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
@@ -629,6 +630,7 @@ async def test_run_paste_secrets_submission_when_admin_and_two_pairs_posts_count
         settings=settings,
         anthropic=build_fake_anthropic(_handler),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
@@ -780,6 +782,7 @@ async def test_run_edit_repo_submission_when_pat_replace_false_preserves_inline_
             _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
         ),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
@@ -852,6 +855,7 @@ async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_
             _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
         ),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
@@ -930,6 +934,7 @@ async def test_run_edit_repo_submission_no_pat_binds_anon(
             _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
         ),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 

@@ -51,6 +51,7 @@ def _build_runtime(
         settings=settings,
         anthropic=MagicMock(),
         sessionmaker=db_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 

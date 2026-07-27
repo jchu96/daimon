@@ -219,6 +219,7 @@ def _build_runtime(
         settings=settings,
         anthropic=build_fake_anthropic(handler),
         sessionmaker=db_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
@@ -483,6 +484,7 @@ async def test_handle_agent_setup_action_connect_mcp_sends_ephemeral_not_modal_u
         settings=settings,
         anthropic=build_fake_anthropic(handler),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 

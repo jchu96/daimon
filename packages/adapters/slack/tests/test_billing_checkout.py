@@ -88,6 +88,7 @@ async def runtime(
         settings=settings,
         anthropic=MagicMock(spec=AsyncAnthropic),
         sessionmaker=db_session_factory,
+        billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
     )
 
