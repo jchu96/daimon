@@ -144,4 +144,5 @@ dev = [
     "pyjwt>=2.12.1",
     "daimon-testing",
     "aioresponses>=0.7.9",
+    "syrupy>=5.5.3",
 ]
