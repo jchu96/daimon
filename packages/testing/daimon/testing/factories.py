@@ -44,14 +44,19 @@ from daimon.core.stores import (
 )
 from daimon.core.stores.agent_memory_stores import insert_memory_store
 from daimon.core.stores.domain import (
+    AccountRow,
     AgentGithubBindingRow,
     AgentMemoryStoreRow,
     AgentRepoBindingRow,
+    CliPrincipalRow,
     McpTokenRow,
     Platform,
+    PlatformPrincipalRow,
+    PrincipalLinkRow,
     RoutineRow,
     SlackUserTokenRow,
     TenantLedgerRow,
+    TenantRow,
     TenantUserCapRow,
     ThreadSessionRow,
     UsageEventRow,
@@ -66,7 +71,7 @@ async def make_tenant(
     *,
     platform: Platform = "discord",
     workspace_id: str | None = None,
-) -> Tenant:
+) -> TenantRow:
     """Create a Tenant row and flush it into the session.
 
     WARNING: If you call make_tenant() multiple times within the same test schema
@@ -79,33 +84,33 @@ async def make_tenant(
     """
     wid = workspace_id if workspace_id is not None else str(uuid.uuid4())
     tenant_id = derive_tenant_uuid(platform=platform, workspace_id=wid)
-    tenant = Tenant(id=tenant_id, platform=platform, external_id=wid)
-    session.add(tenant)
+    orm = Tenant(id=tenant_id, platform=platform, external_id=wid)
+    session.add(orm)
     await session.flush()
-    return tenant
+    return TenantRow.model_validate(orm)
 
 
-async def make_account(session: AsyncSession, *, tenant: Tenant | None = None) -> Account:
+async def make_account(session: AsyncSession, *, tenant: TenantRow | None = None) -> AccountRow:
     tenant = tenant or await make_tenant(session)
-    account = Account(tenant_id=tenant.id)
-    session.add(account)
+    orm = Account(tenant_id=tenant.id)
+    session.add(orm)
     await session.flush()
-    return account
+    return AccountRow.model_validate(orm)
 
 
 async def make_cli_principal(
     session: AsyncSession,
     *,
     os_user: str = "test",
-    tenant: Tenant | None = None,
-    account: Account | None = None,
-) -> CliPrincipal:
+    tenant: TenantRow | None = None,
+    account: AccountRow | None = None,
+) -> CliPrincipalRow:
     tenant = tenant or await make_tenant(session)
     account = account or await make_account(session, tenant=tenant)
-    principal = CliPrincipal(tenant_id=tenant.id, os_user=os_user, account_id=account.id)
-    session.add(principal)
+    orm = CliPrincipal(tenant_id=tenant.id, os_user=os_user, account_id=account.id)
+    session.add(orm)
     await session.flush()
-    return principal
+    return CliPrincipalRow.model_validate(orm)
 
 
 async def make_platform_principal(
@@ -113,41 +118,41 @@ async def make_platform_principal(
     *,
     platform: str,
     external_id: str,
-    tenant: Tenant | None = None,
-    account: Account | None = None,
-) -> PlatformPrincipal:
+    tenant: TenantRow | None = None,
+    account: AccountRow | None = None,
+) -> PlatformPrincipalRow:
     tenant = tenant or await make_tenant(session)
     account = account or await make_account(session, tenant=tenant)
-    principal = PlatformPrincipal(
+    orm = PlatformPrincipal(
         tenant_id=tenant.id,
         platform=platform,
         external_id=external_id,
         account_id=account.id,
     )
-    session.add(principal)
+    session.add(orm)
     await session.flush()
-    return principal
+    return PlatformPrincipalRow.model_validate(orm)
 
 
 async def link_principals(
     session: AsyncSession,
     *,
-    cli: CliPrincipal,
-    platform: PlatformPrincipal,
-) -> PrincipalLink:
-    link = PrincipalLink(
+    cli: CliPrincipalRow,
+    platform: PlatformPrincipalRow,
+) -> PrincipalLinkRow:
+    orm = PrincipalLink(
         cli_principal_id=cli.id,
         platform_principal_id=platform.id,
     )
-    session.add(link)
+    session.add(orm)
     await session.flush()
-    return link
+    return PrincipalLinkRow.model_validate(orm)
 
 
 async def make_routine(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     created_by_user_id: str | None = None,
     agent_id: str = "agent-1",
     agent_name: str = "Agent One",
@@ -176,7 +181,7 @@ async def make_routine(
 async def make_tenant_config(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     agent_name: str | None = "agent-1",
     environment_name: str | None = None,
     mode: scoped_config_write.PropagationMode | None = None,
@@ -208,7 +213,7 @@ async def make_tenant_config(
 async def make_usage_event(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     platform_user_id: str | None = "test-user",
     managed_session_id: str | None = None,
     model: str = "claude-sonnet-5",
@@ -258,7 +263,7 @@ async def make_usage_event(
 async def make_ledger_entry(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     delta_usd: Decimal = Decimal("10"),
     reason: str = "topup",
     idempotency_key: str | None = None,
@@ -315,7 +320,7 @@ async def make_slack_user_token(
 async def make_tenant_user_cap(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     user_id: str | None = None,
     amount: Decimal = Decimal("5"),
 ) -> TenantUserCapRow:
@@ -334,7 +339,7 @@ async def make_tenant_user_cap(
 async def make_agent_memory_store(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     agent_id: uuid.UUID | None = None,
     memory_store_id: str | None = None,
 ) -> AgentMemoryStoreRow:
@@ -377,7 +382,7 @@ async def make_agent_github_binding(
 async def make_agent_repo_binding(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
+    tenant: TenantRow | None = None,
     agent_id: uuid.UUID | None = None,
     repo_url: str = "owner/repo",
     default_branch: str = "main",
@@ -400,8 +405,8 @@ async def make_agent_repo_binding(
 async def make_thread_session(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
-    account: Account | None = None,
+    tenant: TenantRow | None = None,
+    account: AccountRow | None = None,
     platform: str = "discord",
     thread_id: str | None = None,
     ma_session_id: str | None = None,
@@ -428,8 +433,8 @@ async def make_thread_session(
 async def make_mcp_token(
     session: AsyncSession,
     *,
-    tenant: Tenant | None = None,
-    account: Account | None = None,
+    tenant: TenantRow | None = None,
+    account: AccountRow | None = None,
     agent_id: str = "agent-1",
     label: str | None = None,
     jti: uuid.UUID | None = None,
