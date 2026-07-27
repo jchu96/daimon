@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Final
 import httpx
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent
+from cryptography.fernet import Fernet
 from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.core import agent_lifecycle
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     find_agents_by_daimon_tag,
@@ -36,6 +38,7 @@ from daimon.core.github_credentials import (
     upsert_credential_encrypted,
 )
 from daimon.core.ma import update_agent_with_version_retry
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import (
     ChannelConfigRow,
     ChannelScopeRef,
@@ -154,6 +157,22 @@ def _build_runtime_fernet(runtime: SlackRuntime) -> MultiFernet:
     return build_multifernet(keys)
 
 
+def _build_fork_fernet(runtime: SlackRuntime) -> MultiFernet:
+    """Build the fernet ``copy_credential_and_repo_binding`` requires, tolerating
+    an unconfigured deployment (``settings.crypto.keys == ()``).
+
+    ``copy_credential_and_repo_binding`` only reads/writes through ``fernet``
+    when the source has an ``inline-pat:`` binding — which cannot exist in a
+    deployment with no crypto keys configured (storing one requires crypto
+    too, via ``store_inline_pat``). The anon:/unbound-source paths never touch
+    the value, so a throwaway single-use key keeps the primitives-only
+    interface satisfied without forcing every fork to require crypto config.
+    """
+    if not runtime.settings.crypto.keys:
+        return build_multifernet((Fernet.generate_key().decode(),))
+    return _build_runtime_fernet(runtime)
+
+
 async def create_blank_agent(
     runtime: SlackRuntime,
     *,
@@ -242,7 +261,19 @@ async def fork_agent(
     fork_params["tools"] = merge_default_agent_toolset(
         fork_params.get("tools"),  # type: ignore[arg-type]
     )
-    await runtime.anthropic.beta.agents.create(**fork_params)  # type: ignore[arg-type]
+    created = await runtime.anthropic.beta.agents.create(**fork_params)  # type: ignore[arg-type]
+
+    fork_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(created.id))
+    source_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(source.id))
+    await agent_lifecycle.copy_credential_and_repo_binding(
+        anthropic=runtime.anthropic,
+        sessionmaker=runtime.sessionmaker,
+        fernet=_build_fork_fernet(runtime),
+        oauth_scopes=tuple(runtime.settings.github.oauth_scopes),
+        tenant_id=tenant_id,
+        source_agent_uuid=source_agent_uuid,
+        fork_agent_uuid=fork_agent_uuid,
+    )
 
 
 async def delete_agent(runtime: SlackRuntime, *, tenant_id: uuid.UUID, name: str) -> None:
@@ -251,6 +282,13 @@ async def delete_agent(runtime: SlackRuntime, *, tenant_id: uuid.UUID, name: str
     if agent is None:
         raise DaimonError(f"No agent named *{name}* found.")
     await runtime.anthropic.beta.agents.archive(agent.id)
+    await agent_lifecycle.archive_memory_store_best_effort(
+        anthropic=runtime.anthropic,
+        sessionmaker=runtime.sessionmaker,
+        tenant_id=tenant_id,
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
+        log_context={"tenant_id": str(tenant_id), "agent_name": name, "ma_agent_id": agent.id},
+    )
 
 
 async def replace_agent_resources_for_panel(
