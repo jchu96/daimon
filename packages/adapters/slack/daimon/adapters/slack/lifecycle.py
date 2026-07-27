@@ -86,6 +86,7 @@ class SlackTurnLifecycle:
         model_id: str,
         register: Callable[[str, asyncio.Event, str], None],
         deregister: Callable[[str], None],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client
         self._channel = channel
@@ -95,10 +96,11 @@ class SlackTurnLifecycle:
         self._model_id = model_id
         self._register = register
         self._deregister = deregister
+        self._clock = clock
         self._state: State = State(
             phase=TurnPhase.THINKING,
             agent_name=agent_name,
-            started_at=time.monotonic(),
+            started_at=self._clock(),
         )
         self._status_ts: str | None = None
         self._last_flush: float = 0.0
@@ -116,7 +118,7 @@ class SlackTurnLifecycle:
         """Post or update the status message, subject to debounce. No-op after terminal."""
         if self._terminal:
             return
-        now = time.monotonic()
+        now = self._clock()
         blocks = to_blocks(self._state, now=now)
         text = f"{self._state.phase.value} …"
 
@@ -198,7 +200,7 @@ class SlackTurnLifecycle:
         (done/error) so to_blocks emits the collapsed footer with no cancel button.
         """
         self._terminal = True
-        blocks = to_blocks(self._state, now=time.monotonic())
+        blocks = to_blocks(self._state, now=self._clock())
         await self._post_or_update(blocks, f"{self._state.phase.value} …")
 
     async def _flush_cancelled(self) -> None:
@@ -247,7 +249,7 @@ class SlackTurnLifecycle:
             self._terminal = True
             first_blocks: list[dict[str, Any]] = [
                 {"type": "markdown", "text": first_chunk},
-                *to_blocks(self._state, now=time.monotonic()),
+                *to_blocks(self._state, now=self._clock()),
             ]
             await self._post_or_update(first_blocks, first_chunk)
             assert self._status_ts is not None  # narrowing — _post_or_update always sets it
