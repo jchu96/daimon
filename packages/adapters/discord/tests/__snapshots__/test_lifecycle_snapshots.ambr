@@ -1,0 +1,79 @@
+# serializer version: 1
+# name: TestFailureSnapshot.test_terminal_failure_sequence
+  dict({
+    'edits': list([
+      dict({
+        'content': None,
+        'embeds': list([
+          dict({
+            'color': 15548997,
+            'description': None,
+            'footer': '❌ upstream timeout · Atlas · 15s · 500 in / 80 out · $0.003',
+            'title': None,
+          }),
+        ]),
+      }),
+    ]),
+    'sends': list([
+      dict({
+        'content': None,
+        'embeds': list([
+          dict({
+            'color': 9807270,
+            'description': '⏱️ 0s',
+            'footer': None,
+            'title': '🧠 thinking',
+          }),
+        ]),
+      }),
+    ]),
+  })
+# ---
+# name: TestSuccessSequenceSnapshot.test_thinking_tool_then_done_sequence
+  dict({
+    'edits': list([
+      dict({
+        'content': None,
+        'embeds': list([
+          dict({
+            'color': 3447003,
+            'description': '''
+              ⏱️ 11s
+              ⚙️ Bash
+            ''',
+            'footer': None,
+            'title': '⚙️ running tool',
+          }),
+        ]),
+      }),
+      dict({
+        'content': None,
+        'embeds': list([
+          dict({
+            'color': 5763719,
+            'description': None,
+            'footer': 'Atlas · 11s · 1.5k in / 320 out · $0.008',
+            'title': None,
+          }),
+        ]),
+      }),
+      dict({
+        'content': 'Here is the answer.',
+        'embeds': None,
+      }),
+    ]),
+    'sends': list([
+      dict({
+        'content': None,
+        'embeds': list([
+          dict({
+            'color': 9807270,
+            'description': '⏱️ 0s',
+            'footer': None,
+            'title': '🧠 thinking',
+          }),
+        ]),
+      }),
+    ]),
+  })
+# ---
