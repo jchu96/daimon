@@ -443,9 +443,9 @@ async def test_cli_sessions_create_back_compat_when_mcp_settings_unset(
 ) -> None:
     """When mcp_settings has no public_url/jwt_secret, no vault calls happen.
 
-    Pinning this from the CLI side: passing session_context must NOT cause
-    ensure_mcp_vault to be called when mcp_settings is unset. The router has
-    no vault routes registered, so any vault request would raise.
+    Pinning this from the CLI side: ensure_mcp_vault must NOT be called when
+    mcp_settings is unset. The router has no vault routes registered, so any
+    vault request would raise.
     """
     tenant_id = await _seed_system_defaults(db_session)
     router = _create_router(tenant_id, "sess_cli_nomcp_01")

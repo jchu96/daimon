@@ -3,13 +3,9 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from daimon.core._models import ChannelConfig, PlatformPrincipal
-from daimon.core.errors import StoreError
+from daimon.core._models import ChannelConfig, PlatformPrincipal, PrincipalLink
 from daimon.core.stores.identity import (
-    count_principal_links_for_principal,
-    create_principal_link,
     delete_for_principal,
-    delete_principal_link,
     delete_principal_links_for_principal,
     find_platform_principal,
     get_discord_principal_for_account,
@@ -17,10 +13,7 @@ from daimon.core.stores.identity import (
     get_or_create_platform_principal,
     get_slack_principal_for_account,
     list_cli_principals_for_account,
-    list_links_for_cli,
     list_platform_principals_for_account,
-    resolve_linked_platform_principal,
-    set_active_agent_name,
 )
 from daimon.testing.factories import (
     link_principals,
@@ -121,116 +114,6 @@ async def test_get_or_create_platform_principal_different_external_id_yields_dis
     )
 
 
-async def test_create_principal_link_connects_cli_to_platform_when_both_exist(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    cli = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="op")
-    plat = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="999"
-    )
-    link = await create_principal_link(
-        db_session, cli_principal_id=cli.id, platform_principal_id=plat.id
-    )
-    assert link.cli_principal_id == cli.id
-    assert link.platform_principal_id == plat.id
-
-
-async def test_list_links_returns_only_current_cli_principal_links_when_queried(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    cli_a = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="a")
-    cli_b = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="b")
-    plat = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="x"
-    )
-    await create_principal_link(
-        db_session, cli_principal_id=cli_a.id, platform_principal_id=plat.id
-    )
-
-    a_links = await list_links_for_cli(db_session, cli_principal_id=cli_a.id)
-    b_links = await list_links_for_cli(db_session, cli_principal_id=cli_b.id)
-
-    assert len(a_links) == 1
-    assert len(b_links) == 0, "cli B never linked to anyone"
-
-
-async def test_delete_principal_link_removes_only_named_pair_when_multi_linked(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    cli_a = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="a")
-    cli_b = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="b")
-    plat = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="x"
-    )
-    await create_principal_link(
-        db_session, cli_principal_id=cli_a.id, platform_principal_id=plat.id
-    )
-    await create_principal_link(
-        db_session, cli_principal_id=cli_b.id, platform_principal_id=plat.id
-    )
-
-    await delete_principal_link(
-        db_session, cli_principal_id=cli_a.id, platform_principal_id=plat.id
-    )
-
-    assert await list_links_for_cli(db_session, cli_principal_id=cli_a.id) == []
-    b_links = await list_links_for_cli(db_session, cli_principal_id=cli_b.id)
-    assert len(b_links) == 1, "cli B's link to the same platform must survive"
-
-
-async def test_delete_principal_link_raises_when_pair_missing(
-    db_session: AsyncSession,
-) -> None:
-    with pytest.raises(StoreError):
-        await delete_principal_link(
-            db_session,
-            cli_principal_id=uuid.uuid4(),
-            platform_principal_id=uuid.uuid4(),
-        )
-
-
-async def test_resolve_linked_platform_principal_returns_row_when_link_exists(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    cli = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="op")
-    plat = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="999"
-    )
-    await create_principal_link(db_session, cli_principal_id=cli.id, platform_principal_id=plat.id)
-
-    resolved = await resolve_linked_platform_principal(
-        db_session,
-        cli_principal_id=cli.id,
-        platform="discord",
-        external_id="999",
-    )
-    assert resolved is not None
-    assert resolved.id == plat.id
-
-
-async def test_resolve_linked_platform_principal_returns_none_when_unlinked(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    cli = await get_or_create_cli_principal(db_session, tenant_id=tenant.id, os_user="op")
-    await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="999"
-    )
-    # No link created.
-
-    resolved = await resolve_linked_platform_principal(
-        db_session,
-        cli_principal_id=cli.id,
-        platform="discord",
-        external_id="999",
-    )
-    assert resolved is None, "unlinked platform principal must not be resolvable"
-
-
 # ---------------------------------------------------------------------------
 # delete_for_principal — idempotent DELETE-by-id, never raises on rowcount=0
 # ---------------------------------------------------------------------------
@@ -280,7 +163,14 @@ async def test_delete_principal_links_for_principal_deletes_both_directions_for_
         db_session, principal_id=cli.id, kind="cli"
     )
     assert rowcount == 1, "link from cli side must be deleted"
-    assert await list_links_for_cli(db_session, cli_principal_id=cli.id) == []
+    remaining = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(PrincipalLink)
+            .where(PrincipalLink.cli_principal_id == cli.id)
+        )
+    ).scalar_one()
+    assert remaining == 0
 
 
 async def test_delete_principal_links_for_principal_deletes_for_platform(
@@ -495,46 +385,6 @@ async def test_find_platform_principal_matches_external_id_exactly(
 
 
 # ---------------------------------------------------------------------------
-# count_principal_links_for_principal — read-only mirror of the delete helper
-# ---------------------------------------------------------------------------
-
-
-async def test_count_principal_links_for_principal_returns_zero_when_no_links(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    cli = await make_cli_principal(db_session, os_user="lonely", tenant=tenant)
-
-    count = await count_principal_links_for_principal(db_session, principal_id=cli.id, kind="cli")
-    assert count == 0, "no links seeded -> count must be 0"
-
-
-async def test_count_principal_links_for_principal_counts_rows_when_present(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    account = await make_account(db_session, tenant=tenant)
-    cli = await make_cli_principal(db_session, os_user="linked", tenant=tenant, account=account)
-    pp = await make_platform_principal(
-        db_session,
-        platform="discord",
-        external_id="ext-linked",
-        tenant=tenant,
-        account=account,
-    )
-    await link_principals(db_session, cli=cli, platform=pp)
-
-    cli_count = await count_principal_links_for_principal(
-        db_session, principal_id=cli.id, kind="cli"
-    )
-    platform_count = await count_principal_links_for_principal(
-        db_session, principal_id=pp.id, kind="platform"
-    )
-    assert cli_count == 1, "cli-side count must include the seeded link"
-    assert platform_count == 1, "platform-side count must include the seeded link"
-
-
-# ---------------------------------------------------------------------------
 # Migration 0013 — active_agent_name + propagation mode columns
 # ---------------------------------------------------------------------------
 
@@ -579,81 +429,6 @@ async def test_migration_0013_mode_check_constraint_rejects_invalid_value(
             {"tid": tenant.id},
         )
         await db_session.flush()
-
-
-# ---------------------------------------------------------------------------
-# set_active_agent_name — per-principal active agent
-# ---------------------------------------------------------------------------
-
-
-async def test_set_active_agent_name_sets_and_reads_back(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    principal = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u1"
-    )
-
-    await set_active_agent_name(db_session, principal_id=principal.id, agent_name="research-bot")
-
-    refetched = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u1"
-    )
-    assert refetched.active_agent_name == "research-bot", "write must be readable on refetch"
-
-
-async def test_set_active_agent_name_clears_to_none(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    principal = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u2"
-    )
-    await set_active_agent_name(db_session, principal_id=principal.id, agent_name="some-agent")
-    await set_active_agent_name(db_session, principal_id=principal.id, agent_name=None)
-
-    refetched = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u2"
-    )
-    assert refetched.active_agent_name is None, "passing None must clear the column"
-
-
-async def test_set_active_agent_name_normalizes_empty_string(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    principal = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u3"
-    )
-    await set_active_agent_name(db_session, principal_id=principal.id, agent_name="")
-
-    refetched = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u3"
-    )
-    assert refetched.active_agent_name is None, "empty string is normalized to None"
-
-
-async def test_set_active_agent_name_noop_on_missing_principal(
-    db_session: AsyncSession,
-) -> None:
-    # No assertion on DB state — contract is "doesn't raise".
-    await set_active_agent_name(db_session, principal_id=uuid.uuid4(), agent_name="whatever")
-
-
-async def test_set_active_agent_name_idempotent(
-    db_session: AsyncSession,
-) -> None:
-    tenant = await make_tenant(db_session)
-    principal = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u4"
-    )
-    await set_active_agent_name(db_session, principal_id=principal.id, agent_name="same")
-    await set_active_agent_name(db_session, principal_id=principal.id, agent_name="same")
-
-    refetched = await get_or_create_platform_principal(
-        db_session, tenant_id=tenant.id, platform="discord", external_id="u4"
-    )
-    assert refetched.active_agent_name == "same", "second identical write must not corrupt state"
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Tests for DaimonBot in-flight concurrency cap, is_admin derivation,
 per-caller session keying, and per-turn role upsert.
 
-Plan 50-08: per-tenant in-flight counter + is_admin threading into SessionContext.
+Plan 50-08: per-tenant in-flight counter + is_admin derivation.
 Plan 88-04: per-(thread,account) session keying (flag-gated) + unconditional role upsert.
 """
 
@@ -377,13 +377,11 @@ class TestInflightIsolation:
 class TestIsAdminDerivation:
     """is_admin derived from manage_guild writes the live DB role.
 
-    Prior to this change, is_admin was threaded into SessionContext and baked into
-    the long-lived vault credential. The new design removes the SessionContext baking
-    (credential is now identity-stable) and instead writes the live
-    DB account.role each turn — the MCP gate then reads it live.
+    is_admin is not threaded into the vault credential (identity-stable);
+    instead the live DB account.role is written each turn — the MCP gate then
+    reads it live.
 
-    These tests verify that manage_guild derives correctly and that create_session
-    is no longer passed session_context.
+    These tests verify that manage_guild derives correctly.
     """
 
     @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
@@ -403,8 +401,7 @@ class TestIsAdminDerivation:
     ) -> None:
         """Member with manage_guild=True → account.role=admin written to the DB each turn.
 
-        The current design replaces the defunct SessionContext(is_admin=...) baking with a
-        live DB role write. The MCP gate reads account.role on every request (88-03).
+        The MCP gate reads account.role on every request (88-03).
         """
         from daimon.core.defaults.provisioning import provision_tenant
         from daimon.core.ma_identity import derive_tenant_uuid
@@ -452,12 +449,8 @@ class TestIsAdminDerivation:
 
         await bot.on_message(message)
 
-        # is_admin drives a live DB role write, not SessionContext baking.
+        # is_admin drives a live DB role write, not vault-credential baking.
         mock_create_session.assert_called_once()
-        assert "session_context" not in mock_create_session.call_args.kwargs, (
-            "create_session must NOT receive session_context — credential is now identity-stable; "
-            "credential identity-stable; admin gate reads live DB role (88-04)"
-        )
 
         # The account.role must be admin in the DB.
         async with db_session_factory() as s:
@@ -533,11 +526,7 @@ class TestIsAdminDerivation:
 
         await bot.on_message(message)
 
-        # No session_context in create_session call.
         mock_create_session.assert_called_once()
-        assert "session_context" not in mock_create_session.call_args.kwargs, (
-            "create_session must NOT receive session_context"
-        )
 
         async with db_session_factory() as s:
             principal = await get_or_create_platform_principal(
@@ -608,9 +597,6 @@ class TestIsAdminDerivation:
         await bot.on_message(message)
 
         mock_create_session.assert_called_once()
-        assert "session_context" not in mock_create_session.call_args.kwargs, (
-            "create_session must NOT receive session_context"
-        )
 
         async with db_session_factory() as s:
             principal = await get_or_create_platform_principal(

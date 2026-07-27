@@ -48,9 +48,6 @@ import discord
 
 log = structlog.get_logger()
 
-_SKILL_CAP = 20
-_MCP_CAP = 20
-
 
 def _capture_panel_exception(
     err: BaseException,

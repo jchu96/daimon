@@ -5,11 +5,6 @@ from __future__ import annotations
 from typing import Any, cast
 
 
-def is_app_mention(event: dict[str, Any]) -> bool:
-    """Return True when the Slack event type is ``app_mention``."""
-    return event.get("type") == "app_mention"
-
-
 def is_slack_connect_external(event: dict[str, Any], *, team_id: str) -> bool:
     """Return True if the event originates from a different Slack workspace.
 

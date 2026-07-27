@@ -20,7 +20,6 @@ __all__ = [
     "RoutinesPanelState",
     "derive_glyph",
     "picker_label",
-    "state_label",
 ]
 
 Glyph = Literal["⏸", "⏳", "❌", "✅"]
@@ -47,16 +46,6 @@ def picker_label(row: RoutineRow) -> str:
     if not stripped:
         return f"routine {row.id.hex[:8]}"
     return stripped[:60]
-
-
-def state_label(glyph: Glyph) -> str:
-    """Human label for a state glyph (used in section text)."""
-    return {
-        "⏸": "Paused",
-        "⏳": "Never run",
-        "❌": "Errored",
-        "✅": "Success",
-    }[glyph]
 
 
 @dataclasses.dataclass(frozen=True)

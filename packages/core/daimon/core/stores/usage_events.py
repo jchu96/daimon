@@ -93,20 +93,6 @@ def _sum_cost(rows: Sequence[UsageEventRow]) -> float:
     return total
 
 
-async def cost_for_user_in_tenant(
-    session: AsyncSession,
-    *,
-    tenant_id: uuid.UUID,
-    platform_user_id: str,
-) -> float:
-    rows = await _select_rows(
-        session,
-        tenant_id=tenant_id,
-        platform_user_id=platform_user_id,
-    )
-    return _sum_cost(rows)
-
-
 async def cost_for_user_in_tenant_since(
     session: AsyncSession,
     *,
@@ -260,15 +246,6 @@ async def turns_by_user_in_tenant_since(
             continue
         out[row.platform_user_id] = int(row.turns)
     return out
-
-
-async def cost_for_tenant(
-    session: AsyncSession,
-    *,
-    tenant_id: uuid.UUID,
-) -> float:
-    rows = await _select_rows(session, tenant_id=tenant_id)
-    return _sum_cost(rows)
 
 
 async def delete_all_for_user(

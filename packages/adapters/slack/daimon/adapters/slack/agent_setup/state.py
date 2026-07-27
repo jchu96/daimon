@@ -5,8 +5,7 @@ No I/O, no clock, no DB, no slack_sdk. Identifiers only — workspace id is re-d
 server-side per event, never serialized here.
 
 Port of the BEHAVIOR from discord/agent_setup/state.py (apply_agent_modal rename-forbidden
-invariant, apply_mcp_modal, remove_skill_at, remove_mcp_at) collapsed to stateless
-identifiers-only functions (no fat PanelState self).
+invariant) collapsed to stateless identifiers-only functions (no fat PanelState self).
 """
 
 from __future__ import annotations
@@ -21,9 +20,6 @@ __all__ = [
     "decode_private_metadata",
     "encode_private_metadata",
     "apply_agent_modal",
-    "apply_mcp_modal",
-    "remove_skill_at",
-    "remove_mcp_at",
 ]
 
 
@@ -108,49 +104,4 @@ def apply_agent_modal(
         result["model"] = model_id
     if system_prompt is not None:
         result["system"] = system_prompt
-    return result
-
-
-def apply_mcp_modal(
-    *,
-    name: str,
-    endpoint: str,
-    has_token: bool,
-) -> dict[str, Any]:
-    """Return the MCP-server entry dict for an add-MCP-modal submission.
-
-    Reserved-name validation and endpoint format checking live in submit.py
-    (pure format validators run pre-ack). This function only constructs the
-    shape the write layer needs.
-    """
-    return {
-        "name": name,
-        "url": endpoint,
-        "has_token": has_token,
-    }
-
-
-def remove_skill_at(skills: list[str], index: int) -> list[str]:
-    """Return a new skills list with the element at index removed.
-
-    Out-of-range index returns the list unchanged — caller does not need to
-    guard bounds before calling.
-    """
-    if not (0 <= index < len(skills)):
-        return list(skills)
-    result = list(skills)
-    result.pop(index)
-    return result
-
-
-def remove_mcp_at(mcps: list[str], index: int) -> list[str]:
-    """Return a new MCP list with the element at index removed.
-
-    Out-of-range index returns the list unchanged — caller does not need to
-    guard bounds before calling.
-    """
-    if not (0 <= index < len(mcps)):
-        return list(mcps)
-    result = list(mcps)
-    result.pop(index)
     return result

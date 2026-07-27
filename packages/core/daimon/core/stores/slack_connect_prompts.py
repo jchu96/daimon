@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any, cast
 
 from daimon.core._models import SlackConnectPrompt
+from sqlalchemy import CursorResult, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,3 +37,16 @@ async def was_connect_prompted(
     slack_user_id: str,
 ) -> bool:
     return await session.get(SlackConnectPrompt, (team_id, slack_user_id)) is not None
+
+
+async def delete_connect_prompts_for_team(session: AsyncSession, *, team_id: str) -> int:
+    """Delete every slack_connect_prompts row for a workspace. Idempotent.
+
+    Returns rowcount; never raises on 0. Used by the Slack uninstall teardown.
+    """
+    result = await session.execute(
+        delete(SlackConnectPrompt).where(SlackConnectPrompt.team_id == team_id)
+    )
+    rowcount = cast(CursorResult[Any], result).rowcount
+    await session.flush()
+    return rowcount

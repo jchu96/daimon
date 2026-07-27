@@ -30,6 +30,7 @@ from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.testing.ma import build_stub_anthropic
 from pydantic import HttpUrl
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,7 +66,11 @@ def _fake_ma_agent(tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
 
 
 def _runtime(
-    *, anthropic: Any, public_url: HttpUrl | None, jwt_secret: str | None
+    *,
+    anthropic: Any,
+    public_url: HttpUrl | None,
+    jwt_secret: str | None,
+    sessionmaker: Any = None,
 ) -> DiscordRuntime:
     settings = MagicMock()
     settings.mcp.public_url = public_url
@@ -80,7 +85,7 @@ def _runtime(
     return DiscordRuntime(
         settings=settings,
         anthropic=anthropic,
-        sessionmaker=MagicMock(),
+        sessionmaker=sessionmaker if sessionmaker is not None else MagicMock(),
         billing_config=None,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         deployment_default=DeploymentDefault(),
@@ -88,12 +93,13 @@ def _runtime(
     )
 
 
-def _runtime_configured(*, anthropic: Any) -> DiscordRuntime:
+def _runtime_configured(*, anthropic: Any, sessionmaker: Any = None) -> DiscordRuntime:
     """Runtime with mcp.public_url and mcp.jwt_secret both set."""
     return _runtime(
         anthropic=anthropic,
         public_url=HttpUrl("https://mcp.example.com/mcp"),
         jwt_secret="x" * 32,
+        sessionmaker=sessionmaker,
     )
 
 
@@ -128,6 +134,7 @@ async def test_add_mcp_modal_resolves_agent_uuid_and_writes_per_agent_vault(
     monkeypatch: pytest.MonkeyPatch,
     tenant_id: uuid.UUID,
     account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Happy path: credential lands in daimon-mcp:{account_id}:{agent_uuid} vault.
 
@@ -188,7 +195,9 @@ async def test_add_mcp_modal_resolves_agent_uuid_and_writes_per_agent_vault(
             )
         raise AssertionError(f"unexpected: {req.method} {req.url.path}")
 
-    rt = _runtime_configured(anthropic=build_stub_anthropic(vault_handler))
+    rt = _runtime_configured(
+        anthropic=build_stub_anthropic(vault_handler), sessionmaker=db_session_factory
+    )
     selected = _entry("my-agent")
     state = PanelState(
         roster=[selected],

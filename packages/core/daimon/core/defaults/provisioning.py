@@ -24,6 +24,8 @@ from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.stores import tenant_ledger
 from daimon.core.stores.domain import Platform
 from daimon.core.stores.slack_bot_tokens import delete_slack_bot_token
+from daimon.core.stores.slack_connect_prompts import delete_connect_prompts_for_team
+from daimon.core.stores.slack_event_dedup import delete_event_dedup_for_team
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -185,12 +187,13 @@ async def teardown_slack_install(
     team_id: str,
     now: datetime,
 ) -> None:
-    """Soft-archive the Slack tenant and delete its bot-token row.
+    """Soft-archive the Slack tenant and delete its workspace-scoped Slack rows.
 
     1. Derives the tenant_id deterministically from (platform="slack", team_id).
     2. Calls archive_tenant to set Tenant.archived_at = now (no-op if absent).
-    3. Deletes the slack_bot_tokens row via delete_slack_bot_token (idempotent —
-       returns 0 rowcount when row is already absent, never raises).
+    3. Deletes the slack_bot_tokens, slack_connect_prompts, and
+       slack_event_dedup rows via their idempotent per-team delete helpers
+       (0 rowcount when rows are already absent, never raise).
 
     Token-existence is the liveness signal: after teardown, any
     event handler that reads the token row will see None and drop the event.
@@ -199,3 +202,5 @@ async def teardown_slack_install(
     await archive_tenant(session_factory, tenant_id=tenant_id, now=now)
     async with session_factory() as s, s.begin():
         await delete_slack_bot_token(s, team_id=team_id)
+        await delete_connect_prompts_for_team(s, team_id=team_id)
+        await delete_event_dedup_for_team(s, team_id=team_id)

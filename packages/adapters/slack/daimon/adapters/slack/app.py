@@ -1060,6 +1060,7 @@ class SlackApp:
                 tenant_id=tenant_id,
                 account_id=principal.account_id,
                 agent_uuid=agent_uuid,
+                session_factory=self.runtime.sessionmaker,
                 github_fallback_pat=(
                     self.runtime.settings.github.fallback_pat.get_secret_value()
                     if self.runtime.settings.github.fallback_pat is not None
