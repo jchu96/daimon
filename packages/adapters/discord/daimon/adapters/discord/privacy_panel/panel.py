@@ -34,6 +34,10 @@ def _summary_line(preview: PurgePreview) -> str:
         parts.append(f"{preview.mcp_tokens.count} MCP token(s)")
     if preview.agent_github_binding.count > 0:
         parts.append(f"{preview.agent_github_binding.count} per-agent GitHub link(s)")
+    if preview.slack_user_tokens.count > 0:
+        parts.append(f"{preview.slack_user_tokens.count} Slack user token(s)")
+    if preview.slack_turn_contexts.count > 0:
+        parts.append(f"{preview.slack_turn_contexts.count} Slack turn context(s)")
     return ", ".join(parts) if parts else "nothing visible to you yet"
 
 

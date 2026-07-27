@@ -275,3 +275,37 @@ def test_cascade_container_agent_github_binding_row_absent_when_zero() -> None:
     assert "per-agent GitHub credential link" not in joined, (
         "zero-count agent_github_binding must NOT render a row"
     )
+
+
+def test_cascade_container_slack_user_tokens_row_renders_when_nonzero() -> None:
+    """slack_user_tokens row appears when count > 0 (PAR-05 Discord parity gap)."""
+    preview = _make_preview(slack_user_tokens=PurgePreviewRow(count=1, example=None))
+    joined = _joined_text(build_cascade_preview_container(preview))
+    assert "1" in joined, "slack_user_tokens count must appear in the row"
+    assert "Slack user token" in joined, "slack_user_tokens row must mention Slack user token(s)"
+
+
+def test_cascade_container_slack_user_tokens_row_absent_when_zero() -> None:
+    """slack_user_tokens row is suppressed when count == 0."""
+    preview = _make_preview(slack_user_tokens=PurgePreviewRow(count=0, example=None))
+    joined = _joined_text(build_cascade_preview_container(preview))
+    assert "Slack user token" not in joined, "zero-count slack_user_tokens must NOT render a row"
+
+
+def test_cascade_container_slack_turn_contexts_row_renders_when_nonzero() -> None:
+    """slack_turn_contexts row appears when count > 0 (PAR-05 Discord parity gap)."""
+    preview = _make_preview(slack_turn_contexts=PurgePreviewRow(count=4, example=None))
+    joined = _joined_text(build_cascade_preview_container(preview))
+    assert "4" in joined, "slack_turn_contexts count must appear in the row"
+    assert "Slack turn context" in joined, (
+        "slack_turn_contexts row must mention Slack turn context(s)"
+    )
+
+
+def test_cascade_container_slack_turn_contexts_row_absent_when_zero() -> None:
+    """slack_turn_contexts row is suppressed when count == 0."""
+    preview = _make_preview(slack_turn_contexts=PurgePreviewRow(count=0, example=None))
+    joined = _joined_text(build_cascade_preview_container(preview))
+    assert "Slack turn context" not in joined, (
+        "zero-count slack_turn_contexts must NOT render a row"
+    )

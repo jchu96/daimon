@@ -59,6 +59,14 @@ def build_cascade_preview_container(
     if preview.agent_github_binding.count > 0:
         n = preview.agent_github_binding.count
         will_happen_rows.append(f"-# 🤖 Remove **{n}** per-agent GitHub credential link(s)")
+    if preview.slack_user_tokens.count > 0:
+        will_happen_rows.append(
+            f"-# 🔐 Remove **{preview.slack_user_tokens.count}** Slack user token(s)"
+        )
+    if preview.slack_turn_contexts.count > 0:
+        will_happen_rows.append(
+            f"-# 💬 Remove **{preview.slack_turn_contexts.count}** Slack turn context(s)"
+        )
     if preview.account.count > 0:
         will_happen_rows.append("-# 🪪 Remove the account row itself")
 
