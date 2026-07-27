@@ -6,20 +6,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 
-import httpx
 import pytest
-from anthropic import AsyncAnthropic
 from daimon.core._models import Routine, Tenant
 from daimon.core.stores.domain import RoutineRow
-from daimon.testing.ma import build_stub_anthropic, stub_anthropic  # noqa: F401
+from daimon.testing.ma import make_stub_anthropic, stub_anthropic  # noqa: F401
 from sqlalchemy.ext.asyncio import AsyncSession
-
-
-@pytest.fixture
-def make_stub_anthropic() -> Callable[
-    [Callable[[httpx.Request], httpx.Response] | None], AsyncAnthropic
-]:
-    return build_stub_anthropic
 
 
 @pytest.fixture

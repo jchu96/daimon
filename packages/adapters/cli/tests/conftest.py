@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 
-import httpx
 import pytest
 import pytest_asyncio
 import structlog
-from anthropic import AsyncAnthropic
 from daimon.testing.db import (  # noqa: F401  # pyright: ignore[reportUnusedImport]
     db_engine,
     db_session,
 )
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import build_stub_anthropic, stub_anthropic  # noqa: F401
+from daimon.testing.ma import make_stub_anthropic, stub_anthropic  # noqa: F401
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -57,13 +55,3 @@ async def db_session_factory(
         await make_tenant(db_session, platform="cli", workspace_id="local")
         await db_session.commit()
     return async_sessionmaker(bind=db_session.bind, expire_on_commit=False)
-
-
-@pytest.fixture
-def make_stub_anthropic() -> Callable[
-    [Callable[[httpx.Request], httpx.Response] | None], AsyncAnthropic
-]:
-    """Factory fixture: tests that need a custom handler call
-    `make_stub_anthropic(handler)` to build an AsyncAnthropic that routes
-    to it. Returned type matches `build_stub_anthropic`'s signature."""
-    return build_stub_anthropic

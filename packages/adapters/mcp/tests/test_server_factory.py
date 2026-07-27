@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import httpx
 import pytest
-from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import (
     AnthropicSettings,
@@ -14,21 +12,12 @@ from daimon.core.config import (
     Settings,
 )
 from daimon.core.errors import BootstrapError
+from daimon.testing.ma import build_stub_anthropic
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.asyncio
-
-
-def _make_stub_anthropic() -> AsyncAnthropic:
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={})
-
-    return AsyncAnthropic(
-        api_key="sk-ant-test-stub",
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
-    )
 
 
 _EXPECTED_TOOLS = {
@@ -109,7 +98,7 @@ async def test_create_mcp_app_registers_all_phase_2_tools(
         settings=settings,
         sessionmaker=sessionmaker,
         auth=StaticTokenVerifier(tokens={}),
-        anthropic=_make_stub_anthropic(),
+        anthropic=build_stub_anthropic(),
     )
     mcp = app.state.mcp
     registered = {t.name for t in await mcp.local_provider.list_tools()}
@@ -138,7 +127,7 @@ async def test_factory_omits_discord_tools_when_no_discord_settings(
         settings=settings,
         sessionmaker=sessionmaker,
         auth=StaticTokenVerifier(tokens={}),
-        anthropic=_make_stub_anthropic(),
+        anthropic=build_stub_anthropic(),
     )
     mcp = app.state.mcp
     registered = {t.name for t in await mcp.local_provider.list_tools()}
