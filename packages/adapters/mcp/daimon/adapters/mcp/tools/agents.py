@@ -28,6 +28,7 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.core import agent_lifecycle
 from daimon.core.agent_guidance import apply_credential_guidance
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
@@ -49,7 +50,7 @@ from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.defaults.reconcile_agents import reconcile_agent
 from daimon.core.defaults.skills import resolve_skill_names
 from daimon.core.defaults.spec_merge import merge_mcp_servers_with_ma, merge_skills_with_ma
-from daimon.core.errors import DefaultsError
+from daimon.core.errors import DaimonError, DefaultsError
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.memory_resource import archive_memory_store_for_agent
@@ -605,7 +606,33 @@ async def _fork_agent_impl(
     fork_params["tools"] = merge_default_agent_toolset(
         cast("list[Tool] | None", fork_params.get("tools"))
     )
+
+    # Narrow the cached fernet BEFORE any partial write (T-02-09) — the create
+    # below is the first write, so this must gate ahead of it.
+    fernet = runtime.fernet
+    if fernet is None:
+        raise ToolError(
+            "fork_agent: no crypto keys configured — cannot copy the source agent's "
+            "credential. Configure DAIMON_CRYPTO__KEYS to enable fork."
+        )
+
     new_ma = await runtime.client.beta.agents.create(**fork_params)
+
+    source_agent_uuid = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(source.id))
+    fork_agent_uuid = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(new_ma.id))
+    try:
+        await agent_lifecycle.copy_credential_and_repo_binding(
+            anthropic=runtime.client,
+            sessionmaker=runtime.session_factory,
+            fernet=fernet,
+            oauth_scopes=tuple(runtime.settings.github.oauth_scopes),
+            tenant_id=auth.tenant_id,
+            source_agent_uuid=source_agent_uuid,
+            fork_agent_uuid=fork_agent_uuid,
+        )
+    except DaimonError as exc:
+        raise ToolError(str(exc)) from exc
+
     return await _build_agent_info(runtime.client, new_ma, tenant_id=auth.tenant_id)
 
 

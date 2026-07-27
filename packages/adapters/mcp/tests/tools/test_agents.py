@@ -13,6 +13,7 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import SkillListResponse
+from cryptography.fernet import Fernet, MultiFernet
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, Role
 from daimon.adapters.mcp.middleware.mcp_identity import (
     IdentityMiddleware,
@@ -36,9 +37,14 @@ from daimon.adapters.mcp.tools.agents import (
     _update_agent_impl,
     register_agent_tools,
 )
+from daimon.core._models import Tenant
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
+from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec, SkillRef, SkillRepo
+from daimon.core.stores.agent_github_binding import set_agent_github_binding
+from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
 from factories import make_ma_agent
 from fastmcp import FastMCP
@@ -60,6 +66,7 @@ def _make_settings(*, public_url: str | None = None) -> MagicMock:
     """Return a minimal settings mock with mcp.public_url wired explicitly."""
     settings = MagicMock()
     settings.mcp.public_url = public_url
+    settings.github.oauth_scopes = ("repo", "read:user")
     return settings
 
 
@@ -68,12 +75,14 @@ def _runtime(
     *,
     public_url: str | None = None,
     session_factory: async_sessionmaker[AsyncSession] | MagicMock | None = None,
+    fernet: MultiFernet | None = None,
 ) -> McpRuntime:
     return McpRuntime(
         session_factory=session_factory if session_factory is not None else MagicMock(),
         client=client,  # type: ignore[arg-type]
         settings=_make_settings(public_url=public_url),  # type: ignore[arg-type]
         deployment_default=DeploymentDefault(),
+        fernet=fernet,
     )
 
 
@@ -700,7 +709,9 @@ async def test_update_agent_impl_forwards_empty_list_to_clear() -> None:
     assert captured["tools"] == [], "empty list should be forwarded to clear the field"
 
 
-async def test_fork_agent_impl_creates_ma_agent_from_source_spec() -> None:
+async def test_fork_agent_impl_creates_ma_agent_from_source_spec(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
 
@@ -736,8 +747,9 @@ async def test_fork_agent_impl_creates_ma_agent_from_source_spec() -> None:
     client = build_fake_anthropic(router.dispatch)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
     result = await _fork_agent_impl(
-        _runtime(client),
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
         auth,
         source_name="source",
         new_name="myfork",
@@ -753,7 +765,9 @@ async def test_fork_agent_impl_creates_ma_agent_from_source_spec() -> None:
     )
 
 
-async def test_fork_agent_impl_adds_base_toolset_when_source_lacks_it() -> None:
+async def test_fork_agent_impl_adds_base_toolset_when_source_lacks_it(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """Forking a legacy agent created before the base-toolset guarantee must not
     propagate the hole — the fork gains the base toolset so skills stay usable."""
     tenant_id = uuid.uuid4()
@@ -789,7 +803,13 @@ async def test_fork_agent_impl_adds_base_toolset_when_source_lacks_it() -> None:
     client = build_fake_anthropic(router.dispatch)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
-    await _fork_agent_impl(_runtime(client), auth, source_name="source", new_name="myfork")
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+    await _fork_agent_impl(
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
+        auth,
+        source_name="source",
+        new_name="myfork",
+    )
 
     assert len(created) == 1, "should call MA create exactly once"
     tool_types = [t.get("type") for t in created[0].get("tools", [])]
@@ -847,7 +867,6 @@ async def test_archive_agent_impl_succeeds_when_store_archive_fails(
     would strand the flow with no retry path (archived agents are filtered
     from lookup). _archive_agent_impl degrades best-effort instead.
     """
-    from daimon.core.ma_identity import derive_agent_uuid
     from daimon.core.stores.agent_memory_stores import insert_memory_store
     from daimon.testing.factories import make_tenant
 
@@ -1029,7 +1048,9 @@ async def test_create_agent_stamps_spec_hash_and_managed_false() -> None:
     )
 
 
-async def test_fork_agent_impl_stamps_daimon_account_on_clone() -> None:
+async def test_fork_agent_impl_stamps_daimon_account_on_clone(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
     guild_account = derive_guild_account_uuid(tenant_id)
@@ -1067,8 +1088,9 @@ async def test_fork_agent_impl_stamps_daimon_account_on_clone() -> None:
     client = build_fake_anthropic(router.dispatch)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
     await _fork_agent_impl(
-        _runtime(client),
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
         auth,
         source_name="source",
         new_name="myfork",
@@ -1082,7 +1104,9 @@ async def test_fork_agent_impl_stamps_daimon_account_on_clone() -> None:
     )
 
 
-async def test_fork_agent_impl_copies_source_skills() -> None:
+async def test_fork_agent_impl_copies_source_skills(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """Fork must carry the source agent's attached skills into the create
     payload (panel _FORK_COPY_FIELDS parity) — dropping them silently strips
     every skill from the 'fork the system agent, then edit it' workflow."""
@@ -1124,8 +1148,9 @@ async def test_fork_agent_impl_copies_source_skills() -> None:
     client = build_fake_anthropic(router.dispatch)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
     await _fork_agent_impl(
-        _runtime(client),
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
         auth,
         source_name="source",
         new_name="myfork",
@@ -1141,7 +1166,9 @@ async def test_fork_agent_impl_copies_source_skills() -> None:
     )
 
 
-async def test_fork_agent_merges_daimon_mcp_when_public_url_set() -> None:
+async def test_fork_agent_merges_daimon_mcp_when_public_url_set(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """#139: fork_agent merges daimon-mcp server + mcp_toolset into the create payload
     when public_url is set, plus guarantees the base agent_toolset_20260401."""
     tenant_id = uuid.uuid4()
@@ -1178,8 +1205,12 @@ async def test_fork_agent_merges_daimon_mcp_when_public_url_set() -> None:
     client = build_fake_anthropic(router.dispatch)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
     await _fork_agent_impl(
-        _runtime(client, public_url=public_url), auth, source_name="source", new_name="myfork"
+        _runtime(client, public_url=public_url, session_factory=db_session_factory, fernet=fernet),
+        auth,
+        source_name="source",
+        new_name="myfork",
     )
 
     assert len(created) == 1, "should call MA create exactly once"
@@ -1199,7 +1230,9 @@ async def test_fork_agent_merges_daimon_mcp_when_public_url_set() -> None:
     )
 
 
-async def test_fork_agent_skips_mcp_merge_when_public_url_none() -> None:
+async def test_fork_agent_skips_mcp_merge_when_public_url_none(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """#139: fork_agent skips daimon-mcp merges when public_url is None,
     but still guarantees the base agent_toolset_20260401."""
     tenant_id = uuid.uuid4()
@@ -1235,8 +1268,14 @@ async def test_fork_agent_skips_mcp_merge_when_public_url_none() -> None:
     client = build_fake_anthropic(router.dispatch)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
     # public_url=None (default) — no daimon-mcp merge expected
-    await _fork_agent_impl(_runtime(client), auth, source_name="source", new_name="myfork")
+    await _fork_agent_impl(
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
+        auth,
+        source_name="source",
+        new_name="myfork",
+    )
 
     assert len(created) == 1, "should call MA create exactly once"
     mcp_server_names = [s.get("name") for s in created[0].get("mcp_servers", [])]
@@ -1247,6 +1286,196 @@ async def test_fork_agent_skips_mcp_merge_when_public_url_none() -> None:
     assert "agent_toolset_20260401" in tool_types, (
         "fork must still guarantee the base toolset even when public_url is None"
     )
+
+
+def _fork_agent_router(
+    *,
+    tenant_id: uuid.UUID,
+    source_id: str,
+    source_name: str,
+    fork_id: str,
+    fork_name: str,
+) -> MARouter:
+    """Build a MARouter that answers list/retrieve/create for a single fork."""
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [
+                make_ma_agent(
+                    id=source_id,
+                    name=source_name,
+                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": source_name},
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200,
+            json=make_ma_agent(id=source_id, name=source_name).model_dump(mode="json"),
+        ),
+    )
+    router.add(
+        "POST",
+        r"/v1/agents",
+        lambda _req, _m: httpx.Response(
+            200, json=make_ma_agent(id=fork_id, name=fork_name).model_dump(mode="json")
+        ),
+    )
+    return router
+
+
+async def test_fork_agent_impl_rekeys_source_credential_onto_fork(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """After _fork_agent_impl, get_pat(agent_id=fork) resolves the source's token,
+    re-keyed under the fork's OWN principal (D-07 fork-copy gap closure)."""
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    db_session.add(Tenant(id=tenant_id, platform="discord", external_id=str(tenant_id)))
+    await db_session.flush()
+    source_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_src_cred")
+    fork_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_fork_cred")
+
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+    plaintext = "ghp_source_token_xxxx1234"
+    await upsert_credential_encrypted(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        principal_id=source_agent_uuid,
+        github_login="(inline-pat)",
+        plaintext_token=plaintext,
+        scopes=("repo", "read:user"),
+    )
+    async with db_session_factory() as s, s.begin():
+        await set_agent_github_binding(
+            s, agent_id=source_agent_uuid, principal_id=source_agent_uuid
+        )
+        await set_binding(
+            s,
+            tenant_id=tenant_id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/repo",
+            default_branch="main",
+            ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+        )
+
+    router = _fork_agent_router(
+        tenant_id=tenant_id,
+        source_id="ag_src_cred",
+        source_name="source",
+        fork_id="ag_fork_cred",
+        fork_name="myfork",
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    await _fork_agent_impl(
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
+        auth,
+        source_name="source",
+        new_name="myfork",
+    )
+
+    fork_pat = await get_pat(
+        principal_id=fork_agent_uuid,
+        agent_id=fork_agent_uuid,
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+    )
+    assert fork_pat == plaintext, "fork's credential must resolve the source's token"
+
+
+async def test_fork_agent_impl_raises_tool_error_on_undecryptable_source_credential(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """D-08: an undecryptable inline-pat source binding must fail loud as a
+    ToolError (the core DaimonError converted at the MCP call site)."""
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    db_session.add(Tenant(id=tenant_id, platform="discord", external_id=str(tenant_id)))
+    await db_session.flush()
+    source_agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_src_nocred")
+
+    # Binding exists (inline-pat:) but no github_credentials row backs it.
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=tenant_id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/repo",
+            default_branch="main",
+            ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+        )
+
+    router = _fork_agent_router(
+        tenant_id=tenant_id,
+        source_id="ag_src_nocred",
+        source_name="source",
+        fork_id="ag_fork_nocred",
+        fork_name="myfork2",
+    )
+    client = build_fake_anthropic(router.dispatch)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    with pytest.raises(ToolError, match="github git-proxy"):
+        await _fork_agent_impl(
+            _runtime(client, session_factory=db_session_factory, fernet=fernet),
+            auth,
+            source_name="source",
+            new_name="myfork2",
+        )
+
+
+async def test_fork_agent_impl_raises_tool_error_when_fernet_none() -> None:
+    """T-02-09: McpRuntime.fernet is None (no crypto keys configured) must raise
+    a clean ToolError before any partial write, not crash with an AttributeError."""
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    def on_create(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        raise AssertionError("fork must not POST create before the fernet-None guard fires")
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [
+                make_ma_agent(
+                    id="ag_src",
+                    name="source",
+                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": "source"},
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200, json=make_ma_agent(id="ag_src", name="source").model_dump(mode="json")
+        ),
+    )
+    router.add("POST", r"/v1/agents", on_create)
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    with pytest.raises(ToolError, match="no crypto keys configured"):
+        await _fork_agent_impl(
+            _runtime(client, fernet=None),
+            auth,
+            source_name="source",
+            new_name="myfork3",
+        )
 
 
 async def test_update_agent_impl_passes_skills_to_ma_when_provided() -> None:
