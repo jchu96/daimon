@@ -17,9 +17,8 @@ import pytest
 import yarl
 from daimon.adapters.slack.routines_panel.submit import run_routines_delete_submission
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core._models import Tenant
-from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.stores.routines import create_routine, get_routine
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic, make_fake_ma_handler
 
 _TEAM_ID = "T_DEL_SUB"
@@ -43,9 +42,9 @@ def _build_runtime(db_session_factory: Any) -> SlackRuntime:
 
 
 async def _seed_tenant(db_session_factory: Any, *, team_id: str = _TEAM_ID) -> uuid.UUID:
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=team_id))
+        tenant = await make_tenant(session, platform="slack", workspace_id=team_id)
+        tenant_id = tenant.id
         await session.commit()
     return tenant_id
 

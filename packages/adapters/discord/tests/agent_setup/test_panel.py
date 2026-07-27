@@ -1015,18 +1015,12 @@ async def test_load_repo_binding_reads_persisted_binding(
     """load_repo_binding derives the agent uuid from the roster entry's ma_agent_id
     and returns the binding persisted under that key."""
     from daimon.adapters.discord.agent_setup.panel import load_repo_binding
-    from daimon.core._models import Tenant
-    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.ma_identity import derive_agent_uuid
     from daimon.core.stores.agent_repo_binding import set_binding
+    from daimon.testing.factories import make_tenant
 
     _guild = str(uuid.uuid4())
-    tenant = Tenant(
-        id=derive_tenant_uuid(platform="discord", workspace_id=_guild),
-        platform="discord",
-        external_id=_guild,
-    )
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id=_guild)
 
     ma_agent_id = "agent_017abc"
     agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)

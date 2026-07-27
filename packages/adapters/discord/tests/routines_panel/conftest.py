@@ -7,8 +7,15 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 import pytest
-from daimon.core._models import Routine, Tenant
 from daimon.core.stores.domain import RoutineRow
+from daimon.core.stores.routines import (
+    create_routine,
+    get_routine,
+    record_result,
+    set_last_fired_at,
+)
+from daimon.core.stores.tenants import get_tenant
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import make_stub_anthropic, stub_anthropic  # noqa: F401
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,28 +59,31 @@ def seed_routine(db_session: AsyncSession) -> SeedRoutineFn:
         trigger_message: str = "summarize yesterday's commits",
     ) -> RoutineRow:
         resolved_tenant_id = tenant_id if tenant_id is not None else uuid.uuid4()
-        existing = await db_session.get(Tenant, resolved_tenant_id)
-        if existing is None:
+        if await get_tenant(db_session, resolved_tenant_id) is None:
             ws_id = str(resolved_tenant_id)
-            db_session.add(Tenant(id=resolved_tenant_id, platform="discord", external_id=ws_id))
-            await db_session.flush()
-        orm = Routine(
+            await make_tenant(
+                db_session, platform="discord", workspace_id=ws_id, id=resolved_tenant_id
+            )
+        row = await create_routine(
+            db_session,
             tenant_id=resolved_tenant_id,
             created_by_user_id=created_by_user_id,
             agent_id=agent_id,
             agent_name=agent_name,
             cron_expr=cron_expr,
-            timezone=timezone,
+            timezone_=timezone,
             trigger_message=trigger_message,
             enabled=enabled,
             next_fire_at=next_fire_at,
-            last_fired_at=last_fired_at,
-            last_error=last_error,
-            last_result_tail=last_result_tail,
         )
-        db_session.add(orm)
-        await db_session.flush()
-        await db_session.refresh(orm)
-        return RoutineRow.model_validate(orm)
+        if last_fired_at is not None:
+            await set_last_fired_at(db_session, row.id, last_fired_at=last_fired_at)
+        if last_error is not None or last_result_tail is not None:
+            await record_result(db_session, row.id, tail=last_result_tail, error=last_error)
+        if last_fired_at is not None or last_error is not None or last_result_tail is not None:
+            refreshed = await get_routine(db_session, row.id, tenant_id=resolved_tenant_id)
+            assert refreshed is not None, "seeded routine must still resolve after the update"
+            return refreshed
+        return row
 
     return _seed

@@ -30,16 +30,16 @@ from daimon.adapters.slack.agent_setup.write import (
     mask_tail,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core._models import Account, Tenant
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
-from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault, TenantScopeRef
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.github_credentials import delete_credential_for_principal
 from daimon.core.stores.scoped_config_read import get_scope
-from daimon.testing.factories import make_tenant
+from daimon.core.stores.tenants import get_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
     FakeMemoryStoreState,
     NotHandled,
@@ -63,18 +63,16 @@ _CHANNEL_ID = "C_WRITE_TESTS"
 
 async def _seed_tenant(session: AsyncSession, team_id: str = _TEAM_ID) -> uuid.UUID:
     """Create a Tenant row and return the derived tenant_id."""
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
-    session.add(Tenant(id=tenant_id, platform="slack", external_id=team_id))
-    await session.flush()
-    return tenant_id
+    tenant = await make_tenant(session, platform="slack", workspace_id=team_id)
+    return tenant.id
 
 
 async def _seed_account(session: AsyncSession, tenant_id: uuid.UUID) -> uuid.UUID:
     """Create an Account row and return its id."""
-    account = Account(tenant_id=tenant_id, role="user")
-    session.add(account)
-    await session.flush()
-    return account.id  # type: ignore[return-value]  # SA mapped column UUID
+    tenant_row = await get_tenant(session, tenant_id)
+    assert tenant_row is not None, "_seed_account requires a tenant seeded via _seed_tenant"
+    account = await make_account(session, tenant=tenant_row)
+    return account.id
 
 
 # ---------------------------------------------------------------------------
@@ -298,10 +296,8 @@ async def test_fork_agent_rekeys_source_credential_onto_fork(
 ) -> None:
     """After fork_agent, get_pat(agent_id=fork) resolves the source's token,
     re-keyed under the fork's OWN principal."""
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id="T_FORK_CRED")
-    tenant = Tenant(id=tenant_id, platform="slack", external_id="T_FORK_CRED")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_FORK_CRED")
+    tenant_id = tenant.id
     account_id = await _seed_account(db_session, tenant_id)
 
     source_payload = _agent_dict(
@@ -383,10 +379,8 @@ async def test_fork_agent_raises_when_source_credential_unresolvable(
 ) -> None:
     """fork_agent fails loud when the source's inline-pat binding has no
     resolvable credential (binding row exists, credential row does not)."""
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id="T_FORK_NOCRED")
-    tenant = Tenant(id=tenant_id, platform="slack", external_id="T_FORK_NOCRED")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_FORK_NOCRED")
+    tenant_id = tenant.id
     account_id = await _seed_account(db_session, tenant_id)
 
     source_payload = _agent_dict(
@@ -436,10 +430,8 @@ async def test_fork_agent_copies_anon_binding_without_error_or_credential_write(
 ) -> None:
     """A public/anon: source binding forks with no error and no credential write;
     the fork's binding carries the same repo with ma_secret_ref copied verbatim."""
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id="T_FORK_ANON")
-    tenant = Tenant(id=tenant_id, platform="slack", external_id="T_FORK_ANON")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_FORK_ANON")
+    tenant_id = tenant.id
     account_id = await _seed_account(db_session, tenant_id)
 
     source_payload = _agent_dict(

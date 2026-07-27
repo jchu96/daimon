@@ -24,12 +24,13 @@ from daimon.adapters.slack.agent_setup.read import (
     load_section_data,
     load_tenant_roster,
 )
-from daimon.core._models import Account, Tenant
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
-from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import TenantScopeRef
 from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.scoped_config_write import set_fields
+from daimon.core.stores.tenants import get_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,18 +45,16 @@ _MA_AGENT_ID = f"agent_{'x' * 24}"
 
 async def _seed_tenant(session: AsyncSession, team_id: str = _TEAM_ID) -> uuid.UUID:
     """Create a Tenant row and return the derived tenant_id."""
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
-    session.add(Tenant(id=tenant_id, platform="slack", external_id=team_id))
-    await session.flush()
-    return tenant_id
+    tenant = await make_tenant(session, platform="slack", workspace_id=team_id)
+    return tenant.id
 
 
 async def _seed_account(session: AsyncSession, tenant_id: uuid.UUID) -> uuid.UUID:
     """Create an Account row and return its id."""
-    account = Account(tenant_id=tenant_id, role="user")
-    session.add(account)
-    await session.flush()
-    return account.id  # type: ignore[return-value]  # SA mapped column UUID
+    tenant_row = await get_tenant(session, tenant_id)
+    assert tenant_row is not None, "_seed_account requires a tenant seeded via _seed_tenant"
+    account = await make_account(session, tenant=tenant_row)
+    return account.id
 
 
 def _make_agent_payload(

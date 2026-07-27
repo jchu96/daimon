@@ -22,7 +22,6 @@ from daimon.adapters.discord.agent_setup.write import (
     replace_agent_resources_for_panel,
 )
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core._models import Tenant
 from daimon.core.defaults.report import Action
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
@@ -34,6 +33,7 @@ from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.github_credentials import delete_credential_for_principal
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from pydantic import HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -406,9 +406,9 @@ async def test_fork_agent_rekeys_source_credential_onto_fork(
 ) -> None:
     """After fork_agent, get_pat(agent_id=fork) resolves the source's token,
     re-keyed under the fork's OWN principal."""
-    tenant = Tenant(id=tenant_id, platform="discord", external_id="test-guild-fork-cred")
-    db_session.add(tenant)
-    await db_session.flush()
+    await make_tenant(
+        db_session, platform="discord", workspace_id="test-guild-fork-cred", id=tenant_id
+    )
 
     source_payload = _agent_dict(
         id_="ag_src_cred", name="source", tenant_id=tenant_id, account_id=account_id
@@ -492,9 +492,9 @@ async def test_fork_agent_raises_when_source_credential_unresolvable(
 ) -> None:
     """fork_agent fails loud when the source's inline-pat binding has no
     resolvable credential (binding row exists, credential row does not)."""
-    tenant = Tenant(id=tenant_id, platform="discord", external_id="test-guild-fork-nocred")
-    db_session.add(tenant)
-    await db_session.flush()
+    await make_tenant(
+        db_session, platform="discord", workspace_id="test-guild-fork-nocred", id=tenant_id
+    )
 
     source_payload = _agent_dict(
         id_="ag_src_nocred", name="source", tenant_id=tenant_id, account_id=account_id
@@ -546,9 +546,9 @@ async def test_fork_agent_copies_anon_binding_without_error_or_credential_write(
 ) -> None:
     """A public/anon: source binding forks with no error and no credential write;
     the fork's binding carries the same repo with ma_secret_ref copied verbatim."""
-    tenant = Tenant(id=tenant_id, platform="discord", external_id="test-guild-fork-anon")
-    db_session.add(tenant)
-    await db_session.flush()
+    await make_tenant(
+        db_session, platform="discord", workspace_id="test-guild-fork-anon", id=tenant_id
+    )
 
     source_payload = _agent_dict(
         id_="ag_src_anon", name="source", tenant_id=tenant_id, account_id=account_id
@@ -612,9 +612,9 @@ async def test_fork_agent_copies_repo_binding_with_rewritten_secret_ref(
 ) -> None:
     """Fork's repo binding matches the source's repo_url/default_branch,
     with ma_secret_ref rewritten to the fork's own inline-pat ref."""
-    tenant = Tenant(id=tenant_id, platform="discord", external_id="test-guild-fork-binding")
-    db_session.add(tenant)
-    await db_session.flush()
+    await make_tenant(
+        db_session, platform="discord", workspace_id="test-guild-fork-binding", id=tenant_id
+    )
 
     source_payload = _agent_dict(
         id_="ag_src_bind", name="source", tenant_id=tenant_id, account_id=account_id
@@ -684,9 +684,9 @@ async def test_fork_agent_unbound_source_produces_unbound_fork(
     account_id: uuid.UUID,
 ) -> None:
     """A source with no repo binding forks with no binding and no error."""
-    tenant = Tenant(id=tenant_id, platform="discord", external_id="test-guild-fork-unbound")
-    db_session.add(tenant)
-    await db_session.flush()
+    await make_tenant(
+        db_session, platform="discord", workspace_id="test-guild-fork-unbound", id=tenant_id
+    )
 
     source_payload = _agent_dict(
         id_="ag_src_unbound", name="source", tenant_id=tenant_id, account_id=account_id
@@ -1211,14 +1211,10 @@ async def test_apply_repo_modal_persists_binding(
 
     from daimon.adapters.discord.agent_setup import modals as modals_mod
     from daimon.adapters.discord.agent_setup.modals import RepoAuthModal
-    from daimon.core._models import Tenant
-    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.ma_identity import derive_agent_uuid
     from daimon.core.stores import agent_repo_binding as binding_store
 
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild-write")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild-write")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild-write")
 
     ma_agent_id = "agent_017abc"  # MA returns prefixed strings, not UUIDs (BUG-25-01)
     expected_agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)

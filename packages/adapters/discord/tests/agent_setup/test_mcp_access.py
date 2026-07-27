@@ -28,13 +28,14 @@ from daimon.adapters.discord.agent_setup import mcp_access as mcp_access_mod
 from daimon.adapters.discord.agent_setup.mcp_access import send_connect_via_mcp
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core._models import Account, Tenant
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
+from daimon.core.stores.domain import AccountRow, TenantRow
 from daimon.core.stores.mcp_tokens import get_mcp_token
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -112,21 +113,17 @@ async def _setup_tenant_and_account(
     tenant_id: uuid.UUID,
     account_id: uuid.UUID,
     external_id: str,
-) -> tuple[Tenant, Account]:
+) -> tuple[TenantRow, AccountRow]:
     """Insert a Tenant + Account row pair for tests that call mint_agent_mcp_token.
 
     The mcp_tokens FK account_id → accounts.id requires an Account row to exist.
     We explicitly set the Account.id so it matches the PanelState.account_id
     the handler threads into the mint call.
     """
-    tenant = Tenant(id=tenant_id, platform="discord", external_id=external_id)
-    db_session.add(tenant)
-    await db_session.flush()
-
-    account = Account(id=account_id, tenant_id=tenant_id)
-    db_session.add(account)
-    await db_session.flush()
-
+    tenant = await make_tenant(
+        db_session, platform="discord", workspace_id=external_id, id=tenant_id
+    )
+    account = await make_account(db_session, tenant=tenant, id=account_id)
     return tenant, account
 
 

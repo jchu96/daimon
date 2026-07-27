@@ -27,10 +27,10 @@ from anthropic.types.beta import (
 )
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, resolve_role
 from daimon.adapters.mcp.auth.verifier import DaimonJWTVerifier
-from daimon.core._models import Account, Tenant
 from daimon.core.config import McpSettings
-from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.sessions import create_session
+from daimon.testing.factories import make_account, make_tenant
 from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -226,13 +226,8 @@ def _warm_rebind_handler(
 
 
 async def _seed_tenant_and_account(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild-scope")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild-scope")
-    session.add(tenant)
-    await session.flush()
-    account = Account(tenant_id=tenant.id, role="user")
-    session.add(account)
-    await session.flush()
+    tenant = await make_tenant(session, platform="discord", workspace_id="test-guild-scope")
+    account = await make_account(session, tenant=tenant)
     return tenant.id, account.id
 
 

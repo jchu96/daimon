@@ -16,12 +16,9 @@ import pytest
 from daimon.adapters.slack.routines_panel.read import _PICKER_CAP, load_routines
 from daimon.adapters.slack.routines_panel.state import RoutinesPanelState
 from daimon.adapters.slack.routines_panel.views import build_content_view
-from daimon.core._models import Routine as RoutineOrm  # ORM escape-hatch for seeding
-from daimon.core._models import Tenant
-from daimon.core.ma_identity import derive_tenant_uuid
-from daimon.core.stores.routines import create_routine
+from daimon.core.stores.routines import create_routine, record_result, set_last_fired_at
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic, make_fake_ma_handler
-from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -33,10 +30,8 @@ _TEAM_ID = "T_ROUTINES_PANEL"
 
 async def _seed_tenant(session: AsyncSession, *, workspace_id: str = _TEAM_ID) -> uuid.UUID:
     """Create a slack Tenant row and flush. Returns the tenant UUID."""
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=workspace_id)
-    session.add(Tenant(id=tenant_id, platform="slack", external_id=workspace_id))
-    await session.flush()
-    return tenant_id
+    tenant = await make_tenant(session, platform="slack", workspace_id=workspace_id)
+    return tenant.id
 
 
 async def _set_routine_state(
@@ -46,17 +41,10 @@ async def _set_routine_state(
     last_fired_at: datetime | None,
     last_error: str | None,
 ) -> None:
-    """Directly update last_fired_at and last_error for a routine row.
-
-    Uses the ORM escape-hatch (permitted in tests per guideline:testing) to
-    set fields that core stores don't expose via their public API.
-    """
-    await session.execute(
-        update(RoutineOrm)
-        .where(RoutineOrm.id == routine_id)
-        .values(last_fired_at=last_fired_at, last_error=last_error)
-    )
-    await session.flush()
+    """Set last_fired_at and last_error for a routine row via the routines store."""
+    if last_fired_at is not None:
+        await set_last_fired_at(session, routine_id, last_fired_at=last_fired_at)
+    await record_result(session, routine_id, tail=None, error=last_error)
 
 
 # ---------------------------------------------------------------------------

@@ -203,13 +203,9 @@ async def test_inline_pat_persisted_encrypted(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Inline PAT must be Fernet-encrypted before DB write."""
-    from daimon.core._models import Tenant
-    from daimon.core.ma_identity import derive_tenant_uuid
+    from daimon.testing.factories import make_tenant
 
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild-pat")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild-pat")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild-pat")
     principal = await get_or_create_cli_principal(
         db_session, tenant_id=tenant.id, os_user="test-discord-pat"
     )
@@ -265,18 +261,11 @@ async def test_store_inline_pat_writes_per_agent_overlay(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """store_inline_pat writes credential under agent_id; Agent B cannot resolve it."""
-    from daimon.core._models import Tenant
     from daimon.core.github_credentials import get_pat
-    from daimon.core.ma_identity import derive_tenant_uuid
+    from daimon.testing.factories import make_tenant
 
     _guild = str(uuid.uuid4())
-    tenant = Tenant(
-        id=derive_tenant_uuid(platform="discord", workspace_id=_guild),
-        platform="discord",
-        external_id=_guild,
-    )
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id=_guild)
     principal = await get_or_create_cli_principal(
         db_session, tenant_id=tenant.id, os_user="test-per-agent-pat"
     )

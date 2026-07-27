@@ -17,8 +17,7 @@ from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
-from daimon.core.stores.tenants import get_tenant_liveness
-from sqlalchemy import func, select
+from daimon.core.stores.tenants import get_tenant, get_tenant_liveness
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -68,12 +67,6 @@ async def test_on_guild_remove_soft_archives_without_delete(
     assert tr is not None, "row must still exist after remove (soft-archive, no delete)"
     assert tr.archived_at is not None, "on_guild_remove must stamp archived_at"
 
-    # Rows are still present (no delete).
-    from daimon.core._models import Tenant  # test-only ORM peek
-
-    tenant_count = (
-        await db_session.execute(
-            select(func.count()).select_from(Tenant).where(Tenant.id == derived)
-        )
-    ).scalar_one()
-    assert tenant_count == 1, "Tenant row must NOT be deleted on remove"
+    # Row is still present (no delete).
+    still_present = await get_tenant(db_session, derived)
+    assert still_present is not None, "Tenant row must NOT be deleted on remove"

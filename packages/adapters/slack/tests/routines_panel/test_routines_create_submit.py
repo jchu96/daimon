@@ -24,10 +24,10 @@ from daimon.adapters.slack.routines_panel.submit import (
     run_routines_create_submission,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core._models import Tenant
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.stores.routines import list_routines_for_tenant
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic
 
 _TEAM_ID = "T_RC"
@@ -181,7 +181,7 @@ async def test_run_routines_create_when_dev_allow_all_creates_row_with_creator_u
     Slack-native create surface."""
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=_TEAM_ID))
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
         await session.commit()
 
     runtime = _build_runtime(_agent_handler(str(tenant_id)), db_session_factory)
@@ -229,7 +229,7 @@ async def test_run_routines_create_when_bad_cron_creates_no_row_and_posts_error(
     """A bad cron expression must create no routine row and post an :x: ephemeral."""
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=_TEAM_ID))
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
         await session.commit()
 
     runtime = _build_runtime(_agent_handler(str(tenant_id)), db_session_factory)

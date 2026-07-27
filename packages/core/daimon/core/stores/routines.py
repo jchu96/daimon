@@ -309,6 +309,22 @@ async def record_result(
     await session.flush()
 
 
+async def set_last_fired_at(
+    session: AsyncSession, routine_id: _uuid.UUID, *, last_fired_at: datetime
+) -> None:
+    """Directly set `last_fired_at` on one routine.
+
+    Test/seed support for building a routine that has already fired at a known
+    timestamp — the scheduler's normal path sets this atomically as part of
+    `claim_due_fireable`'s batch claim, which isn't suitable for seeding a
+    single row at an arbitrary instant.
+    """
+    await session.execute(
+        update(Routine).where(Routine.id == routine_id).values(last_fired_at=last_fired_at)
+    )
+    await session.flush()
+
+
 async def claim_due_fireable(
     session: AsyncSession,
     *,

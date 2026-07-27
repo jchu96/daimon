@@ -71,6 +71,7 @@ async def make_tenant(
     *,
     platform: Platform = "discord",
     workspace_id: str | None = None,
+    id: uuid.UUID | None = None,  # noqa: A002 - mirrors the Tenant.id column name
 ) -> TenantRow:
     """Create a Tenant row and flush it into the session.
 
@@ -81,18 +82,26 @@ async def make_tenant(
 
     When workspace_id is None (the default), a random UUID is used so default
     calls never collide with each other.
+
+    `id`, when given, overrides the derived tenant id (tests that need a fixed,
+    pre-known tenant_id — e.g. shared across fixtures in the same module).
     """
     wid = workspace_id if workspace_id is not None else str(uuid.uuid4())
-    tenant_id = derive_tenant_uuid(platform=platform, workspace_id=wid)
+    tenant_id = id if id is not None else derive_tenant_uuid(platform=platform, workspace_id=wid)
     orm = Tenant(id=tenant_id, platform=platform, external_id=wid)
     session.add(orm)
     await session.flush()
     return TenantRow.model_validate(orm)
 
 
-async def make_account(session: AsyncSession, *, tenant: TenantRow | None = None) -> AccountRow:
+async def make_account(
+    session: AsyncSession,
+    *,
+    tenant: TenantRow | None = None,
+    id: uuid.UUID | None = None,  # noqa: A002 - mirrors the Account.id column name
+) -> AccountRow:
     tenant = tenant or await make_tenant(session)
-    orm = Account(tenant_id=tenant.id)
+    orm = Account(id=id, tenant_id=tenant.id) if id is not None else Account(tenant_id=tenant.id)
     session.add(orm)
     await session.flush()
     return AccountRow.model_validate(orm)

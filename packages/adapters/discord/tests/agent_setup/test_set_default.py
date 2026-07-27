@@ -30,9 +30,7 @@ from daimon.adapters.discord.agent_setup.set_default import (
 )
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core._models import Account, Tenant  # noqa: PLC0415  # ORM only for setup
 from daimon.core.errors import StoreError
-from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.scope import (
     ChannelConfigRow,
     ChannelScopeRef,
@@ -43,29 +41,12 @@ from daimon.core.scope import (
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields
+from daimon.testing.factories import make_account, make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-async def _make_tenant(session: AsyncSession) -> Tenant:
-    import uuid as _uuid
-
-    ws_id = str(_uuid.uuid4())
-    _tid = derive_tenant_uuid(platform="discord", workspace_id=ws_id)
-    t = Tenant(id=_tid, platform="discord", external_id=ws_id)
-    session.add(t)
-    await session.flush()
-    return t
-
-
-async def _make_account(session: AsyncSession, tenant: Tenant) -> Account:
-    a = Account(tenant_id=tenant.id)
-    session.add(a)
-    await session.flush()
-    return a
 
 
 def _entry(name: str) -> RosterEntry:
@@ -111,8 +92,8 @@ def _make_state(
 async def test_do_propagate_clean_scope_returns_no_prior_and_stamps_audit(
     db_session: AsyncSession,
 ) -> None:
-    tenant = await _make_tenant(db_session)
-    actor = await _make_account(db_session, tenant)
+    tenant = await make_tenant(db_session)
+    actor = await make_account(db_session, tenant=tenant)
     scope = ChannelScopeRef(tenant_id=tenant.id, channel_id="c1")
     result = await do_propagate(
         db_session,
@@ -138,9 +119,9 @@ async def test_do_propagate_overwrite_returns_prior_values(
     db_session: AsyncSession,
 ) -> None:
     """Overwrite returns prior agent name for cascade naming."""
-    tenant = await _make_tenant(db_session)
-    actor_a = await _make_account(db_session, tenant)
-    actor_b = await _make_account(db_session, tenant)
+    tenant = await make_tenant(db_session)
+    actor_a = await make_account(db_session, tenant=tenant)
+    actor_b = await make_account(db_session, tenant=tenant)
     scope = TenantScopeRef(tenant_id=tenant.id)
     await do_propagate(
         db_session,
@@ -176,8 +157,8 @@ async def test_do_unpropagate_deletes_row_when_only_agent_name_was_set(
     db_session: AsyncSession,
 ) -> None:
     """Clearing agent_name auto-deletes fully-NULL row."""
-    tenant = await _make_tenant(db_session)
-    actor = await _make_account(db_session, tenant)
+    tenant = await make_tenant(db_session)
+    actor = await make_account(db_session, tenant=tenant)
     scope = TenantScopeRef(tenant_id=tenant.id)
     await do_propagate(
         db_session,
@@ -196,8 +177,8 @@ async def test_do_unpropagate_preserves_row_when_environment_name_still_set(
     db_session: AsyncSession,
 ) -> None:
     """Clearing agent_name preserves the row when environment_name is set."""
-    tenant = await _make_tenant(db_session)
-    actor = await _make_account(db_session, tenant)
+    tenant = await make_tenant(db_session)
+    actor = await make_account(db_session, tenant=tenant)
     scope = TenantScopeRef(tenant_id=tenant.id)
     # set both fields explicitly via set_fields, then unpropagate only agent_name
     await set_fields(
@@ -220,10 +201,10 @@ async def test_list_guild_propagations_filters_by_tenant_id(
     db_session: AsyncSession,
 ) -> None:
     """list_guild_propagations must isolate by tenant_id."""
-    tenant_a = await _make_tenant(db_session)
-    tenant_b = await _make_tenant(db_session)
-    actor_a = await _make_account(db_session, tenant_a)
-    actor_b = await _make_account(db_session, tenant_b)
+    tenant_a = await make_tenant(db_session)
+    tenant_b = await make_tenant(db_session)
+    actor_a = await make_account(db_session, tenant=tenant_a)
+    actor_b = await make_account(db_session, tenant=tenant_b)
     # tenant_a: tenant-level + 2 channels
     await do_propagate(
         db_session,
@@ -267,8 +248,8 @@ async def test_list_guild_propagations_filters_by_tenant_id(
 @pytest.mark.asyncio
 async def test_do_propagate_requires_agent_name(db_session: AsyncSession) -> None:
     """do_propagate must raise StoreError on falsy agent_name (mode='agent' is implicit)."""
-    tenant = await _make_tenant(db_session)
-    actor = await _make_account(db_session, tenant)
+    tenant = await make_tenant(db_session)
+    actor = await make_account(db_session, tenant=tenant)
     scope = ChannelScopeRef(tenant_id=tenant.id, channel_id="c1")
     with pytest.raises(StoreError, match="agent_name"):
         await do_propagate(
@@ -369,8 +350,8 @@ async def test_whole_server_writes_tenant_config(
     from daimon.core.scope import TenantScopeRef  # noqa: PLC0415
     from daimon.core.stores.scoped_config_read import get_scope  # noqa: PLC0415
 
-    t = await _make_tenant(db_session)
-    actor = await _make_account(db_session, t)
+    t = await make_tenant(db_session)
+    actor = await make_account(db_session, tenant=t)
 
     scope = TenantScopeRef(tenant_id=t.id)
     await do_propagate(

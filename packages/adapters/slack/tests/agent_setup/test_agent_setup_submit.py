@@ -567,14 +567,13 @@ async def test_run_paste_secrets_submission_when_admin_and_two_pairs_posts_count
     """
     from cryptography.fernet import Fernet
     from daimon.adapters.slack.runtime import SlackRuntime
-    from daimon.core._models import Tenant
-    from daimon.core.ma_identity import derive_tenant_uuid
+    from daimon.testing.factories import make_tenant
 
     # We need a Tenant row so put_agent_file's FK resolves. Seed it via a
     # one-shot session from the factory (per-test schema isolation is active).
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=_TEAM_ID))
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        tenant_id = tenant.id
         await session.commit()
 
     client_fake: Any = fake_slack_web_client
@@ -743,16 +742,16 @@ async def test_run_edit_repo_submission_when_pat_replace_false_preserves_inline_
     repo_url must reflect the new URL.
     """
     from daimon.adapters.slack.runtime import SlackRuntime
-    from daimon.core._models import Tenant
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding, set_binding
+    from daimon.testing.factories import make_tenant
 
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
     ma_agent_id = f"agent_{'c' * 24}"
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
 
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=_TEAM_ID))
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
         await session.commit()
 
     async with db_session_factory() as session:
@@ -825,16 +824,16 @@ async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_
     """pat_replace=True + a typed PAT still replaces (existing behavior preserved)."""
     from cryptography.fernet import Fernet
     from daimon.adapters.slack.runtime import SlackRuntime
-    from daimon.core._models import Tenant
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding
+    from daimon.testing.factories import make_tenant
 
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
     ma_agent_id = f"agent_{'d' * 24}"
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
 
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=_TEAM_ID))
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
         await session.commit()
 
     client_fake: Any = fake_slack_web_client
@@ -913,16 +912,16 @@ async def test_run_edit_repo_submission_no_pat_binds_anon(
     tracked follow-up.
     """
     from daimon.adapters.slack.runtime import SlackRuntime
-    from daimon.core._models import Tenant
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding
+    from daimon.testing.factories import make_tenant
 
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
     ma_agent_id = f"agent_{'e' * 24}"
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
 
     async with db_session_factory() as session:
-        session.add(Tenant(id=tenant_id, platform="slack", external_id=_TEAM_ID))
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
         await session.commit()
 
     client_fake: Any = fake_slack_web_client

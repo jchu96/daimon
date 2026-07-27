@@ -10,6 +10,7 @@ Per `guideline:architecture`: this module does NOT swallow exceptions.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any, cast
 
@@ -70,6 +71,15 @@ async def get_clawed_back_total(session: AsyncSession, *, payment_intent: str) -
         TenantLedger.delta_usd < Decimal("0"),
     )
     return (await session.execute(stmt)).scalar_one()  # type: ignore[no-any-return]
+
+
+async def list_for_tenant(
+    session: AsyncSession, *, tenant_id: uuid.UUID
+) -> Sequence[TenantLedgerRow]:
+    """List every ledger row for a tenant (e.g. test assertions on individual entries)."""
+    stmt = select(TenantLedger).where(TenantLedger.tenant_id == tenant_id)
+    result = await session.execute(stmt)
+    return [TenantLedgerRow.model_validate(r, from_attributes=True) for r in result.scalars().all()]
 
 
 async def get_by_payment_intent(

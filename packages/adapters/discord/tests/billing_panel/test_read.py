@@ -26,6 +26,8 @@ from daimon.adapters.discord.billing_panel.read import (
 )
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.stores import tenant_ledger, usage_events
+from daimon.core.stores.tenants import get_tenant
+from daimon.testing.factories import make_tenant, make_usage_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -161,18 +163,12 @@ async def _record_usage(
     guild_id: str = "guild_1",
     input_tokens: int = 1_000_000,
 ) -> None:
-    from daimon.core._models import Tenant
-
     tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
-    # Ensure the tenant row exists (FK requirement); idempotent across calls.
-    from sqlalchemy.dialects.postgresql import insert as pg_insert_tenant
-
-    await session.execute(
-        pg_insert_tenant(Tenant)
-        .values(id=tenant_id, platform="discord", external_id=guild_id)
-        .on_conflict_do_nothing(index_elements=["id"])
-    )
-    await session.flush()
+    # Ensure the tenant row exists (FK requirement); idempotent across calls
+    # (check-then-create — this helper is called multiple times per test with
+    # the same default guild_id).
+    if await get_tenant(session, tenant_id) is None:
+        await make_tenant(session, platform="discord", workspace_id=guild_id)
     await usage_events.record(
         session,
         tenant_id=tenant_id,
@@ -299,27 +295,24 @@ async def test_load_billing_snapshot_excludes_null_user_rows_from_guild_total(
     db_session: AsyncSession,
 ) -> None:
     """Rows with platform_user_id IS NULL must not appear in guild distinct count."""
-    from daimon.core._models import UsageEvent
-
     since = datetime.now(UTC) - timedelta(days=1)
     caller = "100000000000000001"
     await _record_usage(db_session, user_id=caller, session_id="s_a", event_id="e_a")
-    # Insert a NULL-attributed row directly via the ORM.
-    db_session.add(
-        UsageEvent(
-            tenant_id=derive_tenant_uuid(platform="discord", workspace_id="guild_1"),
-            platform_user_id=None,
-            managed_session_id="s_null",
-            model="claude-opus-4-7",
-            input_tokens=5_000_000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-            occurred_at=datetime.now(UTC),
-            event_id="e_null",
-        )
+    # Insert a NULL-attributed row via the make_usage_event factory (supports
+    # platform_user_id=None for exactly this edge case).
+    tenant_row = await get_tenant(
+        db_session, derive_tenant_uuid(platform="discord", workspace_id="guild_1")
     )
-    await db_session.flush()
+    assert tenant_row is not None, "_record_usage above must have provisioned the guild_1 tenant"
+    await make_usage_event(
+        db_session,
+        tenant=tenant_row,
+        platform_user_id=None,
+        managed_session_id="s_null",
+        model="claude-opus-4-7",
+        input_tokens=5_000_000,
+        event_id="e_null",
+    )
     guild = _make_guild_with_members({})
 
     state = await load_billing_snapshot(
@@ -366,12 +359,8 @@ async def _seed_tenant_for_guild(session: AsyncSession, guild_id: str) -> uuid.U
     The tenant_ledger FK requires the tenant to exist. load_billing_snapshot
     derives tenant_id via derive_tenant_uuid — no workspaces table lookup is needed.
     """
-    from daimon.core._models import Tenant
-
-    tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
-    session.add(Tenant(id=tenant_id, platform="discord", external_id=guild_id))
-    await session.flush()
-    return tenant_id
+    tenant = await make_tenant(session, platform="discord", workspace_id=guild_id)
+    return tenant.id
 
 
 async def test_load_billing_snapshot_uses_derived_tenant_id(
@@ -383,13 +372,9 @@ async def test_load_billing_snapshot_uses_derived_tenant_id(
     there is no workspaces-table lookup. Ledger credits posted against that derived UUID
     must appear in the snapshot.
     """
-    from daimon.core._models import Tenant
-
     guild_id = f"gbal_derived_{uuid.uuid4().hex[:8]}"
-    derived_tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
-
-    db_session.add(Tenant(id=derived_tenant_id, platform="discord", external_id=guild_id))
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id=guild_id)
+    derived_tenant_id = tenant.id
     await tenant_ledger.insert_entry(
         db_session,
         tenant_id=derived_tenant_id,

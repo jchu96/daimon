@@ -76,6 +76,19 @@ async def _select_rows(
     return [UsageEventRow.model_validate(r, from_attributes=True) for r in result.scalars().all()]
 
 
+async def list_for_tenant(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    platform_user_id: str | None = None,
+    since: datetime | None = None,
+) -> Sequence[UsageEventRow]:
+    """Public row-list read (e.g. test assertions on individual event fields)."""
+    return await _select_rows(
+        session, tenant_id=tenant_id, platform_user_id=platform_user_id, since=since
+    )
+
+
 def _sum_cost(rows: Sequence[UsageEventRow]) -> float:
     """Reprice each row at query time against current MODEL_PRICING."""
     total = 0.0

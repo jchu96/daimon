@@ -33,13 +33,12 @@ from daimon.adapters.slack.agent_setup.actions import (
     handle_agent_setup_command,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core._models import Tenant
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.github_credentials import build_multifernet, encrypt_token
-from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.scope import ChannelConfigRow, ChannelScopeRef, TenantScopeRef
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     build_fake_anthropic,
     make_fake_ma_handler,
@@ -115,9 +114,8 @@ async def _seed_team(
     fernet = build_multifernet((fernet_key,))
     encrypted = encrypt_token(fernet, "xoxb-test")
 
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
-    session.add(Tenant(id=tenant_id, platform="slack", external_id=team_id))
-    await session.flush()
+    tenant = await make_tenant(session, platform="slack", workspace_id=team_id)
+    tenant_id = tenant.id
     await upsert_slack_bot_token(session, team_id=team_id, encrypted_token=encrypted)
     await session.flush()
     return tenant_id, fernet_key, encrypted

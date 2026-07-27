@@ -36,13 +36,14 @@ from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAg
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.app import SlackApp
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core._models import Tenant
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
+from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token, upsert_slack_bot_token
+from daimon.core.stores.tenants import get_tenant
 from daimon.core.stores.thread_sessions import create_thread_session, get_live_thread_session
 from daimon.core.turn.state import TextBlock, TurnState
 from daimon.testing.ma import (
@@ -55,7 +56,6 @@ from daimon.testing.ma import build_fake_anthropic
 from pydantic import SecretStr
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from yarl import URL
 
@@ -259,10 +259,8 @@ async def test_handle_teardown_when_app_uninstalled_archives_tenant_and_deletes_
 
     # Tenant must be soft-archived.
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
-    tenant_row = (
-        await db_session.execute(select(Tenant).where(Tenant.id == tenant_id))
-    ).scalar_one()
-    assert tenant_row.archived_at is not None, (
+    tenant_row = await get_tenant(db_session, tenant_id)
+    assert tenant_row is not None and tenant_row.archived_at is not None, (
         "_handle_teardown must archive the tenant via teardown_slack_install"
     )
 
@@ -1445,8 +1443,6 @@ async def test_run_thread_turn_when_over_balance_blocks_before_session_create(
     D-10 balance copy in-thread (chat.postMessage, not ephemeral), and writes
     no usage_events row.
     """
-    from daimon.core._models import UsageEvent
-
     team_id = "T_ORCH_OVER_BALANCE"
     channel = "C_TEST"
     thread_ts = "9000000020.000001"
@@ -1515,7 +1511,7 @@ async def test_run_thread_turn_when_over_balance_blocks_before_session_create(
         f"expected the exact D-10 over-balance copy via chat.postMessage, got: {post_bodies}"
     )
 
-    rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert rows == [], "over-balance turn must write zero usage_events rows"
 
 
@@ -1527,8 +1523,6 @@ async def test_run_thread_turn_when_over_cap_blocks_before_session_create(
     """Over-cap tenant/user: gate blocks BEFORE create_session, posts the exact
     D-10 cap copy in-thread, and writes no usage_events row.
     """
-    from daimon.core._models import UsageEvent
-
     team_id = "T_ORCH_OVER_CAP"
     channel = "C_TEST"
     thread_ts = "9000000021.000001"
@@ -1604,7 +1598,7 @@ async def test_run_thread_turn_when_over_cap_blocks_before_session_create(
         f"expected the exact D-10 over-cap copy via chat.postMessage, got: {post_bodies}"
     )
 
-    rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert rows == [], "over-cap turn must write zero usage_events rows"
 
 
@@ -1623,7 +1617,6 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
     from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
         BetaManagedAgentsSpanModelUsage,
     )
-    from daimon.core._models import TenantLedger, UsageEvent
 
     team_id = "T_ORCH_USAGE_BILLED"
     channel = "C_TEST"
@@ -1727,13 +1720,13 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
         usage_record = call_kwargs["usage_record"]
         assert usage_record is not None, "usage_record must be wired into run_turn"
 
-    usage_rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(usage_rows) == 1, "unblocked turn must write exactly one usage_events row"
     assert usage_rows[0].event_id == "evt_slack_usage_1"
     assert usage_rows[0].managed_session_id == "sess-usage-billed"
     assert usage_rows[0].model == "claude-sonnet-4-6"
 
-    ledger_rows = (await db_session.execute(select(TenantLedger))).scalars().all()
+    ledger_rows = await tenant_ledger.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(ledger_rows) == 1, "unblocked turn must write exactly one tenant_ledger debit"
     assert ledger_rows[0].delta_usd < 0, "the ledger row must be a debit (negative delta_usd)"
 
@@ -1753,7 +1746,6 @@ async def test_run_thread_turn_reused_session_over_balance_blocks_and_skips_run_
     """A follow-up turn on an already-live thread is blocked by the
     over-balance gate before run_turn, and writes no usage_events row.
     """
-    from daimon.core._models import UsageEvent
     from daimon.core.stores.identity import get_or_create_platform_principal
 
     team_id = "T_ORCH_REUSED_OVER_BALANCE"
@@ -1838,7 +1830,7 @@ async def test_run_thread_turn_reused_session_over_balance_blocks_and_skips_run_
         f"expected the exact over-balance copy via chat.postMessage, got: {post_bodies}"
     )
 
-    rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert rows == [], "blocked reused-session turn must write zero usage_events rows"
 
 
@@ -1850,7 +1842,6 @@ async def test_run_thread_turn_reused_session_over_cap_blocks_and_skips_run_turn
     """A follow-up turn on an already-live thread is blocked by the
     over-cap gate before run_turn, and writes no usage_events row.
     """
-    from daimon.core._models import UsageEvent
     from daimon.core.stores.identity import get_or_create_platform_principal
 
     team_id = "T_ORCH_REUSED_OVER_CAP"
@@ -1941,7 +1932,7 @@ async def test_run_thread_turn_reused_session_over_cap_blocks_and_skips_run_turn
     ]
     assert cap_msgs, f"expected the exact over-cap copy via chat.postMessage, got: {post_bodies}"
 
-    rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert rows == [], "blocked reused-session turn must write zero usage_events rows"
 
 
@@ -1960,7 +1951,6 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
     from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
         BetaManagedAgentsSpanModelUsage,
     )
-    from daimon.core._models import TenantLedger, UsageEvent
     from daimon.core.stores.identity import get_or_create_platform_principal
 
     team_id = "T_ORCH_REUSED_USAGE_BILLED"
@@ -2052,14 +2042,14 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
         mock_run_turn.assert_called_once()
         mock_create.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
 
-    usage_rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(usage_rows) == 1, "unblocked reused-session turn must write exactly one usage row"
     assert usage_rows[0].managed_session_id == seeded_session_id, (
         "usage row must be keyed to the pre-seeded (reused) session id"
     )
     assert usage_rows[0].model == "claude-sonnet-4-6"
 
-    ledger_rows = (await db_session.execute(select(TenantLedger))).scalars().all()
+    ledger_rows = await tenant_ledger.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(ledger_rows) == 1, "unblocked reused-session turn must write one tenant_ledger debit"
     assert ledger_rows[0].delta_usd < 0, "the ledger row must be a debit (negative delta_usd)"
 

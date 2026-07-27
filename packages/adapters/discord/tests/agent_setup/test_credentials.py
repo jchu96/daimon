@@ -24,13 +24,13 @@ from daimon.adapters.discord.agent_setup.credentials import (
 from daimon.adapters.discord.agent_setup.edit_view import EditView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core._models import Tenant
-from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_files import get_agent_file, list_agent_files, put_agent_file
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -294,10 +294,8 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
     db_session_factory: async_sessionmaker[AsyncSession],
     account_id: uuid.UUID,
 ) -> None:
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+    _tid = tenant.id
     agent_id = uuid.uuid4()
 
     runtime = DiscordRuntime(
@@ -356,10 +354,8 @@ async def test_paste_modal_rejects_invalid_key_and_writes_nothing(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+    _tid = tenant.id
     agent_id = uuid.uuid4()
 
     runtime = DiscordRuntime(
@@ -398,10 +394,8 @@ async def test_remove_deletes_the_key_and_rerenders(
     db_session_factory: async_sessionmaker[AsyncSession],
     account_id: uuid.UUID,
 ) -> None:
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+    _tid = tenant.id
     agent_id = uuid.uuid4()
     async with db_session_factory() as s, s.begin():
         await put_agent_file(
@@ -502,10 +496,8 @@ async def test_editview_secrets_button_opens_subview(
     account_id: uuid.UUID,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _tid = derive_tenant_uuid(platform="discord", workspace_id="test-guild")
-    tenant = Tenant(id=_tid, platform="discord", external_id="test-guild")
-    db_session.add(tenant)
-    await db_session.flush()
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+    _tid = tenant.id
 
     ma_agent_id = "agent_017abc"
     agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)

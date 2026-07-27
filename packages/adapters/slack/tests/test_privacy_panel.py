@@ -20,11 +20,10 @@ from daimon.adapters.slack.privacy_panel.views import (
     build_privacy_main_container,
     summary_line,
 )
-from daimon.core._models import PlatformPrincipal
 from daimon.core.privacy import PurgePreview, PurgePreviewRow
 from daimon.core.stores import routines as routines_store
+from daimon.core.stores.identity import find_platform_principal
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _POLICY_URL = "https://github.com/pymc-labs/daimon/blob/main/PRIVACY.md"
@@ -68,11 +67,12 @@ async def test_resolve_privacy_account_returns_none_and_creates_no_principal_on_
     tenant = await make_tenant(db_session, platform="slack", workspace_id="T_PRIV_R02")
     await db_session.commit()
 
-    count_before = (
-        await db_session.execute(
-            select(func.count()).select_from(PlatformPrincipal)  # type: ignore[arg-type]
+    async def _lookup() -> object | None:
+        return await find_platform_principal(
+            db_session, tenant_id=tenant.id, platform="slack", external_id="U_UNKNOWN_PRIV"
         )
-    ).scalar_one()
+
+    principal_before = await _lookup()
 
     async with db_session_factory() as s:
         result = await resolve_privacy_account(
@@ -83,12 +83,8 @@ async def test_resolve_privacy_account_returns_none_and_creates_no_principal_on_
 
     assert result is None, "resolve_privacy_account should return None for an unknown user"
 
-    count_after = (
-        await db_session.execute(
-            select(func.count()).select_from(PlatformPrincipal)  # type: ignore[arg-type]
-        )
-    ).scalar_one()
-    assert count_after == count_before, (
+    principal_after = await _lookup()
+    assert principal_after is None and principal_before is None, (
         "resolve_privacy_account must NOT create a new principal row on miss"
     )
 

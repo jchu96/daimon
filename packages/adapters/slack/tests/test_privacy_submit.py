@@ -23,11 +23,11 @@ from daimon.adapters.slack.privacy_panel.submit import (
     run_purge_and_update,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core._models import Account, PlatformPrincipal
+from daimon.core.stores.accounts import get_account
+from daimon.core.stores.identity import find_platform_principal
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from pydantic import SecretStr
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -114,19 +114,13 @@ async def test_evaluate_delete_submission_mismatch_returns_errors_and_proceed_fa
     )
 
     # Verify DB rows are intact — evaluate_delete_submission is pure, so no purge.
-    pp_count = (
-        await db_session.execute(
-            select(func.count()).select_from(PlatformPrincipal)  # type: ignore[arg-type]
-        )
-    ).scalar_one()
-    assert pp_count > 0, "platform principal must still exist after a mismatch (no purge)"
+    principal = await find_platform_principal(
+        db_session, tenant_id=tenant.id, platform="slack", external_id="U_SUB_01"
+    )
+    assert principal is not None, "platform principal must still exist after a mismatch (no purge)"
 
-    account_count = (
-        await db_session.execute(
-            select(func.count()).select_from(Account)  # type: ignore[arg-type]
-        )
-    ).scalar_one()
-    assert account_count > 0, "account row must still exist after a mismatch (no purge)"
+    account_row = await get_account(db_session, account.id)
+    assert account_row is not None, "account row must still exist after a mismatch (no purge)"
 
 
 async def test_evaluate_delete_submission_match_returns_update_and_proceed_true() -> None:
@@ -222,19 +216,13 @@ async def test_run_purge_and_update_deletes_account_rows_and_calls_views_update(
     )
 
     # DB: platform principal and account should be gone after purge.
-    pp_count = (
-        await db_session.execute(
-            select(func.count()).select_from(PlatformPrincipal)  # type: ignore[arg-type]
-        )
-    ).scalar_one()
-    assert pp_count == 0, "run_purge_and_update must delete the platform principal row"
+    principal = await find_platform_principal(
+        db_session, tenant_id=tenant.id, platform="slack", external_id="U_SUB_02"
+    )
+    assert principal is None, "run_purge_and_update must delete the platform principal row"
 
-    account_count = (
-        await db_session.execute(
-            select(func.count()).select_from(Account)  # type: ignore[arg-type]
-        )
-    ).scalar_one()
-    assert account_count == 0, "run_purge_and_update must delete the account row"
+    account_row = await get_account(db_session, account.id)
+    assert account_row is None, "run_purge_and_update must delete the account row"
 
     # views.update must have been called (post-delete status view).
     views_update_key = ("POST", yarl.URL("https://slack.com/api/views.update"))
@@ -283,12 +271,8 @@ async def test_run_purge_and_update_aborts_when_account_does_not_match_submitter
         view_id="V_SUB_03_ABORT",
     )
 
-    account_count = (
-        await db_session.execute(
-            select(func.count()).select_from(Account)  # type: ignore[arg-type]
-        )
-    ).scalar_one()
-    assert account_count == 1, (
+    account_row = await get_account(db_session, account.id)
+    assert account_row is not None, (
         "purge must be refused when the metadata account_id does not match the "
         "account resolved from the authenticated submitter"
     )
