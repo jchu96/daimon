@@ -607,7 +607,7 @@ async def _fork_agent_impl(
         cast("list[Tool] | None", fork_params.get("tools"))
     )
 
-    # Narrow the cached fernet BEFORE any partial write (T-02-09) — the create
+    # Narrow the cached fernet BEFORE any partial write — the create
     # below is the first write, so this must gate ahead of it.
     fernet = runtime.fernet
     if fernet is None:

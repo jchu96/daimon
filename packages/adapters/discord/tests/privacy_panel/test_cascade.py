@@ -278,7 +278,7 @@ def test_cascade_container_agent_github_binding_row_absent_when_zero() -> None:
 
 
 def test_cascade_container_slack_user_tokens_row_renders_when_nonzero() -> None:
-    """slack_user_tokens row appears when count > 0 (PAR-05 Discord parity gap)."""
+    """slack_user_tokens row appears when count > 0."""
     preview = _make_preview(slack_user_tokens=PurgePreviewRow(count=1, example=None))
     joined = _joined_text(build_cascade_preview_container(preview))
     assert "1" in joined, "slack_user_tokens count must appear in the row"
@@ -293,7 +293,7 @@ def test_cascade_container_slack_user_tokens_row_absent_when_zero() -> None:
 
 
 def test_cascade_container_slack_turn_contexts_row_renders_when_nonzero() -> None:
-    """slack_turn_contexts row appears when count > 0 (PAR-05 Discord parity gap)."""
+    """slack_turn_contexts row appears when count > 0."""
     preview = _make_preview(slack_turn_contexts=PurgePreviewRow(count=4, example=None))
     joined = _joined_text(build_cascade_preview_container(preview))
     assert "4" in joined, "slack_turn_contexts count must appear in the row"

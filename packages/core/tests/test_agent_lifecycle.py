@@ -3,7 +3,7 @@
 Ports the 5 fork-copy scenarios and 2 archive scenarios from Discord's
 `_copy_credential_and_repo_binding` / delete_agent inline archival block
 (agent_setup/write.py) that this module extracts from. These tests are the
-regression proof the whole phase's extraction (D-05..D-08) leans on.
+regression proof the whole phase's extraction leans on.
 """
 
 from __future__ import annotations

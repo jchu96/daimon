@@ -1334,7 +1334,7 @@ async def test_fork_agent_impl_rekeys_source_credential_onto_fork(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """After _fork_agent_impl, get_pat(agent_id=fork) resolves the source's token,
-    re-keyed under the fork's OWN principal (D-07 fork-copy gap closure)."""
+    re-keyed under the fork's OWN principal."""
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
     db_session.add(Tenant(id=tenant_id, platform="discord", external_id=str(tenant_id)))
@@ -1396,7 +1396,7 @@ async def test_fork_agent_impl_raises_tool_error_on_undecryptable_source_credent
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """D-08: an undecryptable inline-pat source binding must fail loud as a
+    """An undecryptable inline-pat source binding must fail loud as a
     ToolError (the core DaimonError converted at the MCP call site)."""
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
@@ -1436,7 +1436,7 @@ async def test_fork_agent_impl_raises_tool_error_on_undecryptable_source_credent
 
 
 async def test_fork_agent_impl_raises_tool_error_when_fernet_none() -> None:
-    """T-02-09: McpRuntime.fernet is None (no crypto keys configured) must raise
+    """McpRuntime.fernet is None (no crypto keys configured) must raise
     a clean ToolError before any partial write, not crash with an AttributeError."""
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()

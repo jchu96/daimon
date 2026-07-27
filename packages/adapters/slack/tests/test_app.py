@@ -1422,7 +1422,7 @@ async def test_orchestrate_first_turn_when_no_agent_configured_posts_guidance_an
 
 
 # ---------------------------------------------------------------------------
-# Billing admission gates + usage_record wiring (PAR-01 / PAR-02, plan 02-01)
+# Billing admission gates + usage_record wiring
 # ---------------------------------------------------------------------------
 
 

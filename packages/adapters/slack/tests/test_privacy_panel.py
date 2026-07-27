@@ -317,7 +317,7 @@ def _make_preview(**overrides: Any) -> PurgePreview:
 
 
 def test_summary_line_includes_mcp_tokens_agent_github_binding_slack_categories() -> None:
-    """summary_line reflects all 4 newly-added categories when non-zero (PAR-05)."""
+    """summary_line reflects all 4 newly-added categories when non-zero."""
     preview = _make_preview(
         mcp_tokens=PurgePreviewRow(count=2, example=None),
         agent_github_binding=PurgePreviewRow(count=1, example=None),
@@ -332,7 +332,7 @@ def test_summary_line_includes_mcp_tokens_agent_github_binding_slack_categories(
 
 
 def test_cascade_blocks_render_mcp_tokens_row_when_nonzero() -> None:
-    """mcp_tokens row appears in the cascade preview when count > 0 (PAR-05)."""
+    """mcp_tokens row appears in the cascade preview when count > 0."""
     preview = _make_preview(mcp_tokens=PurgePreviewRow(count=3, example=None))
     view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V1")
     joined = _extract_text(view)
@@ -341,7 +341,7 @@ def test_cascade_blocks_render_mcp_tokens_row_when_nonzero() -> None:
 
 
 def test_cascade_blocks_render_agent_github_binding_row_when_nonzero() -> None:
-    """agent_github_binding row appears in the cascade preview when count > 0 (PAR-05)."""
+    """agent_github_binding row appears in the cascade preview when count > 0."""
     preview = _make_preview(agent_github_binding=PurgePreviewRow(count=2, example=None))
     view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V2")
     joined = _extract_text(view)
@@ -352,7 +352,7 @@ def test_cascade_blocks_render_agent_github_binding_row_when_nonzero() -> None:
 
 
 def test_cascade_blocks_render_slack_user_tokens_row_when_nonzero() -> None:
-    """slack_user_tokens row appears in the cascade preview when count > 0 (PAR-05)."""
+    """slack_user_tokens row appears in the cascade preview when count > 0."""
     preview = _make_preview(slack_user_tokens=PurgePreviewRow(count=1, example=None))
     view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V3")
     joined = _extract_text(view)
@@ -361,7 +361,7 @@ def test_cascade_blocks_render_slack_user_tokens_row_when_nonzero() -> None:
 
 
 def test_cascade_blocks_render_slack_turn_contexts_row_when_nonzero() -> None:
-    """slack_turn_contexts row appears in the cascade preview when count > 0 (PAR-05)."""
+    """slack_turn_contexts row appears in the cascade preview when count > 0."""
     preview = _make_preview(slack_turn_contexts=PurgePreviewRow(count=5, example=None))
     view = build_delete_modal(preview, account_id=uuid.uuid4(), user_name="alice", view_id="V4")
     joined = _extract_text(view)
