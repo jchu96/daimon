@@ -711,7 +711,9 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
     prior_watermark = "9000000002.000002"
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
 
-    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
     # Pre-create the principal so account_id is known for both the seed row and the verify query.
     # _orchestrate uses external_id=str(event["user"]) = "U_TEST_CONT".
     async with db_session_factory() as s:
@@ -755,11 +757,19 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
         patch(
             "daimon.adapters.slack.app.build_delta_xml", new_callable=AsyncMock
         ) as mock_build_delta,
+        patch(
+            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
     ):
         mock_run_turn.side_effect = _fake_run_turn
         mock_build_delta.return_value = (
             "<context><thread_delta/></context>\n\n<user_query>follow-up</user_query>"
         )
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
 
         await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
             event,

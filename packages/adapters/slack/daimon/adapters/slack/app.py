@@ -863,9 +863,8 @@ class SlackApp:
             )
             # Drain loop: new events may arrive during the drain turn; they land
             # in _pending and are picked up by the next iteration. Each drained
-            # turn independently re-hits _run_thread_turn's admission gates
-            # (over-balance / over-cap) — intentional, matches Discord's
-            # per-turn gating model.
+            # turn independently re-enters _run_thread_turn, which admission-gates
+            # and bills every turn — new session or reused.
             while queued := self._pending.pop(thread_id, []):
                 composite = _compose_queued_content(queued)
                 representative = queued[0]
@@ -927,6 +926,154 @@ class SlackApp:
             )
             await s.commit()
 
+        # --- Config resolution (mirror bot.py:776-815): channel → tenant →
+        # deployment cascade, so /agent-setup propagations take effect here.
+        # Runs on EVERY turn (new session or reused) so admission gates and
+        # usage_record below always have a resolved agent/model to bind against.
+        async with self.runtime.sessionmaker() as s:
+            config = await resolve_config(
+                s,
+                context=ScopeContext(
+                    tenant_id=tenant_id,
+                    channel_id=channel,
+                    account_id=principal.account_id,
+                ),
+                default=self.runtime.deployment_default,
+            )
+        agent_tag = config.agent_name
+        environment_tag = config.environment_name
+        if agent_tag is None or environment_tag is None:
+            missing = [
+                name
+                for name, value in (("agent", agent_tag), ("environment", environment_tag))
+                if value is None
+            ]
+            log.info(
+                "slack.missing_config",
+                team_id=team_id,
+                channel_id=channel,
+                missing=missing,
+            )
+            hints: list[str] = []
+            if agent_tag is None:
+                hints.append(
+                    "An admin can set the default agent in `/agent-setup` → "
+                    "*Set as default…* → [This channel] or [Whole workspace]."
+                )
+            if environment_tag is None:
+                hints.append(
+                    "Environment is operator-only — an operator can set it via the CLI "
+                    "(`daimon config set environment_name=...`)."
+                )
+            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel,
+                thread_ts=thread_id,
+                text=(f"No {' or '.join(missing)} configured for this channel. " + " ".join(hints)),
+            )
+            return
+
+        resolver_cache = new_resolver_cache()
+        public_url = (
+            str(self.runtime.settings.mcp.public_url)
+            if self.runtime.settings.mcp.public_url is not None
+            else None
+        )
+
+        async def _apply() -> object:
+            return await reconcile_tenant_defaults(
+                self.runtime.anthropic,
+                self.runtime.settings.defaults_root,
+                tenant_id=tenant_id,
+                public_url=public_url,
+            )
+
+        try:
+            agent_id = await resolve_agent(
+                self.runtime.anthropic,
+                tenant_id=tenant_id,
+                daimon_tag=agent_tag,
+                apply_callable=_apply,
+                cache=resolver_cache,
+                cached_id=None,
+            )
+            env_id = await resolve_environment(
+                self.runtime.anthropic,
+                tenant_id=tenant_id,
+                daimon_tag=environment_tag,
+                apply_callable=_apply,
+                cache=resolver_cache,
+                cached_id=None,
+            )
+        except MAResolverMissError as err:
+            log.warning(
+                "slack.resolver.miss",
+                kind=err.kind,
+                daimon_tag=err.daimon_tag,
+                tenant_id=str(err.tenant_id),
+            )
+            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel,
+                thread_ts=thread_id,
+                text=(
+                    "The configured agent or environment no longer exists. "
+                    "An admin can re-set the agent in `/agent-setup` → "
+                    "*Set as default…*; the environment is operator-only via the CLI "
+                    "(`daimon config set environment_name=...`)."
+                ),
+            )
+            return
+        agent = await self.runtime.anthropic.beta.agents.retrieve(agent_id)
+        agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id))
+        _lc_agent_name: str = agent.name
+        _lc_model_id: str = agent.model.id
+        env = await self.runtime.anthropic.beta.environments.retrieve(env_id)
+
+        # --- Admission gate: per-tenant balance — independent of Stripe config ---
+        if await is_over_balance(sessionmaker=self.runtime.sessionmaker, tenant_id=tenant_id):
+            log.info(
+                "turn.skipped.over_balance",
+                tenant_id=str(tenant_id),
+                team_id=team_id,
+                channel_id=channel,
+                thread_id=thread_id,
+            )
+            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel,
+                thread_ts=thread_id,
+                text=(
+                    "This workspace's daimon credit is depleted. "
+                    "An admin can top up with `/billing`."
+                ),
+            )
+            return
+
+        # --- Admission gate: monthly usage cap ---
+        over_cap = await is_over_cap(
+            billing_config=self.runtime.billing_config,
+            sessionmaker=self.runtime.sessionmaker,
+            tenant_id=tenant_id,
+            user_id=str(event.get("user") or ""),
+            now=datetime.now(UTC),
+        )
+        if over_cap:
+            log.info(
+                "turn.skipped.over_cap",
+                tenant_id=str(tenant_id),
+                user_id=str(event.get("user") or ""),
+                team_id=team_id,
+                channel_id=channel,
+                thread_id=thread_id,
+            )
+            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel,
+                thread_ts=thread_id,
+                text=(
+                    "Monthly usage cap reached for this workspace. "
+                    "An admin can adjust the cap with `/billing` (when available)."
+                ),
+            )
+            return
+
         # --- Session find-or-create ---
         async with self.runtime.sessionmaker() as s:
             existing = await get_live_thread_session(
@@ -941,14 +1088,6 @@ class SlackApp:
         mapping_id: uuid.UUID
         watermark: str | None
         reused: bool
-        # Populated in the new-session path; placeholder strings on session reuse until
-        # the full app wiring (registry, model info for reused sessions) lands.
-        _lc_agent_name: str = ""
-        _lc_model_id: str = ""
-        # Bound below in the new-session path (agent/model info is unavailable for a
-        # reused session until the placeholder above is resolved by full app wiring);
-        # a reused-session turn is therefore not billed today — a tracked follow-up.
-        usage_record: Callable[..., Coroutine[Any, Any, None]] | None = None
 
         if existing is not None:
             ma_session_id = existing.ma_session_id
@@ -963,154 +1102,6 @@ class SlackApp:
             )
         else:
             # Create a fresh MA session (mirror bot.py:852-871).
-            # --- Config resolution (mirror bot.py:776-815): channel → tenant →
-            # deployment cascade, so /agent-setup propagations take effect here.
-            async with self.runtime.sessionmaker() as s:
-                config = await resolve_config(
-                    s,
-                    context=ScopeContext(
-                        tenant_id=tenant_id,
-                        channel_id=channel,
-                        account_id=principal.account_id,
-                    ),
-                    default=self.runtime.deployment_default,
-                )
-            agent_tag = config.agent_name
-            environment_tag = config.environment_name
-            if agent_tag is None or environment_tag is None:
-                missing = [
-                    name
-                    for name, value in (("agent", agent_tag), ("environment", environment_tag))
-                    if value is None
-                ]
-                log.info(
-                    "slack.missing_config",
-                    team_id=team_id,
-                    channel_id=channel,
-                    missing=missing,
-                )
-                hints: list[str] = []
-                if agent_tag is None:
-                    hints.append(
-                        "An admin can set the default agent in `/agent-setup` → "
-                        "*Set as default…* → [This channel] or [Whole workspace]."
-                    )
-                if environment_tag is None:
-                    hints.append(
-                        "Environment is operator-only — an operator can set it via the CLI "
-                        "(`daimon config set environment_name=...`)."
-                    )
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel,
-                    thread_ts=thread_id,
-                    text=(
-                        f"No {' or '.join(missing)} configured for this channel. " + " ".join(hints)
-                    ),
-                )
-                return
-
-            resolver_cache = new_resolver_cache()
-            public_url = (
-                str(self.runtime.settings.mcp.public_url)
-                if self.runtime.settings.mcp.public_url is not None
-                else None
-            )
-
-            async def _apply() -> object:
-                return await reconcile_tenant_defaults(
-                    self.runtime.anthropic,
-                    self.runtime.settings.defaults_root,
-                    tenant_id=tenant_id,
-                    public_url=public_url,
-                )
-
-            try:
-                agent_id = await resolve_agent(
-                    self.runtime.anthropic,
-                    tenant_id=tenant_id,
-                    daimon_tag=agent_tag,
-                    apply_callable=_apply,
-                    cache=resolver_cache,
-                    cached_id=None,
-                )
-                env_id = await resolve_environment(
-                    self.runtime.anthropic,
-                    tenant_id=tenant_id,
-                    daimon_tag=environment_tag,
-                    apply_callable=_apply,
-                    cache=resolver_cache,
-                    cached_id=None,
-                )
-            except MAResolverMissError as err:
-                log.warning(
-                    "slack.resolver.miss",
-                    kind=err.kind,
-                    daimon_tag=err.daimon_tag,
-                    tenant_id=str(err.tenant_id),
-                )
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel,
-                    thread_ts=thread_id,
-                    text=(
-                        "The configured agent or environment no longer exists. "
-                        "An admin can re-set the agent in `/agent-setup` → "
-                        "*Set as default…*; the environment is operator-only via the CLI "
-                        "(`daimon config set environment_name=...`)."
-                    ),
-                )
-                return
-            agent = await self.runtime.anthropic.beta.agents.retrieve(agent_id)
-            agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id))
-            _lc_agent_name = agent.name
-            _lc_model_id = agent.model.id
-            env = await self.runtime.anthropic.beta.environments.retrieve(env_id)
-
-            # --- Admission gate: per-tenant balance — independent of Stripe config ---
-            if await is_over_balance(sessionmaker=self.runtime.sessionmaker, tenant_id=tenant_id):
-                log.info(
-                    "turn.skipped.over_balance",
-                    tenant_id=str(tenant_id),
-                    team_id=team_id,
-                    channel_id=channel,
-                    thread_id=thread_id,
-                )
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel,
-                    thread_ts=thread_id,
-                    text=(
-                        "This workspace's daimon credit is depleted. "
-                        "An admin can top up with `/billing`."
-                    ),
-                )
-                return
-
-            # --- Admission gate: monthly usage cap ---
-            over_cap = await is_over_cap(
-                billing_config=self.runtime.billing_config,
-                sessionmaker=self.runtime.sessionmaker,
-                tenant_id=tenant_id,
-                user_id=str(event.get("user") or ""),
-                now=datetime.now(UTC),
-            )
-            if over_cap:
-                log.info(
-                    "turn.skipped.over_cap",
-                    tenant_id=str(tenant_id),
-                    user_id=str(event.get("user") or ""),
-                    team_id=team_id,
-                    channel_id=channel,
-                    thread_id=thread_id,
-                )
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel,
-                    thread_ts=thread_id,
-                    text=(
-                        "Monthly usage cap reached for this workspace. "
-                        "An admin can adjust the cap with `/billing` (when available)."
-                    ),
-                )
-                return
-
             ma_session = await create_session(
                 self.runtime.anthropic,
                 agent=agent,
@@ -1133,16 +1124,6 @@ class SlackApp:
                 ),
             )
             ma_session_id = ma_session.id
-            usage_record = functools.partial(
-                record_turn_usage,
-                sessionmaker=self.runtime.sessionmaker,
-                platform_user_id=str(event.get("user") or ""),
-                managed_session_id=ma_session_id,
-                model_id=agent.model.id,
-                tenant_id=tenant_id,
-                markup=self.runtime.settings.billing.markup,
-                pricing=MODEL_PRICING.get(agent.model.id),
-            )
 
             async with self.runtime.sessionmaker() as s:
                 row = await create_thread_session(
@@ -1162,6 +1143,18 @@ class SlackApp:
                 session_id=ma_session_id,
                 thread_id=thread_id,
             )
+
+        # --- usage_record binding: unconditional, mirrors bot.py:1107-1116 ---
+        usage_record: Callable[..., Coroutine[Any, Any, None]] = functools.partial(
+            record_turn_usage,
+            sessionmaker=self.runtime.sessionmaker,
+            platform_user_id=str(event.get("user") or ""),
+            managed_session_id=ma_session_id,
+            model_id=agent.model.id,
+            tenant_id=tenant_id,
+            markup=self.runtime.settings.billing.markup,
+            pricing=MODEL_PRICING.get(agent.model.id),
+        )
 
         # --- Build user message ---
         proxy_base = self.runtime.settings.mcp.app_root_url
