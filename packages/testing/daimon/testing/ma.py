@@ -222,6 +222,20 @@ def stub_anthropic() -> AsyncAnthropic:
     return build_stub_anthropic()
 
 
+@pytest.fixture
+def make_stub_anthropic() -> Callable[
+    [Callable[[httpx.Request], httpx.Response] | None], AsyncAnthropic
+]:
+    """Factory fixture: tests that need a custom handler call
+    `make_stub_anthropic(handler)` to build an AsyncAnthropic that routes
+    to it. Returned type matches `build_stub_anthropic`'s signature.
+
+    Import into a package's `conftest.py` (`from daimon.testing.ma import
+    make_stub_anthropic  # noqa: F401`) to make it discoverable by pytest.
+    """
+    return build_stub_anthropic
+
+
 # ---------------------------------------------------------------------------
 # Live-API contract-test helper
 # ---------------------------------------------------------------------------
