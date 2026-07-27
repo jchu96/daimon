@@ -12,13 +12,11 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import cast
 
-from daimon.core._models import TenantLedger, UsageEvent
 from daimon.core.billing import BillingConfig
-from daimon.core.stores import tenant_ledger
+from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import Platform
 from daimon.testing.factories import make_tenant, make_tenant_user_cap, make_usage_event
 from pydantic import SecretStr
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import build_turn_router
@@ -81,25 +79,11 @@ async def test_turn_blocked_when_over_cap_writes_no_new_usage_or_ledger_row(
     expected = driver.expected_blocked_text("cap")
     assert expected in posted, f"expected the over-cap copy {expected!r}, got: {posted}"
 
-    usage_rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant.id)))
-        .scalars()
-        .all()
-    )
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert len(usage_rows) == 1, (
         "over-cap turn must write no NEW usage_events row (only the pre-seeded breach row)"
     )
 
-    debit_rows = (
-        (
-            await db_session.execute(
-                select(TenantLedger).where(
-                    TenantLedger.tenant_id == tenant.id,
-                    TenantLedger.delta_usd < 0,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    ledger_rows = await tenant_ledger.list_for_tenant(db_session, tenant_id=tenant.id)
+    debit_rows = [row for row in ledger_rows if row.delta_usd < 0]
     assert debit_rows == [], "over-cap turn must write zero tenant_ledger debits"

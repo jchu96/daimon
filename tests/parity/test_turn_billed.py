@@ -14,11 +14,9 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import cast
 
-from daimon.core._models import TenantLedger, UsageEvent
-from daimon.core.stores import tenant_ledger
+from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import Platform
 from daimon.testing.factories import make_tenant
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import build_turn_router
@@ -59,25 +57,11 @@ async def test_turn_billed_when_unblocked_writes_usage_event_and_ledger_debit(
     )
     assert posted, f"expected the agent's reply to be posted somewhere, got: {posted}"
 
-    usage_rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant.id)))
-        .scalars()
-        .all()
-    )
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert len(usage_rows) == 1, "unblocked turn must write exactly one usage_events row"
     assert usage_rows[0].managed_session_id == "sess_parity_test"
     assert usage_rows[0].model == "claude-sonnet-4-6"
 
-    debit_rows = (
-        (
-            await db_session.execute(
-                select(TenantLedger).where(
-                    TenantLedger.tenant_id == tenant.id,
-                    TenantLedger.delta_usd < 0,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    ledger_rows = await tenant_ledger.list_for_tenant(db_session, tenant_id=tenant.id)
+    debit_rows = [row for row in ledger_rows if row.delta_usd < 0]
     assert len(debit_rows) == 1, "unblocked turn must write exactly one tenant_ledger debit"

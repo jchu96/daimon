@@ -27,6 +27,13 @@
 #   T8  find_skills?_by_display_title( outside sanctioned canonical-title callers
 #       — banned. Every allowlisted module builds its lookup title via
 #       tenant_scoped_display_title. New callers must be vetted and added here.
+#   T9  daimon.core._models imports under adapter test trees + tests/ (integration
+#       + parity) — banned (SUITE-02, D-08). Tests must seed via daimon.testing
+#       factories / store helpers, never raw ORM rows. Scoped to its OWN
+#       T9_SEARCH_PATHS (not the shared SEARCH_PATHS above) so packages/core/tests
+#       and packages/testing — which legitimately need ORM access — are never
+#       scanned. Allowlisted: conftest.py files that need Base.metadata.create_all
+#       for schema-per-test setup (a distinct concern from row seeding).
 #
 # Each rule emits a list of file:line matches. Exits non-zero with the number
 # of failing rules if any pattern is found outside an allow-list.
@@ -43,6 +50,20 @@ SEARCH_PATHS=(
   "packages/adapters/mcp/tests"
   "packages/adapters/slack/tests"
   "packages/core/tests"
+)
+
+# Scope: T9 only — adapter test trees + top-level integration/parity tests.
+# Deliberately separate from SEARCH_PATHS above: SEARCH_PATHS includes
+# packages/core/tests (needed by T1-T3), but packages/core/tests and
+# packages/testing legitimately import daimon.core._models for ORM-backed
+# test setup and factories, so T9 must never scan them.
+T9_SEARCH_PATHS=(
+  "packages/adapters/discord/tests"
+  "packages/adapters/slack/tests"
+  "packages/adapters/mcp/tests"
+  "packages/adapters/cli/tests"
+  "packages/adapters/scheduler/tests"
+  "tests"
 )
 
 # Scope: production source (T4 and future prod-only rules).
@@ -89,6 +110,17 @@ ALLOWLIST_T8=(
   "mcp/tools/skills.py"
   "cli/commands/skills.py"
 )
+# T9: daimon.core._models is banned in adapter/integration/parity test trees
+# (SUITE-02). The only tolerated occurrences are conftest.py files that need
+# Base.metadata.create_all for schema-per-test DDL setup — a distinct concern
+# from seeding rows, which must go through daimon.testing factories/store
+# helpers. Each entry below is exactly such a conftest.
+ALLOWLIST_T9=(
+  "packages/adapters/mcp/tests/conftest.py"
+  "packages/adapters/cli/tests/commands/conftest.py"
+  "packages/adapters/cli/tests/contract_flows/conftest.py"
+  "tests/integration/conftest.py"
+)
 
 DIVIDER="------------------------------------------------------------------"
 PASS=0
@@ -108,6 +140,41 @@ run_rule() {
   # file-level allowlists directly; we collect hits then filter.
   local hits
   hits=$(grep -rnE "$pattern" "${SEARCH_PATHS[@]}" 2>/dev/null || true)
+  if [ -z "$hits" ]; then
+    echo "  no matches"
+    PASS=$((PASS + 1))
+    return
+  fi
+  local filtered="$hits"
+  for allowed in "${allow[@]:-}"; do
+    [ -z "$allowed" ] && continue
+    filtered=$(echo "$filtered" | grep -vF "$allowed" || true)
+  done
+  if [ -z "$filtered" ]; then
+    echo "  all matches were on the allow-list — clean"
+    PASS=$((PASS + 1))
+    return
+  fi
+  echo "$filtered" | sed 's/^/  /'
+  local count
+  count=$(echo "$filtered" | wc -l | tr -d ' ')
+  echo
+  echo "  $count match(es) — FAIL"
+  FAIL=$((FAIL + 1))
+}
+
+run_rule_t9() {
+  local name="$1"; shift
+  local description="$1"; shift
+  local pattern="$1"; shift
+  local -n allow=$1; shift
+
+  echo
+  echo "[$name] $description"
+  echo "$DIVIDER"
+
+  local hits
+  hits=$(grep -rnE "$pattern" "${T9_SEARCH_PATHS[@]}" 2>/dev/null || true)
   if [ -z "$hits" ]; then
     echo "  no matches"
     PASS=$((PASS + 1))
@@ -223,6 +290,13 @@ run_rule_prod "T8" \
   "Banned: find_skills?_by_display_title( outside sanctioned canonical-title callers" \
   'find_skills?_by_display_title\(' \
   ALLOWLIST_T8
+
+# T9: daimon.core._models banned under adapter test trees + tests/ (SUITE-02, D-08).
+# Uses its OWN T9_SEARCH_PATHS (excludes packages/core/tests + packages/testing).
+run_rule_t9 "T9" \
+  "Banned: daimon.core._models import under adapter/integration/parity test trees" \
+  '(from daimon\.core(\.| import )_models\b|daimon\.core\._models\b)' \
+  ALLOWLIST_T9
 
 
 echo "$DIVIDER"

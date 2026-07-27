@@ -13,10 +13,9 @@ from __future__ import annotations
 
 from typing import cast
 
-from daimon.core._models import TenantLedger, UsageEvent
+from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import Platform
 from daimon.testing.factories import make_tenant
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import build_turn_router
@@ -50,16 +49,8 @@ async def test_turn_blocked_when_over_balance_writes_no_usage_and_no_ledger_row(
     expected = driver.expected_blocked_text("balance")
     assert expected in posted, f"expected the over-balance copy {expected!r}, got: {posted}"
 
-    usage_rows = (
-        (await db_session.execute(select(UsageEvent).where(UsageEvent.tenant_id == tenant.id)))
-        .scalars()
-        .all()
-    )
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert usage_rows == [], "over-balance turn must write zero usage_events rows"
 
-    ledger_rows = (
-        (await db_session.execute(select(TenantLedger).where(TenantLedger.tenant_id == tenant.id)))
-        .scalars()
-        .all()
-    )
+    ledger_rows = await tenant_ledger.list_for_tenant(db_session, tenant_id=tenant.id)
     assert ledger_rows == [], "over-balance turn must write zero tenant_ledger rows"
