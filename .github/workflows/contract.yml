@@ -1,0 +1,96 @@
+name: Contract
+
+# Dispatch-only by construction (D-14): no push/pull_request/schedule trigger
+# exists anywhere in this file. The 16 `contract`-marked test files run real
+# Managed Agents API calls against the staging Anthropic workspace, and the
+# shared conftest destructively wipes that entire workspace before and after
+# each module (delete_entire_workspace_for_testing) — that must never fire
+# from an automatic trigger.
+#
+# The dedicated contract service account + its single-secret IAM grant are
+# defined in the companion infra repo (staging environment's cicd module).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    name: Contract tests (staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: daimon
+          POSTGRES_PASSWORD: daimon
+          POSTGRES_DB: daimon
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U daimon"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+    env:
+      DAIMON_DATABASE__URL: postgresql+asyncpg://daimon:daimon@localhost:5432/daimon
+      DAIMON_DATABASE__TEST_URL: postgresql+asyncpg://daimon:daimon@localhost:5432/daimon_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --all-packages
+
+      - name: Create daimon_test database
+        env:
+          PGPASSWORD: daimon
+        run: psql -h localhost -U daimon -d daimon -v ON_ERROR_STOP=1 -c "CREATE DATABASE daimon_test;"
+
+      - name: alembic upgrade (test DB)
+        env:
+          DAIMON_DATABASE_URL: ${{ env.DAIMON_DATABASE__TEST_URL }}
+        run: uv run alembic upgrade head
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CONTRACT_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Fetched at run time via the dedicated staging-daimon-contract SA,
+      # which has secretAccessor on exactly this one secret (D-13). Masked
+      # immediately and never echoed — only written to GITHUB_ENV (T-05-04a).
+      - name: Fetch staging Anthropic key
+        run: |
+          KEY=$(gcloud secrets versions access latest \
+            --secret=DAIMON_ANTHROPIC__API_KEY \
+            --project="${{ vars.GCP_PROJECT_ID }}")
+          echo "::add-mask::$KEY"
+          printf 'DAIMON_TEST_ANTHROPIC_API_KEY=%s\n' "$KEY" >> "$GITHUB_ENV"
+
+      - name: pytest (contract, staging)
+        run: uv run pytest -m contract -n auto
+
+      # Best-effort immediate re-seed of the just-wiped staging Anthropic
+      # workspace so it isn't left empty between this run and the mandatory
+      # manual heal step (see the companion infra repo's contract job
+      # runbook — this step alone does NOT update the real staging
+      # deployment's database, only this job's own throwaway Postgres, so it
+      # cannot fix the running deployment's now-stale agent references).
+      - name: Best-effort workspace re-seed (deployment scope)
+        if: always()
+        env:
+          DAIMON_ANTHROPIC__API_KEY: ${{ env.DAIMON_TEST_ANTHROPIC_API_KEY }}
+        run: uv run daimon defaults apply
