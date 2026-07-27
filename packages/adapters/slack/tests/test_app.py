@@ -1739,6 +1739,332 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
 
 
 # ---------------------------------------------------------------------------
+# Billing admission gates + usage_record wiring on a REUSED (already-live)
+# thread session — a follow-up turn must be gated and billed identically to
+# a first turn.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_thread_turn_reused_session_over_balance_blocks_and_skips_run_turn(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A follow-up turn on an already-live thread is blocked by the
+    over-balance gate before run_turn, and writes no usage_events row.
+    """
+    from daimon.core._models import UsageEvent
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_ORCH_REUSED_OVER_BALANCE"
+    channel = "C_TEST"
+    thread_ts = "9000000030.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    async with db_session_factory() as s:
+        principal = await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_REUSED_BALANCE"
+        )
+        await s.commit()
+    async with db_session_factory() as s:
+        await create_thread_session(
+            s,
+            tenant_id=tenant_id,
+            platform="slack",
+            thread_id=thread_ts,
+            account_id=principal.account_id,
+            ma_session_id="sess-reused-over-balance",
+            watermark_message_id="9000000030.000000",
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": "9000000030.000002",
+        "thread_ts": thread_ts,
+        "event_ts": "9000000030.000002",
+        "channel": channel,
+        "user": "U_TEST_REUSED_BALANCE",
+        "text": "<@U_BOT> follow-up",
+    }
+
+    with (
+        patch(
+            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+        ) as mock_over_balance,
+        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_over_balance.return_value = True
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts="9000000030.000002",
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+
+        mock_over_balance.assert_awaited_once()
+        mock_create.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+        mock_run_turn.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+
+    post_url = URL("https://slack.com/api/chat.postMessage")
+    post_bodies = [
+        req.kwargs.get("json") or json.loads(req.kwargs.get("data") or "{}")
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == post_url
+        for req in reqs
+    ]
+    depleted = [
+        b
+        for b in post_bodies
+        if str(b.get("text", ""))
+        == "This workspace's daimon credit is depleted. An admin can top up with `/billing`."
+    ]
+    assert depleted, (
+        f"expected the exact over-balance copy via chat.postMessage, got: {post_bodies}"
+    )
+
+    rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    assert rows == [], "blocked reused-session turn must write zero usage_events rows"
+
+
+async def test_run_thread_turn_reused_session_over_cap_blocks_and_skips_run_turn(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A follow-up turn on an already-live thread is blocked by the
+    over-cap gate before run_turn, and writes no usage_events row.
+    """
+    from daimon.core._models import UsageEvent
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_ORCH_REUSED_OVER_CAP"
+    channel = "C_TEST"
+    thread_ts = "9000000031.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    async with db_session_factory() as s:
+        principal = await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_REUSED_CAP"
+        )
+        await s.commit()
+    async with db_session_factory() as s:
+        await create_thread_session(
+            s,
+            tenant_id=tenant_id,
+            platform="slack",
+            thread_id=thread_ts,
+            account_id=principal.account_id,
+            ma_session_id="sess-reused-over-cap",
+            watermark_message_id="9000000031.000000",
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": "9000000031.000002",
+        "thread_ts": thread_ts,
+        "event_ts": "9000000031.000002",
+        "channel": channel,
+        "user": "U_TEST_REUSED_CAP",
+        "text": "<@U_BOT> follow-up",
+    }
+
+    with (
+        patch(
+            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+        ) as mock_over_balance,
+        patch("daimon.adapters.slack.app.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_over_balance.return_value = False
+        mock_over_cap.return_value = True
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts="9000000031.000002",
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+
+        mock_over_cap.assert_awaited_once()
+        assert mock_over_cap.call_args.kwargs["user_id"] == "U_TEST_REUSED_CAP", (
+            "gate should pass the Slack user id from the event"
+        )
+        mock_create.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+        mock_run_turn.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+
+    post_url = URL("https://slack.com/api/chat.postMessage")
+    post_bodies = [
+        req.kwargs.get("json") or json.loads(req.kwargs.get("data") or "{}")
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == post_url
+        for req in reqs
+    ]
+    cap_msgs = [
+        b
+        for b in post_bodies
+        if str(b.get("text", ""))
+        == (
+            "Monthly usage cap reached for this workspace. "
+            "An admin can adjust the cap with `/billing` (when available)."
+        )
+    ]
+    assert cap_msgs, f"expected the exact over-cap copy via chat.postMessage, got: {post_bodies}"
+
+    rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    assert rows == [], "blocked reused-session turn must write zero usage_events rows"
+
+
+async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_ledger_debit(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A non-blocked follow-up turn on an already-live thread writes exactly
+    one usage_events row (keyed to the PRE-SEEDED session id, proving the
+    reuse path was taken and billed) and one tenant_ledger debit.
+    """
+    from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
+        BetaManagedAgentsSpanModelRequestEndEvent,
+    )
+    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
+        BetaManagedAgentsSpanModelUsage,
+    )
+    from daimon.core._models import TenantLedger, UsageEvent
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_ORCH_REUSED_USAGE_BILLED"
+    channel = "C_TEST"
+    thread_ts = "9000000032.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    seeded_session_id = "sess-reused-usage-billed"
+
+    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    async with db_session_factory() as s:
+        principal = await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_REUSED_BILLED"
+        )
+        await s.commit()
+    async with db_session_factory() as s:
+        await create_thread_session(
+            s,
+            tenant_id=tenant_id,
+            platform="slack",
+            thread_id=thread_ts,
+            account_id=principal.account_id,
+            ma_session_id=seeded_session_id,
+            watermark_message_id="9000000032.000000",
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": "9000000032.000002",
+        "thread_ts": thread_ts,
+        "event_ts": "9000000032.000002",
+        "channel": channel,
+        "user": "U_TEST_REUSED_BILLED",
+        "text": "<@U_BOT> follow-up",
+    }
+
+    _now = datetime.now(UTC)
+    model_request_end_event = BetaManagedAgentsSpanModelRequestEndEvent(
+        id="evt_slack_reused_usage_1",
+        is_error=False,
+        model_request_start_id="start_1",
+        model_usage=BetaManagedAgentsSpanModelUsage(
+            input_tokens=100,
+            output_tokens=50,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        processed_at=_now,
+        type="span.model_request_end",
+    )
+
+    async def _fake_run_turn(*, lifecycle: Any, usage_record: Any, **kwargs: Any) -> TurnState:
+        await usage_record(event=model_request_end_event, session_id=seeded_session_id)
+        state = TurnState(content=[TextBlock(kind="text", text="Hello again!")])
+        await lifecycle.on_terminal_success(state)
+        return state
+
+    with (
+        patch(
+            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+        ) as mock_over_balance,
+        patch("daimon.adapters.slack.app.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_over_balance.return_value = False
+        mock_over_cap.return_value = False
+        mock_run_turn.side_effect = _fake_run_turn
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts="9000000032.000002",
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+
+        mock_run_turn.assert_called_once()
+        mock_create.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+
+    usage_rows = (await db_session.execute(select(UsageEvent))).scalars().all()
+    assert len(usage_rows) == 1, "unblocked reused-session turn must write exactly one usage row"
+    assert usage_rows[0].managed_session_id == seeded_session_id, (
+        "usage row must be keyed to the pre-seeded (reused) session id"
+    )
+    assert usage_rows[0].model == "claude-sonnet-4-6"
+
+    ledger_rows = (await db_session.execute(select(TenantLedger))).scalars().all()
+    assert len(ledger_rows) == 1, "unblocked reused-session turn must write one tenant_ledger debit"
+    assert ledger_rows[0].delta_usd < 0, "the ledger row must be a debit (negative delta_usd)"
+
+
+# ---------------------------------------------------------------------------
 # Cancel registry: block_actions routing + author gate
 # ---------------------------------------------------------------------------
 
