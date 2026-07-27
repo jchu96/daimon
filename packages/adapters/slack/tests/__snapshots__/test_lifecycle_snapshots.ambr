@@ -1,0 +1,157 @@
+# serializer version: 1
+# name: test_terminal_failure_sequence
+  dict({
+    'posts': list([
+      dict({
+        'blocks': list([
+          dict({
+            'text': dict({
+              'text': '*🧠 thinking*',
+              'type': 'mrkdwn',
+            }),
+            'type': 'section',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'text': '⏱️ 0s',
+                'type': 'mrkdwn',
+              }),
+            ]),
+            'type': 'context',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'action_id': 'cancel_turn',
+                'style': 'danger',
+                'text': dict({
+                  'text': 'Cancel',
+                  'type': 'plain_text',
+                }),
+                'type': 'button',
+              }),
+            ]),
+            'type': 'actions',
+          }),
+        ]),
+        'text': 'thinking …',
+      }),
+    ]),
+    'updates': list([
+      dict({
+        'blocks': list([
+          dict({
+            'elements': list([
+              dict({
+                'text': '❌ upstream timeout · Atlas · 12s · 500 in / 80 out · $0.003',
+                'type': 'mrkdwn',
+              }),
+            ]),
+            'type': 'context',
+          }),
+        ]),
+        'text': 'error …',
+      }),
+    ]),
+  })
+# ---
+# name: test_thinking_tool_then_success_sequence
+  dict({
+    'posts': list([
+      dict({
+        'blocks': list([
+          dict({
+            'text': dict({
+              'text': '*🧠 thinking*',
+              'type': 'mrkdwn',
+            }),
+            'type': 'section',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'text': '⏱️ 0s',
+                'type': 'mrkdwn',
+              }),
+            ]),
+            'type': 'context',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'action_id': 'cancel_turn',
+                'style': 'danger',
+                'text': dict({
+                  'text': 'Cancel',
+                  'type': 'plain_text',
+                }),
+                'type': 'button',
+              }),
+            ]),
+            'type': 'actions',
+          }),
+        ]),
+        'text': 'thinking …',
+      }),
+    ]),
+    'updates': list([
+      dict({
+        'blocks': list([
+          dict({
+            'text': dict({
+              'text': '*⚙️ running tool*',
+              'type': 'mrkdwn',
+            }),
+            'type': 'section',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'text': '''
+                  ⏱️ 6s
+                  ⚙️ Bash
+                ''',
+                'type': 'mrkdwn',
+              }),
+            ]),
+            'type': 'context',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'action_id': 'cancel_turn',
+                'style': 'danger',
+                'text': dict({
+                  'text': 'Cancel',
+                  'type': 'plain_text',
+                }),
+                'type': 'button',
+              }),
+            ]),
+            'type': 'actions',
+          }),
+        ]),
+        'text': 'tool_running …',
+      }),
+      dict({
+        'blocks': list([
+          dict({
+            'text': 'Here is the answer.',
+            'type': 'markdown',
+          }),
+          dict({
+            'elements': list([
+              dict({
+                'text': 'Atlas · 16s · 1.5k in / 320 out · $0.008',
+                'type': 'mrkdwn',
+              }),
+            ]),
+            'type': 'context',
+          }),
+        ]),
+        'text': 'Here is the answer.',
+      }),
+    ]),
+  })
+# ---
