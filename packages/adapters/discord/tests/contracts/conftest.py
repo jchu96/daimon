@@ -16,19 +16,9 @@ test_panel_roundtrip.py for the canonical pattern).
 
 from __future__ import annotations
 
-import os
-
-import pytest
 import pytest_asyncio
 from anthropic import AsyncAnthropic
-
-
-def _require_api_key() -> str:
-    """Read DAIMON_TEST_ANTHROPIC_API_KEY from env, skip if missing."""
-    key = os.environ.get("DAIMON_TEST_ANTHROPIC_API_KEY")
-    if not key:
-        pytest.skip("DAIMON_TEST_ANTHROPIC_API_KEY not set — contract tests skipped")
-    return key
+from daimon.testing.ma import _require_api_key
 
 
 @pytest_asyncio.fixture(scope="module")

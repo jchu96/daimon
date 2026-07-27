@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from daimon.testing.ma import build_stub_anthropic
+from daimon.testing.ma import build_stub_anthropic, stub_anthropic  # noqa: F401
 
 
 @pytest.fixture
@@ -17,11 +17,6 @@ def make_stub_anthropic() -> Callable[
     [Callable[[httpx.Request], httpx.Response] | None], AsyncAnthropic
 ]:
     return build_stub_anthropic
-
-
-@pytest.fixture
-def stub_anthropic() -> AsyncAnthropic:
-    return build_stub_anthropic()
 
 
 @pytest.fixture

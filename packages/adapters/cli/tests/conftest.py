@@ -14,7 +14,7 @@ from daimon.testing.db import (  # noqa: F401  # pyright: ignore[reportUnusedImp
     db_session,
 )
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import build_stub_anthropic
+from daimon.testing.ma import build_stub_anthropic, stub_anthropic  # noqa: F401
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -57,13 +57,6 @@ async def db_session_factory(
         await make_tenant(db_session, platform="cli", workspace_id="local")
         await db_session.commit()
     return async_sessionmaker(bind=db_session.bind, expire_on_commit=False)
-
-
-@pytest.fixture
-def stub_anthropic() -> AsyncAnthropic:
-    """AsyncAnthropic with a no-op 200 handler. Decorative; for tests that
-    never call through to `beta.*`."""
-    return build_stub_anthropic()
 
 
 @pytest.fixture

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 from collections.abc import Callable
@@ -30,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
     BetaCloudConfig,
@@ -207,6 +209,34 @@ def build_stub_anthropic(
         return httpx.Response(200, json={})
 
     return build_fake_anthropic(handler or _noop)
+
+
+@pytest.fixture
+def stub_anthropic() -> AsyncAnthropic:
+    """AsyncAnthropic with a no-op 200 handler. Decorative; for tests that
+    never call through to `beta.*`.
+
+    Import into a package's `conftest.py` (`from daimon.testing.ma import
+    stub_anthropic  # noqa: F401`) to make it discoverable by pytest.
+    """
+    return build_stub_anthropic()
+
+
+# ---------------------------------------------------------------------------
+# Live-API contract-test helper
+# ---------------------------------------------------------------------------
+
+
+def _require_api_key() -> str:
+    """Read DAIMON_TEST_ANTHROPIC_API_KEY from env, skip if missing.
+
+    Shared by contract-test conftests (`-m contract`, env-gated, never gate
+    CI) that need a real AsyncAnthropic client backed by a live API key.
+    """
+    key = os.environ.get("DAIMON_TEST_ANTHROPIC_API_KEY")
+    if not key:
+        pytest.skip("DAIMON_TEST_ANTHROPIC_API_KEY not set — contract tests skipped")
+    return key
 
 
 # ---------------------------------------------------------------------------

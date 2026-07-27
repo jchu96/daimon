@@ -25,18 +25,11 @@ from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import Settings
 from daimon.core.ma import delete_entire_workspace_for_testing
 from daimon.core.skill_zip import build_skill_zip
+from daimon.testing.ma import _require_api_key
 
 # Each test module in this package must set:
 #   pytestmark = pytest.mark.contract
 # at module level. pytestmark in conftest.py is NOT inherited by child test files.
-
-
-def _require_api_key() -> str:
-    """Read DAIMON_TEST_ANTHROPIC_API_KEY from env, skip if missing."""
-    key = os.environ.get("DAIMON_TEST_ANTHROPIC_API_KEY")
-    if not key:
-        pytest.skip("DAIMON_TEST_ANTHROPIC_API_KEY not set — contract tests skipped")
-    return key
 
 
 @pytest_asyncio.fixture(scope="module")

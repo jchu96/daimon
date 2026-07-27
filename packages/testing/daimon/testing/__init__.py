@@ -14,6 +14,7 @@ from daimon.testing.ma import (
     make_fake_ma_handler,
     send_events_response,
     sse_response,
+    stub_anthropic,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "make_fake_ma_handler",
     "send_events_response",
     "sse_response",
+    "stub_anthropic",
 ]
