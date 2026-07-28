@@ -142,7 +142,17 @@ async def bind_session(
     session is created via the single shared `create_session` call site,
     always passing `fernet=deps.fernet`, and a new `thread_sessions` mapping
     row is written.
+
+    Raises `TypeError` if `admission` is not a real `Admission` -- pyright's
+    strict mode already rejects a mistyped caller at type-check time; this
+    guard makes the same contract hold at runtime (the type-level chokepoint
+    claim tested by 06-05's `test_bind_session_requires_an_admission_value`).
     """
+    if not isinstance(admission, Admission):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise TypeError(
+            f"bind_session requires an Admission instance, got {type(admission).__name__}"
+        )
+
     ma_session_id: str | None = None
     mapping_id: uuid.UUID | None = None
     watermark: str | None = None
