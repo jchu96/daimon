@@ -1267,6 +1267,129 @@ async def test_create_session_skips_copilot_when_no_pat(
     assert len(session_bodies) == 1
 
 
+async def test_create_session_never_mirrors_fallback_pat_into_copilot_vault(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An agent with no per-agent PAT but a configured operator fallback still
+    gets NO Copilot vault credential -- the fallback must never be mirrored
+    into a per-agent MA vault. This is a regression guard: the signature
+    change that added allow_service_default/fallback_pat to get_pat makes it
+    newly *possible* for this call site to opt in; sessions.py's single
+    get_pat call (feeding both the Copilot mirror and the clone resolver)
+    must stay at the default so this never happens."""
+    tenant = await make_tenant(db_session)
+    agent_uuid = uuid.uuid4()
+    account_id = uuid.UUID("00000000-0000-0000-0000-0000000000c2")
+    public_url = "https://mcp.example.com/mcp"
+    await _seed_anon_binding(db_session, tenant_id=tenant.id, agent_uuid=agent_uuid)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+
+    agent = _make_agent(anthropic_id="ag_fallback_novault")
+    env = _make_env(anthropic_id="env_fallback_novault")
+    cred_bodies: list[dict[str, Any]] = []
+    session_bodies: list[dict[str, Any]] = []
+    client = build_fake_anthropic_http(
+        _warm_vault_copilot_handler(
+            account_id=account_id,
+            agent_uuid=agent_uuid,
+            public_url=public_url,
+            credential_post_bodies=cred_bodies,
+            session_create_bodies=session_bodies,
+            session_id="sess_fallback_novault",
+        )
+    )
+
+    await create_session(
+        client,
+        agent=agent,
+        environment=env,
+        account_id=account_id,
+        mcp_settings=McpSettings(jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)),
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        session_factory=db_session_factory,
+        fernet=fernet,
+        github_fallback_pat="ghp_operator_fallback",
+    )
+
+    assert len(cred_bodies) == 0, (
+        "the operator fallback PAT must never be mirrored into a per-agent Copilot vault "
+        "credential, even when a repo binding resolves it for the clone resource"
+    )
+    assert len(session_bodies) == 1, "the session is still created"
+    resources = _without_memory_resource(session_bodies[0].get("resources"))
+    assert resources == [
+        {
+            "type": "github_repository",
+            "url": "https://github.com/example-org/example-repo",
+            "authorization_token": "ghp_operator_fallback",
+            "checkout": {"type": "branch", "name": "main"},
+        }
+    ], "the clone resource still resolves via the fallback -- only the Copilot mirror is guarded"
+
+
+async def test_create_session_app_installation_token_wins_over_fallback_for_anon_binding(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An anon: (verified-public) binding with a configured GitHub App
+    installation AND a configured operator fallback must clone via the
+    installation token, not the fallback -- the App keeps winning. Regression
+    guard for the resolve_clone_token ordering (per_agent_pat -> App ->
+    fallback) now that get_pat can itself resolve a fallback: sessions.py
+    must keep passing per_agent_pat=None to resolve_clone_token so the App
+    branch is reached first, exactly as before this phase's changes."""
+    tenant = await make_tenant(db_session)
+    agent_uuid = uuid.uuid4()
+    await _seed_anon_binding(db_session, tenant_id=tenant.id, agent_uuid=agent_uuid)
+
+    agent = _make_agent(anthropic_id="ag_app_over_fallback")
+    env = _make_env(anthropic_id="env_app_over_fallback")
+    bodies: list[dict[str, Any]] = []
+    client = build_fake_anthropic_http(
+        _files_and_session_handler(
+            file_id="file_unused",
+            session_id="sess_app_over_fallback",
+            session_create_bodies=bodies,
+        )
+    )
+
+    def github_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/example-org/example-repo/installation":
+            return httpx.Response(status_code=200, json={"id": 4242})
+        if request.url.path == "/app/installations/4242/access_tokens":
+            return httpx.Response(status_code=201, json={"token": "ghs_installation_wins"})
+        raise AssertionError(f"unexpected GitHub request: {request.method} {request.url}")
+
+    github_client = httpx.AsyncClient(transport=httpx.MockTransport(github_handler))
+
+    await create_session(
+        client,
+        agent=agent,
+        environment=env,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        session_factory=db_session_factory,
+        github_fallback_pat="ghp_operator_fallback",
+        github_app_id="12345",
+        github_app_private_key=_generate_rsa_keypair(),
+        http_client=github_client,
+    )
+    await github_client.aclose()
+
+    assert len(bodies) == 1, "exactly one session-create call"
+    resources = _without_memory_resource(bodies[0].get("resources"))
+    assert resources == [
+        {
+            "type": "github_repository",
+            "url": "https://github.com/example-org/example-repo",
+            "authorization_token": "ghs_installation_wins",
+            "checkout": {"type": "branch", "name": "main"},
+        }
+    ], "the App installation token must win over a configured operator fallback"
+
+
 def _warm_vault_copilot_500_handler(
     *,
     account_id: uuid.UUID,
