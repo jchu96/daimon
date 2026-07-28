@@ -8,11 +8,19 @@ Registry note: the per-store delete sequence is hardcoded inside
 `_purge_principal_in_session`. Adding a new principal-scoped table means
 appending one helper call here plus one int field on `PurgeReport`. Current
 sequence: user_skills -> github_credentials -> agent_github_binding ->
-github_oauth_states (both kinds where the table permits) -> routines (platform
-only) -> principal_links -> principal row. Account-level deletes (mcp_tokens,
-user_configs, accounts) run in `purge_account` after all principal rows are
-gone; mcp_tokens is keyed by account_id and is deleted before delete_account so
-its NO-ACTION/CASCADE FK to accounts.id is satisfied.
+github_oauth_states (both kinds where the table permits) -> credential_requests
+(both kinds, platform-user-scoped like github_oauth_states) -> routines
+(platform only) -> principal_links -> principal row. Account-level deletes
+(mcp_tokens, user_configs, accounts) run in `purge_account` after all principal
+rows are gone; mcp_tokens is keyed by account_id and is deleted before
+delete_account so its NO-ACTION/CASCADE FK to accounts.id is satisfied.
+
+credential_requests carries a Discord snowflake in requester_platform_user_id
+with no cleanup sweep by design (the table is one row per credential request,
+TTL-bounded relevance) — erasure therefore rides this purge path exactly like
+the OAuth handshake table, rather than a scheduled job. Precedent sweepers
+(`mcp_credential_sweep.py`, `pending_file_sweeper.py`) exist if volume ever
+justifies one instead.
 
 Divergent helper signatures: identity-store `delete_for_principal` is keyed by
 UUID; routines `delete_for_principal` is keyed by `(platform, external_id)`
@@ -46,6 +54,7 @@ from anthropic import APIError, AsyncAnthropic
 from daimon.core.ma import SessionDeletionReport, delete_sessions_for_account
 from daimon.core.stores import accounts as accounts_store
 from daimon.core.stores import agent_github_binding as agent_github_binding_store
+from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
@@ -82,6 +91,7 @@ class PurgeReport(BaseModel):
     agent_github_binding: int = 0
     slack_user_tokens: int = 0
     slack_turn_contexts: int = 0
+    credential_requests: int = 0
 
     def merge(self, other: PurgeReport) -> PurgeReport:
         return PurgeReport(
@@ -98,6 +108,7 @@ class PurgeReport(BaseModel):
             agent_github_binding=self.agent_github_binding + other.agent_github_binding,
             slack_user_tokens=self.slack_user_tokens + other.slack_user_tokens,
             slack_turn_contexts=self.slack_turn_contexts + other.slack_turn_contexts,
+            credential_requests=self.credential_requests + other.credential_requests,
         )
 
 
@@ -141,6 +152,15 @@ async def _purge_principal_in_session(
             platform_user_id=principal.external_id,
             tenant_id=principal.tenant_id,
         )
+        # credential_requests carries the same non-globally-unique
+        # platform_user_id caveat as oauth_states above — always tenant-scoped.
+        credential_requests_count = (
+            await credential_requests_store.delete_credential_requests_for_platform_user(
+                session,
+                platform_user_id=principal.external_id,
+                tenant_id=principal.tenant_id,
+            )
+        )
     else:
         routines_count = 0
         kind = "cli"
@@ -159,6 +179,16 @@ async def _purge_principal_in_session(
             platform="cli",
             platform_user_id=principal.os_user,
             tenant_id=principal.tenant_id,
+        )
+        # CLI principals never own credential_requests rows in practice (the
+        # credential button flow is Discord-only), so this always reports 0 —
+        # kept for symmetry with the platform branch and future-proofing.
+        credential_requests_count = (
+            await credential_requests_store.delete_credential_requests_for_platform_user(
+                session,
+                platform_user_id=principal.os_user,
+                tenant_id=principal.tenant_id,
+            )
         )
 
     # user_skills and github_credentials are keyed by principal_id alone — both
@@ -202,6 +232,7 @@ async def _purge_principal_in_session(
         github_oauth_states=oauth_states_count,
         agent_github_binding=agent_github_binding_count,
         slack_user_tokens=slack_user_tokens_count,
+        credential_requests=credential_requests_count,
     )
 
 

@@ -17,6 +17,7 @@ import uuid
 
 from daimon.core.stores import accounts as accounts_store
 from daimon.core.stores import agent_github_binding as agent_github_binding_store
+from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
@@ -64,6 +65,7 @@ class PurgePreview(BaseModel):
     agent_github_binding: PurgePreviewRow
     slack_user_tokens: PurgePreviewRow
     slack_turn_contexts: PurgePreviewRow
+    credential_requests: PurgePreviewRow
 
 
 def _format_platform_principal(p: PlatformPrincipalRow) -> str:
@@ -259,6 +261,29 @@ async def collect_purge_preview(
             )
         slack_turn_contexts = PurgePreviewRow(count=slack_turn_contexts_total, example=None)
 
+        # 13. credential_requests — requester_platform_user_id-scoped. Keyed by
+        # (platform_user_id, tenant_id) mirroring purge_principal's actual
+        # per-principal tenant-scoped delete call exactly (unlike the
+        # github_oauth_states block above, which counts platform principals
+        # cross-tenant), so this preview agrees field-for-field with what
+        # purge_account actually deletes. Dedup avoids double-counting when two
+        # principals under the account share a (platform_user_id, tenant_id) key.
+        credential_request_keys: set[tuple[str, uuid.UUID]] = set()
+        for pp in pp_list:
+            credential_request_keys.add((pp.external_id, pp.tenant_id))
+        for cli in cli_list:
+            credential_request_keys.add((cli.os_user, cli.tenant_id))
+        credential_requests_total = 0
+        for platform_user_id, key_tenant_id in credential_request_keys:
+            credential_requests_total += (
+                await credential_requests_store.count_credential_requests_for_platform_user(
+                    session,
+                    platform_user_id=platform_user_id,
+                    tenant_id=key_tenant_id,
+                )
+            )
+        credential_requests = PurgePreviewRow(count=credential_requests_total, example=None)
+
     return PurgePreview(
         linked_principals=linked_principals,
         principal_links=principal_links,
@@ -272,4 +297,5 @@ async def collect_purge_preview(
         agent_github_binding=agent_github_binding,
         slack_user_tokens=slack_user_tokens,
         slack_turn_contexts=slack_turn_contexts,
+        credential_requests=credential_requests,
     )

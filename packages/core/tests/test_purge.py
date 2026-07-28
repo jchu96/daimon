@@ -28,6 +28,7 @@ from daimon.core._models import (
     TenantConfig,
     UserConfig,
 )
+from daimon.core.credential_requests import mint_request_token
 from daimon.core.purge import (
     AccountPurgeResult,
     PrincipalPurgeResult,
@@ -35,6 +36,7 @@ from daimon.core.purge import (
     purge_account,
     purge_principal,
 )
+from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import routines as routines_store
@@ -1387,3 +1389,111 @@ async def test_purge_principal_upstream_failure_after_commit_reports_upstream_er
         "post-commit upstream APIError must be folded into sessions.upstream_error"
     )
     assert result.sessions.deleted == 0, "no sessions were deleted before the failure"
+
+
+async def test_purge_principal_platform_deletes_credential_request_and_reports_count(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Platform principal purge removes its credential-request row and reports the count."""
+    from datetime import UTC, datetime, timedelta
+
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="user-cred-req",
+        tenant=tenant,
+        account=account,
+    )
+    await credential_requests_store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="env",
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        account_id=account.id,
+        target="OPENAI_API_KEY",
+        mcp_server_url=None,
+        requester_platform_user_id="user-cred-req",
+        channel_id="C1",
+        expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
+
+    assert report.db.credential_requests == 1, "must delete the platform principal's request row"
+
+
+async def test_purge_principal_cli_credential_requests_reports_zero_when_none_exist(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CLI principal purge runs the same delete for its platform user id, reporting 0."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    cli = await make_cli_principal(
+        db_session, os_user="cli-cred-req", tenant=tenant, account=account
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=cli.id, kind="cli")
+
+    assert report.db.credential_requests == 0, "CLI principals own no credential-request rows"
+
+
+async def test_purge_principal_credential_requests_does_not_delete_same_user_in_other_tenant(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A same-platform-user-id credential-request row under a DIFFERENT tenant must survive."""
+    from datetime import UTC, datetime, timedelta
+
+    tenant_a = await make_tenant(db_session, workspace_id="cred-req-guild-a")
+    tenant_b = await make_tenant(db_session, workspace_id="cred-req-guild-b")
+    account_a = await make_account(db_session, tenant=tenant_a)
+    pp_a = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="shared-user-id",
+        tenant=tenant_a,
+        account=account_a,
+    )
+    # A DIFFERENT tenant's row, same platform_user_id.
+    await credential_requests_store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="env",
+        tenant_id=tenant_b.id,
+        agent_id=uuid.uuid4(),
+        account_id=uuid.uuid4(),
+        target="OPENAI_API_KEY",
+        mcp_server_url=None,
+        requester_platform_user_id="shared-user-id",
+        channel_id="C1",
+        expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+    )
+    await credential_requests_store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="env",
+        tenant_id=tenant_a.id,
+        agent_id=uuid.uuid4(),
+        account_id=account_a.id,
+        target="OPENAI_API_KEY",
+        mcp_server_url=None,
+        requester_platform_user_id="shared-user-id",
+        channel_id="C1",
+        expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=pp_a.id, kind="platform")
+
+    assert report.db.credential_requests == 1, "only tenant A's row must be deleted"
+    surviving = await credential_requests_store.count_credential_requests_for_platform_user(
+        db_session, platform_user_id="shared-user-id", tenant_id=tenant_b.id
+    )
+    assert surviving == 1, "the other tenant's same-user-id row must survive"

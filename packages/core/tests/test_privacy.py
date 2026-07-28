@@ -10,7 +10,7 @@ fails CI if `PurgeReport` grows a category that `PurgePreview` does not mirror
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from daimon.core._models import (
     Account,
@@ -22,6 +22,7 @@ from daimon.core._models import (
     Routine,
     UserConfig,
 )
+from daimon.core.credential_requests import mint_request_token
 from daimon.core.privacy import (
     PurgePreview,
     PurgePreviewRow,
@@ -29,6 +30,7 @@ from daimon.core.privacy import (
 )
 from daimon.core.purge import PurgeReport, purge_account
 from daimon.core.stores import agent_github_binding as agent_github_binding_store
+from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
 from daimon.core.stores import routines as routines_store
@@ -395,6 +397,47 @@ async def test_collect_purge_preview_counts_slack_user_tokens_and_turn_contexts(
     )
 
 
+async def test_collect_purge_preview_credential_requests_matches_purge_account(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Preview counts credential_requests and agrees with purge_account's
+    actual deletion count — the right-to-erasure parity contract."""
+    tenant = await make_tenant(db_session, workspace_id="pv-cred-req")
+    account = await make_account(db_session, tenant=tenant)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="PV_CRED_TARGET",
+        tenant=tenant,
+        account=account,
+    )
+    await credential_requests_store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="env",
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        account_id=account.id,
+        target="OPENAI_API_KEY",
+        mcp_server_url=None,
+        requester_platform_user_id="PV_CRED_TARGET",
+        channel_id="C1",
+        expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+    )
+    await db_session.commit()
+
+    preview = await collect_purge_preview(sm=db_session_factory, account_id=account.id)
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert preview.credential_requests.count == 1, (
+        "must count the platform principal's credential-request row"
+    )
+    assert preview.credential_requests.count == report.db.credential_requests, (
+        "preview and purge must agree on credential_requests"
+    )
+
+
 async def test_collect_purge_preview_matches_purge_account_coverage_field_for_field() -> None:
     """If `PurgeReport` grows a new int field, `PurgePreview` MUST mirror it.
 
@@ -422,6 +465,7 @@ async def test_collect_purge_preview_matches_purge_account_coverage_field_for_fi
         "agent_github_binding": "agent_github_binding",
         "slack_user_tokens": "slack_user_tokens",
         "slack_turn_contexts": "slack_turn_contexts",
+        "credential_requests": "credential_requests",
     }
 
     uncovered = report_fields - set(mapping.keys())
