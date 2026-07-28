@@ -25,6 +25,7 @@ class GitHubTokenProvider:
         agent_id: uuid.UUID | None,
         sessionmaker: async_sessionmaker[AsyncSession],
         settings: Settings,
+        allow_service_default: bool = False,
     ) -> str:
         if not settings.crypto.keys:
             raise ProviderConfigError(
@@ -34,15 +35,24 @@ class GitHubTokenProvider:
         # NOTE: account_id IS principal_id today because
         # credentials are keyed on account_id-as-principal-id.
         # This may break if multi-principal accounts ship.
-        # when agent_id is given, get_pat is overlay-only — if the agent has
-        # no overlay row, None is returned and NoBindingError is raised here. This is
-        # correct: an agent with no per-agent credential bound must not silently inherit
-        # the principal-default PAT from another agent's Connect-GitHub action.
+        # when agent_id is given, get_pat is overlay-only — if the agent has no
+        # overlay row and (when allow_service_default is set) no configured
+        # operator fallback either, None is returned and NoBindingError is
+        # raised here. This is correct: an agent with no per-agent credential
+        # bound must not silently inherit the principal-default PAT from
+        # another agent's Connect-GitHub action. Three-tier resolution:
+        # overlay -> operator service default (opt-in, this caller only) -> raise.
         token = await get_pat(
             principal_id=account_id,
             agent_id=agent_id,
             sessionmaker=sessionmaker,
             fernet=fernet,
+            allow_service_default=allow_service_default,
+            fallback_pat=(
+                settings.github.fallback_pat.get_secret_value()
+                if settings.github.fallback_pat is not None
+                else None
+            ),
         )
         if token is None:
             raise NoBindingError(

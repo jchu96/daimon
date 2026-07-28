@@ -44,12 +44,16 @@ async def _get_cli_token_impl(
     """
     auth = await _auth(ctx)
     try:
+        # This token is handed to the agent's shell for transient gh/clone use
+        # and is never persisted, so opting into the operator service default
+        # is safe here.
         token = await dispatch_mint_token(
             service=service,
             account_id=auth.account_id,
             agent_id=auth.agent_id,
             sessionmaker=runtime.session_factory,
             settings=runtime.settings,
+            allow_service_default=True,
         )
     except NoBindingError as e:
         logger.warning(

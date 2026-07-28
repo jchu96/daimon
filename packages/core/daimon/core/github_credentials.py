@@ -16,13 +16,13 @@ Resolver: get_pat(principal_id, agent_id=None) -> str | None. Cascade:
   omission. A resolved real credential (tier-1 or tier-2) always returns
   before this tier is reached, so the fallback can never shadow one.
 
-  Three callers must NEVER pass allow_service_default=True: the agent-fork
-  copy path (would persist the shared token as a per-agent DB row plus a
-  binding), the session Copilot vault mirror and clone-token resolver (the
-  shared token must never beat a short-lived per-repo GitHub App
-  installation token, nor land in a per-agent MA vault credential), and the
-  MCP self-edit repo-binding write (uploads the minted token as a durable MA
-  vault credential).
+  Three callers must NEVER opt into this tier: the agent-fork copy path
+  (would persist the shared token as a per-agent DB row plus a binding), the
+  session Copilot vault mirror and clone-token resolver (the shared token
+  must never beat a short-lived per-repo GitHub App installation token, nor
+  land in a per-agent MA vault credential), and the MCP self-edit
+  repo-binding write (uploads the minted token as a durable MA vault
+  credential).
 
 No try/except — exceptions propagate. None means 'not found', NEVER
 'something broke'.
@@ -100,8 +100,8 @@ async def get_pat(
     agent_id=None -> principal-default -> opt-in service default -> None
     (OAuth-callback / CLI path).
 
-    The opt-in tier only engages when BOTH `allow_service_default=True` AND
-    `fallback_pat` is not None — see the module docstring for the full
+    The opt-in tier only engages when `allow_service_default` is set to True
+    AND `fallback_pat` is not None — see the module docstring for the full
     contract and the callers that must never opt in.
     """
     async with sessionmaker() as session:
