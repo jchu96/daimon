@@ -71,6 +71,13 @@ repos:
         pass_filenames: false
         files: ^packages/.*/tests/.*\.py$
 
+      - id: lint-migrations
+        name: lint migration downgrade markers
+        entry: uv run python scripts/lint_migrations.py
+        language: system
+        pass_filenames: false
+        files: ^packages/core/alembic/versions/.*\.py$
+
       - id: env-example-check
         name: env example up to date
         entry: uv run python scripts/generate_env_example.py --check

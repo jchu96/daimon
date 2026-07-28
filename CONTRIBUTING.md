@@ -61,6 +61,21 @@ uv run lint-imports                        # package boundary contracts
 Pyright runs in strict mode project-wide — new code should carry precise
 types rather than `Any`.
 
+### Migration downgrade-safety markers
+
+Every file under `packages/core/alembic/versions/` must carry a
+`downgrade: safe | destructive | unsupported` line in its module docstring:
+
+- `safe` — `downgrade()` reverses the migration cleanly, no data loss.
+- `destructive` — `downgrade()` reverses the migration but loses data.
+- `unsupported` — `downgrade()` raises `NotImplementedError`.
+
+`alembic revision` emits an invalid `downgrade: TODO-declare
+(safe|destructive|unsupported)` placeholder — replace it with the real
+value. `scripts/lint_migrations.py` (wired into pre-commit and CI)
+AST-cross-checks the declared value against the `downgrade()` body, so
+declaring `unsupported` requires actually raising `NotImplementedError`.
+
 ## Pull request expectations
 
 - Keep diffs focused: one logical change per PR.
