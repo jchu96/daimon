@@ -195,11 +195,17 @@ def _build_body_text(state: PanelState) -> str:
         )
         groups.append(f"🔌 **MCPs**\n{mcp_lines}")
 
-    # Repo & auth group: only shown when at least one of repo/auth/secrets is set.
+    # Repo & auth group: only shown when at least one of repo/auth/secrets is set,
+    # or the shared service account is the agent's only source of GitHub access.
     has_repo = bool(state.bound_repo_url)
     has_auth = bool(state.github_login or state.pat_last4)
     has_secrets = state.secret_count > 0
-    if has_repo or has_auth or has_secrets:
+    # get_github_login never sees the operator fallback PAT, so an agent relying
+    # on it alone would otherwise read as "unlinked" here despite being able to
+    # clone public repos. Distinct from `wont_clone` below by construction: the
+    # two never fire together (wont_clone already requires fallback NOT configured).
+    uses_shared_service_account = not has_auth and state.fallback_pat_configured
+    if has_repo or has_auth or has_secrets or uses_shared_service_account:
         repo_line_parts: list[str] = []
         if state.bound_repo_url:
             # Masked-link text must NOT be a URL: Discord auto-links the inner
@@ -214,6 +220,11 @@ def _build_body_text(state: PanelState) -> str:
             repo_line_parts.append(login_label)
         elif state.pat_last4:
             repo_line_parts.append(f"PAT ••••{state.pat_last4}")
+        elif uses_shared_service_account:
+            repo_line_parts.append(
+                "🌐 public read-only via shared service account — "
+                "link your GitHub for private repos"
+            )
         if has_secrets:
             repo_line_parts.append(f"🔑 {state.secret_count} secrets")
         repo_line = " · ".join(repo_line_parts)
