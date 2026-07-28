@@ -45,6 +45,7 @@ from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token, upsert_slack_bot_token
 from daimon.core.stores.tenants import get_tenant
 from daimon.core.stores.thread_sessions import create_thread_session, get_live_thread_session
+from daimon.core.turn.posture import Billed, BillingPosture
 from daimon.core.turn.state import TextBlock, TurnState
 from daimon.testing.ma import (
     _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]  # test-only
@@ -1430,7 +1431,7 @@ async def test_orchestrate_first_turn_when_no_agent_configured_posts_guidance_an
 
 
 # ---------------------------------------------------------------------------
-# Billing admission gates + usage_record wiring
+# Billing admission gates + billing posture wiring
 # ---------------------------------------------------------------------------
 
 
@@ -1607,7 +1608,7 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: Any,
 ) -> None:
-    """Unblocked turn: usage_record is wired into run_turn; a
+    """Unblocked turn: a Billed posture is wired into run_turn; a
     span.model_request_end event drives exactly one usage_events row and one
     tenant_ledger debit via the real record_turn_usage writer.
     """
@@ -1677,8 +1678,11 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
         type="span.model_request_end",
     )
 
-    async def _fake_run_turn(*, lifecycle: Any, usage_record: Any, **kwargs: Any) -> TurnState:
-        await usage_record(event=model_request_end_event, session_id=_fake_session.id)
+    async def _fake_run_turn(
+        *, lifecycle: Any, billing: BillingPosture, **kwargs: Any
+    ) -> TurnState:
+        assert isinstance(billing, Billed), "unblocked Slack turn must wire a Billed posture"
+        await billing.record(event=model_request_end_event)
         state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
         await lifecycle.on_terminal_success(state)
         return state
@@ -1717,8 +1721,8 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
 
         mock_run_turn.assert_called_once()
         call_kwargs = mock_run_turn.call_args.kwargs
-        usage_record = call_kwargs["usage_record"]
-        assert usage_record is not None, "usage_record must be wired into run_turn"
+        billing = call_kwargs["billing"]
+        assert isinstance(billing, Billed), "billing must be wired as Billed into run_turn"
 
     usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant_id)
     assert len(usage_rows) == 1, "unblocked turn must write exactly one usage_events row"
@@ -1732,7 +1736,7 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
 
 
 # ---------------------------------------------------------------------------
-# Billing admission gates + usage_record wiring on a REUSED (already-live)
+# Billing admission gates + billing posture wiring on a REUSED (already-live)
 # thread session — a follow-up turn must be gated and billed identically to
 # a first turn.
 # ---------------------------------------------------------------------------
@@ -2004,8 +2008,11 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
         type="span.model_request_end",
     )
 
-    async def _fake_run_turn(*, lifecycle: Any, usage_record: Any, **kwargs: Any) -> TurnState:
-        await usage_record(event=model_request_end_event, session_id=seeded_session_id)
+    async def _fake_run_turn(
+        *, lifecycle: Any, billing: BillingPosture, **kwargs: Any
+    ) -> TurnState:
+        assert isinstance(billing, Billed), "reused-session Slack turn must wire a Billed posture"
+        await billing.record(event=model_request_end_event)
         state = TurnState(content=[TextBlock(kind="text", text="Hello again!")])
         await lifecycle.on_terminal_success(state)
         return state

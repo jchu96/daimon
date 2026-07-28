@@ -1,9 +1,9 @@
 """Regression guard: CLI turn must write zero usage_events rows (REQ-7a).
 
-The CLI path in command.py calls run_turn without wiring usage_record=.
+The CLI path in command.py calls run_turn with billing=BillingExempt(...).
 This test exercises the real run_conversation path (not a monkeypatched
-run_turn) to catch any future regression where usage_record= is accidentally
-wired into the CLI turn driver.
+run_turn) to catch any future regression where a Billed posture is
+accidentally wired into the CLI turn driver.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
+import structlog.testing
 from anthropic.types.beta.sessions.beta_managed_agents_session_end_turn import (
     BetaManagedAgentsSessionEndTurn,
 )
@@ -45,9 +46,9 @@ async def test_cli_turn_writes_no_usage_events(
     Exercises the real run_conversation path with a transport-level fake MA
     server. The fake SSE stream contains a well-formed span.model_request_end
     event (all four required token count fields present) followed by a terminal
-    session.status_idle event. Since command.py never passes usage_record= to
-    run_turn, no usage_events row is written — this test will fail the moment
-    that invariant is broken.
+    session.status_idle event. Since command.py always passes
+    billing=BillingExempt(...) to run_turn, no usage_events row is written —
+    this test will fail the moment that invariant is broken.
     """
     span_event = BetaManagedAgentsSpanModelRequestEndEvent(
         id="evt_span_1",
@@ -91,7 +92,14 @@ async def test_cli_turn_writes_no_usage_events(
         resolver_cache=new_resolver_cache(),
     )
 
-    await run_conversation(rt=rt, session_id="test-session-abc", user_message="hello")
+    with structlog.testing.capture_logs() as logs:
+        await run_conversation(rt=rt, session_id="test-session-abc", user_message="hello")
 
     count = await usage_events.count_all(db_session)
     assert count == 0, "CLI turn must write zero usage_events rows"
+
+    exempt_logs = [e for e in logs if e["event"] == "turn.billing_exempt"]
+    assert len(exempt_logs) == 1, "CLI turn must emit exactly one turn.billing_exempt log entry"
+    assert exempt_logs[0]["reason"] == "cli-operator-run", (
+        "CLI turn's billing_exempt log must carry the cli-operator-run reason"
+    )

@@ -893,7 +893,7 @@ class TestSetupHook:
 
 
 class TestBillingAdmissionGate:
-    """is_over_cap admission gate + usage_record wiring."""
+    """is_over_cap admission gate + billing posture wiring."""
 
     @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
@@ -1007,7 +1007,7 @@ class TestBillingAdmissionGate:
     @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.is_over_cap", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
-    async def test_usage_record_wired_with_session_model_id(
+    async def test_billed_record_wired_with_session_model_id(
         self,
         mock_resolve: AsyncMock,
         mock_is_over_cap: AsyncMock,
@@ -1018,9 +1018,11 @@ class TestBillingAdmissionGate:
         db_session: AsyncSession,
         db_session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        """usage_record passed to run_turn is functools.partial bound to
+        """billing passed to run_turn is Billed(record=...) with record bound to
         ma_session.id and ma_session.agent.model.id."""
         import functools as _functools
+
+        from daimon.core.turn.posture import Billed
 
         tenant = await make_tenant(db_session, platform="discord", workspace_id="123456")
         await _setup_workspace_and_config(db_session, tenant.id)
@@ -1043,11 +1045,13 @@ class TestBillingAdmissionGate:
 
         mock_run_turn.assert_called_once()
         call_kwargs = mock_run_turn.call_args.kwargs
-        usage_record = call_kwargs["usage_record"]
-        assert isinstance(usage_record, _functools.partial), (
-            "usage_record should be a functools.partial"
+        billing = call_kwargs["billing"]
+        assert isinstance(billing, Billed), "billing should be Billed for a Discord turn"
+        record = billing.record
+        assert isinstance(record, _functools.partial), (
+            "billing.record should be a functools.partial"
         )
-        bound = usage_record.keywords
+        bound = record.keywords
         assert bound["tenant_id"] == tenant.id, "usage recording must bind tenant_id"
         assert bound["platform_user_id"] == "111", "platform_user_id should be bound"
         assert bound["managed_session_id"] == "sess-usage", (
