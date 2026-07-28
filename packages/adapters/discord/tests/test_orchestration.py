@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import anthropic as _anthropic
 import discord
+from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
 from anthropic.types.beta.beta_cloud_config import BetaCloudConfig
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
@@ -25,11 +26,13 @@ from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAg
 from anthropic.types.beta.beta_packages import BetaPackages
 from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwork
 from daimon.adapters.discord.bot import DaimonBot
-from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings
+from daimon.core.ma_resolver import ResolverCache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig, ScopeContext
 from daimon.core.stores import tenant_ledger
+from daimon.core.turn.deps import TurnDeps
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import make_tenant
@@ -87,14 +90,46 @@ def _make_runtime(
     anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
     from daimon.core.ma_resolver import new_resolver_cache  # noqa: PLC0415
 
+    resolver_cache = new_resolver_cache()
+    deployment_default = DeploymentDefault()
     return DiscordRuntime(
         settings=settings,
         anthropic=anthropic,
         sessionmaker=sessionmaker,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
+        deployment_default=deployment_default,
+        resolver_cache=resolver_cache,
+        turn_deps=_make_turn_deps(
+            settings,
+            anthropic,
+            sessionmaker,
+            resolver_cache=resolver_cache,
+            deployment_default=deployment_default,
+        ),
+    )
+
+
+def _make_turn_deps(
+    settings: MagicMock,
+    anthropic: AsyncAnthropic,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    resolver_cache: ResolverCache,
+    deployment_default: DeploymentDefault,
+) -> TurnDeps:
+    """Build the TurnDeps a DiscordRuntime carries via the production
+    `build_turn_deps` helper, so tests see the same derivation build_runtime
+    does. `settings.crypto.keys` on an unconfigured MagicMock iterates empty
+    (MagicMock auto-specs `__iter__`), so fernet is None here as in the
+    pre-cutover tests."""
+    return build_turn_deps(
+        settings,
+        anthropic,
+        sessionmaker,
+        deployment_default=deployment_default,
+        resolver_cache=resolver_cache,
+        billing_config=None,
     )
 
 
@@ -260,11 +295,11 @@ class TestNewThreadCreation:
     """Channel mentions create threads and run turns."""
 
     # TODO: migrate to MARouter transport-level fake
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_mention_in_channel_creates_thread_and_runs_turn(
         self,
         mock_resolve: AsyncMock,
@@ -310,11 +345,11 @@ class TestNewThreadCreation:
         assert "hello" in user_message, "trigger content must appear somewhere in the user message"
         assert call_kwargs["session_id"] == "sess-abc", "should use ma_session.id"
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_thread_and_status_embed_posted_before_session_create(
         self,
         mock_resolve: AsyncMock,
@@ -377,7 +412,7 @@ class TestNewThreadCreation:
             "initial embed should show the thinking phase"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_missing_config_sends_error_no_thread(
         self,
         mock_resolve: AsyncMock,
@@ -412,11 +447,11 @@ class TestNewThreadCreation:
         assert "/agent-setup" in sent_text, "recovery hint should point at /agent-setup"
         assert "/propagate" not in sent_text, "the deleted /propagate command must not be suggested"
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_session_creation_failure_sends_error_after_thread_created(
         self,
         mock_resolve: AsyncMock,
@@ -462,12 +497,12 @@ class TestNewThreadCreation:
 class TestThreadMention:
     """Thread mentions respond in-place with XML history context."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_mention_in_thread_responds_in_place(
         self,
         mock_resolve: AsyncMock,
@@ -502,12 +537,12 @@ class TestThreadMention:
         mock_build_xml.assert_called_once()
         mock_run_turn.assert_called_once()
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_mention_in_thread_passes_xml_context_to_run_turn(
         self,
         mock_resolve: AsyncMock,
@@ -545,12 +580,12 @@ class TestThreadMention:
         )
         assert call_kwargs["session_id"] == "sess-xml", "should use ma_session.id"
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_scope_context_uses_parent_channel_id(
         self,
         mock_resolve: AsyncMock,
@@ -582,12 +617,12 @@ class TestThreadMention:
         context: ScopeContext = call_kwargs["context"]
         assert context.channel_id == "789", "should use parent_id, not thread_id"
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_config_change_affects_next_turn(
         self,
         mock_resolve: AsyncMock,
@@ -619,12 +654,12 @@ class TestThreadMention:
         mock_resolve.assert_called_once()
         mock_run_turn.assert_called_once()
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_each_thread_mention_creates_fresh_session(
         self,
         mock_resolve: AsyncMock,
@@ -694,11 +729,11 @@ class TestConcurrentTurnProtection:
 class TestAutoArchive:
     """Thread auto-archive duration."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_thread_created_with_7_day_archive(
         self,
         mock_resolve: AsyncMock,
@@ -736,11 +771,11 @@ class TestAutoArchive:
 class TestHandleMentionErrorBoundary:
     """_handle_mention error boundary uses render_error with ULID request ID."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_turn_error_message_contains_rid_suffix(
         self,
         mock_resolve: AsyncMock,
@@ -782,11 +817,11 @@ class TestHandleMentionErrorBoundary:
             f"got: {error_text!r}"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_turn_error_message_has_structured_format(
         self,
         mock_resolve: AsyncMock,
@@ -895,12 +930,12 @@ class TestSetupHook:
 class TestBillingAdmissionGate:
     """is_over_cap admission gate + billing posture wiring."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.is_over_cap", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_over_cap_skips_turn(
         self,
         mock_resolve: AsyncMock,
@@ -940,12 +975,12 @@ class TestBillingAdmissionGate:
             "cap" in sent_text.lower()  # pyright: ignore[reportUnknownMemberType]
         ), f"over-cap message should mention 'cap'; got: {sent_text!r}"
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.is_over_cap", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_under_cap_proceeds_normally(
         self,
         mock_resolve: AsyncMock,
@@ -981,7 +1016,7 @@ class TestBillingAdmissionGate:
         mock_create_session.assert_called_once()
         mock_run_turn.assert_called_once()
 
-    @patch("daimon.adapters.discord.bot.is_over_cap", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock)
     async def test_dm_no_gate_short_circuit(
         self,
         mock_is_over_cap: AsyncMock,
@@ -1001,12 +1036,12 @@ class TestBillingAdmissionGate:
 
         mock_is_over_cap.assert_not_called()
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.is_over_cap", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_billed_record_wired_with_session_model_id(
         self,
         mock_resolve: AsyncMock,
@@ -1065,9 +1100,9 @@ class TestBillingAdmissionGate:
 class TestResolverSelfHeal:
     """Real ma_resolver runs end-to-end; archived cached id self-heals to live tag-matched id."""
 
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_discord_resolves_via_ma_resolver_end_to_end(
         self,
         mock_resolve: AsyncMock,
@@ -1149,14 +1184,23 @@ class TestResolverSelfHeal:
         discord_settings = MagicMock()
         discord_settings.max_concurrent_turns_per_tenant = 100  # effectively uncapped in tests
         settings.discord = discord_settings
+        resolver_cache = new_resolver_cache()
+        deployment_default = DeploymentDefault()
         runtime = DiscordRuntime(
             settings=settings,
             anthropic=anthropic,
             sessionmaker=db_session_factory,
             notebook_rate_limiter=RateLimiter(max_requests=999),
             billing_config=None,
-            deployment_default=DeploymentDefault(),
-            resolver_cache=new_resolver_cache(),
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            turn_deps=_make_turn_deps(
+                settings,
+                anthropic,
+                db_session_factory,
+                resolver_cache=resolver_cache,
+                deployment_default=deployment_default,
+            ),
         )
 
         bot = _make_bot(runtime)
@@ -1180,10 +1224,10 @@ class TestResolverSelfHeal:
         assert agent_kwarg.id == "ag_live", "resolver returned live id, re-retrieve loaded it"
         assert env_kwarg.id == "env_live", "resolver returned live env id, re-retrieve loaded it"
 
-    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.reconcile_tenant_defaults", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_resolve_ids_tag_miss_wires_guild_tenant_id_and_public_url_into_self_heal(
         self,
         mock_resolve: AsyncMock,
@@ -1300,14 +1344,23 @@ class TestResolverSelfHeal:
         discord_settings = MagicMock()
         discord_settings.max_concurrent_turns_per_tenant = 100
         settings.discord = discord_settings
+        resolver_cache = new_resolver_cache()
+        deployment_default = DeploymentDefault()
         runtime = DiscordRuntime(
             settings=settings,
             anthropic=anthropic,
             sessionmaker=db_session_factory,
             notebook_rate_limiter=RateLimiter(max_requests=999),
             billing_config=None,
-            deployment_default=DeploymentDefault(),
-            resolver_cache=new_resolver_cache(),
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            turn_deps=_make_turn_deps(
+                settings,
+                anthropic,
+                db_session_factory,
+                resolver_cache=resolver_cache,
+                deployment_default=deployment_default,
+            ),
         )
 
         bot = _make_bot(runtime)
@@ -1333,11 +1386,11 @@ class TestResolverSelfHeal:
 class TestAttachmentOrchestration:
     """Non-image attachments surface their signed CDN URL in the user message."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_data_attachment_cdn_url_prefix_prepended_to_user_message(
         self,
         mock_resolve: AsyncMock,
@@ -1388,11 +1441,11 @@ class TestAttachmentOrchestration:
         )
         assert "hello" in user_msg, "trigger content must be preserved in user_query"
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_trigger_image_cdn_url_prefix_prepended_to_user_message(
         self,
         mock_resolve: AsyncMock,
@@ -1464,12 +1517,12 @@ class TestAttachmentOrchestration:
 class TestSessionReuse:
     """SC-1 and SC-4: session-per-thread reuse + 404 recreate."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_delta_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_second_thread_mention_reuses_session_no_second_create(
         self,
         mock_resolve: AsyncMock,
@@ -1536,12 +1589,12 @@ class TestSessionReuse:
             "continuation turn must use delta context, not full history"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_first_thread_mention_creates_and_persists_mapping_and_watermark(
         self,
         mock_resolve: AsyncMock,
@@ -1615,12 +1668,12 @@ class TestSessionReuse:
             "persisted row must store the created ma_session_id"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_dead_session_404_recreates_and_marks_old_row_dead(
         self,
         mock_resolve: AsyncMock,

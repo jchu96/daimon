@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import uuid
 from collections.abc import Coroutine
 from datetime import UTC, datetime
@@ -34,37 +33,24 @@ from daimon.adapters.discord.vision import (
     download_as_image_blocks,
     is_vision_image_attachment,
 )
-from daimon.core.billing import is_over_cap
 from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import provision_tenant, reconcile_tenant_defaults
 from daimon.core.errors import DaimonError
-from daimon.core.github_credentials import build_multifernet
-from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
-from daimon.core.ma_resolver import MAResolverMissError, resolve_agent, resolve_environment
-from daimon.core.pricing import MODEL_PRICING
-from daimon.core.scope import ResolvedConfig, ScopeContext
-from daimon.core.sessions import create_session
+from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_resolver import MAResolverMissError
 from daimon.core.stores.accounts import set_role
 from daimon.core.stores.domain import Role, TenantRow
-from daimon.core.stores.identity import get_or_create_platform_principal
-from daimon.core.stores.scoped_config_read import resolve as resolve_config
 from daimon.core.stores.tenants import (
     get_tenant_liveness,
     list_tenants_by_platform,
     set_provision_status,
 )
-from daimon.core.stores.thread_sessions import (
-    create_thread_session,
-    get_live_thread_session,
-    mark_dead,
-    update_watermark,
-)
-from daimon.core.tenant_balance import is_over_balance
-from daimon.core.turn.driver import run_turn
+from daimon.core.stores.thread_sessions import update_watermark
+from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.gating import should_admit_turn
-from daimon.core.turn.posture import Billed
-from daimon.core.turn.state import TurnState
-from daimon.core.usage_recording import record_turn_usage
+from daimon.core.turn.lifecycle import TurnLifecycle
+from daimon.core.turn.prepare import bind_session
+from daimon.core.turn.run import run_prepared_turn
 from sqlalchemy.exc import SQLAlchemyError  # noqa: TCH002
 
 import discord
@@ -104,21 +90,6 @@ def _credit_depleted_message(bot_display_name: str) -> str:
     return (
         f"This server's {bot_display_name} credit is depleted. An admin can top up with `/billing`."
     )
-
-
-def _is_dead_session(state: TurnState) -> bool:
-    """Return True if state.error signals a gone/expired MA session (HTTP 404).
-
-    A 404 not_found_error from events.send means the session existed but is now
-    gone (deleted / expired / GC'd). The bot recreates silently.
-    A 400 means a malformed session id — not reachable with well-formed stored ids
-    and must surface as a normal turn error (do NOT recreate on it).
-    """
-    err = state.error
-    if err is None or err.kind != "upstream":
-        return False
-    cause = err.cause
-    return isinstance(cause, _anthropic.APIStatusError) and cause.status_code == 404
 
 
 def _compose_queued_content(messages: list[discord.Message]) -> str:
@@ -805,100 +776,40 @@ class DaimonBot(commands.Bot):
             parent_channel_id = str(message.channel.id)
             thread = None
 
-        # --- Identity resolution ---
-        async with self.runtime.sessionmaker() as session:
-            principal = await get_or_create_platform_principal(
-                session,
+        # --- Stage one: admission (identity, config cascade, missing-config
+        # bail, MA resolve/retrieve, balance gate, cap gate) -- D-01 admit(). ---
+        try:
+            admission = await admit(
+                self.runtime.turn_deps,
                 tenant_id=tenant_id,
                 platform="discord",
-                external_id=str(message.author.id),
+                external_user_id=str(message.author.id),
+                channel_id=parent_channel_id,
+                now=datetime.now(UTC),
             )
-            await session.commit()
-
-        # --- Config resolution (per turn) ---
-        scope = ScopeContext(
-            account_id=principal.account_id,
-            tenant_id=tenant_id,
-            channel_id=parent_channel_id,
-        )
-        async with self.runtime.sessionmaker() as session:
-            config = await resolve_config(
-                session, context=scope, default=self.runtime.deployment_default
-            )
-
-        # --- Missing config check (before thread creation) ---
-        if config.agent_name is None or config.environment_name is None:
-            missing: list[str] = []
-            if config.agent_name is None:
-                missing.append("agent")
-            if config.environment_name is None:
-                missing.append("environment")
+        except MissingTurnConfigError as err:
             log.info(
                 "missing_config",
                 guild_id=guild_id,
                 channel_id=parent_channel_id,
-                missing=missing,
+                missing=list(err.missing),
             )
             target = thread or message.channel
             hints: list[str] = []
-            if config.agent_name is None:
+            if "agent" in err.missing:
                 hints.append(
                     "An admin can set the default agent in `/agent-setup` -> "
                     "**Set as default...** -> [This channel] or [Whole server]."
                 )
-            if config.environment_name is None:
+            if "environment" in err.missing:
                 hints.append(
                     "Environment is operator-only -- an operator can set it via the CLI "
                     "(`daimon config set environment_name=...`)."
                 )
             await target.send(
-                f"No {' or '.join(missing)} configured for this channel. " + " ".join(hints)
+                f"No {' or '.join(err.missing)} configured for this channel. " + " ".join(hints)
             )
             return
-
-        # --- Resolve agent and environment via ma_resolver (self-heals on
-        # archive / recreate). Resolver returns live MA ids; we re-retrieve
-        # the full SDK objects so downstream code (thread name, create_session)
-        # gets BetaManagedAgentsAgent / BetaEnvironment with all fields.
-        async def _resolve_ids(cfg: ResolvedConfig) -> tuple[str, str]:
-            assert cfg.agent_name is not None and cfg.environment_name is not None
-            # Self-heal reconciles must thread public_url like the guild-join seed
-            # does — without it the re-seeded agent loses its daimon-mcp entry.
-            resolve_public_url = (
-                str(self.runtime.settings.mcp.public_url)
-                if self.runtime.settings.mcp.public_url is not None
-                else None
-            )
-            agent_id = await resolve_agent(
-                self.runtime.anthropic,
-                tenant_id=tenant_id,
-                daimon_tag=cfg.agent_name,
-                cached_id=None,
-                apply_callable=lambda: reconcile_tenant_defaults(
-                    self.runtime.anthropic,
-                    self.runtime.settings.defaults_root,
-                    tenant_id=tenant_id,
-                    public_url=resolve_public_url,
-                ),
-                cache=self.runtime.resolver_cache,
-            )
-            env_id = await resolve_environment(
-                self.runtime.anthropic,
-                tenant_id=tenant_id,
-                daimon_tag=cfg.environment_name,
-                cached_id=None,
-                apply_callable=lambda: reconcile_tenant_defaults(
-                    self.runtime.anthropic,
-                    self.runtime.settings.defaults_root,
-                    tenant_id=tenant_id,
-                    public_url=resolve_public_url,
-                ),
-                cache=self.runtime.resolver_cache,
-            )
-            return agent_id, env_id
-
-        try:
-            agent_id, env_id = await _resolve_ids(config)
         except MAResolverMissError as err:
             log.warning(
                 "resolver.miss",
@@ -914,38 +825,26 @@ class DaimonBot(commands.Bot):
                 "operator-only via the CLI (`daimon config set environment_name=...`)."
             )
             return
-        agent = await self.runtime.anthropic.beta.agents.retrieve(agent_id)
-        env = await self.runtime.anthropic.beta.environments.retrieve(env_id)
-
-        # --- Admission gate: per-tenant balance — independent of Stripe config ---
-        if await is_over_balance(sessionmaker=self.runtime.sessionmaker, tenant_id=tenant_id):
-            log.info("turn.skipped.over_balance", guild_id=guild_id, tenant_id=str(tenant_id))
+        except AdmissionDenied as err:
             target = thread or message.channel
-            await target.send(
-                _credit_depleted_message(_resolve_bot_display_name(self.runtime.settings))
-            )
+            if err.reason == "balance_depleted":
+                log.info("turn.skipped.over_balance", guild_id=guild_id, tenant_id=str(tenant_id))
+                await target.send(
+                    _credit_depleted_message(_resolve_bot_display_name(self.runtime.settings))
+                )
+            else:
+                log.info(
+                    "turn.skipped.over_cap",
+                    guild_id=guild_id,
+                    user_id=str(message.author.id),
+                )
+                await target.send(
+                    "Monthly usage cap reached for this guild. "
+                    "An admin can adjust the cap with `/billing` (when available)."
+                )
             return
 
-        # --- Admission gate: monthly usage cap ---
-        over_cap = await is_over_cap(
-            billing_config=self.runtime.billing_config,
-            sessionmaker=self.runtime.sessionmaker,
-            tenant_id=tenant_id,
-            user_id=str(message.author.id),
-            now=datetime.now(UTC),
-        )
-        if over_cap:
-            log.info(
-                "turn.skipped.over_cap",
-                guild_id=guild_id,
-                user_id=str(message.author.id),
-            )
-            target = thread or message.channel
-            await target.send(
-                "Monthly usage cap reached for this guild. "
-                "An admin can adjust the cap with `/billing` (when available)."
-            )
-            return
+        agent = admission.agent
 
         # --- Derive is_admin from Discord-native permissions ---
         # author is Union[User, Member]; guild_permissions is only on Member.
@@ -967,13 +866,13 @@ class DaimonBot(commands.Bot):
         #     caller's current guild-admin status, so concurrent same-account turns write the
         #     IDENTICAL value. No lock is needed — accounts are tenant-scoped so admin status
         #     is singular within a tenant (B1).
-        # (c) Targets only principal.account_id — by construction a platform-principal account
-        #     created by get_or_create_platform_principal. CLI/operator accounts are distinct
+        # (c) Targets only admission.account_id — by construction a platform-principal account
+        #     created by admit()'s identity resolution. CLI/operator accounts are distinct
         #     rows and are never touched by this write (T-88-04-03).
         async with self.runtime.sessionmaker() as _role_session:
             await set_role(
                 _role_session,
-                principal.account_id,
+                admission.account_id,
                 Role.ADMIN if is_admin else Role.USER,
             )
             await _role_session.commit()
@@ -1021,11 +920,6 @@ class DaimonBot(commands.Bot):
         )
         await lifecycle.post_initial()
 
-        # --- Session find-or-create (session-per-thread reuse) ---
-        # The per-thread mention mutex (bot.py:449-476) already serialises
-        # concurrent mentions for the same thread, so there is no race in the
-        # lookup-or-create below. Do NOT add an asyncio.Lock here.
-
         # Compute the account_id used to key thread-session lookup and create.
         # When per_caller_thread_sessions is ON (default): use the caller's real
         # account_id so each caller in a thread gets their own durable session
@@ -1044,109 +938,32 @@ class DaimonBot(commands.Bot):
             "_orchestrate called without discord settings — entrypoint must validate at boot"
         )
         if discord_settings.per_caller_thread_sessions:
-            session_account_id = principal.account_id
+            session_account_id = admission.account_id
         else:
             session_account_id = uuid.uuid5(
                 uuid.NAMESPACE_URL,
                 f"legacy-thread-sentinel:{tenant_id}:{thread.id}",
             )
 
-        agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id))
-        # Fernet decrypts the per-agent GitHub PAT so a bound repo clones into
-        # the session workspace. None when no crypto keys are configured
-        # (build_multifernet raises on empty) — repo injection is then skipped.
-        crypto_keys = tuple(
-            secret.get_secret_value() for secret in self.runtime.settings.crypto.keys
-        )
-        fernet = build_multifernet(crypto_keys) if crypto_keys else None
-
-        # For thread mentions, check for a live mapping before creating.
-        # Channel mentions always create (their thread was just created above,
-        # so no mapping can exist for it yet).
-        ma_session_id: str = ""  # overwritten in every live code path below
-        mapping_id: uuid.UUID | None = None
-        watermark: str | None = None
-        reused = False
-
-        if is_thread_mention:
-            # Thread mention: look up existing live session for this thread.
-            async with self.runtime.sessionmaker() as _lookup_session:
-                existing = await get_live_thread_session(
-                    _lookup_session,
-                    tenant_id=tenant_id,
-                    platform="discord",
-                    thread_id=str(thread.id),
-                    account_id=session_account_id,
-                )
-            if existing is not None:
-                ma_session_id = existing.ma_session_id
-                mapping_id = existing.id
-                watermark = existing.watermark_message_id
-                reused = True
-                log.info(
-                    "session.reused",
-                    session_id=ma_session_id,
-                    thread_id=thread.id,
-                    watermark=watermark,
-                )
-
-        if not reused:
-            # First turn for this thread, or channel mention — create a new session.
-            ma_session = await create_session(
-                self.runtime.anthropic,
-                agent=agent,
-                environment=env,
-                mcp_settings=self.runtime.settings.mcp,
-                account_id=principal.account_id,
-                tenant_id=tenant_id,
-                agent_uuid=agent_uuid,
-                session_factory=self.runtime.sessionmaker,
-                fernet=fernet,
-                github_fallback_pat=(
-                    self.runtime.settings.github.fallback_pat.get_secret_value()
-                    if self.runtime.settings.github.fallback_pat is not None
-                    else None
-                ),
-                github_app_id=self.runtime.settings.github.app_id,
-                github_app_private_key=(
-                    self.runtime.settings.github.app_private_key.get_secret_value()
-                    if self.runtime.settings.github.app_private_key is not None
-                    else None
-                ),
-            )
-            ma_session_id = ma_session.id
-
-        usage_record = functools.partial(
-            record_turn_usage,
-            sessionmaker=self.runtime.sessionmaker,
-            platform_user_id=str(message.author.id),
-            managed_session_id=ma_session_id,
-            model_id=agent.model.id,
+        # --- Stage two: bind_session (find-or-create, mapping write,
+        # recorder binding) -- D-01 bind_session(). ---
+        prepared = await bind_session(
+            self.runtime.turn_deps,
+            admission,
             tenant_id=tenant_id,
-            markup=self.runtime.settings.billing.markup,
-            pricing=MODEL_PRICING.get(agent.model.id),
+            platform="discord",
+            external_user_id=str(message.author.id),
+            thread_id=str(thread.id),
+            session_account_id=session_account_id,
+            reuse_existing=is_thread_mention,
         )
 
         log.info(
             "session.ready",
-            session_id=ma_session_id,
+            session_id=prepared.ma_session_id,
             thread_id=thread.id,
-            reused=reused,
+            reused=prepared.reused,
         )
-
-        # Persist mapping for the create path (after thread.id is known).
-        if not reused:
-            async with self.runtime.sessionmaker() as _map_session:
-                row = await create_thread_session(
-                    _map_session,
-                    tenant_id=tenant_id,
-                    platform="discord",
-                    thread_id=str(thread.id),
-                    account_id=session_account_id,
-                    ma_session_id=ma_session_id,
-                )
-                await _map_session.commit()
-            mapping_id = row.id
 
         # Split trigger-message attachments: API-consumable images → vision
         # blocks; everything else (data files, unsupported/oversized images)
@@ -1181,11 +998,11 @@ class DaimonBot(commands.Bot):
         # read them on demand instead. (build_context_xml still reports the
         # history image attachments; we just don't download them here.)
         if isinstance(message.channel, discord.Thread):
-            if reused and watermark is not None:
+            if prepared.reused and prepared.watermark is not None:
                 user_message, _ = await build_delta_xml(
                     thread,
                     trigger=message,
-                    after_message_id=int(watermark),
+                    after_message_id=int(prepared.watermark),
                     bot_user_id=self.user.id if self.user else None,
                     bot_display_name=discord_settings.bot_display_name,
                 )
@@ -1242,80 +1059,17 @@ class DaimonBot(commands.Bot):
                 + ", ".join(f"`{att.filename}` ({r})" for att, r in images_skipped)
             )
 
-        # --- Run the turn ---
-        log.info(
-            "turn.started",
-            guild_id=guild_id,
-            channel_id=parent_channel_id,
-            thread_id=thread.id,
-            session_id=ma_session_id,
-        )
-        state = await run_turn(
-            anthropic=self.runtime.anthropic,
-            session_id=ma_session_id,
-            user_message=user_message,
-            lifecycle=lifecycle,
-            cancel=cancel,
-            render_interval_s=2.0,
-            billing=Billed(record=usage_record),
-            image_blocks=image_blocks,
-        )
+        # --- Run the turn (D-08/D-09/D-10: run_prepared_turn owns the driver
+        # call and the one-shot dead-session recovery cycle). ---
+        # lifecycle_holder tracks whichever DiscordTurnLifecycle actually
+        # completed the turn -- recovery_lifecycle rebuilds a fresh one against
+        # the recreated session, and the watermark write below must read
+        # final_message_id off THAT lifecycle, not the pre-recovery one.
+        lifecycle_holder: list[DiscordTurnLifecycle] = [lifecycle]
 
-        # --- Recreate on dead session (404 not_found_error) ---
-        # Dead = session existed but is gone (expired/GC'd); 404 is the confirmed signal.
-        # On dead session: mark old row dead, create new session + new mapping row,
-        # re-seed with full history, re-run once. If the retry also fails, let it
-        # fall through to the normal error render — no infinite loop.
-        if _is_dead_session(state) and mapping_id is not None:
-            log.info(
-                "session.dead_recreate",
-                old_session_id=ma_session_id,
-                thread_id=thread.id,
-            )
-            async with self.runtime.sessionmaker() as _dead_session:
-                await mark_dead(_dead_session, id=mapping_id)
-                await _dead_session.commit()
-
-            ma_session_recreated = await create_session(
-                self.runtime.anthropic,
-                agent=agent,
-                environment=env,
-                mcp_settings=self.runtime.settings.mcp,
-                account_id=principal.account_id,
-                tenant_id=tenant_id,
-                agent_uuid=agent_uuid,
-                session_factory=self.runtime.sessionmaker,
-                fernet=fernet,
-                github_fallback_pat=(
-                    self.runtime.settings.github.fallback_pat.get_secret_value()
-                    if self.runtime.settings.github.fallback_pat is not None
-                    else None
-                ),
-                github_app_id=self.runtime.settings.github.app_id,
-                github_app_private_key=(
-                    self.runtime.settings.github.app_private_key.get_secret_value()
-                    if self.runtime.settings.github.app_private_key is not None
-                    else None
-                ),
-            )
-            new_session_id = ma_session_recreated.id
-            async with self.runtime.sessionmaker() as _new_map_session:
-                new_row = await create_thread_session(
-                    _new_map_session,
-                    tenant_id=tenant_id,
-                    platform="discord",
-                    thread_id=str(thread.id),
-                    # session_account_id is always non-NULL (real account_id or
-                    # deterministic sentinel). A NULL insert here would cause a
-                    # permanent cold-create loop on the next turn (T-88-04-02).
-                    account_id=session_account_id,
-                    ma_session_id=new_session_id,
-                )
-                await _new_map_session.commit()
-            mapping_id = new_row.id
-
-            # Full history re-seed for the recreated session.
-            user_message, _ = await build_context_xml(
+        async def _reseed_user_message() -> str:
+            """Full history re-seed for the recreated session (dead-session recovery)."""
+            full_message, _ = await build_context_xml(
                 thread,
                 trigger=message,
                 limit=100,
@@ -1323,43 +1077,61 @@ class DaimonBot(commands.Bot):
                 bot_display_name=discord_settings.bot_display_name,
             )
             if synthetic_prefix:
-                user_message = synthetic_prefix + "\n" + user_message
+                full_message = synthetic_prefix + "\n" + full_message
+            return full_message
 
-            cancel_retry = asyncio.Event()
-            lifecycle = DiscordTurnLifecycle(
+        def _recovery_lifecycle(cancel_event: asyncio.Event) -> TurnLifecycle:
+            new_lifecycle = DiscordTurnLifecycle(
                 send=_send_embed,
                 edit=_edit_message,
                 agent_name=agent.name,
                 model_id=agent.model.id,
-                cancel_view=CancelView(allowed_user_id=message.author.id, cancel=cancel_retry),
+                cancel_view=CancelView(allowed_user_id=message.author.id, cancel=cancel_event),
             )
-            state = await run_turn(
-                anthropic=self.runtime.anthropic,
-                session_id=new_session_id,
-                user_message=user_message,
-                lifecycle=lifecycle,
-                cancel=cancel_retry,
-                render_interval_s=2.0,
-                billing=Billed(record=usage_record),
-                image_blocks=image_blocks,
-            )
-            ma_session_id = new_session_id
+            lifecycle_holder[0] = new_lifecycle
+            return new_lifecycle
+
+        log.info(
+            "turn.started",
+            guild_id=guild_id,
+            channel_id=parent_channel_id,
+            thread_id=thread.id,
+            session_id=prepared.ma_session_id,
+        )
+        outcome = await run_prepared_turn(
+            self.runtime.turn_deps,
+            prepared,
+            tenant_id=tenant_id,
+            platform="discord",
+            thread_id=str(thread.id),
+            external_user_id=str(message.author.id),
+            user_message=user_message,
+            lifecycle=lifecycle,
+            cancel=cancel,
+            reseed_user_message=_reseed_user_message,
+            recovery_lifecycle=_recovery_lifecycle,
+            image_blocks=image_blocks,
+            render_interval_s=2.0,
+        )
+        state = outcome.state
+        mapping_id = outcome.mapping_id
+        final_lifecycle = lifecycle_holder[0]
 
         if state.error is not None:
             log.warning(
                 "turn.error",
                 thread_id=thread.id,
-                session_id=ma_session_id,
+                session_id=outcome.ma_session_id,
                 kind=state.error.kind,
             )
         else:
-            log.info("turn.completed", thread_id=thread.id, session_id=ma_session_id)
+            log.info("turn.completed", thread_id=thread.id, session_id=outcome.ma_session_id)
             # --- Write watermark (bot's reply message id) ---
-            if mapping_id is not None and lifecycle.final_message_id is not None:
+            if mapping_id is not None and final_lifecycle.final_message_id is not None:
                 async with self.runtime.sessionmaker() as _wm_session:
                     await update_watermark(
                         _wm_session,
                         id=mapping_id,
-                        watermark_message_id=lifecycle.final_message_id,
+                        watermark_message_id=final_lifecycle.final_message_id,
                     )
                     await _wm_session.commit()

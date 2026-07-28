@@ -52,6 +52,7 @@ def _runtime(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # credential-modal tests never run a turn
     )
 
 

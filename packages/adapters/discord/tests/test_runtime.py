@@ -22,6 +22,7 @@ def _make_runtime() -> DiscordRuntime:
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub for structural test
     )
 
 
@@ -37,7 +38,8 @@ class TestDiscordRuntime:
             "billing_config",
             "deployment_default",
             "resolver_cache",
-        }, f"expected 7 fields, got {fields}"
+            "turn_deps",
+        }, f"expected 8 fields, got {fields}"
 
     def test_frozen(self) -> None:
         """DiscordRuntime should be immutable (frozen=True)."""

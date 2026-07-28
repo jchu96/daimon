@@ -90,6 +90,7 @@ def _runtime(
         notebook_rate_limiter=RateLimiter(max_requests=999),
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
 

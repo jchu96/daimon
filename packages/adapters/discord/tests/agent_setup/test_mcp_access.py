@@ -170,6 +170,7 @@ async def test_on_talk_via_mcp_writes_row_and_replies_with_config_block(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     entry = _entry("expert-bot")
     state = PanelState(roster=[entry], selected=entry, account_id=account_id)
@@ -257,6 +258,7 @@ async def test_on_talk_via_mcp_reply_is_ephemeral(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     entry = _entry("expert-bot-2")
     state = PanelState(roster=[entry], selected=entry, account_id=account_id)
@@ -312,6 +314,7 @@ async def test_revoke_callback_flips_revoked_at(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     entry = _entry("expert-bot-3")
     state = PanelState(roster=[entry], selected=entry, account_id=account_id)
@@ -398,6 +401,7 @@ async def test_revoke_confirmation_edits_message_content_and_clears_view(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     entry = _entry("expert-bot-wr01")
     state = PanelState(roster=[entry], selected=entry, account_id=account_id)

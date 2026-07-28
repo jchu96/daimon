@@ -39,6 +39,7 @@ def _make_runtime() -> DiscordRuntime:
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # shutdown tests never run a turn
     )
 
 

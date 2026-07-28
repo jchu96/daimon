@@ -28,7 +28,7 @@ from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAg
 from anthropic.types.beta.beta_packages import BetaPackages
 from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwork
 from daimon.adapters.discord.bot import DaimonBot
-from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.ma_identity import derive_tenant_uuid as _derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError, new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
@@ -117,14 +117,24 @@ def _make_runtime(
     anthropic = AsyncMock()
     anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())
     anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
+    resolver_cache = new_resolver_cache()
+    deployment_default = DeploymentDefault()
     return DiscordRuntime(
         settings=settings,
         anthropic=anthropic,
         sessionmaker=sessionmaker,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
+        deployment_default=deployment_default,
+        resolver_cache=resolver_cache,
+        turn_deps=build_turn_deps(
+            settings,
+            anthropic,
+            sessionmaker,
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            billing_config=None,
+        ),
     )
 
 
@@ -167,11 +177,11 @@ class TestAgentResolveMiss:
     """A miss on a ready guild collapses to the plain 'no longer exists' message —
     no retry, no per-user-active fallthrough."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_non_user_active_miss_preserves_no_longer_exists_error(
         self,
         mock_resolve_config: AsyncMock,
@@ -221,11 +231,11 @@ class TestPerMessageTenantResolution:
     """on_message resolves TenantContext per-guild and threads tenant_id into _orchestrate
     (per_message_tenant invariant). Only 'ready' guilds proceed."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_on_message_resolves_tenant_per_guild(
         self,
         mock_resolve_config: AsyncMock,
@@ -270,7 +280,7 @@ class TestPerMessageTenantResolution:
         scope = mock_resolve_config.call_args.kwargs["context"]
         assert scope.tenant_id == tenant_a, "must thread guild A's derived tenant_id, not B's"
 
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_on_message_pending_guild_sends_setting_up(
         self,
         mock_resolve_config: AsyncMock,
@@ -302,7 +312,7 @@ class TestNonReadySelfHealGate:
     'failed' is never user-visible (provisioning_pending invariant)."""
 
     @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_on_message_failed_guild_self_heals_and_sends_setting_up(
         self,
         mock_resolve_config: AsyncMock,
@@ -338,7 +348,7 @@ class TestNonReadySelfHealGate:
         assert "failed" not in sent_text.lower(), "'failed' must never be shown to the user"  # pyright: ignore[reportUnknownMemberType]
 
     @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_on_message_unprovisioned_guild_self_heals(
         self,
         mock_resolve_config: AsyncMock,
@@ -376,7 +386,7 @@ class TestEveryoneMentionIgnored:
     on_message gates on message.mentions instead, which excludes @everyone/@here."""
 
     @patch("daimon.adapters.discord.bot.derive_tenant_uuid")
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_on_message_everyone_ping_is_ignored(
         self,
         mock_resolve_config: AsyncMock,

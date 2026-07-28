@@ -295,6 +295,7 @@ def _runtime_with_settings(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
 
@@ -368,6 +369,7 @@ def _runtime_with_db(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
 
@@ -1128,6 +1130,7 @@ async def test_kick_off_skill_sync_fire_and_forget(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
     await kick_off_skill_sync(
@@ -1184,6 +1187,7 @@ async def test_kick_off_skill_sync_uses_runtime_credentials(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
     await kick_off_skill_sync(
@@ -1259,6 +1263,7 @@ async def test_apply_repo_modal_persists_binding(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
     modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)

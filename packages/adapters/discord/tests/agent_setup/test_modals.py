@@ -91,6 +91,7 @@ def _runtime_for_view(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
 
@@ -226,6 +227,7 @@ async def test_inline_pat_persisted_encrypted(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
     # The credential is stored under agent_id (per-agent principal), not account_id.
@@ -287,6 +289,7 @@ async def test_store_inline_pat_writes_per_agent_overlay(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
     agent_a = uuid.uuid4()

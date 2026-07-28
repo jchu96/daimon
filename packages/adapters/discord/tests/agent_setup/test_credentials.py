@@ -306,6 +306,7 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     on_added = AsyncMock()
     modal = PasteSecretModal(
@@ -366,6 +367,7 @@ async def test_paste_modal_rejects_invalid_key_and_writes_nothing(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     modal = PasteSecretModal(
         runtime=runtime, tenant_id=tenant.id, agent_id=agent_id, on_added=AsyncMock()
@@ -414,6 +416,7 @@ async def test_remove_deletes_the_key_and_rerenders(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     view = CredentialsSubView(
         runtime=runtime,
@@ -462,6 +465,7 @@ async def test_back_replaces_with_editview_in_place(account_id: uuid.UUID) -> No
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     view = CredentialsSubView(
         runtime=runtime,
@@ -539,6 +543,7 @@ async def test_editview_secrets_button_opens_subview(
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     entry = _entry("bot")
     edit_view = EditView(_state(entry, account_id), runtime=runtime, allowed_user_id=42)
@@ -569,6 +574,7 @@ def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.
         billing_config=None,
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
     sys_entry = RosterEntry(
         name="sys",

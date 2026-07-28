@@ -19,7 +19,7 @@ from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAg
 from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
 from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.adapters.discord.bot import DaimonBot
-from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
@@ -70,14 +70,24 @@ def _make_runtime(
     anthropic = AsyncMock()
     anthropic.beta.agents.retrieve = AsyncMock()
     anthropic.beta.environments.retrieve = AsyncMock()
+    resolver_cache = new_resolver_cache()
+    deployment_default = DeploymentDefault()
     return DiscordRuntime(
         settings=settings,
         anthropic=anthropic,
         sessionmaker=sessionmaker,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
+        deployment_default=deployment_default,
+        resolver_cache=resolver_cache,
+        turn_deps=build_turn_deps(
+            settings,
+            anthropic,
+            sessionmaker,
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            billing_config=None,
+        ),
     )
 
 
@@ -123,11 +133,11 @@ def _make_channel_message(
 class TestInflightCapRejection:
     """4th turn for a saturated tenant rejected (SCALE-01)."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_on_message_rejects_over_cap_for_tenant(
         self,
         mock_resolve_config: AsyncMock,
@@ -183,11 +193,11 @@ class TestInflightCapRejection:
 class TestInflightDecrement:
     """In-flight counter released on success and error."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_inflight_decrements_after_successful_turn(
         self,
         mock_resolve_config: AsyncMock,
@@ -237,11 +247,11 @@ class TestInflightDecrement:
             f"in-flight counter must be 0 after a successful turn; got {count_after}"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_inflight_decrements_after_failed_turn(
         self,
         mock_resolve_config: AsyncMock,
@@ -296,11 +306,11 @@ class TestInflightDecrement:
 class TestInflightIsolation:
     """Per-tenant isolation: A saturated, B unaffected."""
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_inflight_isolated_per_tenant(
         self,
         mock_resolve_config: AsyncMock,
@@ -384,11 +394,11 @@ class TestIsAdminDerivation:
     These tests verify that manage_guild derives correctly.
     """
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_manage_guild_member_writes_admin_role_to_db(
         self,
         mock_resolve_config: AsyncMock,
@@ -464,11 +474,11 @@ class TestIsAdminDerivation:
             "manage_guild=True member must write account.role=admin to the DB each turn"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_non_manage_guild_member_writes_user_role_to_db(
         self,
         mock_resolve_config: AsyncMock,
@@ -539,11 +549,11 @@ class TestIsAdminDerivation:
             "non-manage_guild member must write account.role=user to the DB each turn"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_plain_user_not_member_writes_user_role_to_db(
         self,
         mock_resolve_config: AsyncMock,
@@ -824,12 +834,12 @@ class TestPerCallerSessionKeying:
               single session per thread, identical to pre-88-04 behavior.
     """
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_low_priv_caller_in_admin_starter_thread_gets_own_session_when_distinct_external_ids(
         self,
         mock_resolve_config: AsyncMock,
@@ -965,12 +975,12 @@ class TestPerCallerSessionKeying:
             "session row must carry the low-priv caller's account_id, not the admin's"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_recreate_path_persists_account_id_on_new_row(
         self,
         mock_resolve_config: AsyncMock,
@@ -1082,12 +1092,12 @@ class TestPerCallerSessionKeying:
             "recreated row must reference the new MA session, not the dead one"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_legacy_flag_off_reuses_single_session_per_thread(
         self,
         mock_resolve_config: AsyncMock,
@@ -1212,11 +1222,11 @@ class TestPerTurnRoleUpsert:
     It targets only the platform-principal's account — never CLI/operator accounts (T-88-04-03).
     """
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_admin_turn_upserts_account_role_admin(
         self,
         mock_resolve_config: AsyncMock,
@@ -1287,11 +1297,11 @@ class TestPerTurnRoleUpsert:
             f"admin caller's turn must set account.role = Role.ADMIN; got: {account.role!r}"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_non_admin_turn_upserts_account_role_user(
         self,
         mock_resolve_config: AsyncMock,
@@ -1361,11 +1371,11 @@ class TestPerTurnRoleUpsert:
             f"non-admin caller's turn must set account.role = Role.USER; got: {account.role!r}"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_role_upsert_does_not_downgrade_cli_operator_account(
         self,
         mock_resolve_config: AsyncMock,
@@ -1446,11 +1456,11 @@ class TestPerTurnRoleUpsert:
             f"got: {cli_account.role!r}"
         )
 
-    @patch("daimon.adapters.discord.bot.resolve_agent", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_environment", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.run_turn", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.create_session", new_callable=AsyncMock)
-    @patch("daimon.adapters.discord.bot.resolve_config", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+    @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+    @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+    @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
     async def test_role_upsert_runs_with_flag_off(
         self,
         mock_resolve_config: AsyncMock,
