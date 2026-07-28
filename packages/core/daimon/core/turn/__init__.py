@@ -8,6 +8,13 @@ No I/O lives in this package. The driver that consumes these primitives
 from anthropic.types.beta.sessions import BetaManagedAgentsSessionEvent as SessionEvent
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
+from daimon.core.turn.posture import (
+    Billed,
+    BillingExempt,
+    BillingPosture,
+    ExemptReason,
+    UsageRecorder,
+)
 from daimon.core.turn.reducers import apply
 from daimon.core.turn.render import (
     BlockAdded,
@@ -28,6 +35,12 @@ __all__ = [
     # SDK alias (re-exported for short imports in driver/test code)
     "SessionEvent",
     "TurnLifecycle",
+    # billing posture
+    "Billed",
+    "BillingExempt",
+    "BillingPosture",
+    "ExemptReason",
+    "UsageRecorder",
     # state
     "ContentBlock",
     "Task",

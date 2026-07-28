@@ -1,9 +1,10 @@
 """Per-event usage recording helper.
 
 Callers bind context via `functools.partial(record_turn_usage, ...)` once at
-session-create time and pass the resulting callable as the `usage_record`
-parameter to `turn.driver.run_turn` / `headless_runner.run_turn`. The driver/
-runner invokes it for each `span.model_request_end` event.
+session-create time and pass the resulting callable as `Billed(record=...)`
+to `turn.driver.run_turn`'s `billing` parameter, or as the `usage_record`
+parameter to `headless_runner.run_turn`. The driver/runner invokes it for
+each `span.model_request_end` event.
 
 Per RESEARCH §"SDK Event Shape": the typed SDK event does NOT carry model_id.
 The caller resolves it once from `session.agent.model.id` and binds via
@@ -38,15 +39,10 @@ async def record_turn_usage(
     managed_session_id: str,
     model_id: str,
     event: BetaManagedAgentsSpanModelRequestEndEvent,
-    session_id: str | None = None,
     markup: Decimal = Decimal("1.0"),
     pricing: ModelRates | None = None,
 ) -> None:
     """Write one usage_events row and one debit ledger row.
-
-    `session_id` is accepted to match the driver/runner call signature
-    (`await usage_record(event=event, session_id=session.id)`) and is
-    unused — `managed_session_id` is bound by the caller's partial.
 
     `markup` and `pricing` are keyword-only params for the transactional debit
     (TOPUP-01). Writes a negative delta_usd row to tenant_ledger in the SAME
@@ -55,7 +51,6 @@ async def record_turn_usage(
 
     tenant_id=None is the DM signal — no tenant, no usage row, no ledger row.
     """
-    del session_id  # explicit unused
     if tenant_id is None:
         return  # DM turn — no tenant to bill, skip write
     async with sessionmaker() as s, s.begin():
