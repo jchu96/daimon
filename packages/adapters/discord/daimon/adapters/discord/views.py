@@ -5,6 +5,15 @@ CancelView for interrupting running turns (no timeout -- lifecycle manages remov
 
 All Views are non-persistent (VIEW-04): no custom_id, no bot.add_view(). CancelView uses
 timeout=None -- lifecycle manages removal.
+
+The one documented exception: the chat-initiated credential-request button
+(`daimon.adapters.discord.credential_button.CredentialRequestButton`) IS
+persistent -- it carries a custom_id and is registered as a
+`discord.ui.DynamicItem` class in `setup_hook`. This is necessary because the
+process that posts that button (the MCP server) is not the process that
+dispatches its click (this bot) -- there is no live in-memory View instance
+to attach a non-persistent handler to. Every other interactive component in
+this adapter stays non-persistent.
 """
 
 from __future__ import annotations

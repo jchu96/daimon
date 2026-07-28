@@ -198,7 +198,11 @@ async def _set_repo_binding_impl(
     _require_admin(auth)
     agent_id = _require_agent_id(auth)
 
-    # 1. Mint plaintext PAT via the broker.
+    # 1. Mint plaintext PAT via the broker. Deliberately does NOT opt into the
+    # operator service default: the minted token is uploaded as a durable MA
+    # vault static_bearer credential below, so opting in would write the
+    # shared operator secret into a per-agent vault — the exact durable-copy
+    # failure mode this must avoid.
     try:
         token = await dispatch_mint_token(
             service=service,

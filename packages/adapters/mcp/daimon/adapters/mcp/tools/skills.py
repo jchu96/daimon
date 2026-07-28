@@ -75,11 +75,20 @@ async def _resolve_sync_token(
 
     The session JWT carries no agent_id claim (SC-4), so the credential is
     resolved from the URL instead: the caller-tenant's ``agent_repo_binding``
-    for this repo → that agent's PAT overlay. Other tenants' bindings
-    for the same repo never resolve — no cross-tenant credential bleed.
+    for this repo → that agent's PAT overlay, else the operator service
+    default (opt-in). Other tenants' bindings for the same repo never
+    resolve — no cross-tenant credential bleed. Because the loop returns on
+    the first `token is not None`, a fallback resolved on the first
+    tenant-matching binding short-circuits the loop — correct, since every
+    binding would resolve the same fallback.
     """
     if runtime.fernet is None:
         return None
+    fallback_pat = (
+        runtime.settings.github.fallback_pat.get_secret_value()
+        if runtime.settings.github.fallback_pat is not None
+        else None
+    )
     async with runtime.session_factory() as session:
         bindings = await get_bindings_for_repo(session, repo_url=url)
     for binding in bindings:
@@ -90,6 +99,8 @@ async def _resolve_sync_token(
             agent_id=binding.agent_id,
             sessionmaker=runtime.session_factory,
             fernet=runtime.fernet,
+            allow_service_default=True,
+            fallback_pat=fallback_pat,
         )
         if token is not None:
             return token

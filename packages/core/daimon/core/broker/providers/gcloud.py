@@ -33,6 +33,9 @@ class GcloudTokenProvider:
         agent_id: uuid.UUID | None,
         sessionmaker: async_sessionmaker[AsyncSession],
         settings: Settings,
+        # Accepted for Protocol conformance; inert here — no service-wide
+        # gcloud identity exists to fall back to.
+        allow_service_default: bool = False,
     ) -> str:
         # Pitfall 2: config check FIRST, then binding check.
         if settings.credentials.google_sa_json is None:

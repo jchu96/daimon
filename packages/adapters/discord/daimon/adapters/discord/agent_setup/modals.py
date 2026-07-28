@@ -324,7 +324,9 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
                         public = await is_public_repo(http_client, owner_repo=owner_repo)
                         if not public:
                             raise DaimonError(
-                                "This repo is private (or not found). Paste a PAT to bind it."
+                                "This repo isn't visible to the shared service account "
+                                "(it's private, or it doesn't exist) — paste a PAT or "
+                                "connect your GitHub to bind it."
                             )
                 # No inline PAT -> no per-agent credential is written. The resync
                 # path is agent-overlay-only and never consults a principal-default, so

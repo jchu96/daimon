@@ -29,6 +29,7 @@ from daimon.core.config import (
     CredentialsSettings,
     CryptoSettings,
     DatabaseSettings,
+    GithubSettings,
     Settings,
 )
 from daimon.core.github_credentials import build_multifernet, upsert_credential_encrypted
@@ -40,6 +41,7 @@ def _base_settings(
     *,
     crypto_keys: tuple[SecretStr, ...] = (),
     google_sa_json: SecretStr | None = None,
+    github_fallback_pat: SecretStr | None = None,
 ) -> Settings:
     """Construct a fully-populated Settings for broker tests."""
     return Settings(
@@ -52,6 +54,7 @@ def _base_settings(
         ),
         crypto=CryptoSettings(keys=crypto_keys),
         credentials=CredentialsSettings(google_sa_json=google_sa_json),
+        github=GithubSettings(fallback_pat=github_fallback_pat),
     )
 
 
@@ -132,6 +135,88 @@ async def test_github_passthrough_raises_no_binding_when_unbound(
             sessionmaker=db_session_factory,
             settings=github_settings,
         )
+
+
+@pytest.mark.asyncio
+async def test_github_opt_in_returns_fallback_when_unbound_and_configured(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet_key: SecretStr,
+) -> None:
+    """allow_service_default=True + a configured fallback_pat -> the fallback
+    token resolves instead of NoBindingError for an unbound account."""
+    account_id = uuid.uuid4()
+    settings = _base_settings(
+        crypto_keys=(fernet_key,),
+        github_fallback_pat=SecretStr("ghp_operator_fallback"),
+    )
+
+    token = await dispatch_mint_token(
+        service="github",
+        account_id=account_id,
+        agent_id=None,
+        sessionmaker=db_session_factory,
+        settings=settings,
+        allow_service_default=True,
+    )
+    assert token == "ghp_operator_fallback", (
+        "opted-in dispatch with a configured fallback must return it instead of raising"
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_opt_in_raises_no_binding_when_fallback_unset(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet_key: SecretStr,
+) -> None:
+    """allow_service_default=True but no configured fallback_pat -> still
+    raises NoBindingError (a deployment that hasn't provisioned the service
+    token gets the same error as before)."""
+    account_id = uuid.uuid4()
+    settings = _base_settings(crypto_keys=(fernet_key,))
+
+    with pytest.raises(NoBindingError):
+        await dispatch_mint_token(
+            service="github",
+            account_id=account_id,
+            agent_id=None,
+            sessionmaker=db_session_factory,
+            settings=settings,
+            allow_service_default=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_gcloud_opt_in_is_inert(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    gcloud_settings: Settings,
+) -> None:
+    """allow_service_default=True is a no-op for the gcloud provider — behavior
+    is identical to the opt-out call."""
+
+    def _fake_refresh(self: Any, request: Any) -> None:
+        self.token = "fake-access-token"
+
+    monkeypatch.setattr(
+        "google.oauth2.service_account.Credentials.refresh",
+        _fake_refresh,
+    )
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    await _insert_google_binding(db_session, agent_id=agent_id)
+
+    token = await dispatch_mint_token(
+        service="gcloud",
+        account_id=account_id,
+        agent_id=agent_id,
+        sessionmaker=db_session_factory,
+        settings=gcloud_settings,
+        allow_service_default=True,
+    )
+    assert token == "fake-access-token", (
+        "allow_service_default must be inert for the gcloud provider"
+    )
 
 
 @pytest.mark.asyncio

@@ -93,10 +93,15 @@ class _FakeCrypto:
         self.keys = keys
 
 
+class _FakeGithub:
+    fallback_pat: SecretStr | None = None
+
+
 class _FakeSettings:
     def __init__(self, fernet_key: bytes) -> None:
         self.cli = _FakeCli()
         self.crypto = _FakeCrypto(keys=(SecretStr(fernet_key.decode("utf-8")),))
+        self.github = _FakeGithub()
 
 
 def _make_rt(

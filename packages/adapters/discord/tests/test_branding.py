@@ -87,6 +87,7 @@ def _make_preview() -> PurgePreview:
         agent_github_binding=zero,
         slack_user_tokens=zero,
         slack_turn_contexts=zero,
+        credential_requests=zero,
     )
 
 

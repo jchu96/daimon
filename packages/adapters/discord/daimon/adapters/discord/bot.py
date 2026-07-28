@@ -265,6 +265,17 @@ class DaimonBot(commands.Bot):
         await self.add_cog(PrivacyCog(self))
         await self.add_cog(MemoryCog(self))
 
+        # One-time CLASS registration (not per-button) for the chat-initiated
+        # credential-request button. Imported here, not at module level, since
+        # credential_button.py imports DaimonBot at module level -- importing
+        # it up top here would be a cycle. Needed because a button posted by
+        # the separate MCP process still has to dispatch in THIS process:
+        # Discord routes interactions by bot application id, not by which
+        # process sent the message that carried the button.
+        from daimon.adapters.discord.credential_button import CredentialRequestButton
+
+        self.add_dynamic_items(CredentialRequestButton)
+
     async def _post_to_guild(self, guild: discord.Guild, embed: discord.Embed) -> None:
         """Post an embed via the fallback chain: text channel → DM owner → skip."""
         channel = _pick_post_channel(guild)

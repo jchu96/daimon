@@ -18,12 +18,16 @@ from daimon.core.agent_lifecycle import (
     archive_memory_store_best_effort,
     copy_credential_and_repo_binding,
 )
+from daimon.core.config import AnthropicSettings, DatabaseSettings, GithubSettings, Settings
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_memory_stores import get_memory_store_id, insert_memory_store
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
-from daimon.core.stores.github_credentials import delete_credential_for_principal
+from daimon.core.stores.github_credentials import (
+    delete_credential_for_principal,
+    get_credential_by_principal,
+)
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     FakeMemoryStoreState,
@@ -31,6 +35,7 @@ from daimon.testing.ma import (
     build_fake_anthropic,
     make_fake_memory_store_handler,
 )
+from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.asyncio
@@ -150,6 +155,69 @@ async def test_copy_raises_when_source_credential_unresolvable(
 
     fork_binding = await get_binding(db_session, tenant_id=tenant.id, agent_id=fork_agent_uuid)
     assert fork_binding is None, "no partial write on the fail-loud path"
+
+
+async def test_copy_raises_even_with_operator_fallback_configured(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Regression guard: copy_credential_and_repo_binding has no wiring to
+    receive an operator fallback PAT at all (no settings/
+    allow_service_default/fallback_pat parameter exists on this function) --
+    an inline-pat source with no resolvable credential must still fail loud
+    and write nothing for the fork, even in an environment where
+    settings.github.fallback_pat IS configured. This proves the fork path
+    cannot silently inherit the shared operator secret, structurally, not
+    just by convention."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    source_agent_uuid = uuid.uuid4()
+    fork_agent_uuid = uuid.uuid4()
+
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+
+    # An ambient operator fallback PAT is configured in this environment --
+    # copy_credential_and_repo_binding takes no settings/fallback_pat
+    # parameter, so it structurally cannot see or use it.
+    fallback_settings = Settings(
+        database=DatabaseSettings(
+            url=PostgresDsn("postgresql+asyncpg://daimon:daimon@localhost:5432/daimon"),
+        ),
+        anthropic=AnthropicSettings(
+            api_key=SecretStr("sk-test"),
+            base_url=HttpUrl("https://api.anthropic.com"),
+        ),
+        github=GithubSettings(fallback_pat=SecretStr("ghp_operator_fallback")),
+    )
+    assert fallback_settings.github.fallback_pat is not None, "sanity: fallback is configured"
+
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=tenant.id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/repo",
+            default_branch="main",
+            ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+        )
+
+    with pytest.raises(DaimonError, match="github git-proxy"):
+        await copy_credential_and_repo_binding(
+            anthropic=_refusing_anthropic(),  # type: ignore[arg-type]
+            sessionmaker=db_session_factory,
+            fernet=fernet,
+            oauth_scopes=_OAUTH_SCOPES,
+            tenant_id=tenant.id,
+            source_agent_uuid=source_agent_uuid,
+            fork_agent_uuid=fork_agent_uuid,
+        )
+
+    fork_binding = await get_binding(db_session, tenant_id=tenant.id, agent_id=fork_agent_uuid)
+    assert fork_binding is None, "no partial binding write on the fail-loud path"
+    fork_credential = await get_credential_by_principal(db_session, principal_id=fork_agent_uuid)
+    assert fork_credential is None, (
+        "no github_credentials row for the fork -- the fallback was never persisted"
+    )
 
 
 async def test_copy_anon_binding_without_error_or_credential_write(

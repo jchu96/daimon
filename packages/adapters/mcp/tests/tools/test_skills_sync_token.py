@@ -17,11 +17,13 @@ from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, Role
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.skills import _resolve_sync_token
+from daimon.core.config import AnthropicSettings, DatabaseSettings, GithubSettings, Settings
 from daimon.core.github_credentials import build_multifernet, upsert_credential_encrypted
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.testing.factories import make_tenant
+from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.asyncio
@@ -29,11 +31,15 @@ pytestmark = pytest.mark.asyncio
 FERNET_KEY = "x" * 43 + "="  # length-44 urlsafe base64 — valid Fernet key shape
 
 
-def _make_runtime(sessionmaker: async_sessionmaker[AsyncSession]) -> McpRuntime:
+def _make_runtime(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    settings: Settings | None = None,
+) -> McpRuntime:
     return McpRuntime(
         session_factory=sessionmaker,
         client=MagicMock(spec=AsyncAnthropic),
-        settings=MagicMock(),  # type: ignore[arg-type]
+        settings=settings if settings is not None else MagicMock(),  # type: ignore[arg-type]
         fernet=build_multifernet((FERNET_KEY,)),
         deployment_default=DeploymentDefault(),
     )
@@ -135,3 +141,45 @@ async def test_resolve_sync_token_returns_none_when_no_binding(
         "https://github.com/example-org/example-agent",
     )
     assert token is None, "no binding for the repo means anonymous fetch (public-repo path)"
+
+
+def _minimal_settings(*, fallback_pat: SecretStr | None) -> Settings:
+    return Settings(
+        database=DatabaseSettings(
+            url=PostgresDsn("postgresql+asyncpg://daimon:daimon@localhost:5432/daimon"),
+        ),
+        anthropic=AnthropicSettings(
+            api_key=SecretStr("sk-test"),
+            base_url=HttpUrl("https://api.anthropic.com"),
+        ),
+        github=GithubSettings(fallback_pat=fallback_pat),
+    )
+
+
+async def test_resolve_sync_token_returns_fallback_for_tenant_binding_with_no_overlay(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A tenant-matching binding whose agent has no overlay PAT still resolves
+    the configured operator fallback, so a fresh agent's public skill sync
+    isn't limited to the unauthenticated GitHub rate limit."""
+    async with sessionmaker.begin() as session:
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(uuid.uuid4()))
+    agent_id = uuid.uuid4()
+    url = "https://github.com/example-org/example-agent"
+    async with sessionmaker.begin() as session:
+        await set_binding(
+            session,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            repo_url=url,
+            default_branch="main",
+            ma_secret_ref="anon:",
+        )
+
+    settings = _minimal_settings(fallback_pat=SecretStr("ghp_operator_fallback"))
+    token = await _resolve_sync_token(
+        _make_runtime(sessionmaker, settings=settings), _identity(tenant.id), url
+    )
+    assert token == "ghp_operator_fallback", (
+        "a tenant binding with no overlay PAT must resolve the configured operator fallback"
+    )

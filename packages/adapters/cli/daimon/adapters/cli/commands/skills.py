@@ -175,6 +175,11 @@ async def sync_agent(
         )
         raise typer.Exit(code=3)
     fernet = build_multifernet(tuple(k.get_secret_value() for k in rt.settings.crypto.keys))
+    github_fallback_pat = (
+        rt.settings.github.fallback_pat.get_secret_value()
+        if rt.settings.github.fallback_pat is not None
+        else None
+    )
 
     async def _run(http: httpx.AsyncClient) -> SyncReport:
         return await sync_agent_skills(
@@ -186,6 +191,7 @@ async def sync_agent(
             fernet=fernet,
             http_client=http,
             anthropic_client=rt.anthropic,
+            github_fallback_pat=github_fallback_pat,
         )
 
     try:

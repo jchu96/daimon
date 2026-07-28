@@ -38,8 +38,16 @@ async def dispatch_mint_token(
     agent_id: uuid.UUID | None,
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
+    allow_service_default: bool = False,
 ) -> str:
-    """Mint a token for ``service``. Audit-logs metadata only — never the token."""
+    """Mint a token for ``service``. Audit-logs metadata only — never the token.
+
+    ``allow_service_default`` passes straight through to the provider — the
+    broker itself makes no opt-in decision. Each consumer of this function
+    decides whether its use of the token is transient (safe to opt in) or
+    durable (must stay at the default so it never inherits the shared
+    operator secret).
+    """
     provider = _REGISTRY.get(service)
     if provider is None:
         raise ProviderConfigError(f"unknown service: {service!r}")
@@ -49,6 +57,7 @@ async def dispatch_mint_token(
             agent_id=agent_id,
             sessionmaker=sessionmaker,
             settings=settings,
+            allow_service_default=allow_service_default,
         )
     except NoBindingError:
         logger.warning(

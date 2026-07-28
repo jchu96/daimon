@@ -74,6 +74,7 @@ source_modules = [
     "daimon.core.broker",
     "daimon.core.config",
     "daimon.core.constants",
+    "daimon.core.credential_requests",
     "daimon.core.db",
     "daimon.core.errors",
     "daimon.core.headless_runner",

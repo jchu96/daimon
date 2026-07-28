@@ -22,4 +22,5 @@ class TokenProvider(Protocol):
         agent_id: uuid.UUID | None,
         sessionmaker: async_sessionmaker[AsyncSession],
         settings: Settings,
+        allow_service_default: bool = False,
     ) -> str: ...

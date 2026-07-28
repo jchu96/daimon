@@ -217,3 +217,165 @@ async def test_get_github_login_agent_no_overlay_returns_none(
         sessionmaker=db_session_factory,
     )
     assert result is None, "get_github_login(agent_id=X) with no overlay binding must return None"
+
+
+# --- Opt-in operator service-default tier (allow_service_default + fallback_pat) ---
+
+
+async def test_get_pat_agent_unbound_returns_fallback_when_opted_in(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """agent_id given, no binding row at all, opted in with a fallback value
+    -> the fallback wins (no bleed to principal-default; still no real credential)."""
+    result = await get_pat(
+        principal_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        allow_service_default=True,
+        fallback_pat="ghp_service",
+    )
+    assert result == "ghp_service", (
+        "get_pat must return the fallback when opted in and no binding resolves"
+    )
+
+
+async def test_get_pat_agent_bound_no_credential_returns_fallback_when_opted_in(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """agent_id given, binding row exists but the bound principal has no
+    credential row -> opted-in fallback still resolves."""
+    agent_id = uuid.uuid4()
+    unbound_principal_id = uuid.uuid4()  # no credential row for this principal
+    async with db_session_factory.begin() as session:
+        session.add(AgentGithubBinding(agent_id=agent_id, principal_id=unbound_principal_id))
+
+    result = await get_pat(
+        principal_id=uuid.uuid4(),
+        agent_id=agent_id,
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        allow_service_default=True,
+        fallback_pat="ghp_service",
+    )
+    assert result == "ghp_service", (
+        "get_pat must return the fallback when the bound principal has no credential row"
+    )
+
+
+async def test_get_pat_agent_overlay_credential_wins_over_fallback(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """A real overlay credential must win over a configured fallback — the
+    fallback can never shadow a resolved real credential."""
+    overlay_principal_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    await upsert_credential_encrypted(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        principal_id=overlay_principal_id,
+        github_login="overlay-user",
+        plaintext_token="ghp_overlay",
+        scopes=("repo",),
+    )
+    async with db_session_factory.begin() as session:
+        session.add(AgentGithubBinding(agent_id=agent_id, principal_id=overlay_principal_id))
+
+    result = await get_pat(
+        principal_id=uuid.uuid4(),
+        agent_id=agent_id,
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        allow_service_default=True,
+        fallback_pat="ghp_service",
+    )
+    assert result == "ghp_overlay", (
+        "a resolved overlay credential must win over the fallback, never be shadowed by it"
+    )
+
+
+async def test_get_pat_agent_path_fallback_none_still_resolves_none(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """allow_service_default=True alone (fallback_pat=None) resolves None —
+    the flag is the authorization, the value is the payload; neither alone does anything."""
+    result = await get_pat(
+        principal_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        allow_service_default=True,
+        fallback_pat=None,
+    )
+    assert result is None, (
+        "allow_service_default=True with fallback_pat=None must still resolve None"
+    )
+
+
+async def test_get_pat_principal_default_path_returns_fallback_when_opted_in(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """agent_id=None, no principal-default credential -> opted-in fallback wins."""
+    result = await get_pat(
+        principal_id=uuid.uuid4(),
+        agent_id=None,
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        allow_service_default=True,
+        fallback_pat="ghp_service",
+    )
+    assert result == "ghp_service", (
+        "get_pat(agent_id=None) must return the fallback when opted in and unbound"
+    )
+
+
+async def test_get_pat_principal_default_credential_wins_over_fallback(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """agent_id=None with a real principal-default credential -> that credential
+    wins over the fallback."""
+    principal_id = uuid.uuid4()
+    await upsert_credential_encrypted(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        principal_id=principal_id,
+        github_login="octocat",
+        plaintext_token="ghp_principal_default",
+        scopes=("repo",),
+    )
+
+    result = await get_pat(
+        principal_id=principal_id,
+        agent_id=None,
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        allow_service_default=True,
+        fallback_pat="ghp_service",
+    )
+    assert result == "ghp_principal_default", (
+        "the real principal-default credential must win over the fallback"
+    )
+
+
+async def test_get_pat_fallback_value_alone_without_flag_resolves_none(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fernet: MultiFernet,
+) -> None:
+    """fallback_pat set but allow_service_default left at its False default ->
+    the value alone must never leak without the flag."""
+    result = await get_pat(
+        principal_id=uuid.uuid4(),
+        agent_id=None,
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        fallback_pat="ghp_service",
+    )
+    assert result is None, (
+        "fallback_pat set without allow_service_default=True must never leak the value"
+    )
