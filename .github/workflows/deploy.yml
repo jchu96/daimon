@@ -166,3 +166,20 @@ jobs:
             sleep 6
           done
           echo "mcp did not become healthy" >&2; exit 1
+
+      - name: Post-deploy smoke turn
+        if: inputs.environment == 'staging'
+        timeout-minutes: 5
+        run: |
+          # Deliberately no VM-status precheck and no error-suppressing fallback
+          # here (unlike the worker refresh step above): a staging deploy that
+          # could not be smoke-verified must fail loudly, not read green. If the
+          # workers VM is stopped, the SSH command below fails and so does this step.
+          gcloud compute ssh ${{ vars.GCP_AR_REPO }}-workers --zone "$ZONE" \
+            --tunnel-through-iap --command '
+              export DAIMON_IMAGE="${{ steps.tags.outputs.daimon }}"
+              export SMOKE_DEPLOY_SHA="${{ inputs.sha }}"
+              export DOCKER_CONFIG=/root/.docker
+              cd /etc/daimon
+              sudo -E docker compose -f compose.worker.yml run --rm smoke
+            '
