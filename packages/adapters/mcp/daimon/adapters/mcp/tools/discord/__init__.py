@@ -25,6 +25,9 @@ from daimon.adapters.mcp.tools.discord._client import (
 from daimon.adapters.mcp.tools.discord._client import (
     rest_client as rest_client,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.discord._credential_button import (
+    _post_credential_button_impl as _post_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.adapters.mcp.tools.discord._models import (
     AttachmentRow as AttachmentRow,  # pyright: ignore[reportPrivateUsage]
 )
