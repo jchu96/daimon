@@ -62,6 +62,7 @@ from daimon.core.stores.thread_sessions import (
 from daimon.core.tenant_balance import is_over_balance
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.gating import should_admit_turn
+from daimon.core.turn.posture import Billed
 from daimon.core.turn.state import TurnState
 from daimon.core.usage_recording import record_turn_usage
 from sqlalchemy.exc import SQLAlchemyError  # noqa: TCH002
@@ -1256,7 +1257,7 @@ class DaimonBot(commands.Bot):
             lifecycle=lifecycle,
             cancel=cancel,
             render_interval_s=2.0,
-            usage_record=usage_record,
+            billing=Billed(record=usage_record),
             image_blocks=image_blocks,
         )
 
@@ -1339,7 +1340,7 @@ class DaimonBot(commands.Bot):
                 lifecycle=lifecycle,
                 cancel=cancel_retry,
                 render_interval_s=2.0,
-                usage_record=usage_record,
+                billing=Billed(record=usage_record),
                 image_blocks=image_blocks,
             )
             ma_session_id = new_session_id

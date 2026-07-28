@@ -19,6 +19,7 @@ from daimon.adapters.cli.run.lifecycle import NdjsonLifecycle
 from daimon.adapters.cli.runtime import CliRuntime, build_runtime
 from daimon.core.config import load_settings
 from daimon.core.turn.driver import run_turn
+from daimon.core.turn.posture import BillingExempt
 from daimon.core.turn.state import TurnState
 
 
@@ -79,6 +80,7 @@ async def run_conversation(
             user_message=user_message,
             lifecycle=lifecycle,
             cancel=cancel,
+            billing=BillingExempt(reason="cli-operator-run"),
         )
     except anthropic.APIError as err:
         _emit_failed_terminal(

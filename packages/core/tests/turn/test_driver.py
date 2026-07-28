@@ -8,6 +8,7 @@ from anthropic import AsyncAnthropic
 from anthropic.types.beta.sessions import BetaManagedAgentsImageBlockParam
 from daimon.core.errors import TurnError
 from daimon.core.turn import run_turn
+from daimon.core.turn.posture import BillingExempt
 from daimon.core.turn.state import TextBlock
 
 from .conftest import (
@@ -25,6 +26,7 @@ from .fakes import (
 )
 
 _FROZEN_NOW = datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC)
+_EXEMPT = BillingExempt(reason="cli-operator-run")
 
 
 def _now() -> datetime:
@@ -55,6 +57,7 @@ async def test_run_turn_folds_full_stream_and_returns_terminal_state() -> None:
         cancel=cancel,
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.content == [TextBlock(kind="text", text="hello world")]
@@ -91,6 +94,7 @@ async def test_run_turn_finalizes_session_status_terminated_as_terminal_failure(
             cancel=asyncio.Event(),
             render_interval_s=0.001,
             now=_now,
+            billing=_EXEMPT,
         ),
         timeout=2.0,
     )
@@ -127,6 +131,7 @@ async def test_run_turn_finalizes_requires_action_idle_as_actionable_failure() -
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -151,6 +156,7 @@ async def test_run_turn_posts_user_message_after_opening_stream() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert fa.beta.sessions.events.stream_calls == 1
@@ -185,6 +191,7 @@ async def test_run_turn_prepends_image_blocks_before_text_block() -> None:
         render_interval_s=0.001,
         now=_now,
         image_blocks=[image_block],
+        billing=_EXEMPT,
     )
 
     assert len(fa.beta.sessions.events.sent_events) == 1
@@ -222,6 +229,7 @@ async def test_run_turn_always_fires_final_render_before_terminal_success() -> N
         # synchronous final-render guarantee can surface "final content".
         render_interval_s=60.0,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert lc.renders, "on_render was never called; final-render guarantee violated"
@@ -260,6 +268,7 @@ async def test_reconnect_refolds_from_empty_and_continues_the_turn() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
     assert final.content == [TextBlock(kind="text", text="hello world")]
     assert final.stop_reason is not None
@@ -292,6 +301,7 @@ async def test_reconnect_does_not_re_emit_pre_reconnect_content() -> None:
         # Fast ticks to force renders around reconnect.
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     # No render state should show text shrinking or non-monotonic content.
@@ -325,6 +335,7 @@ async def test_double_connection_error_surfaces_connection_lost() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -349,6 +360,7 @@ async def test_non_retryable_status_error_surfaces_upstream() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -372,6 +384,7 @@ async def test_upstream_error_clears_stop_reason() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -398,6 +411,7 @@ async def test_rate_limit_error_populates_rate_limit_until_from_retry_after() ->
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -425,6 +439,7 @@ async def test_inband_rate_limited_session_error_wraps_but_rate_limit_until_stay
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -465,6 +480,7 @@ async def test_interrupt_during_replay_raises_interrupted_without_posting_user_i
         cancel=cancel,
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -511,6 +527,7 @@ async def test_interrupt_during_reattach_raises_interrupted_without_user_interru
         cancel=cancel,
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -540,6 +557,7 @@ async def test_interrupt_before_stream_open_raises_interrupted_with_pre_stream_p
         cancel=cancel,
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert final.error is not None
@@ -576,6 +594,7 @@ async def test_interrupt_mid_consume_posts_user_interrupt_and_ends_clean_on_ack(
             render_interval_s=0.001,
             interrupt_timeout_s=5.0,
             now=_now,
+            billing=_EXEMPT,
         )
 
     # user.interrupt was posted.
@@ -612,6 +631,7 @@ async def test_interrupt_mid_consume_timeout_surfaces_interrupt_timeout() -> Non
             render_interval_s=0.001,
             interrupt_timeout_s=0.05,
             now=_now,
+            billing=_EXEMPT,
         )
 
     assert final.error is not None
@@ -637,6 +657,7 @@ async def test_structlog_emits_turn_started_completed_on_happy_path() -> None:
             cancel=asyncio.Event(),
             render_interval_s=0.001,
             now=_now,
+            billing=_EXEMPT,
         )
 
     names = [e["event"] for e in logs]
@@ -671,6 +692,7 @@ async def test_structlog_emits_reconnect_events_on_retry() -> None:
             cancel=asyncio.Event(),
             render_interval_s=0.001,
             now=_now,
+            billing=_EXEMPT,
         )
 
     names = [e["event"] for e in logs]
@@ -700,6 +722,7 @@ async def test_structlog_turn_rate_limited_carries_retry_after_s_and_until() -> 
             cancel=asyncio.Event(),
             render_interval_s=0.001,
             now=_now,
+            billing=_EXEMPT,
         )
 
     rate_limited = next(e for e in logs if e["event"] == "turn.rate_limited")
@@ -749,6 +772,7 @@ async def test_reconnect_on_reused_session_two_turn_log_renders_only_current_tur
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     from daimon.core.turn.state import TextBlock

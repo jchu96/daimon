@@ -16,7 +16,7 @@ import contextlib
 import functools
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -115,6 +115,7 @@ from daimon.core.stores.thread_sessions import (
 from daimon.core.tenant_balance import is_over_balance
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.gating import should_admit_turn
+from daimon.core.turn.posture import Billed, UsageRecorder
 from daimon.core.usage_recording import record_turn_usage
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.async_client import AsyncBaseSocketModeClient
@@ -1145,7 +1146,7 @@ class SlackApp:
             )
 
         # --- usage_record binding: unconditional, mirrors bot.py:1107-1116 ---
-        usage_record: Callable[..., Coroutine[Any, Any, None]] = functools.partial(
+        usage_record: UsageRecorder = functools.partial(
             record_turn_usage,
             sessionmaker=self.runtime.sessionmaker,
             platform_user_id=str(event.get("user") or ""),
@@ -1276,7 +1277,7 @@ class SlackApp:
                 cancel=cancel_event,
                 render_interval_s=2.0,
                 image_blocks=image_blocks or None,
-                usage_record=usage_record,
+                billing=Billed(record=usage_record),
             )
         finally:
             # Leak-policy bookkeeping only — a delete failure must not mask the

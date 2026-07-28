@@ -10,6 +10,7 @@ import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types import RawMessageStreamEvent
 from daimon.core.turn import run_turn
+from daimon.core.turn.posture import BillingExempt
 
 from .conftest import make_agent_message, make_end_turn, make_status_idle
 from .fakes import (
@@ -22,6 +23,7 @@ from .fakes import (
 )
 
 _FROZEN_NOW = datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC)
+_EXEMPT = BillingExempt(reason="cli-operator-run")
 
 
 def _now() -> datetime:
@@ -65,6 +67,7 @@ async def test_driver_calls_on_sse_event_for_each_upstream_event() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert len(lc.sse_events) == 3, (
@@ -94,6 +97,7 @@ async def test_driver_calls_on_reconnect_on_connection_drop() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert lc.reconnects == ["connection_dropped"], (
@@ -116,6 +120,7 @@ async def test_driver_calls_on_rate_limited_with_until_before_sleep() -> None:
         cancel=asyncio.Event(),
         render_interval_s=0.001,
         now=_now,
+        billing=_EXEMPT,
     )
 
     assert len(lc.rate_limits) == 1, "driver must call on_rate_limited once on RateLimitError"
@@ -151,6 +156,7 @@ async def test_driver_calls_on_interrupt_sent_when_sigint() -> None:
             render_interval_s=0.001,
             interrupt_timeout_s=5.0,
             now=_now,
+            billing=_EXEMPT,
         )
 
     assert lc.interrupts == ["cancel_event"], (

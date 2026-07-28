@@ -1,7 +1,10 @@
 """Turn driver — pumps an SSE session to terminal idle or error.
 
 Entry point `run_turn` delegates to a module-private `_pump(...)` helper that
-runs the consume-loop and render-loop concurrently.
+runs the consume-loop and render-loop concurrently. Every call must declare
+a `BillingPosture`: `Billed(record=...)` meters each `span.model_request_end`
+event through the caller-bound recorder, `BillingExempt(reason=...)` emits a
+single structured exempt-billing log line at turn start and meters nothing.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from anthropic.types.beta.sessions import (
 from daimon.core.errors import TurnError
 from daimon.core.ma import replay_events, send_interrupt_and_wait, terminal_stop_reason
 from daimon.core.turn.lifecycle import TurnLifecycle
+from daimon.core.turn.posture import Billed, BillingExempt, BillingPosture
 from daimon.core.turn.reducers import apply
 from daimon.core.turn.state import TurnState
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
@@ -72,13 +76,15 @@ async def run_turn(
     render_interval_s: float = 0.05,
     interrupt_timeout_s: float = 120.0,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
-    usage_record: Callable[..., Awaitable[None]] | None = None,
+    billing: BillingPosture,
     image_blocks: Sequence[BetaManagedAgentsImageBlockParam] | None = None,
 ) -> TurnState:
     """Open the SSE stream, post the user message, and pump to terminal idle.
 
     Returns the final `TurnState`.
     """
+    if isinstance(billing, BillingExempt):
+        log.info("turn.billing_exempt", session_id=session_id, reason=billing.reason)
 
     async def _send_initial() -> None:
         content: list[BetaManagedAgentsImageBlockParam | BetaManagedAgentsTextBlockParam] = [
@@ -103,7 +109,7 @@ async def run_turn(
         interrupt_timeout_s=interrupt_timeout_s,
         now=now,
         entry="run",
-        usage_record=usage_record,
+        billing=billing,
     )
 
 
@@ -120,7 +126,7 @@ async def _pump(
     interrupt_timeout_s: float,
     now: Callable[[], datetime],
     entry: Literal["run", "resume"],
-    usage_record: Callable[..., Awaitable[None]] | None,
+    billing: BillingPosture,
 ) -> TurnState:
     log.info("turn.started", session_id=session_id, entry=entry)
 
@@ -168,7 +174,7 @@ async def _pump(
                         events_folded_cell=events_folded_cell,
                         cancel=cancel,
                         lifecycle=lifecycle,
-                        usage_record=usage_record,
+                        billing=billing,
                     )
         except _InterruptedDuringRecovery as err:
             await _cancel_render()
@@ -269,7 +275,7 @@ async def _consume_with_reconnect(
     events_folded_cell: list[int],
     cancel: asyncio.Event,
     lifecycle: TurnLifecycle,
-    usage_record: Callable[..., Awaitable[None]] | None,
+    billing: BillingPosture,
 ) -> None:
     """One attempt at the consume leg. On retry, replay + re-fold first."""
     if cancel.is_set():
@@ -327,10 +333,14 @@ async def _consume_with_reconnect(
                 event = next_task.result()
             except StopAsyncIteration:
                 return
-            # Per-event metering. Invoke caller-bound usage_record on
+            # Per-event metering. Invoke the caller-bound recorder on
             # span.model_request_end events. Exceptions propagate (fail-closed).
-            if usage_record is not None and event.type == "span.model_request_end":
-                await usage_record(event=event, session_id=session_id)
+            match billing:
+                case Billed(record=record):
+                    if event.type == "span.model_request_end":
+                        await record(event=event)
+                case BillingExempt():
+                    pass
             await lifecycle.on_sse_event(event)
             state_cell[0] = apply(state_cell[0], event)
             events_folded_cell[0] += 1
