@@ -55,10 +55,6 @@ def smoke_command(
             # ON CONFLICT DO NOTHING.
             topup_key = deploy_sha or dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S")
 
-            public_url = (
-                str(rt.settings.mcp.public_url) if rt.settings.mcp.public_url is not None else None
-            )
-
             def on_stage(stage: str) -> None:
                 console.print(f"smoke: {stage}")
 
@@ -71,7 +67,6 @@ def smoke_command(
                 resolver_cache=rt.resolver_cache,
                 topup_key=topup_key,
                 markup=rt.settings.billing.markup,
-                public_url=public_url,
                 timeout_s=timeout,
                 on_stage=on_stage,
             )

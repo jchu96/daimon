@@ -22,7 +22,11 @@ Bare-turn constraint: the smoke turn intentionally passes nothing beyond
 (vault/MCP settings, the caller account id, the per-agent uuid, the DB
 session factory, the crypto key, and the three GitHub credential params)
 is left at its default. A smoke turn never touches vault, MCP, or GitHub
-code paths; it only proves the MA + billing plumbing works.
+code paths; it only proves the MA + billing plumbing works. For the same
+reason the smoke tenant's defaults are reconciled with `public_url=None`:
+a non-None public_url makes the defaults merge attach the `daimon-mcp`
+server to the seeded agent, and MA refuses to start a session for such an
+agent without a vault credential — which a bare turn never binds.
 
 No-retries posture: per `guideline:architecture` error propagation, this
 orchestrator does not retry or swallow. The only exception this module
@@ -96,7 +100,6 @@ async def run_smoke_check(
     resolver_cache: ResolverCache,
     topup_key: str,
     markup: Decimal,
-    public_url: str | None = None,
     timeout_s: float = SMOKE_TIMEOUT_S,
     on_stage: Callable[[str], None],
 ) -> SmokeResult:
@@ -131,7 +134,13 @@ async def run_smoke_check(
 
     async def _apply() -> object:
         return await reconcile_tenant_defaults(
-            anthropic, defaults_root, tenant_id=tenant_id, public_url=public_url
+            # public_url=None keeps the seeded smoke agent free of the
+            # daimon-mcp server — a bare turn binds no vault credential, and
+            # MA fails session init for an agent whose MCP server has none.
+            anthropic,
+            defaults_root,
+            tenant_id=tenant_id,
+            public_url=None,
         )
 
     on_stage(f"resolving agent tag={agent_tag!r}")
