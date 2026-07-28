@@ -6,14 +6,17 @@ the platform-user-scoped erasure helpers.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from daimon.core.credential_requests import mint_request_token
 from daimon.core.stores import credential_requests as store
 from daimon.core.stores.domain import CredentialRequestRow
 from daimon.testing.factories import make_account, make_tenant
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 
 async def _seed_request(
@@ -232,3 +235,70 @@ async def test_count_credential_requests_for_platform_user_matches_delete_rowcou
     )
 
     assert count_before == deleted == 3
+
+
+def _concurrency_dsn() -> str:
+    """Read the real test DSN.
+
+    The single-use guarantee rests on Postgres row locks serializing two
+    *separate* connections, so this needs two independent engines rather than
+    the shared single-connection ``db_session`` fixture the rest of this file
+    uses.
+    """
+    url = os.environ.get("DAIMON_DATABASE__TEST_URL")
+    if not url:
+        pytest.skip("DAIMON_DATABASE__TEST_URL must be set for the concurrency test")
+    return url
+
+
+async def test_concurrent_consume_of_one_token_succeeds_exactly_once() -> None:
+    """Two connections racing the same token: one wins, one gets None.
+
+    The consume is a single `UPDATE ... WHERE used_at IS NULL AND
+    expires_at > now RETURNING`, so the loser's WHERE clause matches zero rows
+    once the winner's row lock is released. Asserting that empirically is the
+    difference between trusting the SQL shape and knowing it holds — and this
+    is the only gate standing between a leaked button and a second credential
+    write.
+
+    Runs against the default schema with a freshly minted token, so parallel
+    pytest workers cannot collide.
+    """
+    dsn = _concurrency_dsn()
+    engine_a = create_async_engine(dsn)
+    engine_b = create_async_engine(dsn)
+    factory_a = async_sessionmaker(engine_a, expire_on_commit=False)
+    factory_b = async_sessionmaker(engine_b, expire_on_commit=False)
+
+    token = mint_request_token()
+    try:
+        async with factory_a.begin() as seed:
+            tenant = await make_tenant(seed)
+            account = await make_account(seed, tenant=tenant)
+            await _seed_request(seed, tenant_id=tenant.id, account_id=account.id, token=token)
+
+        now = datetime.now(tz=UTC)
+
+        async def consume(factory: async_sessionmaker[AsyncSession]) -> CredentialRequestRow | None:
+            async with factory.begin() as session:
+                return await store.consume_credential_request(session, token=token, now=now)
+
+        first, second = await asyncio.gather(consume(factory_a), consume(factory_b))
+
+        winners = [row for row in (first, second) if row is not None]
+        assert len(winners) == 1, (
+            "exactly one racing connection may consume a single-use credential request; "
+            f"got {len(winners)} winners"
+        )
+        assert winners[0].token == token, "the winning consume must return the raced row"
+
+        async with factory_a() as check:
+            after = await store.peek_credential_request(check, token=token)
+        assert after is not None, "the row must survive consumption (it is marked, not deleted)"
+        assert after.used_at is not None, "the winning consume must persist used_at"
+
+        replayed = await consume(factory_a)
+        assert replayed is None, "a consumed token must never be consumable again"
+    finally:
+        await engine_a.dispose()
+        await engine_b.dispose()
