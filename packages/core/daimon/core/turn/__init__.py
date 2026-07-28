@@ -17,6 +17,7 @@ from daimon.core.turn.posture import (
     ExemptReason,
     UsageRecorder,
 )
+from daimon.core.turn.prepare import PreparedTurn, bind_session
 from daimon.core.turn.reducers import apply
 from daimon.core.turn.render import (
     BlockAdded,
@@ -49,6 +50,9 @@ __all__ = [
     "BillingPosture",
     "ExemptReason",
     "UsageRecorder",
+    # session preparation (D-01 stage two)
+    "PreparedTurn",
+    "bind_session",
     # state
     "ContentBlock",
     "Task",
