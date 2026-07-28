@@ -1650,3 +1650,28 @@ class TestDrainLoopDeCoalescing:
             "second drain turn content must not contain author A's prefix — "
             f"it would be a mixed-author composite; got: {second_override!r}"
         )
+
+
+class TestCredentialButtonRegistration:
+    """setup_hook registers CredentialRequestButton as a dynamic item exactly once."""
+
+    async def test_setup_hook_registers_credential_request_button(
+        self, db_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        from daimon.adapters.discord.credential_button import CredentialRequestButton
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+
+        await bot.setup_hook()
+
+        # The registry is private (ConnectionState._view_store._dynamic_items) --
+        # discord.py exposes no public read of the registration.
+        dynamic_items = (
+            bot._connection._view_store._dynamic_items  # pyright: ignore[reportPrivateUsage]  # discord.py exposes no public accessor
+        )
+        template = CredentialRequestButton.__discord_ui_compiled_template__
+        assert dynamic_items.get(template) is CredentialRequestButton, (
+            "CredentialRequestButton's compiled template must be registered as a "
+            "dynamic item after setup_hook runs"
+        )
