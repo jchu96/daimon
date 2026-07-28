@@ -124,3 +124,23 @@ async def mark_dead(
     """
     await session.execute(update(ThreadSession).where(ThreadSession.id == id).values(status="dead"))
     await session.flush()
+
+
+async def get_thread_session_by_id(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+) -> ThreadSessionRow | None:
+    """Return a mapping row by id regardless of status (live or dead).
+
+    Unlike `get_live_thread_session`, this does not filter on `status` -- it
+    exists for callers (audit trails, dead-session-recovery assertions) that
+    need to read a specific row's current status rather than look up the
+    newest live row for a caller.
+    """
+    orm = (
+        await session.execute(select(ThreadSession).where(ThreadSession.id == id))
+    ).scalar_one_or_none()
+    if orm is None:
+        return None
+    return ThreadSessionRow.model_validate(orm)

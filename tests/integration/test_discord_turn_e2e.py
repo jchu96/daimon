@@ -39,7 +39,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
     BetaManagedAgentsTextBlock,
 )
 from daimon.adapters.discord.bot import DaimonBot
-from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_resolver import new_resolver_cache
@@ -213,17 +213,28 @@ def _make_runtime(
     discord_settings.max_concurrent_turns_per_tenant = 100
     settings.discord = discord_settings
 
+    anthropic = build_fake_anthropic(router.dispatch)
+    resolver_cache = new_resolver_cache()
+    deployment_default = DeploymentDefault(
+        agent_name="test-agent",
+        environment_name="test-env",
+    )
     return DiscordRuntime(
         settings=settings,
-        anthropic=build_fake_anthropic(router.dispatch),
+        anthropic=anthropic,
         sessionmaker=sessionmaker,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,  # billing disabled → is_over_cap always False
-        deployment_default=DeploymentDefault(
-            agent_name="test-agent",
-            environment_name="test-env",
+        deployment_default=deployment_default,
+        resolver_cache=resolver_cache,
+        turn_deps=build_turn_deps(
+            settings,
+            anthropic,
+            sessionmaker,
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            billing_config=None,
         ),
-        resolver_cache=new_resolver_cache(),
     )
 
 
@@ -277,7 +288,7 @@ def _make_thread_message(*, guild_id: int = 123456) -> discord.Message:
     return message
 
 
-@patch("daimon.adapters.discord.bot.create_session")
+@patch("daimon.core.turn.prepare.create_session")
 @patch("daimon.adapters.discord.bot.build_context_xml")
 async def test_discord_mention_delivers_agent_reply_via_edit(
     mock_build_context_xml: AsyncMock,

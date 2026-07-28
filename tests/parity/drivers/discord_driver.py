@@ -28,7 +28,7 @@ from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAg
 from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.adapters.discord.agent_setup import write as discord_write
 from daimon.adapters.discord.bot import DaimonBot
-from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
@@ -103,16 +103,25 @@ class DiscordDriver:
         discord_settings.max_concurrent_turns_per_tenant = 100
         discord_settings.bot_display_name = "daimon"
         settings.discord = discord_settings
+        anthropic = build_fake_anthropic(router.dispatch)
+        resolver_cache = new_resolver_cache()
+        deployment_default = DeploymentDefault(agent_name="test-agent", environment_name="test-env")
         return DiscordRuntime(
             settings=settings,
-            anthropic=build_fake_anthropic(router.dispatch),
+            anthropic=anthropic,
             sessionmaker=sessionmaker,
             notebook_rate_limiter=RateLimiter(max_requests=999),
             billing_config=billing_config,  # pyright: ignore[reportArgumentType]  # test-injected BillingConfig | None
-            deployment_default=DeploymentDefault(
-                agent_name="test-agent", environment_name="test-env"
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            turn_deps=build_turn_deps(
+                settings,
+                anthropic,
+                sessionmaker,
+                deployment_default=deployment_default,
+                resolver_cache=resolver_cache,
+                billing_config=billing_config,  # pyright: ignore[reportArgumentType]  # test-injected BillingConfig | None
             ),
-            resolver_cache=new_resolver_cache(),
         )
 
     def _make_bot(self, runtime: DiscordRuntime) -> DaimonBot:
@@ -175,7 +184,7 @@ class DiscordDriver:
         thread = cast(MagicMock, message.channel)
 
         with (
-            patch("daimon.adapters.discord.bot.create_session") as mock_create_session,
+            patch("daimon.core.turn.prepare.create_session") as mock_create_session,
             patch("daimon.adapters.discord.bot.build_context_xml") as mock_build_context_xml,
         ):
             mock_create_session.return_value = _make_fake_session(
