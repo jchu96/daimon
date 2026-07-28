@@ -169,6 +169,86 @@ async def test_pat_missing_falls_back_to_unauthenticated_fetch(
     assert report.synced == 0, "no skill should be created when fetch fails"
 
 
+async def test_github_fallback_pat_used_when_no_overlay_and_no_override(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No per-agent overlay PAT, no credential_override, but github_fallback_pat
+    is threaded -> the fetch carries the fallback as its Authorization header
+    instead of falling back to an anonymous (unauthenticated) fetch."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+
+    fernet = _make_fernet()
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured_requests: list[httpx.Request] = []
+
+    def tarball_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(tarball_handler))
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        github_fallback_pat="ghp_operator_fallback",
+    )
+
+    assert len(captured_requests) == 1, "fetcher should be invoked exactly once"
+    assert captured_requests[0].headers.get("Authorization") == "token ghp_operator_fallback", (
+        "github_fallback_pat must be used as the fetch credential when no overlay PAT resolves"
+    )
+
+
+async def test_github_fallback_pat_omitted_behaves_as_before(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Callers that don't pass github_fallback_pat keep the pre-existing
+    anonymous-fetch behavior — the new kwarg is source-compatible."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+
+    fernet = _make_fernet()
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured_requests: list[httpx.Request] = []
+
+    def tarball_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(tarball_handler))
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+    )
+
+    assert len(captured_requests) == 1, "fetcher should be invoked exactly once"
+    assert "Authorization" not in captured_requests[0].headers, (
+        "omitting github_fallback_pat must keep the pre-existing anonymous fetch behavior"
+    )
+
+
 async def test_first_sync_creates_new_skill(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],

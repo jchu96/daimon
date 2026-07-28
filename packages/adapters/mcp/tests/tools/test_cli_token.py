@@ -28,6 +28,7 @@ from daimon.core.config import (
     CredentialsSettings,
     CryptoSettings,
     DatabaseSettings,
+    GithubSettings,
     Settings,
 )
 from daimon.core.github_credentials import build_multifernet, upsert_credential_encrypted
@@ -45,7 +46,11 @@ async def _fixture_is_admin_resolver_false(_ctx: object) -> str | None:
     return None
 
 
-def _build_settings(*, fernet_key: SecretStr) -> Settings:
+def _build_settings(
+    *,
+    fernet_key: SecretStr,
+    github_fallback_pat: SecretStr | None = None,
+) -> Settings:
     return Settings(
         database=DatabaseSettings(
             url=PostgresDsn("postgresql+asyncpg://daimon:daimon@localhost:5432/daimon"),
@@ -56,6 +61,7 @@ def _build_settings(*, fernet_key: SecretStr) -> Settings:
         ),
         crypto=CryptoSettings(keys=(fernet_key,)),
         credentials=CredentialsSettings(google_sa_json=None),
+        github=GithubSettings(fallback_pat=github_fallback_pat),
     )
 
 
@@ -165,6 +171,62 @@ async def test_get_cli_token_no_binding_maps_to_tool_error(
     async with Client(mcp) as client:
         with pytest.raises(ToolError, match="agent-setup repo-auth panel"):
             await client.call_tool("get_cli_token", {"service": "github"})
+
+
+async def test_get_cli_token_github_resolves_operator_fallback_when_unbound(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No credential bound + a configured operator fallback -> get_cli_token
+    resolves the shared service PAT instead of raising NoBindingError. This
+    token is handed to the agent's shell for transient gh/clone use, never
+    persisted, so it is a legitimate opt-in site."""
+    fernet_key = SecretStr(Fernet.generate_key().decode("ascii"))
+    settings = _build_settings(
+        fernet_key=fernet_key, github_fallback_pat=SecretStr("ghp_operator_fallback")
+    )
+    account_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+
+    runtime = McpRuntime(
+        session_factory=db_session_factory,
+        client=MagicMock(spec=AsyncAnthropic),
+        settings=settings,
+        deployment_default=DeploymentDefault(),
+    )
+
+    async def fixture_subject_resolver(_ctx: object) -> str:
+        return str(account_id)
+
+    async def fixture_tenant_resolver(_ctx: object) -> str:
+        return str(tenant_id)
+
+    async def fixture_role_resolver(_ctx: object) -> str:
+        return "user"
+
+    async def fixture_agent_id_resolver(_ctx: object) -> str | None:
+        return None
+
+    mcp = FastMCP(name="test")
+    mcp.add_middleware(
+        IdentityMiddleware(
+            subject_resolver=fixture_subject_resolver,
+            tenant_resolver=fixture_tenant_resolver,
+            role_resolver=fixture_role_resolver,
+            agent_id_resolver=fixture_agent_id_resolver,
+            is_admin_resolver=_fixture_is_admin_resolver_false,
+            internal_resolver=_fixture_is_admin_resolver_false,
+            sessionmaker=db_session_factory,
+        )
+    )
+    register_cli_token_tool(mcp, runtime)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_cli_token", {"service": "github"})
+
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert text == "ghp_operator_fallback", (
+        "get_cli_token('github') must resolve the operator fallback when no credential is bound"
+    )
 
 
 async def test_get_cli_token_unknown_service_rejected_by_literal(
