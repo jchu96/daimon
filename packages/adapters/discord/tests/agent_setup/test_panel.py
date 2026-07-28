@@ -266,10 +266,14 @@ def test_body_text_shows_pat_last4_masked(account_id: uuid.UUID) -> None:
         selected=selected,
         account_id=account_id,
         pat_last4="7890",
+        fallback_pat_configured=True,
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
     assert "••••7890" in text, "pat_last4 must render as ••••7890 in body text"
+    assert "shared service account" not in text, (
+        "a masked PAT must suppress the shared-service-account line"
+    )
 
 
 def test_body_text_shows_github_login_when_hydrated(account_id: uuid.UUID) -> None:
@@ -280,10 +284,14 @@ def test_body_text_shows_github_login_when_hydrated(account_id: uuid.UUID) -> No
         selected=selected,
         account_id=account_id,
         github_login="octocat",
+        fallback_pat_configured=True,
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
     assert "@octocat" in text, "hydrated GitHub login must render as @handle in body"
+    assert "shared service account" not in text, (
+        "a linked GitHub login must suppress the shared-service-account line"
+    )
 
 
 def test_body_text_labels_inline_pat_as_pat_not_handle(account_id: uuid.UUID) -> None:
@@ -398,10 +406,14 @@ def test_body_text_anon_binding_warns_without_fallback(account_id: uuid.UUID) ->
     assert "won't clone — no token" in text, (
         "anon: binding with no fallback PAT must warn it won't clone"
     )
+    assert "shared service account" not in text, (
+        "no fallback PAT configured must NOT show the shared-service-account line"
+    )
 
 
 def test_body_text_anon_binding_no_warning_with_fallback(account_id: uuid.UUID) -> None:
-    """An anon: binding clones via the operator fallback PAT — no warning."""
+    """An anon: binding clones via the operator fallback PAT — no warning, and the
+    shared-service-account line renders instead."""
     selected = _entry("my-agent")
     state = PanelState(
         roster=[selected],
@@ -417,6 +429,30 @@ def test_body_text_anon_binding_no_warning_with_fallback(account_id: uuid.UUID) 
     assert "won't clone" not in text, (
         "anon: binding must NOT warn when the operator fallback PAT is configured"
     )
+    assert "shared service account" in text, (
+        "an anon: binding backed by the fallback PAT must show the shared-service-account line"
+    )
+
+
+def test_body_text_shows_shared_service_account_line_with_no_repo_bound(
+    account_id: uuid.UUID,
+) -> None:
+    """With the fallback PAT configured but nothing bound yet, the Repo & auth group
+    renders with just the shared-service-account line — not the 'unconfigured' hint."""
+    selected = _entry("my-agent")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        fallback_pat_configured=True,
+    )
+    container = build_panel_container(state, thumbnail_url=None)
+    text = _container_text(container)
+    assert "📦" in text, "fallback PAT configured must show the Repo & auth group even unbound"
+    assert "shared service account" in text, (
+        "fallback PAT configured with nothing bound must show the shared-service-account line"
+    )
+    assert "won't clone" not in text, "no repo is bound, so the clone warning must not appear"
 
 
 def test_body_text_inline_pat_binding_never_warns(account_id: uuid.UUID) -> None:
