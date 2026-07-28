@@ -144,8 +144,9 @@ async def _select_credential(
 
     Priority:
     1. App installation token (preferred when an installation exists AND App is configured)
-    2. Per-agent PAT overlay ONLY (binding.agent_id keyed; never falls back to principal-default)
-    3. None (anon — public repos only)
+    2. Per-agent PAT overlay, else operator service default, else anon
+       (binding.agent_id keyed; never falls back to principal-default)
+    3. None (anon — public repos only, when no fallback is configured either)
 
     Never resolves agent_id=None (principal-default). That is the credential-bleed vector.
     """
@@ -168,12 +169,19 @@ async def _select_credential(
                 return token
 
     # Tier 2: per-agent PAT overlay — agent_id given, NEVER agent_id=None
-    # get_pat with agent_id resolves the overlay-only path; returns None if no overlay row
+    # get_pat with agent_id resolves the overlay-only path; falls through to the
+    # opted-in operator service default when no overlay resolves, else None (anon).
     pat = await get_pat(
         principal_id=binding.agent_id,  # per-agent path: principal_id not used when agent_id is set
         agent_id=binding.agent_id,
         sessionmaker=sessionmaker,
         fernet=fernet,
+        allow_service_default=True,
+        fallback_pat=(
+            github_settings.fallback_pat.get_secret_value()
+            if github_settings is not None and github_settings.fallback_pat is not None
+            else None
+        ),
     )
     return pat  # may be None (anon)
 

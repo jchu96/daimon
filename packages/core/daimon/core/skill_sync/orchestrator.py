@@ -394,6 +394,7 @@ async def sync_agent_skills(
     http_client: httpx.AsyncClient,
     anthropic_client: AsyncAnthropic,
     credential_override: str | None = None,
+    github_fallback_pat: str | None = None,
     max_tarball_bytes: int = 50 * 1024 * 1024,
 ) -> SyncReport:
     """Sync all skill_repos for one agent. Named error boundary.
@@ -407,6 +408,14 @@ async def sync_agent_skills(
         App-installation-token tier actually win when both an installation and a
         per-agent PAT exist. When None (panel / CLI / MCP paths), the per-agent PAT is
         resolved here as before.
+
+        ``github_fallback_pat`` is the operator-wide service default, threaded
+        by callers that already have ``settings.github.fallback_pat`` in scope
+        (panel / CLI / MCP). It is only consulted on the internal ``get_pat``
+        call — when ``credential_override`` is supplied, the caller's
+        pre-selected credential remains the single authority and the fallback
+        is not consulted. Defaults to None so all pre-existing callers stay
+        source-compatible without threading it.
 
         ``max_tarball_bytes`` bounds the per-repo tarball download
     . Defaults to the safe 50 MiB constant so all pre-existing callers
@@ -444,6 +453,8 @@ async def sync_agent_skills(
             agent_id=resolved_agent_id,
             sessionmaker=sessionmaker,
             fernet=fernet,
+            allow_service_default=True,
+            fallback_pat=github_fallback_pat,
         )
 
     # CR-01: user_skills is a per-AGENT ledger, not a per-user one. Both the panel

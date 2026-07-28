@@ -523,6 +523,11 @@ async def kick_off_skill_sync(
     """
     fernet = _build_runtime_fernet(runtime)
     repos = [SkillRepo(url=repo_url, branch="main", path="", split=True)]
+    github_fallback_pat = (
+        runtime.settings.github.fallback_pat.get_secret_value()
+        if runtime.settings.github.fallback_pat is not None
+        else None
+    )
     async with httpx.AsyncClient() as http_client:
         return await sync_agent_skills(
             principal_id=account_id,
@@ -533,4 +538,5 @@ async def kick_off_skill_sync(
             fernet=fernet,
             http_client=http_client,
             anthropic_client=runtime.anthropic,
+            github_fallback_pat=github_fallback_pat,
         )

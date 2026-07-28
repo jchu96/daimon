@@ -377,6 +377,11 @@ async def _create_agent_impl(
                 for r in spec.skill_repos
             ]
         else:
+            github_fallback_pat = (
+                runtime.settings.github.fallback_pat.get_secret_value()
+                if runtime.settings.github.fallback_pat is not None
+                else None
+            )
             async with httpx.AsyncClient() as http_client:
                 report = await sync_agent_skills(
                     principal_id=auth.account_id,  # NOT auth.principal_id (no such field)
@@ -387,6 +392,7 @@ async def _create_agent_impl(
                     fernet=fernet,
                     http_client=http_client,
                     anthropic_client=runtime.client,  # McpRuntime field is client
+                    github_fallback_pat=github_fallback_pat,
                 )
             warnings = sync_report_failures(report) or None
     return await _build_agent_info(
