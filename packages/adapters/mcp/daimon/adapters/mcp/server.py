@@ -48,6 +48,7 @@ from daimon.adapters.mcp.tools import (
 )
 from daimon.adapters.mcp.tools.channels import register_channel_tools
 from daimon.adapters.mcp.tools.cli_token import register_cli_token_tool
+from daimon.adapters.mcp.tools.credential_requests import register_credential_request_tools
 from daimon.adapters.mcp.tools.media import register_media_tools
 from daimon.adapters.mcp.tools.notebook import register_notebook_tools
 from daimon.adapters.mcp.tools.propagation import register_propagation_tools
@@ -257,6 +258,7 @@ def create_mcp_app(
     agents.register_agent_tools(mcp, runtime)
     environments.register_environment_tools(mcp, runtime)
     vault.register_vault_tools(mcp, runtime)
+    register_credential_request_tools(mcp, runtime)
     skills.register_skill_tools(mcp, runtime)
     sessions.register_sessions_tools(mcp, runtime)
     agent_chat.register_agent_chat_tools(mcp, runtime)
