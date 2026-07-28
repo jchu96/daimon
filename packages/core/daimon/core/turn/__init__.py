@@ -26,6 +26,7 @@ from daimon.core.turn.render import (
     TextAppend,
     diff,
 )
+from daimon.core.turn.run import RunOutcome, run_prepared_turn
 from daimon.core.turn.state import (
     ContentBlock,
     Task,
@@ -53,6 +54,9 @@ __all__ = [
     # session preparation (D-01 stage two)
     "PreparedTurn",
     "bind_session",
+    # driver call + one-shot dead-session recovery
+    "RunOutcome",
+    "run_prepared_turn",
     # state
     "ContentBlock",
     "Task",

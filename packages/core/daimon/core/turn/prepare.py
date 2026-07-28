@@ -46,7 +46,57 @@ class PreparedTurn:
     _record: UsageRecorder
 
 
-def _bind_recorder(
+async def create_fresh_session(
+    deps: TurnDeps,
+    admission: Admission,
+    *,
+    tenant_id: uuid.UUID,
+    platform: str,
+    thread_id: str,
+    session_account_id: uuid.UUID,
+) -> tuple[str, uuid.UUID]:
+    """Create a brand-new MA session and its `thread_sessions` mapping row.
+
+    The single shared `create_session` call site for a fresh session. Both
+    `bind_session`'s no-live-row path and 06-05's dead-session recovery cycle
+    call this helper rather than each carrying their own `create_session`
+    call -- a divergent second call site is exactly the bug shape this phase
+    exists to kill.
+
+    Returns `(ma_session_id, mapping_id)`.
+    """
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(admission.agent.id))
+    ma_session = await create_session(
+        deps.anthropic,
+        agent=admission.agent,
+        environment=admission.environment,
+        mcp_settings=deps.mcp,
+        account_id=admission.account_id,
+        tenant_id=tenant_id,
+        agent_uuid=agent_uuid,
+        session_factory=deps.sessionmaker,
+        fernet=deps.fernet,
+        github_fallback_pat=deps.github_fallback_pat,
+        github_app_id=deps.github_app_id,
+        github_app_private_key=deps.github_app_private_key,
+    )
+    ma_session_id = ma_session.id
+
+    async with deps.sessionmaker() as session:
+        row = await create_thread_session(
+            session,
+            tenant_id=tenant_id,
+            platform=platform,
+            thread_id=thread_id,
+            account_id=session_account_id,
+            ma_session_id=ma_session_id,
+        )
+        await session.commit()
+
+    return ma_session_id, row.id
+
+
+def bind_recorder(
     deps: TurnDeps,
     admission: Admission,
     *,
@@ -114,39 +164,19 @@ async def bind_session(
             reused = True
 
     if not reused:
-        agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(admission.agent.id))
-        ma_session = await create_session(
-            deps.anthropic,
-            agent=admission.agent,
-            environment=admission.environment,
-            mcp_settings=deps.mcp,
-            account_id=admission.account_id,
+        ma_session_id, mapping_id = await create_fresh_session(
+            deps,
+            admission,
             tenant_id=tenant_id,
-            agent_uuid=agent_uuid,
-            session_factory=deps.sessionmaker,
-            fernet=deps.fernet,
-            github_fallback_pat=deps.github_fallback_pat,
-            github_app_id=deps.github_app_id,
-            github_app_private_key=deps.github_app_private_key,
+            platform=platform,
+            thread_id=thread_id,
+            session_account_id=session_account_id,
         )
-        ma_session_id = ma_session.id
-
-        async with deps.sessionmaker() as session:
-            row = await create_thread_session(
-                session,
-                tenant_id=tenant_id,
-                platform=platform,
-                thread_id=thread_id,
-                account_id=session_account_id,
-                ma_session_id=ma_session_id,
-            )
-            await session.commit()
-        mapping_id = row.id
         watermark = None
 
     assert ma_session_id is not None, "ma_session_id must be resolved on every code path"
 
-    record = _bind_recorder(
+    record = bind_recorder(
         deps,
         admission,
         tenant_id=tenant_id,

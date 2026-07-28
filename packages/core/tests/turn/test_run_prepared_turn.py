@@ -1,0 +1,717 @@
+"""Unit tests for daimon.core.turn.run.run_prepared_turn -- the D-08/D-09/D-10
+one-shot dead-session recovery cycle: `run_turn` wired to the `PreparedTurn`
+recorder, and on an upstream 404 with a live mapping row, mark-dead + recreate
++ rebind + reseed + one re-run, never looping on a second consecutive 404.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+
+import httpx
+from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
+from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
+from daimon.core.config import McpSettings
+from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
+from daimon.core.ma_resolver import new_resolver_cache
+from daimon.core.scope import DeploymentDefault, ResolvedConfig
+from daimon.core.stores import usage_events
+from daimon.core.stores.thread_sessions import get_live_thread_session
+from daimon.core.turn.admission import Admission
+from daimon.core.turn.deps import TurnDeps
+from daimon.core.turn.prepare import PreparedTurn, bind_recorder
+from daimon.core.turn.run import run_prepared_turn
+from daimon.testing.ma import (
+    EMPTY_CLOUD_CONFIG,
+    MARouter,
+    build_fake_anthropic,
+    make_fake_memory_store_handler,
+    not_found_response,
+    send_events_response,
+    sse_response,
+)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .conftest import make_status_idle
+from .fakes import RecordingLifecycle
+
+from daimon.testing.factories import (  # isort: skip
+    make_account,
+    make_tenant,
+    make_thread_session,
+)
+
+_NOW = datetime(2026, 7, 28, tzinfo=UTC)
+
+
+def _agent(*, agent_id: str, tenant_id: uuid.UUID, name: str = "daimon") -> BetaManagedAgentsAgent:
+    now = datetime.now(UTC)
+    return BetaManagedAgentsAgent(
+        id=agent_id,
+        type="agent",
+        name=name,
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        description=None,
+        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
+        mcp_servers=[],
+        tools=[],
+        skills=[],
+        created_at=now,
+        updated_at=now,
+        archived_at=None,
+    )
+
+
+def _env(*, env_id: str, tenant_id: uuid.UUID, name: str = "default") -> BetaEnvironment:
+    now_iso = datetime.now(UTC).isoformat()
+    return BetaEnvironment(
+        id=env_id,
+        type="environment",
+        name=name,
+        description="",
+        config=EMPTY_CLOUD_CONFIG,
+        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
+        created_at=now_iso,
+        updated_at=now_iso,
+        archived_at=None,
+    )
+
+
+def _admission(
+    *, account_id: uuid.UUID, agent: BetaManagedAgentsAgent, env: BetaEnvironment
+) -> Admission:
+    return Admission(
+        account_id=account_id,
+        agent=agent,
+        environment=env,
+        config=ResolvedConfig(agent_name="daimon", environment_name="default"),
+    )
+
+
+def _deps(
+    *,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    router: MARouter,
+) -> TurnDeps:
+    return TurnDeps(
+        anthropic=build_fake_anthropic(router.dispatch),
+        sessionmaker=sessionmaker,
+        deployment_default=DeploymentDefault(),
+        resolver_cache=new_resolver_cache(),
+        defaults_root=Path("/nonexistent"),
+        mcp=McpSettings(),
+        billing_config=None,
+        markup=Decimal("1.0"),
+        fernet=None,
+        github_fallback_pat=None,
+        github_app_id=None,
+        github_app_private_key=None,
+        public_url=None,
+    )
+
+
+def _prepared_turn(
+    *,
+    deps: TurnDeps,
+    admission: Admission,
+    tenant_id: uuid.UUID,
+    external_user_id: str,
+    ma_session_id: str,
+    mapping_id: uuid.UUID | None,
+    session_account_id: uuid.UUID,
+) -> PreparedTurn:
+    """Build a PreparedTurn directly (bypassing bind_session) so tests can
+    control ma_session_id/mapping_id explicitly -- including the
+    mapping_id=None negative case bind_session never actually produces."""
+    record = bind_recorder(
+        deps,
+        admission,
+        tenant_id=tenant_id,
+        external_user_id=external_user_id,
+        ma_session_id=ma_session_id,
+    )
+    return PreparedTurn(
+        admission=admission,
+        ma_session_id=ma_session_id,
+        mapping_id=mapping_id,
+        watermark=None,
+        reused=True,
+        session_account_id=session_account_id,
+        _record=record,
+    )
+
+
+def _router(
+    *,
+    session_bodies: list[dict[str, object]],
+    dead_session_ids: set[str],
+) -> MARouter:
+    """A router serving memory-store cold-provision, session-create (each
+    call assigns the next `sess_N` id), events.send, and events.stream --
+    returning a 404 not_found for any session id in `dead_session_ids`, else
+    one terminal `session.status_idle` (end_turn) event."""
+    router = MARouter()
+    memory_handler = make_fake_memory_store_handler()
+
+    def _memory(request: httpx.Request, _match: object) -> httpx.Response:
+        return memory_handler(request)
+
+    router.add("POST", r"/v1/memory_stores", _memory)
+
+    def _session_create(request: httpx.Request, _match: object) -> httpx.Response:
+        body = json.loads(request.content)
+        new_id = f"sess_{len(session_bodies) + 1}"
+        session_bodies.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": new_id,
+                "type": "session",
+                "agent": {
+                    "id": body["agent"],
+                    "mcp_servers": [],
+                    "model": {"id": "claude-sonnet-4-6"},
+                    "name": "daimon",
+                    "skills": [],
+                    "tools": [],
+                    "type": "agent",
+                    "version": 1,
+                },
+                "created_at": "2026-07-28T00:00:00Z",
+                "outcome_evaluations": [],
+                "environment_id": body["environment_id"],
+                "metadata": {},
+                "resources": [],
+                "stats": {},
+                "status": "idle",
+                "updated_at": "2026-07-28T00:00:00Z",
+                "usage": {},
+                "vault_ids": [],
+            },
+        )
+
+    router.add("POST", r"/v1/sessions", _session_create)
+
+    def _send(_request: httpx.Request, _match: object) -> httpx.Response:
+        return send_events_response()
+
+    router.add("POST", r"/v1/sessions/[^/]+/events", _send)
+
+    def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        sid = match.group("sid")
+        if sid in dead_session_ids:
+            return not_found_response("session gone")
+        idle = make_status_idle(event_id="evt_idle")
+        return sse_response([idle.model_dump(mode="json")])
+
+    router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _stream)
+
+    return router
+
+
+async def _reseed() -> str:
+    return "full history reseed"
+
+
+def _recovery_lifecycle(_cancel: asyncio.Event) -> RecordingLifecycle:
+    return RecordingLifecycle()
+
+
+async def test_happy_path_runs_once_and_returns_recovered_false(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-1",
+        ma_session_id="sess_1",
+    )
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    router = _router(session_bodies=session_bodies, dead_session_ids=set())
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_1",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-1",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is False, "a clean run must not recover"
+    assert outcome.ma_session_id == "sess_1", "must report the original session id"
+    assert outcome.mapping_id == row.id, "must report the original mapping id"
+    assert outcome.state.error is None, "a clean idle-end-turn run has no error"
+    assert len(session_bodies) == 0, "no create_session call on the happy path"
+
+
+async def test_dead_session_recovers_once_and_rebinds_recorder(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-2",
+        ma_session_id="sess_old",
+    )
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    router = _router(session_bodies=session_bodies, dead_session_ids={"sess_old"})
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_old",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-2",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is True, "a dead-session signature must trigger exactly one recovery"
+    assert outcome.ma_session_id != "sess_old", "the final session id must be the new one"
+    assert outcome.mapping_id != row.id, "the final mapping id must be the new row"
+    assert outcome.state.error is None, "the recovered re-run completes cleanly"
+    assert len(session_bodies) == 1, "recovery must call create_session exactly once"
+
+    async with db_session_factory() as s:
+        live = await get_live_thread_session(
+            s,
+            tenant_id=tenant.id,
+            platform="discord",
+            thread_id="thread-2",
+            account_id=account.id,
+        )
+    assert live is not None, "the new mapping row must be live"
+    assert live.id == outcome.mapping_id, "get_live_thread_session must return the new row"
+    assert live.ma_session_id == outcome.ma_session_id, (
+        "the live row's session id must be the new one"
+    )
+
+    async with db_session_factory() as s:
+        rows = await usage_events.list_for_tenant(s, tenant_id=tenant.id)
+    # The happy-path idle event has no span.model_request_end, so the recorder
+    # is never invoked by run_turn itself -- assert the REBOUND recorder,
+    # once invoked directly, writes against the NEW session id (not the old).
+    assert len(rows) == 0, "no span.model_request_end event fired during either run"
+
+
+async def test_dead_session_recorder_rebind_targets_new_session_id(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """SPEC Req 4 acceptance: a recovered turn's usage_events.managed_session_id
+    equals the NEW session id, proven by driving a real span.model_request_end
+    event through the recovered run and reading the row back."""
+    from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
+        BetaManagedAgentsSpanModelRequestEndEvent,
+    )
+    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
+        BetaManagedAgentsSpanModelUsage,
+    )
+
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-3",
+        ma_session_id="sess_old",
+    )
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+
+    def _router_with_usage_event(dead_ids: set[str]) -> MARouter:
+        router = MARouter()
+        memory_handler = make_fake_memory_store_handler()
+
+        def _memory(request: httpx.Request, _match: object) -> httpx.Response:
+            return memory_handler(request)
+
+        router.add("POST", r"/v1/memory_stores", _memory)
+
+        def _session_create(request: httpx.Request, _match: object) -> httpx.Response:
+            body = json.loads(request.content)
+            new_id = f"sess_{len(session_bodies) + 1}"
+            session_bodies.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "id": new_id,
+                    "type": "session",
+                    "agent": {
+                        "id": body["agent"],
+                        "mcp_servers": [],
+                        "model": {"id": "claude-sonnet-4-6"},
+                        "name": "daimon",
+                        "skills": [],
+                        "tools": [],
+                        "type": "agent",
+                        "version": 1,
+                    },
+                    "created_at": "2026-07-28T00:00:00Z",
+                    "outcome_evaluations": [],
+                    "environment_id": body["environment_id"],
+                    "metadata": {},
+                    "resources": [],
+                    "stats": {},
+                    "status": "idle",
+                    "updated_at": "2026-07-28T00:00:00Z",
+                    "usage": {},
+                    "vault_ids": [],
+                },
+            )
+
+        router.add("POST", r"/v1/sessions", _session_create)
+
+        def _send(_request: httpx.Request, _match: object) -> httpx.Response:
+            return send_events_response()
+
+        router.add("POST", r"/v1/sessions/[^/]+/events", _send)
+
+        def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+            sid = match.group("sid")
+            if sid in dead_ids:
+                return not_found_response("session gone")
+            usage_evt = BetaManagedAgentsSpanModelRequestEndEvent(
+                id="evt_span",
+                is_error=False,
+                model_request_start_id="start_1",
+                model_usage=BetaManagedAgentsSpanModelUsage(
+                    input_tokens=10,
+                    output_tokens=20,
+                    cache_creation_input_tokens=0,
+                    cache_read_input_tokens=0,
+                ),
+                processed_at=datetime.now(UTC),
+                type="span.model_request_end",
+            )
+            idle = make_status_idle(event_id="evt_idle")
+            return sse_response([usage_evt.model_dump(mode="json"), idle.model_dump(mode="json")])
+
+        router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _stream)
+        return router
+
+    router = _router_with_usage_event({"sess_old"})
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_old",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-3",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is True
+    async with db_session_factory() as s:
+        rows = await usage_events.list_for_tenant(s, tenant_id=tenant.id)
+    assert len(rows) == 1, "the recovered run's span.model_request_end must record exactly one row"
+    assert rows[0].managed_session_id == outcome.ma_session_id, (
+        "the recovered turn's usage_events.managed_session_id must equal the NEW session id"
+    )
+    assert rows[0].managed_session_id != "sess_old", (
+        "the recorded session id must not be the stale old session"
+    )
+
+
+async def test_dead_session_without_mapping_id_does_not_recover(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    router = _router(session_bodies=session_bodies, dead_session_ids={"sess_old"})
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_old",
+        mapping_id=None,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-4",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is False, "a 404 with mapping_id=None must not trigger recovery"
+    assert outcome.state.error is not None
+    assert outcome.state.error.kind == "upstream"
+    assert len(session_bodies) == 0, "no create_session call when mapping_id is None"
+
+
+async def test_non_404_upstream_error_does_not_recover(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-5",
+        ma_session_id="sess_bad",
+    )
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    router = MARouter()
+
+    def _400(_request: httpx.Request, _match: object) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"type": "error", "error": {"type": "invalid_request_error", "message": "bad id"}},
+        )
+
+    router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _400)
+
+    def _explode(_request: httpx.Request, _match: object) -> httpx.Response:
+        raise AssertionError("create_session must not be called on a 400")
+
+    router.add("POST", r"/v1/sessions", _explode)
+
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_bad",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-5",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is False, "a 400 must not trigger recovery"
+    assert outcome.state.error is not None
+    assert outcome.state.error.kind == "upstream"
+    assert len(session_bodies) == 0, "a 400 must never call create_session"
+
+
+async def test_second_consecutive_dead_session_does_not_loop(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-6",
+        ma_session_id="sess_old",
+    )
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    stream_calls: list[str] = []
+    router = MARouter()
+    memory_handler = make_fake_memory_store_handler()
+
+    def _memory(request: httpx.Request, _match: object) -> httpx.Response:
+        return memory_handler(request)
+
+    router.add("POST", r"/v1/memory_stores", _memory)
+
+    def _session_create(request: httpx.Request, _match: object) -> httpx.Response:
+        body = json.loads(request.content)
+        new_id = f"sess_{len(session_bodies) + 1}"
+        session_bodies.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": new_id,
+                "type": "session",
+                "agent": {
+                    "id": body["agent"],
+                    "mcp_servers": [],
+                    "model": {"id": "claude-sonnet-4-6"},
+                    "name": "daimon",
+                    "skills": [],
+                    "tools": [],
+                    "type": "agent",
+                    "version": 1,
+                },
+                "created_at": "2026-07-28T00:00:00Z",
+                "outcome_evaluations": [],
+                "environment_id": body["environment_id"],
+                "metadata": {},
+                "resources": [],
+                "stats": {},
+                "status": "idle",
+                "updated_at": "2026-07-28T00:00:00Z",
+                "usage": {},
+                "vault_ids": [],
+            },
+        )
+
+    router.add("POST", r"/v1/sessions", _session_create)
+
+    def _send(_request: httpx.Request, _match: object) -> httpx.Response:
+        return send_events_response()
+
+    router.add("POST", r"/v1/sessions/[^/]+/events", _send)
+
+    def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        sid = match.group("sid")
+        stream_calls.append(sid)
+        return not_found_response("session gone")  # every session id is dead
+
+    router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _stream)
+
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_old",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-6",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is True, "one recovery attempt must fire on the first 404"
+    assert outcome.state.error is not None, "the second TurnState (also a 404) is returned as-is"
+    assert outcome.state.error.kind == "upstream"
+    assert len(session_bodies) == 1, (
+        "exactly one recovery create_session call -- no second recovery"
+    )
+    assert len(stream_calls) == 2, "exactly two run_turn attempts total -- no further retry loop"
