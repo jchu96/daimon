@@ -6,6 +6,7 @@ No I/O lives in this package. The driver that consumes these primitives
 """
 
 from anthropic.types.beta.sessions import BetaManagedAgentsSessionEvent as SessionEvent
+from daimon.core.turn.admission import Admission, AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
@@ -37,6 +38,11 @@ __all__ = [
     "SessionEvent",
     "TurnLifecycle",
     "TurnDeps",
+    # admission (D-01 stage one)
+    "Admission",
+    "AdmissionDenied",
+    "MissingTurnConfigError",
+    "admit",
     # billing posture
     "Billed",
     "BillingExempt",
