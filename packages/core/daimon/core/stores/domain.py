@@ -394,6 +394,25 @@ class GitHubAppInstallationRow(BaseModel):
     updated_at: datetime
 
 
+class CredentialRequestRow(BaseModel):
+    """Pydantic row for CredentialRequest — the credential-button handshake."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    token: str
+    kind: str
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    account_id: uuid.UUID
+    target: str
+    mcp_server_url: str | None
+    requester_platform_user_id: str
+    channel_id: str
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None
+
+
 class McpTokenRow(BaseModel):
     """Pydantic row for McpToken.
 

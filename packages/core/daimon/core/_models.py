@@ -818,6 +818,42 @@ class SlackTurnContext(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class CredentialRequest(Base):
+    """Short-lived handshake row backing the chat-initiated credential button.
+
+    A row is minted when the agent posts a credential-request button in a
+    thread; `used_at` plus `expires_at` make a click single-use and
+    TTL-bounded — the atomic consume in `daimon.core.stores.credential_requests`
+    is the actual single-use gate, this column is just its durable marker.
+    `tenant_id` carries isolation and cascades on tenant teardown. `account_id`
+    intentionally has no FK to `accounts.id`: these rows are erased through the
+    platform-user-scoped erasure helper (mirroring how the OAuth handshake
+    table `github_oauth_states` is erased), not through an accounts.id
+    cascade.
+    """
+
+    __tablename__ = "credential_requests"
+
+    token: Mapped[str] = mapped_column(Text, primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)  # "env" | "mcp"
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    mcp_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requester_platform_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SlackEventDedup(Base):
     """Exactly-once gate for inbound Slack events.
 
