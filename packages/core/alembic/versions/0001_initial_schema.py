@@ -4,6 +4,8 @@ Revision ID: 0001_initial_schema
 Revises:
 Create Date: 2026-07-13
 
+downgrade: unsupported
+
 Squash of the original alembic chain (0001 through 0032, the chain head at
 authoring time). DDL-only: no data backfills, no INSERT/UPDATE/DELETE of
 any kind. Excludes `agents`/`environments`/`skills` (created 0001, dropped

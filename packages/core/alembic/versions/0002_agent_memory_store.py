@@ -2,6 +2,8 @@
 
 One row per (tenant, agent): maps daimon's derived agent UUID to the
 Anthropic memory store id (memstore_...) attached to that agent's sessions.
+
+downgrade: safe
 """
 
 from __future__ import annotations

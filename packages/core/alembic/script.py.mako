@@ -4,6 +4,7 @@ Revision ID: ${up_revision}
 Revises: ${down_revision | comma,n}
 Create Date: ${create_date}
 
+downgrade: TODO-declare (safe|destructive|unsupported)
 """
 from typing import Sequence, Union
 
