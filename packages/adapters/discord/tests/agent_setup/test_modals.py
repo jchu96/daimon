@@ -1139,8 +1139,72 @@ async def test_anon_bind_rejected_when_repo_private(
     assert not set_binding_called, "private/404 repo must not write a binding"
     interaction.followup.send.assert_called_once()
     call_text = str(interaction.followup.send.call_args)
-    assert "private" in call_text.lower(), (
-        "user must see the 'repo is private — connect GitHub or paste a PAT' message"
+    assert "shared service account" in call_text, (
+        "user must see a refusal naming the shared service account, not GitHub's bare framing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anon_bind_rejected_when_repo_lookup_returns_404(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """A 404 repo lookup (GitHub's response for a private repo the shared service
+    account cannot see) must produce the same refusal as an explicitly-private
+    repo — not a "repo doesn't exist" message. Drives the real `is_public_repo`
+    mapping via a mocked transport, rather than stubbing the function itself."""
+    set_binding_called = False
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/me/missing-repo", (
+            "the real is_public_repo must hit the GitHub repo-lookup endpoint"
+        )
+        return httpx.Response(404)
+
+    class _HttpxProxyWithMockedAsyncClient:
+        """Delegates to the real `httpx` module except for `AsyncClient`, which
+        gets the mocked transport. Patching `modals_mod.httpx` (the module's own
+        name binding) rather than the shared global `httpx.AsyncClient` attribute
+        keeps this test from breaking unrelated code (e.g. the anthropic SDK)
+        that also constructs `httpx.AsyncClient` instances during this test."""
+
+        def AsyncClient(self, *args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(httpx, name)
+
+    monkeypatch.setattr(modals_mod, "httpx", _HttpxProxyWithMockedAsyncClient())
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    # Default runtime has no App creds configured, so is_app_installed_for_repo
+    # returns False with zero HTTP calls, leaving is_public_repo as the only
+    # request the mocked transport needs to answer.
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/missing-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    assert not set_binding_called, "a 404 repo lookup must not write a binding"
+    interaction.followup.send.assert_called_once()
+    call_text = str(interaction.followup.send.call_args)
+    assert "shared service account" in call_text, (
+        "a 404 repo lookup must produce the same shared-service-account refusal as a private repo"
     )
 
 
