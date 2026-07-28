@@ -61,6 +61,29 @@ def test_defaults_skills_parse() -> None:
     )
 
 
+def test_defaults_daimon_agent_guidance_routes_credentials_to_request_tools() -> None:
+    """The daimon agent's guidance must name both credential-request tools and
+    no longer route credential entry to the /agent-setup panel — replacing the
+    setup-panel redirect was the whole point of the request_env_credential /
+    request_mcp_credential tools."""
+    specs = load_agent_specs(DEFAULTS / "agents")
+    daimon = next(s for s in specs if s.name == "daimon")
+    system = daimon.system or ""
+    assert "request_env_credential" in system, (
+        "guidance must name request_env_credential for ad hoc env secrets"
+    )
+    assert "request_mcp_credential" in system, (
+        "guidance must name request_mcp_credential for auth-required MCP servers"
+    )
+    for line in system.splitlines():
+        if "/agent-setup" not in line:
+            continue
+        lowered = line.lower()
+        assert not any(
+            word in lowered for word in ("token", "secret", "credential", "mcps modal")
+        ), f"a line mentioning /agent-setup must not also route credential entry there: {line!r}"
+
+
 def test_defaults_agent_skill_references_resolve() -> None:
     agents = load_agent_specs(DEFAULTS / "agents")
     skill_names = {load_skill_spec(d)[0].name for d in load_skill_paths(DEFAULTS / "skills")}
