@@ -126,11 +126,12 @@ async def run_turn(
     ``usage_record_factory``, if provided, is invoked once after the MA
     session opens with ``(session.id, session.agent.model.id)`` and must
     return the bound ``usage_record`` callable. The returned callable is
-    awaited for each ``span.model_request_end`` event with kwargs
-    ``event=event, session_id=session.id``. The factory shape exists
-    because ``model_id`` is only known after ``create_session`` returns,
-    but adapter callers want to preset their own routine context (platform,
-    user, guild) via ``functools.partial`` before fire time.
+    awaited for each ``span.model_request_end`` event with kwarg
+    ``event=event`` (no ``session_id`` — the recorder binds session/tenant
+    context itself via ``functools.partial``, per D-06). The factory shape
+    exists because ``model_id`` is only known after ``create_session``
+    returns, but adapter callers want to preset their own routine context
+    (platform, user, guild) via ``functools.partial`` before fire time.
     """
     agent = await anthropic.beta.agents.retrieve(agent_id)
     environment = await anthropic.beta.environments.retrieve(environment_id)
@@ -170,7 +171,7 @@ async def run_turn(
             continue
 
         if usage_record is not None and event.type == "span.model_request_end":
-            await usage_record(event=event, session_id=session.id)
+            await usage_record(event=event)
 
         state = apply(state, event)
 

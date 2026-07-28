@@ -403,7 +403,9 @@ async def test_run_turn_calls_usage_record_for_span_model_request_end() -> None:
     )
     call = usage_record.await_args
     assert call is not None
-    assert call.kwargs["session_id"] == "ses_abc"
+    assert "session_id" not in call.kwargs, (
+        "record is invoked event-only; session identity is pre-bound by the factory"
+    )
     assert call.kwargs["event"].id == "evt_span_1"
 
 
@@ -425,8 +427,8 @@ async def test_run_turn_propagates_usage_record_factory_exception() -> None:
     ]
     client = _build_client(events)
 
-    async def boom(*, event: object, session_id: str) -> None:
-        del event, session_id
+    async def boom(*, event: object) -> None:
+        del event
         raise RuntimeError("metering down")
 
     def factory(_session_id: str, _model_id: str) -> Callable[..., Awaitable[None]]:
