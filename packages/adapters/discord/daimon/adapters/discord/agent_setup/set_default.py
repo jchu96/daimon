@@ -329,7 +329,9 @@ class SetDefaultView(discord.ui.LayoutView):
         from daimon.adapters.discord.agent_setup.edit_view import BackButton
 
         back_row: discord.ui.ActionRow[discord.ui.LayoutView] = discord.ui.ActionRow()
-        back_row.add_item(BackButton())  # pyright: ignore[reportArgumentType]  # BackButton[View] is structurally compatible at runtime; discord.py V2 ActionRow accepts it
+        back_row.add_item(  # pyright: ignore[reportArgumentType]  # BackButton[View] is structurally compatible at runtime; discord.py V2 ActionRow accepts it
+            BackButton(state=state, runtime=runtime, allowed_user_id=allowed_user_id)
+        )
         container.add_item(back_row)
 
         self.add_item(container)
@@ -436,10 +438,12 @@ async def open_set_default(
     runtime: DiscordRuntime,
     allowed_user_id: int,
 ) -> None:
-    """Send the ephemeral SetDefaultView. Owns the send site for the Default… button callback."""
+    """Swap SetDefaultView onto the panel's own message.
+
+    Owns the swap site for the Default… button callback.
+    """
     blocks = await _build_scope_blocks(state, interaction)
-    await interaction.response.send_message(
+    await interaction.response.edit_message(
         view=SetDefaultView(state, runtime=runtime, allowed_user_id=allowed_user_id, blocks=blocks),
-        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )

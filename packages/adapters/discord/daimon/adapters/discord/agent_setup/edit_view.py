@@ -60,16 +60,34 @@ def build_edit_container(*, agent_name: str) -> discord.ui.Container[discord.ui.
 
 
 class BackButton(discord.ui.Button[discord.ui.LayoutView]):
-    """UX-25-01: closes the ephemeral sub-view so the main panel is visible again."""
+    """Swaps the root panel back onto this message; it no longer closes anything."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        state: PanelState,
+        runtime: DiscordRuntime,
+        allowed_user_id: int,
+    ) -> None:
         super().__init__(label="← Back", style=discord.ButtonStyle.secondary)
+        self.state = state
+        self.runtime = runtime
+        self.allowed_user_id = allowed_user_id
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         log.info("agent_setup.back_btn.click")
         await interaction.response.defer()
         try:
-            await interaction.delete_original_response()
+            # Lazy import: panel.py imports EditView/BackButton from this module
+            # at module scope, so a module-scope import back would be circular.
+            from daimon.adapters.discord.agent_setup.panel import rerender_root_panel
+
+            await rerender_root_panel(
+                interaction,
+                self.state,
+                runtime=self.runtime,
+                allowed_user_id=self.allowed_user_id,
+            )
         except Exception as err:
             rid = generate_request_id()
             log.exception(
@@ -516,7 +534,16 @@ class EditView(discord.ui.LayoutView):
         log.info("agent_setup.back_btn.click")
         await interaction.response.defer()
         try:
-            await interaction.delete_original_response()
+            # Lazy import: panel.py imports EditView from this module at module
+            # scope, so a module-scope import back would be circular.
+            from daimon.adapters.discord.agent_setup.panel import rerender_root_panel
+
+            await rerender_root_panel(
+                interaction,
+                self.state,
+                runtime=self.runtime,
+                allowed_user_id=self.allowed_user_id,
+            )
         except Exception as err:
             rid = generate_request_id()
             log.exception(
@@ -537,9 +564,11 @@ async def open_edit_view(
     runtime: DiscordRuntime,
     allowed_user_id: int,
 ) -> None:
-    """Send the ephemeral EditView. Owns the send site for the Edit button callback."""
-    await interaction.response.send_message(
+    """Swap EditView onto the panel's own message.
+
+    Owns the swap site for the Edit button callback.
+    """
+    await interaction.response.edit_message(
         view=EditView(state, runtime=runtime, allowed_user_id=allowed_user_id),
-        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )

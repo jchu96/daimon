@@ -887,14 +887,24 @@ async def test_admin_view_invoker_match_still_guards(account_id: uuid.UUID) -> N
 
 
 @pytest.mark.asyncio
-async def test_back_button_routes_failure_through_render_error() -> None:
-    """A failed back-button delete surfaces a render_error message (with rid), not the raw type."""
+async def test_back_button_routes_failure_through_render_error(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed back-button rerender surfaces a render_error message (with rid), not the raw type."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
     from daimon.adapters.discord.agent_setup.edit_view import BackButton
 
-    button = BackButton()
+    async def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(panel_mod, "rerender_root_panel", _boom)
+
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    button = BackButton(state=state, runtime=_make_runtime(), allowed_user_id=42)
     interaction = MagicMock()
     interaction.response.defer = AsyncMock()
-    interaction.delete_original_response = AsyncMock(side_effect=RuntimeError("boom"))
+    interaction.delete_original_response = AsyncMock()
     interaction.followup.send = AsyncMock()
 
     await button.callback(interaction)
@@ -903,6 +913,80 @@ async def test_back_button_routes_failure_through_render_error() -> None:
     message = interaction.followup.send.call_args.args[0]
     assert "rid:" in message, "the failure message must carry a request id via render_error"
     assert "RuntimeError" not in message, "the raw exception type must not leak to the user"
+    interaction.delete_original_response.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_back_button_edits_root_panel_in_place(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path: Back calls rerender_root_panel once and never deletes the message."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+    from daimon.adapters.discord.agent_setup.edit_view import BackButton
+
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def _fake_rerender(*args: Any, **kwargs: Any) -> None:
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(panel_mod, "rerender_root_panel", _fake_rerender)
+
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    button = BackButton(state=state, runtime=_make_runtime(), allowed_user_id=42)
+    interaction = MagicMock()
+    interaction.response.defer = AsyncMock()
+    interaction.delete_original_response = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    await button.callback(interaction)
+
+    assert len(calls) == 1, "rerender_root_panel must be called exactly once"
+    interaction.delete_original_response.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rerender_root_panel_hydrates_before_edit(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rerender_root_panel re-fetches secret_count/github_login before editing."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+    from daimon.core.stores.domain import AgentRepoBindingRow
+
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    state.secret_count = 0
+    state.github_login = None
+
+    async def _fake_secret_count(*_args: Any, **_kwargs: Any) -> int:
+        return 7
+
+    async def _fake_github_login(*_args: Any, **_kwargs: Any) -> str | None:
+        return "octocat"
+
+    async def _fake_repo_binding(*_args: Any, **_kwargs: Any) -> AgentRepoBindingRow | None:
+        return None
+
+    monkeypatch.setattr(panel_mod, "load_secret_count", _fake_secret_count)
+    monkeypatch.setattr(panel_mod, "load_selected_github_login", _fake_github_login)
+    monkeypatch.setattr(panel_mod, "load_repo_binding", _fake_repo_binding)
+
+    interaction = MagicMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await panel_mod.rerender_root_panel(
+        interaction, state, runtime=_make_runtime_with_settings(), allowed_user_id=42
+    )
+
+    assert state.secret_count == 7, (
+        "secret_count must reflect the stubbed loader, not its pre-call value"
+    )
+    assert state.github_login == "octocat", "github_login must reflect the stubbed loader"
+    interaction.edit_original_response.assert_called_once()
+    view_kwarg = interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, panel_mod.AgentSetupView), (
+        "rerender_root_panel must edit back to the root AgentSetupView"
+    )
 
 
 @pytest.mark.asyncio

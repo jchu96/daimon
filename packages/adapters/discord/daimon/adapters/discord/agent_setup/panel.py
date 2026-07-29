@@ -118,6 +118,7 @@ __all__ = [
     "build_panel_container",
     "load_secret_count",
     "load_repo_binding",
+    "rerender_root_panel",
     "AgentSetupView",
     "EditView",
     "SetDefaultView",
@@ -363,6 +364,44 @@ async def load_repo_binding(
     agent_id = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=entry.ma_agent_id)
     async with runtime.sessionmaker() as session:
         return await get_binding(session, tenant_id=tenant_id, agent_id=agent_id)
+
+
+async def rerender_root_panel(
+    interaction: discord.Interaction,
+    state: PanelState,
+    *,
+    runtime: DiscordRuntime,
+    allowed_user_id: int,
+) -> None:
+    """Hydrate ``state`` from the DB and edit back to the root ``AgentSetupView``.
+
+    The single hydrate-then-edit path back to the root panel — both the
+    ``EditView``/``BackButton`` Back callbacks route through this. Does NOT
+    touch ``interaction.response``; callers own the ACK (``defer()`` before
+    calling this).
+    """
+    tenant_id = await _resolve_tenant(runtime, interaction)
+    state.secret_count = (
+        await load_secret_count(runtime, tenant_id=tenant_id, agent_name=state.selected.name)
+        if state.selected is not None
+        else 0
+    )
+    state.github_login = await load_selected_github_login(
+        runtime, tenant_id=tenant_id, entry=state.selected
+    )
+    state.hydrate_repo_binding(
+        await load_repo_binding(runtime, tenant_id=tenant_id, entry=state.selected)
+    )
+    state.fallback_pat_configured = runtime.settings.github.fallback_pat is not None
+    await interaction.edit_original_response(
+        view=AgentSetupView(
+            state,
+            runtime=runtime,
+            allowed_user_id=allowed_user_id,
+            thumbnail_url=_get_thumbnail_url(interaction),
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 class _AgentPicker(discord.ui.Select["AgentSetupView"]):

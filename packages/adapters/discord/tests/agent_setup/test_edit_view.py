@@ -596,3 +596,54 @@ def test_edit_view_secrets_button_disabled_for_system_agent(account_id: uuid.UUI
     user_state = PanelState(roster=[user_selected], selected=user_selected, account_id=account_id)
     user_view = EditView(user_state, runtime=runtime, allowed_user_id=42)
     assert _find_button(user_view, "Secrets").disabled is False, "user agents can open Secrets"
+
+
+# --- Back / open_edit_view edit-in-place (D-02, D-03) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_edit_view_back_edits_to_agent_setup_view(
+    account_id: uuid.UUID, mock_interaction: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EditView's ← Back edits back to AgentSetupView in place; it never deletes."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+    from daimon.adapters.discord.agent_setup.panel import AgentSetupView
+
+    monkeypatch.setattr(panel_mod, "load_secret_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(panel_mod, "load_selected_github_login", AsyncMock(return_value=None))
+    monkeypatch.setattr(panel_mod, "load_repo_binding", AsyncMock(return_value=None))
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.settings.github.fallback_pat = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    back_btn = _find_button(view, "← Back")
+    await back_btn.callback(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_called_once()
+    view_kwarg = mock_interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, AgentSetupView), "Back must edit back to AgentSetupView"
+    mock_interaction.delete_original_response.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_open_edit_view_swaps_onto_the_panel_message(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    """open_edit_view swaps EditView onto the existing message; it never sends a new one."""
+    from daimon.adapters.discord.agent_setup.edit_view import open_edit_view
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    await open_edit_view(mock_interaction, state, runtime=runtime, allowed_user_id=42)
+
+    mock_interaction.response.edit_message.assert_called_once()
+    mock_interaction.response.send_message.assert_not_called()
+    view_kwarg = mock_interaction.response.edit_message.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, EditView), "open_edit_view must swap in an EditView"

@@ -610,6 +610,25 @@ def test_set_default_view_has_back_button() -> None:
     assert len(back_buttons) == 1, "exactly one ← Back button must be present"
 
 
+@pytest.mark.asyncio
+async def test_open_set_default_swaps_onto_the_panel_message() -> None:
+    """open_set_default swaps SetDefaultView onto the existing message; never sends a new one."""
+    from daimon.adapters.discord.agent_setup.set_default import open_set_default
+
+    state = _make_state()
+    interaction = MagicMock()
+    interaction.guild = None
+    interaction.response.edit_message = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+
+    await open_set_default(interaction, state, runtime=_set_default_runtime(), allowed_user_id=42)
+
+    interaction.response.edit_message.assert_called_once()
+    interaction.response.send_message.assert_not_called()
+    view_kwarg = interaction.response.edit_message.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, SetDefaultView), "open_set_default must swap in a SetDefaultView"
+
+
 # ---------------------------------------------------------------------------
 # Deployment-default fallback in the scope blocks (R7)
 # ---------------------------------------------------------------------------
