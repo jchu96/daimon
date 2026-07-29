@@ -12,6 +12,7 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.modals import (
     AddMcpModal,
     AddSkillModal,
@@ -145,7 +146,7 @@ class _SkillRemoveSelect(discord.ui.Select["EditView"]):
                     self.view.state,
                     runtime=self.view.runtime,
                     allowed_user_id=self.view.allowed_user_id,
-                )
+                ).bind_render_interaction(interaction, panel=self.view.state)
             )
         except Exception as err:
             rid = generate_request_id()
@@ -254,11 +255,11 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
                 self.view.state,
                 runtime=self.view.runtime,
                 allowed_user_id=self.view.allowed_user_id,
-            )
+            ).bind_render_interaction(interaction, panel=self.view.state)
         )
 
 
-class EditView(discord.ui.LayoutView):
+class EditView(ExpiringView, discord.ui.LayoutView):
     """F5 Components V2 edit view.
 
     Container with ## ✏️ Editing {agent} header, two remove selects, and two
@@ -438,7 +439,7 @@ class EditView(discord.ui.LayoutView):
                 agent_id=agent_id,
                 secret_names=secret_names,
                 is_system=selected.is_system,
-            ),
+            ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -480,7 +481,8 @@ async def open_edit_view(
 
     Owns the swap site for the Edit button callback.
     """
+    view = EditView(state, runtime=runtime, allowed_user_id=allowed_user_id)
     await interaction.response.edit_message(
-        view=EditView(state, runtime=runtime, allowed_user_id=allowed_user_id),
+        view=view.bind_render_interaction(interaction, panel=state),
         allowed_mentions=discord.AllowedMentions.none(),
     )

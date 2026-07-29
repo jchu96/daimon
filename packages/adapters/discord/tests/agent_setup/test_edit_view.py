@@ -580,3 +580,56 @@ async def test_open_edit_view_swaps_onto_the_panel_message(
     mock_interaction.response.send_message.assert_not_called()
     view_kwarg = mock_interaction.response.edit_message.call_args.kwargs["view"]
     assert isinstance(view_kwarg, EditView), "open_edit_view must swap in an EditView"
+
+
+# ---------------------------------------------------------------------------
+# D-10: shared on_timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_edit_view_timeout_replaces_the_edit_view(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    view.bind_render_interaction(mock_interaction, panel=state)
+
+    await view.on_timeout()
+
+    mock_interaction.edit_original_response.assert_called_once()
+    call_kwargs = mock_interaction.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, "the timeout edit must not override content"
+    expired_view = call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert not any(isinstance(c, discord.ui.Select) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert view.timeout == 300, "D-10 leaves timeout values unchanged"
+
+
+@pytest.mark.asyncio
+async def test_open_edit_view_binds_the_render_interaction(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    """open_edit_view's swapped-in EditView must bind the interaction that rendered it."""
+    from daimon.adapters.discord.agent_setup.edit_view import open_edit_view
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    await open_edit_view(mock_interaction, state, runtime=runtime, allowed_user_id=42)
+
+    view_kwarg = mock_interaction.response.edit_message.call_args.kwargs["view"]
+    await view_kwarg.on_timeout()
+
+    mock_interaction.edit_original_response.assert_called_once()

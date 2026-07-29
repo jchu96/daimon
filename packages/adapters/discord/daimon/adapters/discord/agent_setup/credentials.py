@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import structlog
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.state import PanelState
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
@@ -171,7 +172,7 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
         await self._on_added(interaction)
 
 
-class CredentialsSubView(discord.ui.LayoutView):
+class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
     """F5 Components V2 env-vars sub-view opened from EditView's Env vars button.
 
     Container: ## 🔑 Env vars — {agent} + write-only subtext, KEY chips on one
@@ -305,7 +306,7 @@ class CredentialsSubView(discord.ui.LayoutView):
                 self._state,
                 runtime=self._runtime,
                 allowed_user_id=self._allowed_user_id,
-            ),
+            ).bind_render_interaction(interaction, panel=self._state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -316,8 +317,12 @@ class CredentialsSubView(discord.ui.LayoutView):
             )
         self._secret_names = [row.key for row in rows]
         self._build_items()
+        # This view is re-rendered IN PLACE (same instance across renders, not
+        # reconstructed like the other four views), so the binding must be
+        # refreshed here on every render — an interaction bound once at
+        # construction would go stale (Pitfall 2, 09-RESEARCH.md).
         await interaction.edit_original_response(
-            view=self,
+            view=self.bind_render_interaction(interaction, panel=self._state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

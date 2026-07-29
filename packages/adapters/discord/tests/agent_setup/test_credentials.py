@@ -15,6 +15,7 @@ import discord
 import pytest
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
+from daimon.adapters.discord.agent_setup import credentials as credentials_mod
 from daimon.adapters.discord.agent_setup import edit_view as edit_view_mod
 from daimon.adapters.discord.agent_setup.credentials import (
     CredentialsSubView,
@@ -597,3 +598,86 @@ def test_editview_has_env_vars_button_disabled_for_system_agent(account_id: uuid
     user_view = EditView(_state(user_entry, account_id), runtime=runtime, allowed_user_id=42)
     user_buttons = {b.label: b for b in _walk_buttons(user_view) if b.label is not None}
     assert user_buttons["Env vars"].disabled is False, "user agents can open Env vars"
+
+
+# ---------------------------------------------------------------------------
+# D-10: shared on_timeout, including the reused-instance rebind (Pitfall 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_credentials_view_timeout_replaces_the_subview(account_id: uuid.UUID) -> None:
+    entry = _entry("bot")
+    view = CredentialsSubView(
+        runtime=MagicMock(spec=DiscordRuntime),
+        state=_state(entry, account_id),
+        allowed_user_id=42,
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        secret_names=["A"],
+        is_system=False,
+    )
+    interaction = MagicMock()
+    interaction.edit_original_response = AsyncMock()
+    view.bind_render_interaction(interaction, panel=_state(entry, account_id))
+
+    await view.on_timeout()
+
+    interaction.edit_original_response.assert_called_once()
+    call_kwargs = interaction.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, "the timeout edit must not override content"
+    expired_view = call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert not any(isinstance(c, discord.ui.Select) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert view.timeout == 300, "D-10 leaves timeout values unchanged"
+
+
+@pytest.mark.asyncio
+async def test_credentials_rerender_rebinds_the_current_interaction(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pitfall 2 regression guard: `_reload_and_rerender` must rebind on every
+    render, not just once at __init__ — this view is re-rendered as the SAME
+    instance, so a stale-bound interaction would expire against the wrong
+    (or a long-dead) message."""
+    monkeypatch.setattr(credentials_mod, "list_agent_files", AsyncMock(return_value=[]))
+
+    entry = _entry("bot")
+    state = _state(entry, account_id)
+    runtime = MagicMock()
+    runtime.sessionmaker.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    runtime.sessionmaker.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    view = CredentialsSubView(
+        runtime=runtime,
+        state=state,
+        allowed_user_id=42,
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        secret_names=["A"],
+        is_system=False,
+    )
+
+    first_interaction = MagicMock()
+    first_interaction.edit_original_response = AsyncMock()
+    view.bind_render_interaction(first_interaction, panel=state)
+
+    second_interaction = MagicMock()
+    second_interaction.edit_original_response = AsyncMock()
+    await view._reload_and_rerender(second_interaction)  # pyright: ignore[reportPrivateUsage]
+
+    await view.on_timeout()
+
+    first_interaction.edit_original_response.assert_not_called()
+    second_interaction.edit_original_response.assert_called()
+    last_call_kwargs = second_interaction.edit_original_response.call_args.kwargs
+    expired_view = last_call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the timeout edit must land through the SECOND interaction with the controls-less expired view"
+    )

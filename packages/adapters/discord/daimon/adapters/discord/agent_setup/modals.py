@@ -157,7 +157,7 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -429,7 +429,7 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             if coverage_note is not None:
@@ -500,7 +500,7 @@ class AddSkillModal(discord.ui.Modal, title="Add skill repo"):
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:

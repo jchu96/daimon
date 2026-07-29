@@ -207,6 +207,6 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
                 self.state,
                 runtime=self.runtime,
                 allowed_user_id=self.allowed_user_id,
-            ),
+            ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
