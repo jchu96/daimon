@@ -1196,15 +1196,11 @@ class SlackApp:
         mapping_id = outcome.mapping_id
         final_lifecycle = lifecycle_holder[0]
 
-        # --- Watermark ---
-        if outcome.state.error is not None:
-            log.warning(
-                "slack.turn.error",
-                thread_id=thread_id,
-                session_id=outcome.ma_session_id,
-                kind=outcome.state.error.kind,
-            )
-        elif mapping_id is not None and final_lifecycle.final_ts is not None:
+        # --- Watermark --- Preserves Slack's original gate exactly (unconditional
+        # on final_ts, no state.error branch) -- Discord's inline sequence had an
+        # error-vs-success split here, but that is NOT one of SPEC Req 7's four
+        # named behaviour changes, so it is not introduced for Slack either.
+        if mapping_id is not None and final_lifecycle.final_ts is not None:
             async with self.runtime.sessionmaker() as s:
                 await update_watermark(
                     s, id=mapping_id, watermark_message_id=final_lifecycle.final_ts

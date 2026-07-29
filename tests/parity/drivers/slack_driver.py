@@ -191,7 +191,18 @@ class SlackDriver:
         user_id: str,
         text: str,
         billing_config: object | None = None,
+        thread_ts: str | None = None,
     ) -> list[str]:
+        """`thread_ts`, when given, targets an existing thread (e.g. a
+        pre-seeded live `thread_sessions` row) instead of starting a fresh
+        one -- the event's own `ts`/`event_ts` stay unique per dispatch
+        (mirrors a real follow-up mention), only `thread_ts` is pinned so
+        `_orchestrate`'s `thread_id = event.get("thread_ts") or event.get("ts")`
+        resolves to the caller-chosen id. Not part of the `PlatformDriver`
+        Protocol (Discord's `channel_id` already doubles as the thread id) --
+        this is Slack-only, keyword-only, and defaults to None so every
+        existing call site is unaffected.
+        """
         fernet_key = Fernet.generate_key().decode()
         fernet = build_multifernet((fernet_key,))
         async with sessionmaker() as s:
@@ -214,6 +225,8 @@ class SlackDriver:
             "user": user_id,
             "text": f"<@U_BOT> {text}",
         }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
 
         with (
             AioResponsesMock() as mock,
