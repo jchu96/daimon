@@ -1451,6 +1451,226 @@ async def test_app_coverage_probe_error_does_not_block_bind(
 
 
 # ---------------------------------------------------------------------------
+# D-07: a blank PAT field must not mean "no inline PAT exists" (T-09-11)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blank_pat_bind_refused_when_stored_inline_pat_cannot_access_repo(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """A repo bound with a blank PAT field must re-verify any already-stored
+    inline PAT against the newly typed repo, and refuse the bind when that PAT
+    can't access it -- never falling through to the App/public probes. This is
+    the D-07 regression guard: removing the mitigation block must make this
+    test fail (verified by temporary local revert per the plan's acceptance
+    criteria)."""
+    app_installed_called = False
+    public_called = False
+    received: dict[str, Any] = {}
+
+    async def fake_load_inline_pat(runtime: Any, *, agent_id: uuid.UUID) -> str | None:
+        return "ghp_stale_stored_pat"
+
+    async def fake_pat_access(http_client: Any, *, owner_repo: str, pat: str) -> bool:
+        received["owner_repo"] = owner_repo
+        received["pat"] = pat
+        return False
+
+    async def fake_app_installed(http_client: Any, **kwargs: Any) -> bool:
+        nonlocal app_installed_called
+        app_installed_called = True
+        return True
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        nonlocal public_called
+        public_called = True
+        return True
+
+    set_binding_called = False
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "load_agent_inline_pat", fake_load_inline_pat)
+    monkeypatch.setattr(modals_mod, "pat_can_access_repo", fake_pat_access)
+    monkeypatch.setattr(modals_mod, "is_app_installed_for_repo", fake_app_installed)
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/other-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    assert not set_binding_called, (
+        "bind must be refused when the stored inline PAT can't access the new repo"
+    )
+    assert not public_called, "must not fall through to the public-visibility probe on refusal"
+    assert not app_installed_called, "must not fall through to the App-coverage probe on refusal"
+    assert received.get("owner_repo") == "me/other-repo", (
+        "re-verification must receive the normalized owner/repo, not the raw URL"
+    )
+    assert received.get("pat") == "ghp_stale_stored_pat", (
+        "re-verification must check the stored PAT, not the (blank) submitted one"
+    )
+    interaction.followup.send.assert_called_once()
+    call_text = str(interaction.followup.send.call_args).lower()
+    assert "stored" in call_text and "token" in call_text, (
+        "the refusal message must mention the stored token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_blank_pat_bind_writes_inline_pat_ref_when_stored_pat_covers_repo(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """When the stored inline PAT DOES cover the newly typed repo, the bind
+    succeeds and records inline-pat:{agent} -- skipping both the App-coverage
+    and public-visibility probes entirely, since select_clone_auth gives a
+    per-agent PAT unconditional precedence regardless of what those probes
+    would otherwise report."""
+    public_called = False
+    app_installed_called = False
+
+    async def fake_load_inline_pat(runtime: Any, *, agent_id: uuid.UUID) -> str | None:
+        return "ghp_covers_new_repo"
+
+    async def fake_pat_access(http_client: Any, *, owner_repo: str, pat: str) -> bool:
+        return True
+
+    async def fake_app_installed(http_client: Any, **kwargs: Any) -> bool:
+        nonlocal app_installed_called
+        app_installed_called = True
+        return True
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        nonlocal public_called
+        public_called = True
+        return True
+
+    captured: dict[str, Any] = {}
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        captured["ma_secret_ref"] = kwargs["ma_secret_ref"]
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "load_agent_inline_pat", fake_load_inline_pat)
+    monkeypatch.setattr(modals_mod, "pat_can_access_repo", fake_pat_access)
+    monkeypatch.setattr(modals_mod, "is_app_installed_for_repo", fake_app_installed)
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    sm = MagicMock()
+    sm.begin.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    sm.begin.return_value.__aexit__ = AsyncMock(return_value=False)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(), tenant_id=tenant_id, sessionmaker=sm
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/covered-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    await modal.on_submit(_interaction())
+
+    expected_agent_uuid = derive_agent_uuid(
+        tenant_id=tenant_id, ma_agent_id="agent_bindtest_abcdefgh1234"
+    )
+    assert captured.get("ma_secret_ref") == f"inline-pat:{expected_agent_uuid}", (
+        "a covered blank-PAT bind must record the stored inline PAT's ref"
+    )
+    assert not public_called, (
+        "must skip the public-visibility probe once the stored PAT covers the repo"
+    )
+    assert not app_installed_called, (
+        "must skip the App-coverage probe once the stored PAT covers the repo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_blank_pat_bind_falls_through_to_public_check_without_stored_pat(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """No stored inline PAT for this agent -> the pre-existing anon:
+    App-coverage / public-visibility logic must run completely unchanged."""
+    public_called = False
+
+    async def fake_load_inline_pat(runtime: Any, *, agent_id: uuid.UUID) -> str | None:
+        return None
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        nonlocal public_called
+        public_called = True
+        return True
+
+    captured: dict[str, Any] = {}
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        captured["ma_secret_ref"] = kwargs["ma_secret_ref"]
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "load_agent_inline_pat", fake_load_inline_pat)
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    sm = MagicMock()
+    sm.begin.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    sm.begin.return_value.__aexit__ = AsyncMock(return_value=False)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(), tenant_id=tenant_id, sessionmaker=sm
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/public-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    await modal.on_submit(_interaction())
+
+    assert public_called, (
+        "no stored inline PAT -> the existing public-visibility check must still run"
+    )
+    assert captured.get("ma_secret_ref") == "anon:", (
+        "unchanged anon: behavior when no inline PAT is stored for this agent"
+    )
+
+
+# ---------------------------------------------------------------------------
 # D-01: modal submit returns to the launching view (EditView), not AgentSetupView
 # ---------------------------------------------------------------------------
 
