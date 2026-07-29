@@ -200,17 +200,13 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
                 "401 until re-added.",
                 ephemeral=True,
             )
-        from daimon.adapters.discord.agent_setup.panel import (
-            AgentSetupView,
-            _get_thumbnail_url,  # pyright: ignore[reportPrivateUsage]  # module-internal helper
-        )
+        from daimon.adapters.discord.agent_setup.edit_view import EditView
 
         await interaction.edit_original_response(
-            view=AgentSetupView(
+            view=EditView(
                 self.state,
                 runtime=self.runtime,
                 allowed_user_id=self.allowed_user_id,
-                thumbnail_url=_get_thumbnail_url(interaction),
             ),
             allowed_mentions=discord.AllowedMentions.none(),
         )

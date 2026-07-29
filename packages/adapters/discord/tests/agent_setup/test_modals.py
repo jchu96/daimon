@@ -1448,3 +1448,120 @@ async def test_app_coverage_probe_error_does_not_block_bind(
     assert "couldn't verify" in call_text or "could not verify" in call_text, (
         "user should see a neutral note that App coverage could not be verified"
     )
+
+
+# ---------------------------------------------------------------------------
+# D-01: modal submit returns to the launching view (EditView), not AgentSetupView
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_section_submit_returns_to_edit_view(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """AgentSectionModal.on_submit must return the user to EditView, not AgentSetupView."""
+    from daimon.adapters.discord.agent_setup.edit_view import EditView
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+
+    selected = _entry("immutable-name")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = AgentSectionModal(state, runtime=runtime, allowed_user_id=99)
+    modal.model_in._value = "claude-sonnet-4-6"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    interaction.edit_original_response.assert_called_once()
+    view_kwarg = interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, EditView), (
+        "AgentSectionModal submit must return to EditView, not AgentSetupView"
+    )
+    assert view_kwarg.allowed_user_id == 99, "the invoker gate must survive the round trip"
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_submit_returns_to_edit_view(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """RepoAuthModal.on_submit must return the user to EditView, not AgentSetupView."""
+    from daimon.adapters.discord.agent_setup.edit_view import EditView
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        return True
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    sm = MagicMock()
+    sm.begin.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    sm.begin.return_value.__aexit__ = AsyncMock(return_value=False)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(), tenant_id=tenant_id, sessionmaker=sm
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=99)
+    modal.url_in._value = "https://github.com/me/public-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    interaction.edit_original_response.assert_called_once()
+    view_kwarg = interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, EditView), (
+        "RepoAuthModal submit must return to EditView, not AgentSetupView"
+    )
+    assert view_kwarg.allowed_user_id == 99, "the invoker gate must survive the round trip"
+
+
+@pytest.mark.asyncio
+async def test_add_skill_submit_returns_to_edit_view(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """AddSkillModal.on_submit must return the user to EditView, not AgentSetupView."""
+    from daimon.adapters.discord.agent_setup.edit_view import EditView
+
+    async def fake_kickoff(
+        runtime: Any, *, tenant_id: uuid.UUID, account_id: uuid.UUID, agent_name: str, repo_url: str
+    ) -> SyncReport:
+        return SyncReport(synced=1)
+
+    monkeypatch.setattr(modals_mod, "kick_off_skill_sync", fake_kickoff)
+
+    selected = _entry("research-bot")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = AddSkillModal(state, runtime=runtime, allowed_user_id=99)
+    modal.url_in._value = "https://github.com/me/skills-repo"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+    await asyncio.sleep(0)  # let the fire-and-forget sync task finish
+
+    interaction.edit_original_response.assert_called_once()
+    view_kwarg = interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, EditView), (
+        "AddSkillModal submit must return to EditView, not AgentSetupView"
+    )
+    assert view_kwarg.allowed_user_id == 99, "the invoker gate must survive the round trip"

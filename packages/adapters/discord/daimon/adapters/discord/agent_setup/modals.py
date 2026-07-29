@@ -145,17 +145,13 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
             tenant_id = await resolve_tenant_for_panel(self.runtime, interaction)
             self.state.apply_agent_modal(system=system_value, model=model_value)
             outcome = await call_reconcile_for_panel(self.runtime, self.state, tenant_id=tenant_id)
-            from daimon.adapters.discord.agent_setup.panel import (
-                AgentSetupView,
-                _get_thumbnail_url,  # pyright: ignore[reportPrivateUsage]  # module-internal helper
-            )
+            from daimon.adapters.discord.agent_setup.edit_view import EditView
 
             await interaction.edit_original_response(
-                view=AgentSetupView(
+                view=EditView(
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
-                    thumbnail_url=_get_thumbnail_url(interaction),
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -347,17 +343,13 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
             self.state.apply_repo_modal(url=url, branch=branch, pat_last4=pat_last4)
             await call_reconcile_for_panel(self.runtime, self.state, tenant_id=tenant_id)
 
-            from daimon.adapters.discord.agent_setup.panel import (
-                AgentSetupView,
-                _get_thumbnail_url,  # pyright: ignore[reportPrivateUsage]  # module-internal helper
-            )
+            from daimon.adapters.discord.agent_setup.edit_view import EditView
 
             await interaction.edit_original_response(
-                view=AgentSetupView(
+                view=EditView(
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
-                    thumbnail_url=_get_thumbnail_url(interaction),
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -422,17 +414,13 @@ class AddSkillModal(discord.ui.Modal, title="Add skill repo"):
         tenant_id = await resolve_tenant_for_panel(self.runtime, interaction)
         try:
             self.state.add_skill_repo_pending(url)
-            from daimon.adapters.discord.agent_setup.panel import (
-                AgentSetupView,
-                _get_thumbnail_url,  # pyright: ignore[reportPrivateUsage]  # module-internal helper
-            )
+            from daimon.adapters.discord.agent_setup.edit_view import EditView
 
             await interaction.edit_original_response(
-                view=AgentSetupView(
+                view=EditView(
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
-                    thumbnail_url=_get_thumbnail_url(interaction),
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
