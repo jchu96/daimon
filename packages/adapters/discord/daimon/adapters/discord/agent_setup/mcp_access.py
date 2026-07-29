@@ -26,6 +26,11 @@ import uuid
 
 import jwt as pyjwt
 import structlog
+from daimon.adapters.discord.agent_setup.expiry import (
+    EXPIRED_BUTTON_LABEL,
+    ExpiringView,
+    edit_expired_message,
+)
 from daimon.adapters.discord.agent_setup.state import PanelState
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel
 from daimon.adapters.discord.runtime import DiscordRuntime
@@ -117,13 +122,18 @@ async def send_connect_via_mcp(
         # Never log the token itself.
     )
 
+    # This view owns its own ephemeral (created via response.send_message from
+    # the panel button), so it must NOT join the panel's render generation —
+    # doing so would let the next panel render silence this view's expiry, and
+    # it can never be superseded on its own message anyway.
+    mcp_view = _McpAccessView(
+        jti=jti,
+        runtime=runtime,
+        allowed_user_id=allowed_user_id,
+    )
     await interaction.response.send_message(
         content=config_block,
-        view=_McpAccessView(
-            jti=jti,
-            runtime=runtime,
-            allowed_user_id=allowed_user_id,
-        ),
+        view=mcp_view.bind_render_interaction(interaction, panel=None),
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -163,7 +173,7 @@ def render_mcp_config(*, agent_name: str, public_url: str, jwt: str) -> str:
     )
 
 
-class _McpAccessView(discord.ui.View):
+class _McpAccessView(ExpiringView, discord.ui.View):
     """Ephemeral classic View carrying just the Revoke button.
 
     The config itself is sent as plain message ``content`` (see
@@ -173,6 +183,13 @@ class _McpAccessView(discord.ui.View):
     `interaction_check` gates the Revoke button to the original invoker only
     (same pattern as EditView.interaction_check — the allowed_user_id passed
     in from the handler).
+
+    Diverges from the other four /agent-setup views' shared ``on_timeout``:
+    its message body is plain ``content=`` (the copyable MCP config block and
+    the one-time token), so on expiry it disables and relabels its one button
+    IN PLACE and passes NO ``content`` override — replacing the body with the
+    standard expiry container would destroy the artifact the message exists
+    to deliver.
     """
 
     def __init__(
@@ -187,12 +204,12 @@ class _McpAccessView(discord.ui.View):
         self._runtime = runtime
         self._allowed_user_id = allowed_user_id
 
-        revoke_btn: discord.ui.Button[_McpAccessView] = discord.ui.Button(
+        self._revoke_btn: discord.ui.Button[_McpAccessView] = discord.ui.Button(
             label="Revoke",
             style=discord.ButtonStyle.danger,
         )
-        revoke_btn.callback = self._on_revoke  # type: ignore[method-assign]
-        self.add_item(revoke_btn)
+        self._revoke_btn.callback = self._on_revoke  # type: ignore[method-assign]
+        self.add_item(self._revoke_btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
         if interaction.user.id != self._allowed_user_id:
@@ -201,6 +218,11 @@ class _McpAccessView(discord.ui.View):
             )
             return False
         return True
+
+    async def on_timeout(self) -> None:
+        self._revoke_btn.disabled = True
+        self._revoke_btn.label = EXPIRED_BUTTON_LABEL
+        await edit_expired_message(self, interaction=self._render_interaction)
 
     async def _on_revoke(self, interaction: discord.Interaction) -> None:
         log.info("agent_setup.mcp_access.revoke.click", jti=str(self._jti))
@@ -221,3 +243,7 @@ class _McpAccessView(discord.ui.View):
             content="Token revoked. Agents using this token will get 401 on next request.",
             view=None,
         )
+        # That edit deliberately drops the view; a still-running timer would
+        # later re-attach a disabled button to a message intentionally left
+        # button-free.
+        self.stop()

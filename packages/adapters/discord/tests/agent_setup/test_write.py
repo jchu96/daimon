@@ -88,6 +88,69 @@ def test_mask_tail_long_input_returns_last_four() -> None:
     assert mask_tail("abcd") == "****abcd", "exactly-4-char input may show all four"
 
 
+@pytest.mark.asyncio
+async def test_load_agent_inline_pat_returns_none_when_crypto_unconfigured() -> None:
+    """No crypto keys -> no inline PAT could exist; the sessionmaker must never
+    be touched (calling _build_runtime_fernet unconditionally would raise)."""
+    agent_id = uuid.uuid4()
+    settings = MagicMock()
+    settings.crypto.keys = ()
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("sessionmaker must not be called when crypto is unconfigured")
+
+    runtime = DiscordRuntime(
+        settings=settings,
+        anthropic=build_stub_anthropic(),
+        sessionmaker=_boom,  # type: ignore[arg-type]  # deliberately wrong shape; must never be invoked
+        notebook_rate_limiter=RateLimiter(max_requests=999),
+        billing_config=None,
+        deployment_default=DeploymentDefault(),
+        resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
+    )
+
+    result = await write_mod.load_agent_inline_pat(runtime, agent_id=agent_id)
+    assert result is None, "no crypto keys configured -> no inline PAT can exist"
+
+
+@pytest.mark.asyncio
+async def test_load_agent_inline_pat_returns_stored_pat(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Round-trips through store_inline_pat -> load_agent_inline_pat, decrypted."""
+    await make_tenant(db_session, platform="discord", workspace_id="test-guild-inline-pat-load")
+
+    fernet_key = Fernet.generate_key().decode()
+    plaintext = "ghp_inline_pat_load_xxxx9999"
+
+    settings = MagicMock()
+    settings.crypto.keys = (MagicMock(get_secret_value=lambda: fernet_key),)
+    settings.github.oauth_scopes = ("repo", "read:user")
+    runtime = DiscordRuntime(
+        settings=settings,
+        anthropic=build_stub_anthropic(),
+        sessionmaker=db_session_factory,
+        notebook_rate_limiter=RateLimiter(max_requests=999),
+        billing_config=None,
+        deployment_default=DeploymentDefault(),
+        resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
+    )
+
+    agent_id = uuid.uuid4()
+    await write_mod.store_inline_pat(
+        runtime,
+        account_id=uuid.uuid4(),
+        agent_id=agent_id,
+        plaintext_pat=plaintext,
+    )
+
+    result = await write_mod.load_agent_inline_pat(runtime, agent_id=agent_id)
+    assert result == plaintext, "load_agent_inline_pat must decrypt and return the exact stored PAT"
+
+
 async def test_load_tenant_roster_includes_all_tenant_agents(
     tenant_id: uuid.UUID,
     account_id: uuid.UUID,

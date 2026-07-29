@@ -38,6 +38,7 @@ from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import (
     build_multifernet,
     get_github_login,
+    get_pat,
     upsert_credential_encrypted,
 )
 from daimon.core.ma import update_agent_with_version_retry
@@ -225,6 +226,40 @@ async def load_selected_github_login(
         principal_id=agent_uuid,
         agent_id=agent_uuid,
         sessionmaker=runtime.sessionmaker,
+    )
+
+
+async def load_agent_inline_pat(runtime: DiscordRuntime, *, agent_id: uuid.UUID) -> str | None:
+    """Return the inline PAT `core/sessions.py` would resolve for `agent_id`, or None.
+
+    This is the exact credential `resolve_clone_token`'s `per_agent_pat`
+    short-circuit will use to clone any repo later bound to this agent,
+    regardless of which repo that PAT was originally verified against — which
+    is why a caller binding a *different* repo must re-verify this value
+    against it before writing a binding.
+
+    Returns None (no crypto call at all) when `runtime.settings.crypto.keys`
+    is empty: no inline PAT can exist on a deployment that has never
+    configured crypto (storing one requires crypto too, via
+    `store_inline_pat`), and calling `_build_runtime_fernet` unconditionally
+    here would raise `ValueError` on such a deployment, breaking a
+    previously-working bind path (same tolerance rationale as
+    `_build_fork_fernet`).
+
+    Passes `allow_service_default=False` and no `fallback_pat` explicitly:
+    the operator's shared service PAT must never be treated as this agent's
+    own clone credential — letting it through here would gate
+    every re-verification on whether the shared public-read token covers the
+    repo, breaking private App-covered binds.
+    """
+    if not runtime.settings.crypto.keys:
+        return None
+    return await get_pat(
+        principal_id=agent_id,
+        agent_id=agent_id,
+        sessionmaker=runtime.sessionmaker,
+        fernet=_build_runtime_fernet(runtime),
+        allow_service_default=False,
     )
 
 

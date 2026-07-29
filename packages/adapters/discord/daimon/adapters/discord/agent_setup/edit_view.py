@@ -1,11 +1,9 @@
 """EditView (LayoutView) + selects + BackButton + open_edit_view launcher.
 
-Moved verbatim from panel.py.
-V2 migration: classic View → LayoutView, Auth… merge.
-
-The Connect-GitHub (OAuth) button was removed — the Auth… button
-now opens a single-option ephemeral follow-up (Paste a PAT…) that writes the
-per-agent github_credentials slot.
+EditView's container holds a header, two remove selects (skills, MCPs), and
+two button rows: ``Agent…`` / ``GitHub…`` / ``Env vars`` and
+``+ Add skill`` / ``+ Add MCP`` / ``← Back``. ``Agent…`` and ``GitHub…`` each
+open their modal directly — no intermediate view.
 """
 
 from __future__ import annotations
@@ -14,6 +12,7 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.modals import (
     AddMcpModal,
     AddSkillModal,
@@ -60,16 +59,34 @@ def build_edit_container(*, agent_name: str) -> discord.ui.Container[discord.ui.
 
 
 class BackButton(discord.ui.Button[discord.ui.LayoutView]):
-    """UX-25-01: closes the ephemeral sub-view so the main panel is visible again."""
+    """Swaps the root panel back onto this message; it no longer closes anything."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        state: PanelState,
+        runtime: DiscordRuntime,
+        allowed_user_id: int,
+    ) -> None:
         super().__init__(label="← Back", style=discord.ButtonStyle.secondary)
+        self.state = state
+        self.runtime = runtime
+        self.allowed_user_id = allowed_user_id
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         log.info("agent_setup.back_btn.click")
         await interaction.response.defer()
         try:
-            await interaction.delete_original_response()
+            # Lazy import: panel.py imports EditView/BackButton from this module
+            # at module scope, so a module-scope import back would be circular.
+            from daimon.adapters.discord.agent_setup.panel import rerender_root_panel
+
+            await rerender_root_panel(
+                interaction,
+                self.state,
+                runtime=self.runtime,
+                allowed_user_id=self.allowed_user_id,
+            )
         except Exception as err:
             rid = generate_request_id()
             log.exception(
@@ -80,45 +97,6 @@ class BackButton(discord.ui.Button[discord.ui.LayoutView]):
             await interaction.followup.send(
                 render_error(err, request_id=rid),
                 ephemeral=True,
-            )
-
-
-class _ScalarFieldSelect(discord.ui.Select["EditView"]):
-    """Select: pick a scalar field (Agent / Repo) to open its modal."""
-
-    def __init__(self) -> None:
-        options = [
-            discord.SelectOption(label="✎ Agent · name / prompt / model", value="agent"),
-            discord.SelectOption(label="✎ Repo · URL + branch", value="repo"),
-        ]
-        super().__init__(
-            placeholder="Edit a field…",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        if self.view is None:
-            return
-        chosen = self.values[0]
-        log.info("agent_setup.edit.scalar.pick", chosen=chosen)
-        if chosen == "agent":
-            await interaction.response.send_modal(
-                AgentSectionModal(
-                    self.view.state,
-                    runtime=self.view.runtime,
-                    allowed_user_id=self.view.allowed_user_id,
-                )
-            )
-        else:
-            # "repo" opens the combined RepoAuthModal.
-            await interaction.response.send_modal(
-                RepoAuthModal(
-                    self.view.state,
-                    runtime=self.view.runtime,
-                    allowed_user_id=self.view.allowed_user_id,
-                )
             )
 
 
@@ -168,7 +146,7 @@ class _SkillRemoveSelect(discord.ui.Select["EditView"]):
                     self.view.state,
                     runtime=self.view.runtime,
                     allowed_user_id=self.view.allowed_user_id,
-                )
+                ).bind_render_interaction(interaction, panel=self.view.state)
             )
         except Exception as err:
             rid = generate_request_id()
@@ -277,76 +255,16 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
                 self.view.state,
                 runtime=self.view.runtime,
                 allowed_user_id=self.view.allowed_user_id,
-            )
+            ).bind_render_interaction(interaction, panel=self.view.state)
         )
 
 
-class _AuthFollowUpView(discord.ui.LayoutView):
-    """Ephemeral follow-up for the Auth… button: Paste a PAT… (modal).
-
-    The Connect-GitHub (OAuth) option was removed; this now
-    writes the per-agent github_credentials slot via the PAT modal
-    only.
-    """
-
-    def __init__(
-        self,
-        state: PanelState,
-        *,
-        runtime: DiscordRuntime,
-        allowed_user_id: int,
-    ) -> None:
-        super().__init__(timeout=300)
-        self._state = state
-        self._runtime = runtime
-        self._allowed_user_id = allowed_user_id
-
-        container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container()
-        container.add_item(
-            header(
-                "🔗 GitHub auth",
-                subtext="both options fill the same per-agent slot",
-            )
-        )
-
-        btn_row: discord.ui.ActionRow[_AuthFollowUpView] = discord.ui.ActionRow()
-
-        pat_btn: discord.ui.Button[_AuthFollowUpView] = discord.ui.Button(
-            label="Paste a PAT…",
-            style=discord.ButtonStyle.secondary,
-        )
-        pat_btn.callback = self._on_pat  # type: ignore[method-assign]
-        btn_row.add_item(pat_btn)
-
-        container.add_item(btn_row)
-        self.add_item(container)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
-        if interaction.user.id != self._allowed_user_id:
-            await interaction.response.send_message(
-                "Only the command invoker can use these buttons.", ephemeral=True
-            )
-            return False
-        return True
-
-    def _selected_name(self) -> str | None:
-        return self._state.selected.name if self._state.selected else None
-
-    async def _on_pat(self, interaction: discord.Interaction) -> None:
-        log.info("agent_setup.edit.pat.click", agent_name=self._selected_name())
-        await interaction.response.send_modal(
-            RepoAuthModal(self._state, runtime=self._runtime, allowed_user_id=self._allowed_user_id)
-        )
-
-
-class EditView(discord.ui.LayoutView):
+class EditView(ExpiringView, discord.ui.LayoutView):
     """F5 Components V2 edit view.
 
-    Container with ## ✏️ Editing {agent} header, three selects, and a button
-    row: + Add skill · + Add MCP · Auth… · Secrets · ← Back.
-
-    Auth… opens an ephemeral follow-up (Paste a PAT…) that binds a per-agent
-    GitHub PAT (Connect-GitHub OAuth option removed).
+    Container with ## ✏️ Editing {agent} header, two remove selects, and two
+    button rows: Agent… · GitHub… · Env vars, then + Add skill · + Add MCP ·
+    ← Back. Agent… and GitHub… each open their modal directly.
 
     Preserves the isolation invariant: this view is ephemeral and
     never edits the main panel message. Mutations re-render this view via
@@ -373,19 +291,6 @@ class EditView(discord.ui.LayoutView):
         agent_name = state.selected.name if state.selected is not None else "agent"
         container = build_edit_container(agent_name=agent_name)
 
-        # Three select rows inside the container.
-        scalar_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
-        scalar_row.add_item(_ScalarFieldSelect())
-        container.add_item(scalar_row)
-
-        skill_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
-        skill_row.add_item(_SkillRemoveSelect(state))
-        container.add_item(skill_row)
-
-        mcp_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
-        mcp_row.add_item(_McpRemoveSelect(state, public_url=public_url))
-        container.add_item(mcp_row)
-
         skill_count = len(state.selected.spec.skills) if state.selected is not None else 0
         user_mcp_count = sum(
             1
@@ -393,7 +298,38 @@ class EditView(discord.ui.LayoutView):
             if not _is_default_mcp(e, public_url)
         )
 
-        # Button row 1: + Add skill · + Add MCP · Auth… · Secrets · ← Back.
+        # Button row 1: Agent… · GitHub… · Env vars.
+        field_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
+
+        agent_btn: discord.ui.Button[EditView] = discord.ui.Button(
+            label="Agent…",
+            style=discord.ButtonStyle.secondary,
+        )
+        agent_btn.callback = self._on_agent  # type: ignore[method-assign]
+        field_row.add_item(agent_btn)
+
+        github_btn: discord.ui.Button[EditView] = discord.ui.Button(
+            label="GitHub…",
+            style=discord.ButtonStyle.secondary,
+        )
+        github_btn.callback = self._on_github  # type: ignore[method-assign]
+        field_row.add_item(github_btn)
+
+        # Defensive read-only gate: system agents can never reach EditView (the
+        # main panel disables Edit for them), so this `disabled` is belt-and-
+        # braces (defensive).
+        is_system = bool(state.selected and state.selected.is_system)
+        env_vars_btn: discord.ui.Button[EditView] = discord.ui.Button(
+            label="Env vars",
+            style=discord.ButtonStyle.secondary,
+            disabled=is_system,
+        )
+        env_vars_btn.callback = self._on_env_vars  # type: ignore[method-assign]
+        field_row.add_item(env_vars_btn)
+
+        container.add_item(field_row)
+
+        # Button row 2: + Add skill · + Add MCP · ← Back.
         btn_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
 
         add_skill_btn: discord.ui.Button[EditView] = discord.ui.Button(
@@ -412,25 +348,6 @@ class EditView(discord.ui.LayoutView):
         add_mcp_btn.callback = self._on_add_mcp  # type: ignore[method-assign]
         btn_row.add_item(add_mcp_btn)
 
-        auth_btn: discord.ui.Button[EditView] = discord.ui.Button(
-            label="Auth…",
-            style=discord.ButtonStyle.secondary,
-        )
-        auth_btn.callback = self._on_auth  # type: ignore[method-assign]
-        btn_row.add_item(auth_btn)
-
-        # Defensive read-only gate: system agents can never reach EditView (the
-        # main panel disables Edit for them), so this `disabled` is belt-and-
-        # braces (defensive).
-        is_system = bool(state.selected and state.selected.is_system)
-        secrets_btn: discord.ui.Button[EditView] = discord.ui.Button(
-            label="Secrets",
-            style=discord.ButtonStyle.secondary,
-            disabled=is_system,
-        )
-        secrets_btn.callback = self._on_secrets  # type: ignore[method-assign]
-        btn_row.add_item(secrets_btn)
-
         back_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="← Back",
             style=discord.ButtonStyle.secondary,
@@ -439,6 +356,16 @@ class EditView(discord.ui.LayoutView):
         btn_row.add_item(back_btn)
 
         container.add_item(btn_row)
+
+        # Select row 3: skill remove; row 4: MCP remove.
+        skill_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
+        skill_row.add_item(_SkillRemoveSelect(state))
+        container.add_item(skill_row)
+
+        mcp_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
+        mcp_row.add_item(_McpRemoveSelect(state, public_url=public_url))
+        container.add_item(mcp_row)
+
         self.add_item(container)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]  # base uses broader Interaction[Client] type
@@ -464,17 +391,21 @@ class EditView(discord.ui.LayoutView):
             AddMcpModal(self.state, runtime=self.runtime, allowed_user_id=self.allowed_user_id)
         )
 
-    async def _on_auth(self, interaction: discord.Interaction) -> None:
-        log.info("agent_setup.edit.auth.click", agent_name=self._selected_name())
-        await interaction.response.send_message(
-            view=_AuthFollowUpView(
+    async def _on_agent(self, interaction: discord.Interaction) -> None:
+        log.info("agent_setup.edit.agent.click", agent_name=self._selected_name())
+        await interaction.response.send_modal(
+            AgentSectionModal(
                 self.state, runtime=self.runtime, allowed_user_id=self.allowed_user_id
-            ),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
+            )
         )
 
-    async def _on_secrets(self, interaction: discord.Interaction) -> None:
+    async def _on_github(self, interaction: discord.Interaction) -> None:
+        log.info("agent_setup.edit.github.click", agent_name=self._selected_name())
+        await interaction.response.send_modal(
+            RepoAuthModal(self.state, runtime=self.runtime, allowed_user_id=self.allowed_user_id)
+        )
+
+    async def _on_env_vars(self, interaction: discord.Interaction) -> None:
         # Lazy import: credentials.py imports EditView from this module, so a
         # top-level import here would be circular.
         from daimon.adapters.discord.agent_setup.credentials import CredentialsSubView
@@ -482,7 +413,7 @@ class EditView(discord.ui.LayoutView):
         selected = self.state.selected
         if selected is None:
             return
-        log.info("agent_setup.edit.secrets.click", agent_name=selected.name)
+        log.info("agent_setup.edit.env_vars.click", agent_name=selected.name)
         tenant_id = await _resolve_tenant(self.runtime, interaction)
         ma_agent = await find_agent_by_daimon_tag(
             self.runtime.anthropic,
@@ -508,7 +439,7 @@ class EditView(discord.ui.LayoutView):
                 agent_id=agent_id,
                 secret_names=secret_names,
                 is_system=selected.is_system,
-            ),
+            ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -516,7 +447,16 @@ class EditView(discord.ui.LayoutView):
         log.info("agent_setup.back_btn.click")
         await interaction.response.defer()
         try:
-            await interaction.delete_original_response()
+            # Lazy import: panel.py imports EditView from this module at module
+            # scope, so a module-scope import back would be circular.
+            from daimon.adapters.discord.agent_setup.panel import rerender_root_panel
+
+            await rerender_root_panel(
+                interaction,
+                self.state,
+                runtime=self.runtime,
+                allowed_user_id=self.allowed_user_id,
+            )
         except Exception as err:
             rid = generate_request_id()
             log.exception(
@@ -537,9 +477,12 @@ async def open_edit_view(
     runtime: DiscordRuntime,
     allowed_user_id: int,
 ) -> None:
-    """Send the ephemeral EditView. Owns the send site for the Edit button callback."""
-    await interaction.response.send_message(
-        view=EditView(state, runtime=runtime, allowed_user_id=allowed_user_id),
-        ephemeral=True,
+    """Swap EditView onto the panel's own message.
+
+    Owns the swap site for the Edit button callback.
+    """
+    view = EditView(state, runtime=runtime, allowed_user_id=allowed_user_id)
+    await interaction.response.edit_message(
+        view=view.bind_render_interaction(interaction, panel=state),
         allowed_mentions=discord.AllowedMentions.none(),
     )

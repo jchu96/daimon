@@ -10,9 +10,7 @@ import discord
 import pytest
 from daimon.adapters.discord.agent_setup.edit_view import (
     EditView,
-    _AuthFollowUpView,  # pyright: ignore[reportPrivateUsage]
     _McpRemoveSelect,  # pyright: ignore[reportPrivateUsage]
-    _ScalarFieldSelect,  # pyright: ignore[reportPrivateUsage]
     _SkillRemoveSelect,  # pyright: ignore[reportPrivateUsage]
     build_edit_container,
 )
@@ -149,7 +147,7 @@ def test_edit_view_header_and_subtext(account_id: uuid.UUID) -> None:
     assert "-# changes apply immediately" in text, "subtext must be present"
 
 
-def test_edit_view_has_three_selects_via_walk_children(account_id: uuid.UUID) -> None:
+def test_edit_view_has_only_the_two_remove_selects(account_id: uuid.UUID) -> None:
     from daimon.core.specs import SkillRef
 
     selected = _entry_with_mcps(
@@ -163,13 +161,17 @@ def test_edit_view_has_three_selects_via_walk_children(account_id: uuid.UUID) ->
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     selects = _walk_selects(view)
+    assert len(selects) == 2, f"exactly two remove selects; got {len(selects)}"
     placeholders = [s.placeholder for s in selects]
-    assert "Edit a field…" in placeholders, "scalar select present"
     assert "✕ Remove a skill…" in placeholders, "skill remove select present"
     assert "✕ Remove an MCP…" in placeholders, "MCP remove select present"
+    for select in selects:
+        values = [o.value for o in select.options]
+        assert "agent" not in values, "no select offers an agent option value"
+        assert "repo" not in values, "no select offers a repo option value"
 
 
-def test_edit_view_has_five_buttons_via_walk_children(account_id: uuid.UUID) -> None:
+def test_edit_view_button_labels_in_row_order(account_id: uuid.UUID) -> None:
     selected = _entry("agent")
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
@@ -177,15 +179,18 @@ def test_edit_view_has_five_buttons_via_walk_children(account_id: uuid.UUID) -> 
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     btn_labels = [b.label for b in _walk_buttons(view)]
-    assert "+ Add skill" in btn_labels, "+ Add skill button present"
-    assert "+ Add MCP" in btn_labels, "+ Add MCP button present"
-    assert "Auth…" in btn_labels, "Auth… button present"
-    assert "Secrets" in btn_labels, "Secrets button present"
-    assert "← Back" in btn_labels, "← Back button present"
+    assert btn_labels == [
+        "Agent…",
+        "GitHub…",
+        "Env vars",
+        "+ Add skill",
+        "+ Add MCP",
+        "← Back",
+    ], f"button labels must be exactly the flat row order; got {btn_labels}"
 
 
 def test_edit_view_pat_absent_from_main_view(account_id: uuid.UUID) -> None:
-    """PAT must not appear on the EditView itself — it lives in the Auth… follow-up."""
+    """PAT must not appear as its own control on EditView."""
     selected = _entry("agent")
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
@@ -206,83 +211,11 @@ def test_edit_view_timeout(account_id: uuid.UUID) -> None:
     assert view.timeout == 300, "EditView must use timeout=300"
 
 
-# --- Auth… follow-up view --------------------------------------------------
-
-
-def test_auth_followup_view_has_exactly_one_button(account_id: uuid.UUID) -> None:
-    """Connect GitHub was removed; only Paste a PAT… remains."""
-    selected = _entry("agent")
-    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
-    runtime = MagicMock()
-    runtime.settings.mcp.public_url = None
-
-    follow_up = _AuthFollowUpView(state, runtime=runtime, allowed_user_id=42)
-    buttons = _walk_buttons(follow_up)
-    labels = [b.label for b in buttons]
-    assert "Paste a PAT…" in labels, "Paste a PAT… option in follow-up"
-    assert len(buttons) == 1, f"exactly 1 button in auth follow-up; got {labels}"
+# --- Agent…/GitHub… buttons --------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_edit_view_auth_button_sends_followup(
-    account_id: uuid.UUID, mock_interaction: MagicMock
-) -> None:
-    selected = _entry("agent")
-    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
-    runtime = MagicMock()
-    runtime.settings.mcp.public_url = None
-
-    view = EditView(state, runtime=runtime, allowed_user_id=42)
-    auth_btn = _find_button(view, "Auth…")
-    assert auth_btn.callback is not None
-    await auth_btn.callback(mock_interaction)
-
-    mock_interaction.response.send_message.assert_called_once()
-    kwargs = mock_interaction.response.send_message.call_args.kwargs
-    assert isinstance(kwargs["view"], _AuthFollowUpView), "Auth… sends _AuthFollowUpView"
-    assert kwargs.get("ephemeral") is True, "follow-up must be ephemeral"
-
-
-@pytest.mark.asyncio
-async def test_auth_followup_pat_opens_repo_auth_modal(
-    account_id: uuid.UUID, mock_interaction: MagicMock
-) -> None:
-    from daimon.adapters.discord.agent_setup.modals import RepoAuthModal
-
-    selected = _entry("agent")
-    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
-    runtime = MagicMock()
-    runtime.settings.mcp.public_url = None
-
-    follow_up = _AuthFollowUpView(state, runtime=runtime, allowed_user_id=42)
-    pat_btn = next(b for b in _walk_buttons(follow_up) if b.label == "Paste a PAT…")
-    assert pat_btn.callback is not None
-    await pat_btn.callback(mock_interaction)
-
-    mock_interaction.response.send_modal.assert_called_once()
-    modal = mock_interaction.response.send_modal.call_args.args[0]
-    assert isinstance(modal, RepoAuthModal), "Paste a PAT… opens RepoAuthModal"
-
-
-# --- Select behavior -------------------------------------------------------
-
-
-def test_edit_view_scalar_select_options(account_id: uuid.UUID) -> None:
-    selected = _entry("agent")
-    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
-    runtime = MagicMock()
-    runtime.settings.mcp.public_url = None
-
-    view = EditView(state, runtime=runtime, allowed_user_id=42)
-    scalar = next(s for s in _walk_selects(view) if isinstance(s, _ScalarFieldSelect))  # pyright: ignore[reportPrivateUsage]
-    values = [o.value for o in scalar.options]
-    assert values == ["agent", "repo"], (
-        f"scalar select must offer only agent/repo in order; got {values}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_edit_view_scalar_select_dispatches_agent_to_agent_section_modal(
+async def test_edit_view_agent_button_opens_agent_section_modal(
     account_id: uuid.UUID, mock_interaction: MagicMock
 ) -> None:
     from daimon.adapters.discord.agent_setup.modals import AgentSectionModal
@@ -293,18 +226,17 @@ async def test_edit_view_scalar_select_dispatches_agent_to_agent_section_modal(
     runtime.settings.mcp.public_url = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
-    scalar = next(s for s in _walk_selects(view) if isinstance(s, _ScalarFieldSelect))  # pyright: ignore[reportPrivateUsage]
-    scalar._values = ["agent"]  # pyright: ignore[reportPrivateUsage]
-    await scalar.callback(mock_interaction)
+    agent_btn = _find_button(view, "Agent…")
+    assert agent_btn.callback is not None
+    await agent_btn.callback(mock_interaction)
 
     mock_interaction.response.send_modal.assert_called_once()
     modal = mock_interaction.response.send_modal.call_args.args[0]
-    assert isinstance(modal, AgentSectionModal), "agent pick must open AgentSectionModal"
-    mock_interaction.response.defer.assert_not_called()
+    assert isinstance(modal, AgentSectionModal), "Agent… must open AgentSectionModal"
 
 
 @pytest.mark.asyncio
-async def test_edit_view_scalar_select_dispatches_repo_to_repo_auth_modal(
+async def test_edit_view_github_button_opens_repo_auth_modal(
     account_id: uuid.UUID, mock_interaction: MagicMock
 ) -> None:
     from daimon.adapters.discord.agent_setup.modals import RepoAuthModal
@@ -315,13 +247,14 @@ async def test_edit_view_scalar_select_dispatches_repo_to_repo_auth_modal(
     runtime.settings.mcp.public_url = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
-    scalar = next(s for s in _walk_selects(view) if isinstance(s, _ScalarFieldSelect))  # pyright: ignore[reportPrivateUsage]
-    scalar._values = ["repo"]  # pyright: ignore[reportPrivateUsage]
-    await scalar.callback(mock_interaction)
+    github_btn = _find_button(view, "GitHub…")
+    assert github_btn.callback is not None
+    await github_btn.callback(mock_interaction)
 
     mock_interaction.response.send_modal.assert_called_once()
     modal = mock_interaction.response.send_modal.call_args.args[0]
-    assert isinstance(modal, RepoAuthModal), "repo pick must open RepoAuthModal"
+    assert isinstance(modal, RepoAuthModal), "GitHub… must open RepoAuthModal directly"
+    mock_interaction.response.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -561,9 +494,9 @@ async def test_edit_view_remove_paths_never_mutate_main_panel(
     mock_interaction.edit_original_response.assert_called_once()
 
 
-def test_secrets_button_label_has_no_plus(account_id: uuid.UUID) -> None:
-    """The Secrets button opens a sub-view (not an add action), so its label is
-    'Secrets', not '+ Secrets'."""
+def test_env_vars_button_label_has_no_plus(account_id: uuid.UUID) -> None:
+    """The Env vars button opens a sub-view (not an add action), so its label is
+    'Env vars', not '+ Env vars'."""
     selected = _entry("agent")
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
@@ -571,11 +504,11 @@ def test_secrets_button_label_has_no_plus(account_id: uuid.UUID) -> None:
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     labels = [b.label for b in _walk_buttons(view) if b.label is not None]
-    assert "Secrets" in labels, "Secrets button must be labeled 'Secrets'"
-    assert "+ Secrets" not in labels, "the '+' prefix must be dropped from the Secrets button"
+    assert "Env vars" in labels, "Env vars button must be labeled 'Env vars'"
+    assert "+ Env vars" not in labels, "the '+' prefix must be dropped from the Env vars button"
 
 
-def test_edit_view_secrets_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
+def test_edit_view_env_vars_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
     selected = _entry("sys")
     selected = RosterEntry(
         name="sys",
@@ -588,11 +521,115 @@ def test_edit_view_secrets_button_disabled_for_system_agent(account_id: uuid.UUI
     runtime.settings.mcp.public_url = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
-    assert _find_button(view, "Secrets").disabled is True, (
-        "system agents see the Secrets button disabled (defensive)"
+    assert _find_button(view, "Env vars").disabled is True, (
+        "system agents see the Env vars button disabled (defensive)"
     )
 
     user_selected = _entry("bot")
     user_state = PanelState(roster=[user_selected], selected=user_selected, account_id=account_id)
     user_view = EditView(user_state, runtime=runtime, allowed_user_id=42)
-    assert _find_button(user_view, "Secrets").disabled is False, "user agents can open Secrets"
+    assert _find_button(user_view, "Env vars").disabled is False, "user agents can open Env vars"
+
+
+# --- Back / open_edit_view edit-in-place -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_edit_view_back_edits_to_agent_setup_view(
+    account_id: uuid.UUID, mock_interaction: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EditView's ← Back edits back to AgentSetupView in place; it never deletes."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+    from daimon.adapters.discord.agent_setup.panel import AgentSetupView
+
+    monkeypatch.setattr(panel_mod, "load_secret_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(panel_mod, "load_selected_github_login", AsyncMock(return_value=None))
+    monkeypatch.setattr(panel_mod, "load_repo_binding", AsyncMock(return_value=None))
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.settings.github.fallback_pat = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    back_btn = _find_button(view, "← Back")
+    await back_btn.callback(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_called_once()
+    view_kwarg = mock_interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, AgentSetupView), "Back must edit back to AgentSetupView"
+    mock_interaction.delete_original_response.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_open_edit_view_swaps_onto_the_panel_message(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    """open_edit_view swaps EditView onto the existing message; it never sends a new one."""
+    from daimon.adapters.discord.agent_setup.edit_view import open_edit_view
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    await open_edit_view(mock_interaction, state, runtime=runtime, allowed_user_id=42)
+
+    mock_interaction.response.edit_message.assert_called_once()
+    mock_interaction.response.send_message.assert_not_called()
+    view_kwarg = mock_interaction.response.edit_message.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, EditView), "open_edit_view must swap in an EditView"
+
+
+# ---------------------------------------------------------------------------
+# Shared on_timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_edit_view_timeout_replaces_the_edit_view(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    view.bind_render_interaction(mock_interaction, panel=state)
+
+    await view.on_timeout()
+
+    mock_interaction.edit_original_response.assert_called_once()
+    call_kwargs = mock_interaction.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, "the timeout edit must not override content"
+    expired_view = call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert not any(isinstance(c, discord.ui.Select) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert view.timeout == 300, "the shared on_timeout mixin leaves timeout values unchanged"
+
+
+@pytest.mark.asyncio
+async def test_open_edit_view_binds_the_render_interaction(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    """open_edit_view's swapped-in EditView must bind the interaction that rendered it."""
+    from daimon.adapters.discord.agent_setup.edit_view import open_edit_view
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    await open_edit_view(mock_interaction, state, runtime=runtime, allowed_user_id=42)
+
+    view_kwarg = mock_interaction.response.edit_message.call_args.kwargs["view"]
+    await view_kwarg.on_timeout()
+
+    mock_interaction.edit_original_response.assert_called_once()

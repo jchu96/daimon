@@ -11,6 +11,7 @@ import uuid
 
 import structlog
 from daimon.adapters.discord import layout
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.scope_default import (
     do_propagate,
     do_unpropagate,
@@ -281,7 +282,7 @@ class _ChannelPickSelect(discord.ui.ChannelSelect["SetDefaultView"]):
         )
 
 
-class SetDefaultView(discord.ui.LayoutView):
+class SetDefaultView(ExpiringView, discord.ui.LayoutView):
     """C9 V2 cascade panel: airy routing blocks + action select + ChannelSelect.
 
     Write-immediately (no confirm); winner derivation stays in core
@@ -329,7 +330,9 @@ class SetDefaultView(discord.ui.LayoutView):
         from daimon.adapters.discord.agent_setup.edit_view import BackButton
 
         back_row: discord.ui.ActionRow[discord.ui.LayoutView] = discord.ui.ActionRow()
-        back_row.add_item(BackButton())  # pyright: ignore[reportArgumentType]  # BackButton[View] is structurally compatible at runtime; discord.py V2 ActionRow accepts it
+        back_row.add_item(  # pyright: ignore[reportArgumentType]  # BackButton[View] is structurally compatible at runtime; discord.py V2 ActionRow accepts it
+            BackButton(state=state, runtime=runtime, allowed_user_id=allowed_user_id)
+        )
         container.add_item(back_row)
 
         self.add_item(container)
@@ -379,7 +382,7 @@ class SetDefaultView(discord.ui.LayoutView):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     blocks=blocks,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -416,7 +419,7 @@ class SetDefaultView(discord.ui.LayoutView):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     blocks=blocks,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -436,10 +439,13 @@ async def open_set_default(
     runtime: DiscordRuntime,
     allowed_user_id: int,
 ) -> None:
-    """Send the ephemeral SetDefaultView. Owns the send site for the Default… button callback."""
+    """Swap SetDefaultView onto the panel's own message.
+
+    Owns the swap site for the Default… button callback.
+    """
     blocks = await _build_scope_blocks(state, interaction)
-    await interaction.response.send_message(
-        view=SetDefaultView(state, runtime=runtime, allowed_user_id=allowed_user_id, blocks=blocks),
-        ephemeral=True,
+    view = SetDefaultView(state, runtime=runtime, allowed_user_id=allowed_user_id, blocks=blocks)
+    await interaction.response.edit_message(
+        view=view.bind_render_interaction(interaction, panel=state),
         allowed_mentions=discord.AllowedMentions.none(),
     )

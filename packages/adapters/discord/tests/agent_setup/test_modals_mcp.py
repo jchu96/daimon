@@ -508,3 +508,61 @@ async def test_add_mcp_modal_unrelated_server_proceeds_past_guard(
     interaction.response.defer.assert_called_once()
     # reconcile was reached
     assert reconcile_calls == ["called"], "unrelated server must proceed to reconcile"
+
+
+# ---------------------------------------------------------------------------
+# Modal submit returns to the launching view (EditView), not AgentSetupView
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_submit_returns_to_edit_view(
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AddMcpModal.on_submit must return the user to EditView, not a nested AgentSetupView.
+
+    The vault write is made to fail (500) so this test doesn't need to model a
+    full vault bootstrap — modals_mcp.py's on_submit falls through to the final
+    edit_original_response regardless of vault-write outcome.
+    """
+    from daimon.adapters.discord.agent_setup.edit_view import EditView
+
+    monkeypatch.setattr(modals_mcp_mod, "call_reconcile_for_panel", _noop_reconcile())
+
+    async def fake_find(client: Any, *, tenant_id: uuid.UUID, name: str) -> Any:
+        return _fake_ma_agent(tenant_id)
+
+    monkeypatch.setattr(modals_mcp_mod, "find_agent_by_daimon_tag", fake_find)
+
+    def vault_handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "boom", "type": "api_error"}})
+
+    rt = _runtime_configured(
+        anthropic=build_stub_anthropic(vault_handler), sessionmaker=db_session_factory
+    )
+    selected = _entry("my-agent")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        guild_id=12345,
+        is_admin=False,
+    )
+
+    modal = AddMcpModal(state, runtime=rt, allowed_user_id=99)
+    modal.name_in._value = "ext-mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.url_in._value = "https://ext.example.com/mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.token_in._value = "tok_zzzz_9999"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    interaction.edit_original_response.assert_called_once()
+    view_kwarg = interaction.edit_original_response.call_args.kwargs["view"]
+    assert isinstance(view_kwarg, EditView), (
+        "AddMcpModal submit must return to EditView, not AgentSetupView"
+    )
+    assert view_kwarg.allowed_user_id == 99, "the invoker gate must survive the round trip"

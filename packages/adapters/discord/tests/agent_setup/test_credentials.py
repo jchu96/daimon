@@ -15,6 +15,7 @@ import discord
 import pytest
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
+from daimon.adapters.discord.agent_setup import credentials as credentials_mod
 from daimon.adapters.discord.agent_setup import edit_view as edit_view_mod
 from daimon.adapters.discord.agent_setup.credentials import (
     CredentialsSubView,
@@ -102,7 +103,7 @@ def test_container_header_and_subtext() -> None:
     # First TextDisplay is the header from layout.header()
     assert len(texts) >= 1, "at least one TextDisplay in container"
     header_text = texts[0]
-    assert header_text.startswith("## 🔑 Secrets — "), f"header mismatch: {header_text!r}"
+    assert header_text.startswith("## 🔑 Env vars — "), f"header mismatch: {header_text!r}"
     assert "bot" in header_text, "agent name in header"
     assert "-# values are write-only; only key names are shown" in header_text, "subtext present"
 
@@ -140,7 +141,7 @@ def test_container_empty_state_shows_hint() -> None:
         child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
     ]
     # The hint line should be a dim -# line
-    hint_lines = [d for d in displays if "add your first secret" in d]
+    hint_lines = [d for d in displays if "add your first env var" in d]
     assert len(hint_lines) == 1, "empty state has a hint line"
     assert hint_lines[0].startswith("-#"), "empty hint uses dim -# prefix"
 
@@ -169,13 +170,13 @@ def test_subview_renders_remove_select_add_and_back(account_id: uuid.UUID) -> No
         is_system=False,
     )
     select = _remove_select(view)
-    assert select.placeholder == "✕ Remove a secret…", "single remove-select with house placeholder"
+    assert select.placeholder == "✕ Remove a var…", "single remove-select with house placeholder"
     assert [o.label for o in select.options] == ["✕ A", "✕ B"], "one option per secret"
     assert [o.value for o in select.options] == ["A", "B"], "option value is the key name"
     labels = [b.label for b in _find_buttons(view)]
-    assert "+ Add secrets" in labels, "add button present (plural label)"
+    assert "+ Add env vars" in labels, "add button present (plural label)"
     assert "← Back" in labels, "back button present"
-    add_btn = _button_by_label(view, "+ Add secrets")
+    add_btn = _button_by_label(view, "+ Add env vars")
     assert add_btn.disabled is False, "add enabled for a user agent under cap"
 
 
@@ -191,7 +192,7 @@ def test_subview_header_and_subtext(account_id: uuid.UUID) -> None:
         is_system=False,
     )
     text = _container_all_text(view)
-    assert "## 🔑 Secrets — " in text, "container header present"
+    assert "## 🔑 Env vars — " in text, "container header present"
     assert "my-bot" in text, "agent name in header"
     assert "-# values are write-only; only key names are shown" in text, "subtext present"
 
@@ -265,7 +266,7 @@ def test_subview_system_agent_disables_mutations_but_not_back(account_id: uuid.U
         is_system=True,
     )
     assert _remove_select(view).disabled is True, "system agents cannot remove secrets"
-    assert _button_by_label(view, "+ Add secrets").disabled is True, "system add disabled"
+    assert _button_by_label(view, "+ Add env vars").disabled is True, "system add disabled"
     assert _button_by_label(view, "← Back").disabled is False, "back stays enabled (read-only)"
 
 
@@ -282,7 +283,7 @@ def test_subview_empty_state_disables_select(account_id: uuid.UUID) -> None:
     )
     select = _remove_select(view)
     assert select.disabled is True, "no-secrets select is disabled"
-    assert "no secrets" in (select.placeholder or "").lower(), "empty-state placeholder"
+    assert "no env vars" in (select.placeholder or "").lower(), "empty-state placeholder"
 
 
 # --- PasteSecretModal: parse + validate + store (real DB) ------------------
@@ -342,7 +343,7 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
     )
 
     toast = interaction.followup.send.call_args.args[0]
-    assert "Added 2 secrets" in toast, "multi-key success copy"
+    assert "Added 2 env vars" in toast, "multi-key success copy"
     assert _SECRET_VALUE not in toast, "toast never echoes a value"
     on_added.assert_awaited_once()  # re-render callback fired after a successful paste
 
@@ -490,11 +491,11 @@ async def test_back_replaces_with_editview_in_place(account_id: uuid.UUID) -> No
     assert isinstance(sent_view, EditView), "back returns to the unified EditView"
 
 
-# --- EditView._on_secrets opens the sub-view -------------------------------
+# --- EditView._on_env_vars opens the sub-view ------------------------------
 
 
 @pytest.mark.asyncio
-async def test_editview_secrets_button_opens_subview(
+async def test_editview_env_vars_button_opens_subview(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     account_id: uuid.UUID,
@@ -553,9 +554,9 @@ async def test_editview_secrets_button_opens_subview(
     interaction.response.edit_message = AsyncMock()
     interaction.guild_id = 123
 
-    await edit_view._on_secrets(interaction)  # pyright: ignore[reportPrivateUsage]
+    await edit_view._on_env_vars(interaction)  # pyright: ignore[reportPrivateUsage]
 
-    interaction.response.edit_message.assert_awaited_once()  # secrets opens the sub-view in place
+    interaction.response.edit_message.assert_awaited_once()  # env vars opens the sub-view in place
     kwargs = interaction.response.edit_message.call_args.kwargs
     assert isinstance(kwargs["view"], CredentialsSubView), "view is the CredentialsSubView"
     # The sub-view's container must not contain the secret value
@@ -563,7 +564,7 @@ async def test_editview_secrets_button_opens_subview(
     assert _SECRET_VALUE not in all_text, "the opened view lists the key masked, never its value"
 
 
-def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
+def test_editview_has_env_vars_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
     settings = MagicMock()
     settings.mcp.public_url = None
     runtime = DiscordRuntime(
@@ -584,8 +585,8 @@ def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.
     )
     sys_view = EditView(_state(sys_entry, account_id), runtime=runtime, allowed_user_id=42)
     sys_buttons = {b.label: b for b in _walk_buttons(sys_view) if b.label is not None}
-    assert sys_buttons["Secrets"].disabled is True, (
-        "system agents see the Secrets button disabled (defensive)"
+    assert sys_buttons["Env vars"].disabled is True, (
+        "system agents see the Env vars button disabled (defensive)"
     )
 
     user_entry = RosterEntry(
@@ -596,4 +597,87 @@ def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.
     )
     user_view = EditView(_state(user_entry, account_id), runtime=runtime, allowed_user_id=42)
     user_buttons = {b.label: b for b in _walk_buttons(user_view) if b.label is not None}
-    assert user_buttons["Secrets"].disabled is False, "user agents can open Secrets"
+    assert user_buttons["Env vars"].disabled is False, "user agents can open Env vars"
+
+
+# ---------------------------------------------------------------------------
+# Shared on_timeout, including the reused-instance rebind
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_credentials_view_timeout_replaces_the_subview(account_id: uuid.UUID) -> None:
+    entry = _entry("bot")
+    view = CredentialsSubView(
+        runtime=MagicMock(spec=DiscordRuntime),
+        state=_state(entry, account_id),
+        allowed_user_id=42,
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        secret_names=["A"],
+        is_system=False,
+    )
+    interaction = MagicMock()
+    interaction.edit_original_response = AsyncMock()
+    view.bind_render_interaction(interaction, panel=_state(entry, account_id))
+
+    await view.on_timeout()
+
+    interaction.edit_original_response.assert_called_once()
+    call_kwargs = interaction.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, "the timeout edit must not override content"
+    expired_view = call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert not any(isinstance(c, discord.ui.Select) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert view.timeout == 300, "the shared on_timeout mixin leaves timeout values unchanged"
+
+
+@pytest.mark.asyncio
+async def test_credentials_rerender_rebinds_the_current_interaction(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: `_reload_and_rerender` must rebind on every
+    render, not just once at __init__ — this view is re-rendered as the SAME
+    instance, so a stale-bound interaction would expire against the wrong
+    (or a long-dead) message."""
+    monkeypatch.setattr(credentials_mod, "list_agent_files", AsyncMock(return_value=[]))
+
+    entry = _entry("bot")
+    state = _state(entry, account_id)
+    runtime = MagicMock()
+    runtime.sessionmaker.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    runtime.sessionmaker.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    view = CredentialsSubView(
+        runtime=runtime,
+        state=state,
+        allowed_user_id=42,
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        secret_names=["A"],
+        is_system=False,
+    )
+
+    first_interaction = MagicMock()
+    first_interaction.edit_original_response = AsyncMock()
+    view.bind_render_interaction(first_interaction, panel=state)
+
+    second_interaction = MagicMock()
+    second_interaction.edit_original_response = AsyncMock()
+    await view._reload_and_rerender(second_interaction)  # pyright: ignore[reportPrivateUsage]
+
+    await view.on_timeout()
+
+    first_interaction.edit_original_response.assert_not_called()
+    second_interaction.edit_original_response.assert_called()
+    last_call_kwargs = second_interaction.edit_original_response.call_args.kwargs
+    expired_view = last_call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the timeout edit must land through the SECOND interaction with the controls-less expired view"
+    )

@@ -11,7 +11,7 @@ Secret hygiene is enforced structurally, not by convention:
   URL-fetch path and no attachment path),
 - values never reach a custom_id (the remove-select option carries the key name only).
 
-`tenant_id` and `agent_id` are resolved once in `EditView._on_secrets` and
+`tenant_id` and `agent_id` are resolved once in `EditView._on_env_vars` and
 threaded down here as explicit constructor args — the sub-view never re-derives
 the tenant from user input.
 """
@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import structlog
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.state import PanelState
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
@@ -60,7 +61,7 @@ def build_credentials_container(
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container()
     container.add_item(
         header(
-            f"🔑 Secrets — {agent_name}",
+            f"🔑 Env vars — {agent_name}",
             subtext="values are write-only; only key names are shown",
         )
     )
@@ -71,12 +72,12 @@ def build_credentials_container(
         container.add_item(discord.ui.TextDisplay(chips))
     else:
         # Design-language collapse: dim hint instead of "(none)" copy.
-        container.add_item(discord.ui.TextDisplay("-# ＋ add your first secret"))
+        container.add_item(discord.ui.TextDisplay("-# ＋ add your first env var"))
 
     return container
 
 
-class PasteSecretModal(discord.ui.Modal, title="Add secrets"):
+class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
     """Paste KEY=VALUE lines → per-key ``put_agent_file``.
 
     No URL fetch, no attachment, no HTTP: pasted bytes go modal text → store
@@ -166,16 +167,16 @@ class PasteSecretModal(discord.ui.Modal, title="Add secrets"):
         if n == 1:
             toast = f"Added `{pairs[0][0]}`. Takes effect on the next session."
         else:
-            toast = f"Added {n} secrets. Takes effect on the next session."
+            toast = f"Added {n} env vars. Takes effect on the next session."
         await interaction.followup.send(toast, ephemeral=True)
         await self._on_added(interaction)
 
 
-class CredentialsSubView(discord.ui.LayoutView):
-    """F5 Components V2 secrets sub-view opened from EditView's Secrets button.
+class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
+    """F5 Components V2 env-vars sub-view opened from EditView's Env vars button.
 
-    Container: ## 🔑 Secrets — {agent} + write-only subtext, KEY chips on one
-    line, ✕ Remove a secret… select, + Add secrets · ← Back button row.
+    Container: ## 🔑 Env vars — {agent} + write-only subtext, KEY chips on one
+    line, ✕ Remove a var… select, + Add env vars · ← Back button row.
 
     Carries key NAMES only (``secret_names``) — never values. Mutations
     re-render this view in place via ``edit_original_response``; '← Back'
@@ -216,7 +217,7 @@ class CredentialsSubView(discord.ui.LayoutView):
             is_system=self._is_system,
         )
 
-        # ✕ Remove a secret… select (cap 20, glyph in placeholder not emoji=).
+        # ✕ Remove a var… select (cap 20, glyph in placeholder not emoji=).
         remove_select = _build_remove_select(self._secret_names, is_system=self._is_system)
         remove_select.callback = self._make_remove_cb(remove_select)  # type: ignore[method-assign]
 
@@ -224,11 +225,11 @@ class CredentialsSubView(discord.ui.LayoutView):
         select_row.add_item(remove_select)
         container.add_item(select_row)
 
-        # Button row: + Add secrets · ← Back.
+        # Button row: + Add env vars · ← Back.
         btn_row: discord.ui.ActionRow[CredentialsSubView] = discord.ui.ActionRow()
 
         add_btn: discord.ui.Button[CredentialsSubView] = discord.ui.Button(
-            label="+ Add secrets",
+            label="+ Add env vars",
             style=discord.ButtonStyle.success,
             disabled=self._is_system or len(self._secret_names) >= _SECRET_CAP,
         )
@@ -305,7 +306,7 @@ class CredentialsSubView(discord.ui.LayoutView):
                 self._state,
                 runtime=self._runtime,
                 allowed_user_id=self._allowed_user_id,
-            ),
+            ).bind_render_interaction(interaction, panel=self._state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -316,8 +317,12 @@ class CredentialsSubView(discord.ui.LayoutView):
             )
         self._secret_names = [row.key for row in rows]
         self._build_items()
+        # This view is re-rendered IN PLACE (same instance across renders, not
+        # reconstructed like the other four views), so the binding must be
+        # refreshed here on every render — an interaction bound once at
+        # construction would go stale.
         await interaction.edit_original_response(
-            view=self,
+            view=self.bind_render_interaction(interaction, panel=self._state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -325,7 +330,7 @@ class CredentialsSubView(discord.ui.LayoutView):
 def _build_remove_select(
     secret_names: list[str], *, is_system: bool
 ) -> discord.ui.Select[CredentialsSubView]:
-    """✕ Remove a secret… select listing every key (no cap).
+    """✕ Remove a var… select listing every key (no cap).
 
     Each option's ``label``/``value`` carries ONLY the secret KEY NAME — never a
     value, never a per-key custom_id. Disabled (empty placeholder) when
@@ -333,14 +338,14 @@ def _build_remove_select(
     """
     if len(secret_names) == 0:
         return discord.ui.Select(
-            placeholder="(no secrets — use + Add secrets)",
+            placeholder="(no env vars — use + Add env vars)",
             min_values=1,
             max_values=1,
-            options=[discord.SelectOption(label="(no secrets)", value="__none__")],
+            options=[discord.SelectOption(label="(no env vars)", value="__none__")],
             disabled=True,
         )
     return discord.ui.Select(
-        placeholder="✕ Remove a secret…",
+        placeholder="✕ Remove a var…",
         min_values=1,
         max_values=1,
         options=[discord.SelectOption(label=f"✕ {key}"[:100], value=key) for key in secret_names],

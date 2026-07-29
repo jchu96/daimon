@@ -18,6 +18,7 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel as _resolve_tenant
 from daimon.adapters.discord.agent_setup.write import (
@@ -107,7 +108,6 @@ from daimon.adapters.discord.agent_setup.edit_view import (  # noqa: E402
     BackButton,
     EditView,
     _McpRemoveSelect,  # pyright: ignore[reportPrivateUsage]  # re-export for test backwards compat
-    _ScalarFieldSelect,  # pyright: ignore[reportPrivateUsage]  # re-export for test backwards compat
     _SkillRemoveSelect,  # pyright: ignore[reportPrivateUsage]  # re-export for test backwards compat
 )
 from daimon.adapters.discord.agent_setup.set_default import (  # noqa: E402
@@ -118,12 +118,12 @@ __all__ = [
     "build_panel_container",
     "load_secret_count",
     "load_repo_binding",
+    "rerender_root_panel",
     "AgentSetupView",
     "EditView",
     "SetDefaultView",
     "BackButton",
     "_McpRemoveSelect",
-    "_ScalarFieldSelect",
     "_SkillRemoveSelect",
     "NewAgentModal",
     "ForkAgentModal",
@@ -195,8 +195,9 @@ def _build_body_text(state: PanelState) -> str:
         )
         groups.append(f"🔌 **MCPs**\n{mcp_lines}")
 
-    # Repo & auth group: only shown when at least one of repo/auth/secrets is set,
-    # or the shared service account is the agent's only source of GitHub access.
+    # Repo group: shown when at least one of repo/auth is set, or the shared
+    # service account is the agent's only source of GitHub access. No longer
+    # gated on secrets — the 🔑 Env group below carries those independently.
     has_repo = bool(state.bound_repo_url)
     has_auth = bool(state.github_login or state.pat_last4)
     has_secrets = state.secret_count > 0
@@ -205,7 +206,7 @@ def _build_body_text(state: PanelState) -> str:
     # clone public repos. Distinct from `wont_clone` below by construction: the
     # two never fire together (wont_clone already requires fallback NOT configured).
     uses_shared_service_account = not has_auth and state.fallback_pat_configured
-    if has_repo or has_auth or has_secrets or uses_shared_service_account:
+    if has_repo or has_auth or uses_shared_service_account:
         repo_line_parts: list[str] = []
         if state.bound_repo_url:
             # Masked-link text must NOT be a URL: Discord auto-links the inner
@@ -225,8 +226,6 @@ def _build_body_text(state: PanelState) -> str:
                 "🌐 public read-only via shared service account — "
                 "link your GitHub for private repos"
             )
-        if has_secrets:
-            repo_line_parts.append(f"🔑 {state.secret_count} secrets")
         repo_line = " · ".join(repo_line_parts)
         # An anon: binding clones only when the operator fallback PAT is set.
         # inline-pat: refs always carry a per-agent PAT, so they never warn.
@@ -239,7 +238,13 @@ def _build_body_text(state: PanelState) -> str:
             repo_line += "\n⚠️ won't clone — no token"
         if state.last_sync_error is not None:
             repo_line += f"\n⚠️ last sync failed: {state.last_sync_error}"
-        groups.append(f"📦 **Repo & auth**\n{repo_line}")
+        groups.append(f"📦 **Repo**\n{repo_line}")
+
+    # Env group: count only — never key names or values (state carries only
+    # the count, so this is structurally incapable of leaking either).
+    if has_secrets:
+        unit = "variable" if state.secret_count == 1 else "variables"
+        groups.append(f"🔑 **Env**\n{state.secret_count} {unit}")
 
     # Member read-only view: append the cascade ladder as a group.
     if not state.is_admin:
@@ -278,7 +283,7 @@ def _build_body_text(state: PanelState) -> str:
     if not user_mcps:
         missing.append("＋ MCP")
     if not has_secrets:
-        missing.append("＋ secrets")
+        missing.append("＋ env vars")
     if missing and not groups and not (has_repo or has_auth or has_secrets or skills or user_mcps):
         # All resources empty — hint replaces all groups.
         hint = " · ".join(missing) + " — via **Edit**"
@@ -365,6 +370,44 @@ async def load_repo_binding(
         return await get_binding(session, tenant_id=tenant_id, agent_id=agent_id)
 
 
+async def rerender_root_panel(
+    interaction: discord.Interaction,
+    state: PanelState,
+    *,
+    runtime: DiscordRuntime,
+    allowed_user_id: int,
+) -> None:
+    """Hydrate ``state`` from the DB and edit back to the root ``AgentSetupView``.
+
+    The single hydrate-then-edit path back to the root panel — both the
+    ``EditView``/``BackButton`` Back callbacks route through this. Does NOT
+    touch ``interaction.response``; callers own the ACK (``defer()`` before
+    calling this).
+    """
+    tenant_id = await _resolve_tenant(runtime, interaction)
+    state.secret_count = (
+        await load_secret_count(runtime, tenant_id=tenant_id, agent_name=state.selected.name)
+        if state.selected is not None
+        else 0
+    )
+    state.github_login = await load_selected_github_login(
+        runtime, tenant_id=tenant_id, entry=state.selected
+    )
+    state.hydrate_repo_binding(
+        await load_repo_binding(runtime, tenant_id=tenant_id, entry=state.selected)
+    )
+    state.fallback_pat_configured = runtime.settings.github.fallback_pat is not None
+    await interaction.edit_original_response(
+        view=AgentSetupView(
+            state,
+            runtime=runtime,
+            allowed_user_id=allowed_user_id,
+            thumbnail_url=_get_thumbnail_url(interaction),
+        ).bind_render_interaction(interaction, panel=state),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 class _AgentPicker(discord.ui.Select["AgentSetupView"]):
     def __init__(self, state: PanelState) -> None:
         if state.roster:
@@ -428,7 +471,7 @@ class _AgentPicker(discord.ui.Select["AgentSetupView"]):
                     runtime=self.view.runtime,
                     allowed_user_id=self.view.allowed_user_id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=self.view.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -464,7 +507,7 @@ def _get_thumbnail_url(interaction: discord.Interaction) -> str | None:
     return interaction.client.user.display_avatar.url
 
 
-class AgentSetupView(discord.ui.LayoutView):
+class AgentSetupView(ExpiringView, discord.ui.LayoutView):
     """F5 Components V2 agent-setup card.
 
     Container holds header, body, picker row, and (admins only) lifecycle row.
@@ -583,7 +626,7 @@ class AgentSetupView(discord.ui.LayoutView):
                 runtime=self.runtime,
                 allowed_user_id=self.allowed_user_id,
                 thumbnail_url=thumbnail_url,
-            ),
+            ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -751,7 +794,7 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -858,7 +901,7 @@ class ForkAgentModal(discord.ui.Modal, title="Fork agent"):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
