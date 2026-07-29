@@ -78,6 +78,13 @@ repos:
         pass_filenames: false
         files: ^packages/core/alembic/versions/.*\.py$
 
+      - id: lint-designators
+        name: lint companion-repo leakage
+        entry: bash scripts/lint_designators.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: env-example-check
         name: env example up to date
         entry: uv run python scripts/generate_env_example.py --check
