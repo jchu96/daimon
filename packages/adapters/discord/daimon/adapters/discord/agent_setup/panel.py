@@ -194,8 +194,9 @@ def _build_body_text(state: PanelState) -> str:
         )
         groups.append(f"🔌 **MCPs**\n{mcp_lines}")
 
-    # Repo & auth group: only shown when at least one of repo/auth/secrets is set,
-    # or the shared service account is the agent's only source of GitHub access.
+    # Repo group: shown when at least one of repo/auth is set, or the shared
+    # service account is the agent's only source of GitHub access. No longer
+    # gated on secrets — the 🔑 Env group below carries those independently.
     has_repo = bool(state.bound_repo_url)
     has_auth = bool(state.github_login or state.pat_last4)
     has_secrets = state.secret_count > 0
@@ -204,7 +205,7 @@ def _build_body_text(state: PanelState) -> str:
     # clone public repos. Distinct from `wont_clone` below by construction: the
     # two never fire together (wont_clone already requires fallback NOT configured).
     uses_shared_service_account = not has_auth and state.fallback_pat_configured
-    if has_repo or has_auth or has_secrets or uses_shared_service_account:
+    if has_repo or has_auth or uses_shared_service_account:
         repo_line_parts: list[str] = []
         if state.bound_repo_url:
             # Masked-link text must NOT be a URL: Discord auto-links the inner
@@ -224,8 +225,6 @@ def _build_body_text(state: PanelState) -> str:
                 "🌐 public read-only via shared service account — "
                 "link your GitHub for private repos"
             )
-        if has_secrets:
-            repo_line_parts.append(f"🔑 {state.secret_count} secrets")
         repo_line = " · ".join(repo_line_parts)
         # An anon: binding clones only when the operator fallback PAT is set.
         # inline-pat: refs always carry a per-agent PAT, so they never warn.
@@ -238,7 +237,13 @@ def _build_body_text(state: PanelState) -> str:
             repo_line += "\n⚠️ won't clone — no token"
         if state.last_sync_error is not None:
             repo_line += f"\n⚠️ last sync failed: {state.last_sync_error}"
-        groups.append(f"📦 **Repo & auth**\n{repo_line}")
+        groups.append(f"📦 **Repo**\n{repo_line}")
+
+    # Env group: count only — never key names or values (state carries only
+    # the count, so this is structurally incapable of leaking either).
+    if has_secrets:
+        unit = "variable" if state.secret_count == 1 else "variables"
+        groups.append(f"🔑 **Env**\n{state.secret_count} {unit}")
 
     # Member read-only view: append the cascade ladder as a group.
     if not state.is_admin:
@@ -277,7 +282,7 @@ def _build_body_text(state: PanelState) -> str:
     if not user_mcps:
         missing.append("＋ MCP")
     if not has_secrets:
-        missing.append("＋ secrets")
+        missing.append("＋ env vars")
     if missing and not groups and not (has_repo or has_auth or has_secrets or skills or user_mcps):
         # All resources empty — hint replaces all groups.
         hint = " · ".join(missing) + " — via **Edit**"

@@ -102,7 +102,7 @@ def test_container_header_and_subtext() -> None:
     # First TextDisplay is the header from layout.header()
     assert len(texts) >= 1, "at least one TextDisplay in container"
     header_text = texts[0]
-    assert header_text.startswith("## 🔑 Secrets — "), f"header mismatch: {header_text!r}"
+    assert header_text.startswith("## 🔑 Env vars — "), f"header mismatch: {header_text!r}"
     assert "bot" in header_text, "agent name in header"
     assert "-# values are write-only; only key names are shown" in header_text, "subtext present"
 
@@ -140,7 +140,7 @@ def test_container_empty_state_shows_hint() -> None:
         child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
     ]
     # The hint line should be a dim -# line
-    hint_lines = [d for d in displays if "add your first secret" in d]
+    hint_lines = [d for d in displays if "add your first env var" in d]
     assert len(hint_lines) == 1, "empty state has a hint line"
     assert hint_lines[0].startswith("-#"), "empty hint uses dim -# prefix"
 
@@ -169,13 +169,13 @@ def test_subview_renders_remove_select_add_and_back(account_id: uuid.UUID) -> No
         is_system=False,
     )
     select = _remove_select(view)
-    assert select.placeholder == "✕ Remove a secret…", "single remove-select with house placeholder"
+    assert select.placeholder == "✕ Remove a var…", "single remove-select with house placeholder"
     assert [o.label for o in select.options] == ["✕ A", "✕ B"], "one option per secret"
     assert [o.value for o in select.options] == ["A", "B"], "option value is the key name"
     labels = [b.label for b in _find_buttons(view)]
-    assert "+ Add secrets" in labels, "add button present (plural label)"
+    assert "+ Add env vars" in labels, "add button present (plural label)"
     assert "← Back" in labels, "back button present"
-    add_btn = _button_by_label(view, "+ Add secrets")
+    add_btn = _button_by_label(view, "+ Add env vars")
     assert add_btn.disabled is False, "add enabled for a user agent under cap"
 
 
@@ -191,7 +191,7 @@ def test_subview_header_and_subtext(account_id: uuid.UUID) -> None:
         is_system=False,
     )
     text = _container_all_text(view)
-    assert "## 🔑 Secrets — " in text, "container header present"
+    assert "## 🔑 Env vars — " in text, "container header present"
     assert "my-bot" in text, "agent name in header"
     assert "-# values are write-only; only key names are shown" in text, "subtext present"
 
@@ -265,7 +265,7 @@ def test_subview_system_agent_disables_mutations_but_not_back(account_id: uuid.U
         is_system=True,
     )
     assert _remove_select(view).disabled is True, "system agents cannot remove secrets"
-    assert _button_by_label(view, "+ Add secrets").disabled is True, "system add disabled"
+    assert _button_by_label(view, "+ Add env vars").disabled is True, "system add disabled"
     assert _button_by_label(view, "← Back").disabled is False, "back stays enabled (read-only)"
 
 
@@ -282,7 +282,7 @@ def test_subview_empty_state_disables_select(account_id: uuid.UUID) -> None:
     )
     select = _remove_select(view)
     assert select.disabled is True, "no-secrets select is disabled"
-    assert "no secrets" in (select.placeholder or "").lower(), "empty-state placeholder"
+    assert "no env vars" in (select.placeholder or "").lower(), "empty-state placeholder"
 
 
 # --- PasteSecretModal: parse + validate + store (real DB) ------------------
@@ -342,7 +342,7 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
     )
 
     toast = interaction.followup.send.call_args.args[0]
-    assert "Added 2 secrets" in toast, "multi-key success copy"
+    assert "Added 2 env vars" in toast, "multi-key success copy"
     assert _SECRET_VALUE not in toast, "toast never echoes a value"
     on_added.assert_awaited_once()  # re-render callback fired after a successful paste
 

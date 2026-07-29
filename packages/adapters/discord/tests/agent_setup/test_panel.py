@@ -243,7 +243,7 @@ def test_body_text_filters_default_mcp_from_mcp_group(account_id: uuid.UUID) -> 
 
 
 def test_body_text_shows_repo_auth_group_when_repo_set(account_id: uuid.UUID) -> None:
-    """When a repo is bound, body shows the 📦 Repo & auth group with URL."""
+    """When a repo is bound, body shows the 📦 Repo group with URL."""
     selected = _entry_with("bot")
     state = PanelState(
         roster=[selected],
@@ -254,8 +254,9 @@ def test_body_text_shows_repo_auth_group_when_repo_set(account_id: uuid.UUID) ->
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
-    assert "📦" in text, "body must contain 📦 Repo & auth group when repo is set"
+    assert "📦 **Repo**" in text, "body must contain 📦 Repo group when repo is set"
     assert "github.com/me/repo" in text, "repo URL must appear in body text"
+    assert "🔑 **Env**" not in text, "no secrets configured — 🔑 Env group must be absent"
 
 
 def test_body_text_shows_pat_last4_masked(account_id: uuid.UUID) -> None:
@@ -310,18 +311,23 @@ def test_body_text_labels_inline_pat_as_pat_not_handle(account_id: uuid.UUID) ->
 
 
 def test_body_text_shows_secret_count_when_secrets_present(account_id: uuid.UUID) -> None:
-    """When secret_count > 0, body shows the 🔑 secrets count in the Repo & auth group."""
+    """When secret_count > 0, body shows a separate 🔑 Env group with the count —
+    it must never fold back into the 📦 Repo line, even when both groups render."""
     selected = _entry_with("bot")
     state = PanelState(
         roster=[selected],
         selected=selected,
         account_id=account_id,
+        bound_repo_url="https://github.com/me/repo",
+        bound_branch="main",
         secret_count=3,
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
-    assert "🔑" in text, "body must show 🔑 when secrets are present"
-    assert "3 secrets" in text, "body must show the secret count"
+    assert "🔑 **Env**" in text, "body must show a separate 🔑 Env group when secrets are present"
+    assert "3 variables" in text, "body must show the secret count as N variables"
+    repo_line = text.split("📦 **Repo**")[1].split("🔑 **Env**")[0]
+    assert "3" not in repo_line, "the secret count must never appear inside the 📦 Repo line"
 
 
 def test_body_text_hint_line_when_all_empty(account_id: uuid.UUID) -> None:
@@ -338,8 +344,41 @@ def test_body_text_hint_line_when_all_empty(account_id: uuid.UUID) -> None:
     # Empty panel → hint replaces all groups (no group headers)
     assert "🧩" not in text, "empty agent must NOT show 🧩 Skills header"
     assert "🔌" not in text, "empty agent must NOT show 🔌 MCPs header"
-    assert "📦" not in text, "empty agent must NOT show 📦 Repo & auth header"
+    assert "📦" not in text, "empty agent must NOT show 📦 Repo header"
     assert "Edit" in text, "hint line must mention **Edit**"
+
+
+def test_body_text_shows_env_group_without_repo_group(account_id: uuid.UUID) -> None:
+    """Secrets present but nothing repo/auth-related bound: 🔑 Env renders on its
+    own, with no 📦 Repo group and no fallback-hint replacing it."""
+    selected = _entry_with("bot")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        secret_count=2,
+    )
+    container = build_panel_container(state, thumbnail_url=None)
+    text = _container_text(container)
+    assert "🔑 **Env**" in text, "🔑 Env group must render when secrets are present"
+    assert "2 variables" in text, "body must show the secret count as N variables"
+    assert "📦" not in text, "no repo/auth bound — 📦 Repo group must be absent"
+
+
+def test_body_text_missing_hint_names_env_vars(account_id: uuid.UUID) -> None:
+    """The missing-resource hint names 'env vars', not 'secrets'."""
+    selected = _entry_with("bot")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        bound_repo_url="https://github.com/me/repo",
+        bound_branch="main",
+    )
+    container = build_panel_container(state, thumbnail_url=None)
+    text = _container_text(container)
+    assert "＋ env vars" in text, "missing-resource hint must say ＋ env vars"
+    assert "＋ secrets" not in text, "the hint must not still say ＋ secrets"
 
 
 def test_body_text_no_none_literal_in_empty_fields(account_id: uuid.UUID) -> None:
@@ -352,7 +391,7 @@ def test_body_text_no_none_literal_in_empty_fields(account_id: uuid.UUID) -> Non
 
 
 def test_body_text_last_sync_error_appears_in_repo_group(account_id: uuid.UUID) -> None:
-    """When last_sync_error is set, a warning line appears in the Repo & auth group."""
+    """When last_sync_error is set, a warning line appears in the 📦 Repo group."""
     selected = _entry("my-agent")
     state = PanelState(
         roster=[selected],
@@ -437,7 +476,7 @@ def test_body_text_anon_binding_no_warning_with_fallback(account_id: uuid.UUID) 
 def test_body_text_shows_shared_service_account_line_with_no_repo_bound(
     account_id: uuid.UUID,
 ) -> None:
-    """With the fallback PAT configured but nothing bound yet, the Repo & auth group
+    """With the fallback PAT configured but nothing bound yet, the 📦 Repo group
     renders with just the shared-service-account line — not the 'unconfigured' hint."""
     selected = _entry("my-agent")
     state = PanelState(
@@ -448,11 +487,12 @@ def test_body_text_shows_shared_service_account_line_with_no_repo_bound(
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
-    assert "📦" in text, "fallback PAT configured must show the Repo & auth group even unbound"
+    assert "📦 **Repo**" in text, "fallback PAT configured must show the 📦 Repo group even unbound"
     assert "shared service account" in text, (
         "fallback PAT configured with nothing bound must show the shared-service-account line"
     )
     assert "won't clone" not in text, "no repo is bound, so the clone warning must not appear"
+    assert "🔑 **Env**" not in text, "no secrets configured — 🔑 Env group must be absent"
 
 
 def test_body_text_inline_pat_binding_never_warns(account_id: uuid.UUID) -> None:
@@ -473,7 +513,7 @@ def test_body_text_inline_pat_binding_never_warns(account_id: uuid.UUID) -> None
 
 
 def test_body_text_unbound_agent_has_no_repo_group(account_id: uuid.UUID) -> None:
-    """An unbound agent shows no Repo & auth group and no clone warning."""
+    """An unbound agent shows no 📦 Repo group and no clone warning."""
     selected = _entry("my-agent")
     state = PanelState(
         roster=[selected],
@@ -484,7 +524,7 @@ def test_body_text_unbound_agent_has_no_repo_group(account_id: uuid.UUID) -> Non
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
-    assert "📦" not in text, "unbound agent must not show the Repo & auth group"
+    assert "📦" not in text, "unbound agent must not show the 📦 Repo group"
     assert "won't clone" not in text, "unbound agent must not show a clone warning"
 
 
