@@ -107,7 +107,6 @@ from daimon.adapters.discord.agent_setup.edit_view import (  # noqa: E402
     BackButton,
     EditView,
     _McpRemoveSelect,  # pyright: ignore[reportPrivateUsage]  # re-export for test backwards compat
-    _ScalarFieldSelect,  # pyright: ignore[reportPrivateUsage]  # re-export for test backwards compat
     _SkillRemoveSelect,  # pyright: ignore[reportPrivateUsage]  # re-export for test backwards compat
 )
 from daimon.adapters.discord.agent_setup.set_default import (  # noqa: E402
@@ -124,7 +123,6 @@ __all__ = [
     "SetDefaultView",
     "BackButton",
     "_McpRemoveSelect",
-    "_ScalarFieldSelect",
     "_SkillRemoveSelect",
     "NewAgentModal",
     "ForkAgentModal",

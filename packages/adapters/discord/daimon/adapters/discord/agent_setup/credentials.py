@@ -11,7 +11,7 @@ Secret hygiene is enforced structurally, not by convention:
   URL-fetch path and no attachment path),
 - values never reach a custom_id (the remove-select option carries the key name only).
 
-`tenant_id` and `agent_id` are resolved once in `EditView._on_secrets` and
+`tenant_id` and `agent_id` are resolved once in `EditView._on_env_vars` and
 threaded down here as explicit constructor args — the sub-view never re-derives
 the tenant from user input.
 """

@@ -490,11 +490,11 @@ async def test_back_replaces_with_editview_in_place(account_id: uuid.UUID) -> No
     assert isinstance(sent_view, EditView), "back returns to the unified EditView"
 
 
-# --- EditView._on_secrets opens the sub-view -------------------------------
+# --- EditView._on_env_vars opens the sub-view ------------------------------
 
 
 @pytest.mark.asyncio
-async def test_editview_secrets_button_opens_subview(
+async def test_editview_env_vars_button_opens_subview(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     account_id: uuid.UUID,
@@ -553,9 +553,9 @@ async def test_editview_secrets_button_opens_subview(
     interaction.response.edit_message = AsyncMock()
     interaction.guild_id = 123
 
-    await edit_view._on_secrets(interaction)  # pyright: ignore[reportPrivateUsage]
+    await edit_view._on_env_vars(interaction)  # pyright: ignore[reportPrivateUsage]
 
-    interaction.response.edit_message.assert_awaited_once()  # secrets opens the sub-view in place
+    interaction.response.edit_message.assert_awaited_once()  # env vars opens the sub-view in place
     kwargs = interaction.response.edit_message.call_args.kwargs
     assert isinstance(kwargs["view"], CredentialsSubView), "view is the CredentialsSubView"
     # The sub-view's container must not contain the secret value
@@ -563,7 +563,7 @@ async def test_editview_secrets_button_opens_subview(
     assert _SECRET_VALUE not in all_text, "the opened view lists the key masked, never its value"
 
 
-def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
+def test_editview_has_env_vars_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
     settings = MagicMock()
     settings.mcp.public_url = None
     runtime = DiscordRuntime(
@@ -584,8 +584,8 @@ def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.
     )
     sys_view = EditView(_state(sys_entry, account_id), runtime=runtime, allowed_user_id=42)
     sys_buttons = {b.label: b for b in _walk_buttons(sys_view) if b.label is not None}
-    assert sys_buttons["Secrets"].disabled is True, (
-        "system agents see the Secrets button disabled (defensive)"
+    assert sys_buttons["Env vars"].disabled is True, (
+        "system agents see the Env vars button disabled (defensive)"
     )
 
     user_entry = RosterEntry(
@@ -596,4 +596,4 @@ def test_editview_has_secrets_button_disabled_for_system_agent(account_id: uuid.
     )
     user_view = EditView(_state(user_entry, account_id), runtime=runtime, allowed_user_id=42)
     user_buttons = {b.label: b for b in _walk_buttons(user_view) if b.label is not None}
-    assert user_buttons["Secrets"].disabled is False, "user agents can open Secrets"
+    assert user_buttons["Env vars"].disabled is False, "user agents can open Env vars"
