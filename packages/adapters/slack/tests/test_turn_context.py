@@ -22,10 +22,11 @@ from anthropic.types.beta import BetaManagedAgentsSessionAgent as _SessionAgent
 from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
 from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.adapters.slack.app import SlackApp
-from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.errors import TurnError
 from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.slack_turn_contexts import get_slack_turn_channels
@@ -80,13 +81,26 @@ def _make_orchestrate_app(
     settings.mcp.app_root_url = None
     settings.defaults_root = MagicMock()
 
+    anthropic = build_fake_anthropic(_make_agent_env_handler())
+    deployment_default = DeploymentDefault(agent_name="daimon", environment_name="default")
+    resolver_cache = new_resolver_cache()
+    turn_deps = build_turn_deps(
+        settings,
+        anthropic,
+        sessionmaker,
+        deployment_default=deployment_default,
+        resolver_cache=resolver_cache,
+        billing_config=None,
+    )
     runtime = SlackRuntime(
         settings=settings,
-        anthropic=build_fake_anthropic(_make_agent_env_handler()),
+        anthropic=anthropic,
         sessionmaker=sessionmaker,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
-        deployment_default=DeploymentDefault(agent_name="daimon", environment_name="default"),
+        resolver_cache=resolver_cache,
+        turn_deps=turn_deps,
+        deployment_default=deployment_default,
     )
     return SlackApp(runtime=runtime)
 
@@ -169,15 +183,15 @@ async def test_turn_context_row_lives_exactly_during_run_turn(
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_turn_ctx_id"
         mock_resolve_env.return_value = "env_turn_ctx_id"
@@ -244,15 +258,15 @@ async def test_turn_context_row_deleted_when_run_turn_raises(
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_turn_ctx_raise_id"
         mock_resolve_env.return_value = "env_turn_ctx_raise_id"

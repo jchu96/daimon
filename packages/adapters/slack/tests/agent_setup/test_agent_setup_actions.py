@@ -219,6 +219,8 @@ def _build_runtime(
         sessionmaker=db_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
 
@@ -484,6 +486,8 @@ async def test_handle_agent_setup_action_connect_mcp_sends_ephemeral_not_modal_u
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     # Override aioresponses to return is_admin=True (connect_mcp re-checks admin).

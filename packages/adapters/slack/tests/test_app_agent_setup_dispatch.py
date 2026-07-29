@@ -57,6 +57,8 @@ def _make_app() -> SlackApp:
         sessionmaker=MagicMock(),
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
     return SlackApp(runtime=runtime)
 

@@ -30,10 +30,12 @@ class TestSlackRuntime:
             "sessionmaker",
             "billing_config",
             "http_client",
+            "resolver_cache",
+            "turn_deps",
             "deployment_default",
         }, (
             "expected exactly settings/anthropic/sessionmaker/billing_config/http_client/"
-            f"deployment_default fields, got {fields}"
+            f"resolver_cache/turn_deps/deployment_default fields, got {fields}"
         )
 
     def test_frozen(self) -> None:
@@ -44,6 +46,8 @@ class TestSlackRuntime:
             sessionmaker=MagicMock(),  # pyright: ignore[reportArgumentType]
             billing_config=None,
             http_client=MagicMock(),  # pyright: ignore[reportArgumentType]
+            resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]
+            turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             rt.settings = MagicMock()  # type: ignore[misc]  # intentionally testing frozen

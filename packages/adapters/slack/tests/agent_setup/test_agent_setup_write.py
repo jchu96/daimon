@@ -286,6 +286,8 @@ def _runtime_with_db(
         sessionmaker=sessionmaker,
         billing_config=None,
         http_client=MagicMock(),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
         deployment_default=DeploymentDefault(),
     )
 

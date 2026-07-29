@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import time
 import uuid
 from collections.abc import Coroutine
@@ -81,24 +80,13 @@ from daimon.adapters.slack.vision import (
     download_as_image_blocks,
     is_vision_image,
 )
-from daimon.core.billing import is_over_cap
-from daimon.core.defaults.provisioning import reconcile_tenant_defaults, teardown_slack_install
+from daimon.core.defaults.provisioning import teardown_slack_install
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, decrypt_token
-from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
-from daimon.core.ma_resolver import (
-    MAResolverMissError,
-    new_resolver_cache,
-    resolve_agent,
-    resolve_environment,
-)
+from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_resolver import MAResolverMissError
 from daimon.core.observability import capture_exception_with_scope
-from daimon.core.pricing import MODEL_PRICING
-from daimon.core.scope import ScopeContext
-from daimon.core.sessions import create_session
 from daimon.core.slack_oauth import build_slack_connect_url
-from daimon.core.stores.identity import get_or_create_platform_principal
-from daimon.core.stores.scoped_config_read import resolve as resolve_config
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token
 from daimon.core.stores.slack_connect_prompts import mark_connect_prompted, was_connect_prompted
 from daimon.core.stores.slack_event_dedup import insert_if_new
@@ -107,16 +95,12 @@ from daimon.core.stores.slack_turn_contexts import (
     delete_slack_turn_context,
 )
 from daimon.core.stores.slack_user_tokens import get_slack_user_token
-from daimon.core.stores.thread_sessions import (
-    create_thread_session,
-    get_live_thread_session,
-    update_watermark,
-)
-from daimon.core.tenant_balance import is_over_balance
-from daimon.core.turn.driver import run_turn
+from daimon.core.stores.thread_sessions import update_watermark
+from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.gating import should_admit_turn
-from daimon.core.turn.posture import Billed, UsageRecorder
-from daimon.core.usage_recording import record_turn_usage
+from daimon.core.turn.lifecycle import TurnLifecycle
+from daimon.core.turn.prepare import bind_session
+from daimon.core.turn.run import run_prepared_turn
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.async_client import AsyncBaseSocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -917,51 +901,31 @@ class SlackApp:
         No try/except — errors propagate to the listener boundary in
         ``_handle_app_mention``.
         """
-        # --- Identity ---
-        async with self.runtime.sessionmaker() as s:
-            principal = await get_or_create_platform_principal(
-                s,
+        # --- Stage one: admission (identity, config cascade, missing-config
+        # bail, MA resolve/retrieve, balance gate, cap gate) -- D-01 admit(). ---
+        try:
+            admission = await admit(
+                self.runtime.turn_deps,
                 tenant_id=tenant_id,
                 platform="slack",
-                external_id=str(event.get("user") or ""),
+                external_user_id=str(event.get("user") or ""),
+                channel_id=channel,
+                now=datetime.now(UTC),
             )
-            await s.commit()
-
-        # --- Config resolution (mirror bot.py:776-815): channel → tenant →
-        # deployment cascade, so /agent-setup propagations take effect here.
-        # Runs on EVERY turn (new session or reused) so admission gates and
-        # usage_record below always have a resolved agent/model to bind against.
-        async with self.runtime.sessionmaker() as s:
-            config = await resolve_config(
-                s,
-                context=ScopeContext(
-                    tenant_id=tenant_id,
-                    channel_id=channel,
-                    account_id=principal.account_id,
-                ),
-                default=self.runtime.deployment_default,
-            )
-        agent_tag = config.agent_name
-        environment_tag = config.environment_name
-        if agent_tag is None or environment_tag is None:
-            missing = [
-                name
-                for name, value in (("agent", agent_tag), ("environment", environment_tag))
-                if value is None
-            ]
+        except MissingTurnConfigError as err:
             log.info(
                 "slack.missing_config",
                 team_id=team_id,
                 channel_id=channel,
-                missing=missing,
+                missing=list(err.missing),
             )
             hints: list[str] = []
-            if agent_tag is None:
+            if "agent" in err.missing:
                 hints.append(
                     "An admin can set the default agent in `/agent-setup` → "
                     "*Set as default…* → [This channel] or [Whole workspace]."
                 )
-            if environment_tag is None:
+            if "environment" in err.missing:
                 hints.append(
                     "Environment is operator-only — an operator can set it via the CLI "
                     "(`daimon config set environment_name=...`)."
@@ -969,42 +933,11 @@ class SlackApp:
             await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
                 channel=channel,
                 thread_ts=thread_id,
-                text=(f"No {' or '.join(missing)} configured for this channel. " + " ".join(hints)),
+                text=(
+                    f"No {' or '.join(err.missing)} configured for this channel. " + " ".join(hints)
+                ),
             )
             return
-
-        resolver_cache = new_resolver_cache()
-        public_url = (
-            str(self.runtime.settings.mcp.public_url)
-            if self.runtime.settings.mcp.public_url is not None
-            else None
-        )
-
-        async def _apply() -> object:
-            return await reconcile_tenant_defaults(
-                self.runtime.anthropic,
-                self.runtime.settings.defaults_root,
-                tenant_id=tenant_id,
-                public_url=public_url,
-            )
-
-        try:
-            agent_id = await resolve_agent(
-                self.runtime.anthropic,
-                tenant_id=tenant_id,
-                daimon_tag=agent_tag,
-                apply_callable=_apply,
-                cache=resolver_cache,
-                cached_id=None,
-            )
-            env_id = await resolve_environment(
-                self.runtime.anthropic,
-                tenant_id=tenant_id,
-                daimon_tag=environment_tag,
-                apply_callable=_apply,
-                cache=resolver_cache,
-                cached_id=None,
-            )
         except MAResolverMissError as err:
             log.warning(
                 "slack.resolver.miss",
@@ -1023,138 +956,69 @@ class SlackApp:
                 ),
             )
             return
-        agent = await self.runtime.anthropic.beta.agents.retrieve(agent_id)
-        agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id))
+        except AdmissionDenied as err:
+            if err.reason == "balance_depleted":
+                log.info(
+                    "turn.skipped.over_balance",
+                    tenant_id=str(tenant_id),
+                    team_id=team_id,
+                    channel_id=channel,
+                    thread_id=thread_id,
+                )
+                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                    channel=channel,
+                    thread_ts=thread_id,
+                    text=(
+                        "This workspace's daimon credit is depleted. "
+                        "An admin can top up with `/billing`."
+                    ),
+                )
+            else:
+                log.info(
+                    "turn.skipped.over_cap",
+                    tenant_id=str(tenant_id),
+                    user_id=str(event.get("user") or ""),
+                    team_id=team_id,
+                    channel_id=channel,
+                    thread_id=thread_id,
+                )
+                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                    channel=channel,
+                    thread_ts=thread_id,
+                    text=(
+                        "Monthly usage cap reached for this workspace. "
+                        "An admin can adjust the cap with `/billing` (when available)."
+                    ),
+                )
+            return
+
+        agent = admission.agent
         _lc_agent_name: str = agent.name
         _lc_model_id: str = agent.model.id
-        env = await self.runtime.anthropic.beta.environments.retrieve(env_id)
 
-        # --- Admission gate: per-tenant balance — independent of Stripe config ---
-        if await is_over_balance(sessionmaker=self.runtime.sessionmaker, tenant_id=tenant_id):
-            log.info(
-                "turn.skipped.over_balance",
-                tenant_id=str(tenant_id),
-                team_id=team_id,
-                channel_id=channel,
-                thread_id=thread_id,
-            )
-            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                channel=channel,
-                thread_ts=thread_id,
-                text=(
-                    "This workspace's daimon credit is depleted. "
-                    "An admin can top up with `/billing`."
-                ),
-            )
-            return
-
-        # --- Admission gate: monthly usage cap ---
-        over_cap = await is_over_cap(
-            billing_config=self.runtime.billing_config,
-            sessionmaker=self.runtime.sessionmaker,
+        # --- Stage two: bind_session (find-or-create, mapping write,
+        # recorder binding) -- D-01 bind_session(). Slack has no
+        # per_caller_thread_sessions equivalent: session_account_id is always
+        # the admitted caller's account, and threads always pre-exist. ---
+        prepared = await bind_session(
+            self.runtime.turn_deps,
+            admission,
             tenant_id=tenant_id,
-            user_id=str(event.get("user") or ""),
-            now=datetime.now(UTC),
+            platform="slack",
+            external_user_id=str(event.get("user") or ""),
+            thread_id=thread_id,
+            session_account_id=admission.account_id,
+            reuse_existing=True,
         )
-        if over_cap:
-            log.info(
-                "turn.skipped.over_cap",
-                tenant_id=str(tenant_id),
-                user_id=str(event.get("user") or ""),
-                team_id=team_id,
-                channel_id=channel,
-                thread_id=thread_id,
-            )
-            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                channel=channel,
-                thread_ts=thread_id,
-                text=(
-                    "Monthly usage cap reached for this workspace. "
-                    "An admin can adjust the cap with `/billing` (when available)."
-                ),
-            )
-            return
-
-        # --- Session find-or-create ---
-        async with self.runtime.sessionmaker() as s:
-            existing = await get_live_thread_session(
-                s,
-                tenant_id=tenant_id,
-                platform="slack",
-                thread_id=thread_id,
-                account_id=principal.account_id,
-            )
-
-        ma_session_id: str
-        mapping_id: uuid.UUID
-        watermark: str | None
-        reused: bool
-
-        if existing is not None:
-            ma_session_id = existing.ma_session_id
-            mapping_id = existing.id
-            watermark = existing.watermark_message_id
-            reused = True
-            log.info(
-                "slack.session.reused",
-                session_id=ma_session_id,
-                thread_id=thread_id,
-                watermark=watermark,
-            )
-        else:
-            # Create a fresh MA session (mirror bot.py:852-871).
-            ma_session = await create_session(
-                self.runtime.anthropic,
-                agent=agent,
-                environment=env,
-                mcp_settings=self.runtime.settings.mcp,
-                tenant_id=tenant_id,
-                account_id=principal.account_id,
-                agent_uuid=agent_uuid,
-                session_factory=self.runtime.sessionmaker,
-                github_fallback_pat=(
-                    self.runtime.settings.github.fallback_pat.get_secret_value()
-                    if self.runtime.settings.github.fallback_pat is not None
-                    else None
-                ),
-                github_app_id=self.runtime.settings.github.app_id,
-                github_app_private_key=(
-                    self.runtime.settings.github.app_private_key.get_secret_value()
-                    if self.runtime.settings.github.app_private_key is not None
-                    else None
-                ),
-            )
-            ma_session_id = ma_session.id
-
-            async with self.runtime.sessionmaker() as s:
-                row = await create_thread_session(
-                    s,
-                    tenant_id=tenant_id,
-                    platform="slack",
-                    thread_id=thread_id,
-                    account_id=principal.account_id,
-                    ma_session_id=ma_session_id,
-                )
-                await s.commit()
-            mapping_id = row.id
-            watermark = None
-            reused = False
-            log.info(
-                "slack.session.created",
-                session_id=ma_session_id,
-                thread_id=thread_id,
-            )
-
-        # --- usage_record binding: unconditional, mirrors bot.py:1107-1116 ---
-        usage_record: UsageRecorder = functools.partial(
-            record_turn_usage,
-            sessionmaker=self.runtime.sessionmaker,
-            platform_user_id=str(event.get("user") or ""),
-            managed_session_id=ma_session_id,
-            model_id=agent.model.id,
-            tenant_id=tenant_id,
-            markup=self.runtime.settings.billing.markup,
-            pricing=MODEL_PRICING.get(agent.model.id),
+        ma_session_id = prepared.ma_session_id
+        watermark = prepared.watermark
+        reused = prepared.reused
+        log.info(
+            "slack.session.ready",
+            session_id=ma_session_id,
+            thread_id=thread_id,
+            reused=reused,
+            watermark=watermark,
         )
 
         # --- Build user message ---
@@ -1213,8 +1077,9 @@ class SlackApp:
         skipped_ids = {f["id"] for f, _ in images_skipped}
         inlined = [f for f in trigger_images if f["id"] not in skipped_ids]
 
+        synthetic_prefix = ""
         if proxy_ctx is not None:
-            prefix = "\n".join(
+            synthetic_prefix = "\n".join(
                 part
                 for part in (
                     build_attachment_url_prefix(data_files, proxy_ctx),
@@ -1223,8 +1088,8 @@ class SlackApp:
                 )
                 if part
             )
-            if prefix:
-                user_message = prefix + "\n" + user_message
+            if synthetic_prefix:
+                user_message = synthetic_prefix + "\n" + user_message
 
             # Only claim the images were "linked" when the proxy is configured —
             # that's the branch that actually minted fetchable URLs into the prefix.
@@ -1239,7 +1104,12 @@ class SlackApp:
                     ),
                 )
 
-        # --- Run turn ---
+        # --- Run the turn (D-08/D-09/D-10: run_prepared_turn owns the driver
+        # call and the one-shot dead-session recovery cycle). ---
+        # lifecycle_holder tracks whichever SlackTurnLifecycle actually
+        # completed the turn -- recovery_lifecycle rebuilds a fresh one against
+        # the recreated session, and the watermark write below must read
+        # final_ts off THAT lifecycle, not the pre-recovery one.
         log.info(
             "slack.turn.started",
             thread_id=thread_id,
@@ -1258,26 +1128,62 @@ class SlackApp:
             register=self._register_cancel,
             deregister=self._deregister_cancel,
         )
+        lifecycle_holder: list[SlackTurnLifecycle] = [lifecycle]
+
+        async def _reseed_user_message() -> str:
+            """Full history re-seed for the recreated session (dead-session recovery)."""
+            full_message = await build_context_xml(
+                web_client,
+                channel=channel,
+                thread_ts=thread_id,
+                user_query=user_text,
+                author_id=author_id,
+                proxy=proxy_ctx,
+            )
+            if synthetic_prefix:
+                full_message = synthetic_prefix + "\n" + full_message
+            return full_message
+
+        def _recovery_lifecycle(cancel: asyncio.Event) -> TurnLifecycle:
+            new_lifecycle = SlackTurnLifecycle(
+                client=web_client,
+                channel=channel,
+                thread_ts=thread_id,
+                cancel=cancel,
+                author_id=str(event.get("user") or ""),
+                agent_name=_lc_agent_name,
+                model_id=_lc_model_id,
+                register=self._register_cancel,
+                deregister=self._deregister_cancel,
+            )
+            lifecycle_holder[0] = new_lifecycle
+            return new_lifecycle
+
         async with self.runtime.sessionmaker() as s:
             turn_context = await create_slack_turn_context(
                 s,
                 tenant_id=tenant_id,
-                account_id=principal.account_id,
+                account_id=admission.account_id,
                 channel_id=channel,
                 thread_ts=thread_id,
                 started_at=datetime.now(tz=UTC),
             )
             await s.commit()
         try:
-            await run_turn(
-                anthropic=self.runtime.anthropic,
-                session_id=ma_session_id,
+            outcome = await run_prepared_turn(
+                self.runtime.turn_deps,
+                prepared,
+                tenant_id=tenant_id,
+                platform="slack",
+                thread_id=thread_id,
+                external_user_id=str(event.get("user") or ""),
                 user_message=user_message,
                 lifecycle=lifecycle,
                 cancel=cancel_event,
-                render_interval_s=2.0,
+                reseed_user_message=_reseed_user_message,
+                recovery_lifecycle=_recovery_lifecycle,
                 image_blocks=image_blocks or None,
-                billing=Billed(record=usage_record),
+                render_interval_s=2.0,
             )
         finally:
             # Leak-policy bookkeeping only — a delete failure must not mask the
@@ -1287,18 +1193,30 @@ class SlackApp:
                     await delete_slack_turn_context(s, id=turn_context.id)
                     await s.commit()
 
+        mapping_id = outcome.mapping_id
+        final_lifecycle = lifecycle_holder[0]
+
         # --- Watermark ---
-        if lifecycle.final_ts is not None:
+        if outcome.state.error is not None:
+            log.warning(
+                "slack.turn.error",
+                thread_id=thread_id,
+                session_id=outcome.ma_session_id,
+                kind=outcome.state.error.kind,
+            )
+        elif mapping_id is not None and final_lifecycle.final_ts is not None:
             async with self.runtime.sessionmaker() as s:
-                await update_watermark(s, id=mapping_id, watermark_message_id=lifecycle.final_ts)
+                await update_watermark(
+                    s, id=mapping_id, watermark_message_id=final_lifecycle.final_ts
+                )
                 await s.commit()
             log.info(
                 "slack.watermark.updated",
                 thread_id=thread_id,
-                watermark=lifecycle.final_ts,
+                watermark=final_lifecycle.final_ts,
             )
         else:
-            log.info("slack.turn.completed", thread_id=thread_id, session_id=ma_session_id)
+            log.info("slack.turn.completed", thread_id=thread_id, session_id=outcome.ma_session_id)
 
     async def drain_and_close(self, client: AsyncBaseSocketModeClient) -> None:
         """Graceful shutdown drain.

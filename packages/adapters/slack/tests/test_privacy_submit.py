@@ -204,6 +204,8 @@ async def test_run_purge_and_update_deletes_account_rows_and_calls_views_update(
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     await run_purge_and_update(
@@ -258,6 +260,8 @@ async def test_run_purge_and_update_aborts_when_account_does_not_match_submitter
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     # Submitter U_SUB_03 resolves to `account`, but metadata claims a foreign id.
