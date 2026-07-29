@@ -101,6 +101,8 @@ def _build_runtime_no_db(fernet_key: str = "dummy") -> SlackRuntime:
         sessionmaker=async_sessionmaker(),  # pyright: ignore[reportArgumentType]
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
 
@@ -631,6 +633,8 @@ async def test_run_paste_secrets_submission_when_admin_and_two_pairs_posts_count
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     secret_val_1 = "s3cr3t_one"
@@ -783,6 +787,8 @@ async def test_run_edit_repo_submission_when_pat_replace_false_preserves_inline_
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     await run_edit_repo_submission(
@@ -856,6 +862,8 @@ async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     await run_edit_repo_submission(
@@ -935,6 +943,8 @@ async def test_run_edit_repo_submission_no_pat_binds_anon(
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     await run_edit_repo_submission(

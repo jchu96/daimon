@@ -35,10 +35,11 @@ from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAg
 from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.app import SlackApp
-from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.scoped_config_write import set_fields
@@ -162,6 +163,8 @@ def _make_app(
         sessionmaker=sessionmaker,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
     return SlackApp(runtime=runtime)
 
@@ -533,6 +536,20 @@ def _make_orchestrate_app(
     settings.billing.markup = Decimal("1.0")
 
     anthropic_client = build_fake_anthropic(_make_agent_env_handler())
+    resolved_deployment_default = (
+        deployment_default
+        if deployment_default is not None
+        else DeploymentDefault(agent_name="daimon", environment_name="default")
+    )
+    resolver_cache = new_resolver_cache()
+    turn_deps = build_turn_deps(
+        settings,
+        anthropic_client,
+        sessionmaker,
+        deployment_default=resolved_deployment_default,
+        resolver_cache=resolver_cache,
+        billing_config=None,
+    )
 
     runtime = SlackRuntime(
         settings=settings,
@@ -540,11 +557,9 @@ def _make_orchestrate_app(
         sessionmaker=sessionmaker,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
-        deployment_default=(
-            deployment_default
-            if deployment_default is not None
-            else DeploymentDefault(agent_name="daimon", environment_name="default")
-        ),
+        resolver_cache=resolver_cache,
+        turn_deps=turn_deps,
+        deployment_default=resolved_deployment_default,
     )
     return SlackApp(runtime=runtime), anthropic_client
 
@@ -626,15 +641,15 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -752,15 +767,15 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
     }
 
     with (
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
         patch(
             "daimon.adapters.slack.app.build_delta_xml", new_callable=AsyncMock
         ) as mock_build_delta,
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
     ):
         mock_run_turn.side_effect = _fake_run_turn
@@ -867,26 +882,26 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
 
     with (
         patch(
-            "daimon.adapters.slack.app.get_or_create_platform_principal", new_callable=AsyncMock
+            "daimon.core.turn.admission.get_or_create_platform_principal", new_callable=AsyncMock
         ) as mock_principal,
         patch(
-            "daimon.adapters.slack.app.get_live_thread_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.get_live_thread_session", new_callable=AsyncMock
         ) as mock_get_session,
         patch(
-            "daimon.adapters.slack.app.create_thread_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_thread_session", new_callable=AsyncMock
         ) as mock_create_ts,
         patch("daimon.adapters.slack.app.update_watermark", new_callable=AsyncMock),
-        patch("daimon.adapters.slack.app.reconcile_tenant_defaults", new_callable=AsyncMock),
+        patch("daimon.core.turn.admission.reconcile_tenant_defaults", new_callable=AsyncMock),
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_principal.return_value = fake_principal
         mock_get_session.return_value = None  # simulate new thread each time
@@ -1029,15 +1044,15 @@ async def test_orchestrate_first_mention_adds_eyes_reaction_before_turn(
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_eyes_id"
         mock_resolve_env.return_value = "env_eyes_id"
@@ -1174,15 +1189,15 @@ async def test_orchestrate_eyes_reaction_transport_error_does_not_leak_thread_sl
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_eyes_xport_id"
         mock_resolve_env.return_value = "env_eyes_xport_id"
@@ -1241,7 +1256,7 @@ async def test_orchestrate_tenant_cap_when_exhausted_sends_ephemeral_and_skips_t
         "text": "<@U_BOT> hello",
     }
 
-    with patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn:
+    with patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn:
         await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
             event,
             team_id=team_id,
@@ -1337,15 +1352,15 @@ async def test_orchestrate_first_turn_when_channel_agent_propagated_resolves_cha
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_scoped_id"
         mock_resolve_env.return_value = "env_scoped_id"
@@ -1400,9 +1415,9 @@ async def test_orchestrate_first_turn_when_no_agent_configured_posts_guidance_an
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
             event,
@@ -1464,16 +1479,16 @@ async def test_run_thread_turn_when_over_balance_blocks_before_session_create(
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
         ) as mock_over_balance,
-        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -1544,17 +1559,17 @@ async def test_run_thread_turn_when_over_cap_blocks_before_session_create(
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
         ) as mock_over_balance,
-        patch("daimon.adapters.slack.app.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
-        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -1689,19 +1704,19 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
         ) as mock_over_balance,
-        patch("daimon.adapters.slack.app.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
         patch(
-            "daimon.adapters.slack.app.create_session", new_callable=AsyncMock
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -1789,16 +1804,16 @@ async def test_run_thread_turn_reused_session_over_balance_blocks_and_skips_run_
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
         ) as mock_over_balance,
-        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -1885,17 +1900,17 @@ async def test_run_thread_turn_reused_session_over_cap_blocks_and_skips_run_turn
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
         ) as mock_over_balance,
-        patch("daimon.adapters.slack.app.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
-        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -2019,17 +2034,17 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
 
     with (
         patch(
-            "daimon.adapters.slack.app.resolve_agent", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
         ) as mock_resolve_agent,
         patch(
-            "daimon.adapters.slack.app.resolve_environment", new_callable=AsyncMock
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
         ) as mock_resolve_env,
         patch(
-            "daimon.adapters.slack.app.is_over_balance", new_callable=AsyncMock
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
         ) as mock_over_balance,
-        patch("daimon.adapters.slack.app.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
-        patch("daimon.adapters.slack.app.create_session", new_callable=AsyncMock) as mock_create,
-        patch("daimon.adapters.slack.app.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock) as mock_create,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"

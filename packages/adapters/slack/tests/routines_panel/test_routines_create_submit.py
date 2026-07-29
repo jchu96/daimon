@@ -168,6 +168,8 @@ def _build_runtime(handler: Any, db_session_factory: Any) -> SlackRuntime:
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
 

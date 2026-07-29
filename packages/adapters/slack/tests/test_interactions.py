@@ -41,6 +41,8 @@ async def test_resolve_web_client_returns_none_for_unknown_team_id(
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     result = await resolve_web_client(runtime, team_id="T_UNKNOWN")
@@ -73,6 +75,8 @@ async def test_resolve_web_client_returns_async_web_client_with_decrypted_token(
         sessionmaker=db_session_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
     result = await resolve_web_client(runtime, team_id="T_INTERACTIONS")

@@ -5,12 +5,14 @@ GC'd (confirmed signal: 404 `not_found_error` from `events.send`) must mark
 the stale row dead, create a fresh MA session + a new live row, re-run once
 with full history, and bill the NEW session id -- never the dead one. This is
 `run_prepared_turn`'s one-shot recovery cycle (D-08/D-09/D-10), proven here at
-the real platform entry point (`DaimonBot.on_message`) rather than only at
-the core unit-test level (`packages/core/tests/turn/test_run_prepared_turn.py`).
+the real platform entry point (`DaimonBot.on_message` / `SlackApp._handle_app_mention`)
+rather than only at the core unit-test level
+(`packages/core/tests/turn/test_run_prepared_turn.py`).
 
-Discord only for this plan -- the Slack half lands in a follow-up plan once
-its adapter is cut over to the orchestrator; the fixtures below are written
-so a Slack scenario can be added without reshaping this file.
+Both platforms: Discord landed with the 06-06 cutover; the Slack scenario
+below was added once Slack's own cutover (06-07) closed its dead-session gap.
+The router fixture is platform-agnostic (it only fakes the `/v1/...` MA
+endpoints), so both scenarios share `_build_dead_session_router`.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import AGENT_ID, AGENT_TEXT, ENV_ID, MODEL_ID
 from .drivers.discord_driver import DiscordDriver
+from .drivers.slack_driver import SlackDriver
 
 # The Discord driver's `create_session` stub always returns this fixed session
 # id for the recreate call (see DiscordDriver._make_fake_session usage in
@@ -233,6 +236,97 @@ async def test_dead_session_recreates_marks_old_row_dead_and_bills_new_session(
 
     # usage_events must bill the NEW session id, never the dead one (the exact
     # attribution bug D-08/D-09/D-10 fixes -- RESEARCH § "Known attribution bug").
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
+    assert len(usage_rows) == 1, "the recovered turn must write exactly one usage_events row"
+    assert usage_rows[0].managed_session_id == _RECOVERED_SESSION_ID, (
+        "usage_events must attribute the recovered turn to the NEW session id"
+    )
+    assert usage_rows[0].managed_session_id != _DEAD_SESSION_ID, (
+        "usage_events must never attribute the recovered turn to the dead session id"
+    )
+
+    ledger_rows = await tenant_ledger.list_for_tenant(db_session, tenant_id=tenant.id)
+    debit_rows = [row for row in ledger_rows if row.delta_usd < 0]
+    assert len(debit_rows) == 1, "the recovered turn must write exactly one tenant_ledger debit"
+
+
+async def test_dead_session_recreates_marks_old_row_dead_and_bills_new_session_slack(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The Slack half of the same scenario -- proves the D-08/D-09/D-10 recovery
+    cycle at `SlackApp._handle_app_mention`, the real entry point 06-07 cut
+    over onto `run_prepared_turn`. Before 06-07 this loop never terminated:
+    the discarded `run_turn` return value meant a dead Slack session recreated
+    on every turn but the stale mapping was never superseded by a new live row.
+    """
+    workspace_id = "T_DEAD_SESSION_PARITY"
+    user_id = "U_DEAD_SESSION_PARITY"
+    thread_id = "9000005000.000001"
+
+    tenant = await make_tenant(db_session, platform="slack", workspace_id=workspace_id)
+    await tenant_ledger.insert_entry(
+        db_session,
+        tenant_id=tenant.id,
+        delta_usd=Decimal("100.00"),
+        reason="trial",
+        idempotency_key=f"trial:{tenant.id}",
+    )
+    # Identity resolution inside admit() is idempotent get-or-create -- pre-creating
+    # here just lets the test learn the account_id up front to seed the live row.
+    principal = await get_or_create_platform_principal(
+        db_session, tenant_id=tenant.id, platform="slack", external_id=user_id
+    )
+    old_row = await create_thread_session(
+        db_session,
+        tenant_id=tenant.id,
+        platform="slack",
+        thread_id=thread_id,
+        account_id=principal.account_id,
+        ma_session_id=_DEAD_SESSION_ID,
+        watermark_message_id="9000005000.000000",
+    )
+    await db_session.commit()
+
+    router = _build_dead_session_router(str(tenant.id))
+    driver = SlackDriver()
+    posted = await driver.dispatch_turn(
+        sessionmaker=db_session_factory,
+        router=router,
+        tenant_id=tenant.id,
+        workspace_id=workspace_id,
+        channel_id="C_DEAD_SESSION_PARITY",
+        user_id=user_id,
+        text="hello after recovery",
+        thread_ts=thread_id,
+    )
+    assert posted, f"expected the recovered turn's reply to be posted, got: {posted}"
+
+    # The stale mapping is marked dead.
+    dead_row = await get_thread_session_by_id(db_session, id=old_row.id)
+    assert dead_row is not None, "the pre-existing mapping row must still exist"
+    assert dead_row.status == "dead", "the pre-existing mapping must be marked dead"
+
+    # A new live row exists with a different ma_session_id.
+    live_row = await get_live_thread_session(
+        db_session,
+        tenant_id=tenant.id,
+        platform="slack",
+        thread_id=thread_id,
+        account_id=principal.account_id,
+    )
+    assert live_row is not None, "a new live row must exist after recovery"
+    assert live_row.id != old_row.id, "the new live row must be a distinct row"
+    assert live_row.ma_session_id == _RECOVERED_SESSION_ID, (
+        "the new live row must store the recreated session id"
+    )
+    assert live_row.ma_session_id != _DEAD_SESSION_ID, (
+        "the new live row must NOT reuse the dead session id"
+    )
+
+    # usage_events must bill the NEW session id, never the dead one -- this is
+    # the exact assertion that would have caught Slack's permanent dead-session
+    # loop (the discarded run_turn return value pre-06-07).
     usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert len(usage_rows) == 1, "the recovered turn must write exactly one usage_events row"
     assert usage_rows[0].managed_session_id == _RECOVERED_SESSION_ID, (

@@ -64,6 +64,8 @@ def _build_runtime(fernet_key: str, db_factory: async_sessionmaker[AsyncSession]
         sessionmaker=db_factory,
         billing_config=None,
         http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
 
 

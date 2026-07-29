@@ -32,9 +32,10 @@ from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAg
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.agent_setup import write as slack_write
 from daimon.adapters.slack.app import SlackApp
-from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
 from daimon.core.defaults.provisioning import teardown_slack_install
 from daimon.core.github_credentials import build_multifernet, encrypt_token
+from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.purge import AccountPurgeResult
 from daimon.core.purge import purge_account as core_purge_account
 from daimon.core.scope import DeploymentDefault
@@ -157,15 +158,26 @@ class SlackDriver:
         settings.mcp.jwt_secret = None
         settings.defaults_root = MagicMock()
         settings.billing.markup = Decimal("1.0")
+        anthropic = build_fake_anthropic(router.dispatch)
+        deployment_default = DeploymentDefault(agent_name="test-agent", environment_name="test-env")
+        resolver_cache = new_resolver_cache()
+        turn_deps = build_turn_deps(
+            settings,
+            anthropic,
+            sessionmaker,
+            deployment_default=deployment_default,
+            resolver_cache=resolver_cache,
+            billing_config=billing_config,  # pyright: ignore[reportArgumentType]  # test-injected BillingConfig | None
+        )
         return SlackRuntime(
             settings=settings,
-            anthropic=build_fake_anthropic(router.dispatch),
+            anthropic=anthropic,
             sessionmaker=sessionmaker,
             billing_config=billing_config,  # pyright: ignore[reportArgumentType]  # test-injected BillingConfig | None
             http_client=MagicMock(spec=httpx.AsyncClient),
-            deployment_default=DeploymentDefault(
-                agent_name="test-agent", environment_name="test-env"
-            ),
+            resolver_cache=resolver_cache,
+            turn_deps=turn_deps,
+            deployment_default=deployment_default,
         )
 
     async def dispatch_turn(
@@ -179,7 +191,18 @@ class SlackDriver:
         user_id: str,
         text: str,
         billing_config: object | None = None,
+        thread_ts: str | None = None,
     ) -> list[str]:
+        """`thread_ts`, when given, targets an existing thread (e.g. a
+        pre-seeded live `thread_sessions` row) instead of starting a fresh
+        one -- the event's own `ts`/`event_ts` stay unique per dispatch
+        (mirrors a real follow-up mention), only `thread_ts` is pinned so
+        `_orchestrate`'s `thread_id = event.get("thread_ts") or event.get("ts")`
+        resolves to the caller-chosen id. Not part of the `PlatformDriver`
+        Protocol (Discord's `channel_id` already doubles as the thread id) --
+        this is Slack-only, keyword-only, and defaults to None so every
+        existing call site is unaffected.
+        """
         fernet_key = Fernet.generate_key().decode()
         fernet = build_multifernet((fernet_key,))
         async with sessionmaker() as s:
@@ -202,10 +225,12 @@ class SlackDriver:
             "user": user_id,
             "text": f"<@U_BOT> {text}",
         }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
 
         with (
             AioResponsesMock() as mock,
-            patch("daimon.adapters.slack.app.create_session") as mock_create_session,
+            patch("daimon.core.turn.prepare.create_session") as mock_create_session,
         ):
             _register_slack_defaults(mock)
             mock_create_session.return_value = _make_fake_session(
