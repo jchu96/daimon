@@ -11,6 +11,7 @@ import uuid
 
 import structlog
 from daimon.adapters.discord import layout
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.scope_default import (
     do_propagate,
     do_unpropagate,
@@ -281,7 +282,7 @@ class _ChannelPickSelect(discord.ui.ChannelSelect["SetDefaultView"]):
         )
 
 
-class SetDefaultView(discord.ui.LayoutView):
+class SetDefaultView(ExpiringView, discord.ui.LayoutView):
     """C9 V2 cascade panel: airy routing blocks + action select + ChannelSelect.
 
     Write-immediately (no confirm); winner derivation stays in core
@@ -381,7 +382,7 @@ class SetDefaultView(discord.ui.LayoutView):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     blocks=blocks,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -418,7 +419,7 @@ class SetDefaultView(discord.ui.LayoutView):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     blocks=blocks,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -443,7 +444,8 @@ async def open_set_default(
     Owns the swap site for the Default… button callback.
     """
     blocks = await _build_scope_blocks(state, interaction)
+    view = SetDefaultView(state, runtime=runtime, allowed_user_id=allowed_user_id, blocks=blocks)
     await interaction.response.edit_message(
-        view=SetDefaultView(state, runtime=runtime, allowed_user_id=allowed_user_id, blocks=blocks),
+        view=view.bind_render_interaction(interaction, panel=state),
         allowed_mentions=discord.AllowedMentions.none(),
     )

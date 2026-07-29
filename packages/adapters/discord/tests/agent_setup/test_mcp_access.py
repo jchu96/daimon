@@ -429,3 +429,125 @@ async def test_revoke_confirmation_edits_message_content_and_clears_view(
     assert edit_kwargs.get("view") is None, (
         "Revoke confirmation must drop the button by passing view=None"
     )
+
+
+# ---------------------------------------------------------------------------
+# D-10: shared timeout mechanics, but diverging shape (classic View, keeps content)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mcp_access_timeout_disables_revoke_and_keeps_the_config_block(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+) -> None:
+    from daimon.adapters.discord.agent_setup.mcp_access import EXPIRED_BUTTON_LABEL
+
+    await _setup_tenant_and_account(
+        db_session,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        external_id="test-guild-77-timeout",
+    )
+
+    ma_agent_id = "agent_017abc_77_timeout"
+    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-timeout", tenant_id)
+
+    async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
+        return real_agent
+
+    monkeypatch.setattr(mcp_access_mod, "find_agent_by_daimon_tag", fake_find)
+    monkeypatch.setattr(
+        mcp_access_mod, "resolve_tenant_for_panel", AsyncMock(return_value=tenant_id)
+    )
+
+    settings = _make_settings()
+    runtime = DiscordRuntime(
+        settings=settings,
+        anthropic=build_stub_anthropic(),
+        sessionmaker=db_session_factory,
+        notebook_rate_limiter=RateLimiter(max_requests=999),
+        billing_config=None,
+        deployment_default=DeploymentDefault(),
+        resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
+    )
+    entry = _entry("expert-bot-timeout")
+    state = PanelState(roster=[entry], selected=entry, account_id=account_id)
+
+    interaction_mint = _make_interaction()
+    await send_connect_via_mcp(interaction_mint, runtime=runtime, state=state, allowed_user_id=42)
+
+    mint_kwargs = interaction_mint.response.send_message.call_args.kwargs
+    sent_view = mint_kwargs["view"]
+
+    await sent_view.on_timeout()
+
+    interaction_mint.edit_original_response.assert_called_once()
+    call_kwargs = interaction_mint.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, (
+        "the config block and its token must survive — no content override"
+    )
+    assert call_kwargs["view"] is sent_view, "the SAME instance is edited back, not a replacement"
+
+    revoke_btn = _find_button(sent_view, EXPIRED_BUTTON_LABEL)
+    assert revoke_btn.disabled is True, "the Revoke button must be disabled on timeout"
+    assert sent_view.timeout == 300, "D-10 leaves timeout values unchanged"
+
+
+@pytest.mark.asyncio
+async def test_revoke_stops_the_view_so_the_timer_cannot_fire(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+) -> None:
+    await _setup_tenant_and_account(
+        db_session,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        external_id="test-guild-77-stop",
+    )
+
+    ma_agent_id = "agent_017abc_77_stop"
+    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-stop", tenant_id)
+
+    async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
+        return real_agent
+
+    monkeypatch.setattr(mcp_access_mod, "find_agent_by_daimon_tag", fake_find)
+    monkeypatch.setattr(
+        mcp_access_mod, "resolve_tenant_for_panel", AsyncMock(return_value=tenant_id)
+    )
+
+    settings = _make_settings()
+    runtime = DiscordRuntime(
+        settings=settings,
+        anthropic=build_stub_anthropic(),
+        sessionmaker=db_session_factory,
+        notebook_rate_limiter=RateLimiter(max_requests=999),
+        billing_config=None,
+        deployment_default=DeploymentDefault(),
+        resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
+    )
+    entry = _entry("expert-bot-stop")
+    state = PanelState(roster=[entry], selected=entry, account_id=account_id)
+
+    interaction_mint = _make_interaction()
+    await send_connect_via_mcp(interaction_mint, runtime=runtime, state=state, allowed_user_id=42)
+
+    mint_kwargs = interaction_mint.response.send_message.call_args.kwargs
+    sent_view = mint_kwargs["view"]
+    revoke_btn = _find_button(sent_view, "Revoke")
+
+    interaction_revoke = _make_interaction()
+    await revoke_btn.callback(interaction_revoke)
+
+    assert sent_view.is_finished() is True, (
+        "revoke must stop the view so its timer cannot re-attach a button later"
+    )

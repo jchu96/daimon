@@ -630,6 +630,36 @@ async def test_open_set_default_swaps_onto_the_panel_message() -> None:
 
 
 # ---------------------------------------------------------------------------
+# D-10: shared on_timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_default_view_timeout_replaces_the_cascade_panel() -> None:
+    state = _make_state()
+    interaction = MagicMock()
+    interaction.edit_original_response = AsyncMock()
+
+    view = SetDefaultView(state, runtime=_set_default_runtime(), allowed_user_id=42)
+    view.bind_render_interaction(interaction, panel=state)
+
+    await view.on_timeout()
+
+    interaction.edit_original_response.assert_called_once()
+    call_kwargs = interaction.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, "the timeout edit must not override content"
+    expired_view = call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert not any(isinstance(c, discord.ui.Select) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert view.timeout == 300, "D-10 leaves timeout values unchanged"
+
+
+# ---------------------------------------------------------------------------
 # Deployment-default fallback in the scope blocks (R7)
 # ---------------------------------------------------------------------------
 
