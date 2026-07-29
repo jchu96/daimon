@@ -1467,7 +1467,7 @@ async def test_create_session_degrades_when_copilot_credential_mount_fails(
 ) -> None:
     """SYNC-04: a transient anthropic.APIError on the Copilot credential POST
     must not raise out of create_session — the session is still created, and
-    a stable-keyed structured warning fires (Phase 04 consumes these keys)."""
+    a stable-keyed structured warning fires (the alerting pipeline keys off these)."""
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     account_id = uuid.UUID("00000000-0000-0000-0000-0000000000c2")

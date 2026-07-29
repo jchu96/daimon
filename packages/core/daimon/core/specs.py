@@ -2,7 +2,7 @@
 
 Principle: thin passthrough. Field names mirror the `anthropic` SDK's
 `*CreateParams` TypedDicts so that YAML authors write what the SDK sees.
-No daimon-private aliases, no runtime translation layer inside these models —
+No daimon-specific aliases, no runtime translation layer inside these models —
 the seed converter (separate module) is the one place that maps a `*Spec` to
 the SDK's kwargs shape.
 
