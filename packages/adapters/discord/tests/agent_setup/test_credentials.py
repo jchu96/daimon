@@ -601,7 +601,7 @@ def test_editview_has_env_vars_button_disabled_for_system_agent(account_id: uuid
 
 
 # ---------------------------------------------------------------------------
-# D-10: shared on_timeout, including the reused-instance rebind (Pitfall 2)
+# Shared on_timeout, including the reused-instance rebind
 # ---------------------------------------------------------------------------
 
 
@@ -634,14 +634,14 @@ async def test_credentials_view_timeout_replaces_the_subview(account_id: uuid.UU
     assert not any(isinstance(c, discord.ui.Select) for c in walked), (
         "the expired replacement must carry no interactive children"
     )
-    assert view.timeout == 300, "D-10 leaves timeout values unchanged"
+    assert view.timeout == 300, "the shared on_timeout mixin leaves timeout values unchanged"
 
 
 @pytest.mark.asyncio
 async def test_credentials_rerender_rebinds_the_current_interaction(
     account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pitfall 2 regression guard: `_reload_and_rerender` must rebind on every
+    """Regression guard: `_reload_and_rerender` must rebind on every
     render, not just once at __init__ — this view is re-rendered as the SAME
     instance, so a stale-bound interaction would expire against the wrong
     (or a long-dead) message."""

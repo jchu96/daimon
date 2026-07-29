@@ -1364,7 +1364,7 @@ def test_daimon_error_fork_site_is_not_captured() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D-10: shared on_timeout (root panel)
+# Shared on_timeout (root panel)
 # ---------------------------------------------------------------------------
 
 
@@ -1390,7 +1390,7 @@ async def test_agent_setup_view_timeout_replaces_the_panel(
     assert not any(isinstance(c, discord.ui.Select) for c in walked), (
         "the expired replacement must carry no interactive children"
     )
-    assert view.timeout == 600, "D-10 leaves timeout values unchanged"
+    assert view.timeout == 600, "the shared on_timeout mixin leaves timeout values unchanged"
 
 
 @pytest.mark.asyncio

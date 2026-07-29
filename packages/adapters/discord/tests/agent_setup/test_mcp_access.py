@@ -432,7 +432,7 @@ async def test_revoke_confirmation_edits_message_content_and_clears_view(
 
 
 # ---------------------------------------------------------------------------
-# D-10: shared timeout mechanics, but diverging shape (classic View, keeps content)
+# Shared timeout mechanics, but diverging shape (classic View, keeps content)
 # ---------------------------------------------------------------------------
 
 
@@ -495,7 +495,7 @@ async def test_mcp_access_timeout_disables_revoke_and_keeps_the_config_block(
 
     revoke_btn = _find_button(sent_view, EXPIRED_BUTTON_LABEL)
     assert revoke_btn.disabled is True, "the Revoke button must be disabled on timeout"
-    assert sent_view.timeout == 300, "D-10 leaves timeout values unchanged"
+    assert sent_view.timeout == 300, "the shared on_timeout mixin leaves timeout values unchanged"
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""Shared expiry handling for every /agent-setup view (D-10).
+"""Shared expiry handling for every /agent-setup view.
 
 discord.py never populates ``view.message`` for a view sent through an
 interaction response (``_ViewStore.add_view`` only registers a component
@@ -70,7 +70,7 @@ async def edit_expired_message(
 
 
 class ExpiringView:
-    """Mixin supplying the one shared ``on_timeout`` D-10 asks for.
+    """Mixin supplying the one shared ``on_timeout`` every /agent-setup view needs.
 
     Holds no discord API state and defines no ``__init__`` — co-inheriting
     this mixin leaves every view's own ``super().__init__(timeout=...)``
@@ -110,7 +110,7 @@ class ExpiringView:
         return self._render_panel is not None and self._render_panel.render_seq > self._render_seq
 
     async def on_timeout(self) -> None:
-        """Shared D-10 implementation: expire unless superseded."""
+        """Shared on_timeout implementation: expire unless superseded."""
         if self._is_superseded():
             return
         await edit_expired_message(build_expired_view(), interaction=self._render_interaction)

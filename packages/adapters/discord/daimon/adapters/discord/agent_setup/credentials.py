@@ -320,7 +320,7 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         # This view is re-rendered IN PLACE (same instance across renders, not
         # reconstructed like the other four views), so the binding must be
         # refreshed here on every render — an interaction bound once at
-        # construction would go stale (Pitfall 2, 09-RESEARCH.md).
+        # construction would go stale.
         await interaction.edit_original_response(
             view=self.bind_render_interaction(interaction, panel=self._state),
             allowed_mentions=discord.AllowedMentions.none(),

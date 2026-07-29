@@ -236,7 +236,7 @@ async def load_agent_inline_pat(runtime: DiscordRuntime, *, agent_id: uuid.UUID)
     short-circuit will use to clone any repo later bound to this agent,
     regardless of which repo that PAT was originally verified against — which
     is why a caller binding a *different* repo must re-verify this value
-    against it before writing a binding (D-07).
+    against it before writing a binding.
 
     Returns None (no crypto call at all) when `runtime.settings.crypto.keys`
     is empty: no inline PAT can exist on a deployment that has never
@@ -248,7 +248,7 @@ async def load_agent_inline_pat(runtime: DiscordRuntime, *, agent_id: uuid.UUID)
 
     Passes `allow_service_default=False` and no `fallback_pat` explicitly:
     the operator's shared service PAT must never be treated as this agent's
-    own clone credential (Phase 08 D-11) — letting it through here would gate
+    own clone credential — letting it through here would gate
     every re-verification on whether the shared public-read token covers the
     repo, breaking private App-covered binds.
     """

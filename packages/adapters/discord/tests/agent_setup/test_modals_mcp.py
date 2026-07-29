@@ -511,7 +511,7 @@ async def test_add_mcp_modal_unrelated_server_proceeds_past_guard(
 
 
 # ---------------------------------------------------------------------------
-# D-01: modal submit returns to the launching view (EditView), not AgentSetupView
+# Modal submit returns to the launching view (EditView), not AgentSetupView
 # ---------------------------------------------------------------------------
 
 

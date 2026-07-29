@@ -1,4 +1,4 @@
-"""Tests for the shared /agent-setup expiry helpers (D-10).
+"""Tests for the shared /agent-setup expiry helpers.
 
 Covers ``build_expired_view``/``edit_expired_message`` in isolation, plus the
 structural AST guard proving every view render site in ``agent_setup/`` and

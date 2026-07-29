@@ -531,7 +531,7 @@ def test_edit_view_env_vars_button_disabled_for_system_agent(account_id: uuid.UU
     assert _find_button(user_view, "Env vars").disabled is False, "user agents can open Env vars"
 
 
-# --- Back / open_edit_view edit-in-place (D-02, D-03) ----------------------
+# --- Back / open_edit_view edit-in-place -----------------------------------
 
 
 @pytest.mark.asyncio
@@ -583,7 +583,7 @@ async def test_open_edit_view_swaps_onto_the_panel_message(
 
 
 # ---------------------------------------------------------------------------
-# D-10: shared on_timeout
+# Shared on_timeout
 # ---------------------------------------------------------------------------
 
 
@@ -612,7 +612,7 @@ async def test_edit_view_timeout_replaces_the_edit_view(
     assert not any(isinstance(c, discord.ui.Select) for c in walked), (
         "the expired replacement must carry no interactive children"
     )
-    assert view.timeout == 300, "D-10 leaves timeout values unchanged"
+    assert view.timeout == 300, "the shared on_timeout mixin leaves timeout values unchanged"
 
 
 @pytest.mark.asyncio

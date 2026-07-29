@@ -630,7 +630,7 @@ async def test_open_set_default_swaps_onto_the_panel_message() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D-10: shared on_timeout
+# Shared on_timeout
 # ---------------------------------------------------------------------------
 
 
@@ -656,7 +656,7 @@ async def test_set_default_view_timeout_replaces_the_cascade_panel() -> None:
     assert not any(isinstance(c, discord.ui.Select) for c in walked), (
         "the expired replacement must carry no interactive children"
     )
-    assert view.timeout == 300, "D-10 leaves timeout values unchanged"
+    assert view.timeout == 300, "the shared on_timeout mixin leaves timeout values unchanged"
 
 
 # ---------------------------------------------------------------------------

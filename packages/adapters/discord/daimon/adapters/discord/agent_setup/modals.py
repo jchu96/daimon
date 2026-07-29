@@ -182,19 +182,19 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
 
 
 class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
-    """Bind a repo URL, store a GitHub token, or both (D-06).
+    """Bind a repo URL, store a GitHub token, or both.
 
     Repo URL is optional: a token submitted with no repo is verified against
     its own GitHub identity (`is_valid_pat`, no repo-scoped permission
     needed), stored, and writes NO `agent_repo_binding` row — the GitHub
     Copilot MCP mirror in `core/sessions.py` picks it up on the next session
     with zero core changes. A repo submitted with no token still runs the
-    existing App-coverage / public-visibility probes; per D-07, it ALSO
-    re-verifies any already-stored inline PAT against the newly-typed repo
-    before trusting it, since that stored PAT — not App/public coverage — is
-    what will actually clone the repo. Per LD-04-01, the repo binding
-    persists via `agent_repo_binding.set_binding`, never on AgentSpec. Per
-    LD-04-02, modals cannot mix buttons with TextInputs.
+    existing App-coverage / public-visibility probes; it ALSO re-verifies
+    any already-stored inline PAT against the newly-typed repo before
+    trusting it, since that stored PAT — not App/public coverage — is
+    what will actually clone the repo. The repo binding persists via
+    `agent_repo_binding.set_binding`, never on AgentSpec. Modals cannot mix
+    buttons with TextInputs.
     """
 
     def __init__(
@@ -235,7 +235,7 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
         pat = str(self.pat_in).strip()
         agent_name = self.state.selected.name if self.state.selected else None
         if not url and not pat:
-            # D-06: both fields blank must be refused, not written as an
+            # Both fields blank must be refused, not written as an
             # empty binding. Before defer() so the user gets an immediate
             # validation reply.
             await interaction.response.send_message(
@@ -279,7 +279,7 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
 
             coverage_note: str | None = None
             if not url:
-                # PAT-only path (D-06): the guard above guarantees `pat` is
+                # PAT-only path: the guard above guarantees `pat` is
                 # non-empty here. There's no repo to check access against yet,
                 # so verify only the token's own GitHub identity, store it,
                 # and write NO agent_repo_binding row — neither `inline-pat:`
@@ -334,8 +334,8 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                     pat_last4 = pat[-4:]
                 else:
                     owner_repo = _owner_repo_from_url(url)
-                    # D-07: a blank PAT field does NOT mean "no inline PAT will
-                    # clone this repo" -- an earlier repo-free submit (D-06) may
+                    # A blank PAT field does NOT mean "no inline PAT will
+                    # clone this repo" -- an earlier repo-free submit may
                     # already have stored one for this agent. sessions.py resolves
                     # per_agent_pat via get_pat(agent_id=...) unconditionally, and
                     # select_clone_auth gives it unconditional precedence over both
@@ -408,7 +408,7 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                         # mark the ref as anonymous rather than implying a fallback exists.
                         ma_secret_ref = "anon:"
 
-                # LD-04-01: persist binding via the dedicated store.
+                # Persist binding via the dedicated store.
                 async with self.runtime.sessionmaker.begin() as session:
                     await set_agent_repo_binding(
                         session,

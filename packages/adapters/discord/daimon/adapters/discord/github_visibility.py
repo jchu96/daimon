@@ -6,8 +6,8 @@ bind path is already adapter-side I/O. The operator fallback PAT only clones
 ``anon:`` bindings, so an ``anon:`` binding must be verified-public at bind time
 — otherwise a guild could bind a private repo as ``anon:`` and clone it
 cross-tenant with the operator token. ``is_valid_pat`` covers the sibling case
-where no repo is given at all (D-06): it proves only the token's own identity,
-never repo access — the D-07 re-verification gate in ``modals.py`` is what
+where no repo is given at all: it proves only the token's own identity,
+never repo access — the re-verification gate in ``modals.py`` is what
 protects a *later* repo bind against an already-stored PAT.
 """
 
@@ -74,8 +74,9 @@ async def is_valid_pat(http_client: httpx.AsyncClient, *, pat: str) -> bool:
     this is the right check when the submit carries no repo to check access
     against. It deliberately proves only the token's own identity, never repo
     access: a PAT that passes this check is not yet cleared to clone any
-    particular repo, which is why the D-07 re-verification gate exists for a
-    later bind that resolves this same stored PAT against a specific repo.
+    particular repo, which is why the re-verification gate in ``modals.py``
+    exists for a later bind that resolves this same stored PAT against a
+    specific repo.
     """
     resp = await http_client.get(
         "https://api.github.com/user",

@@ -1451,7 +1451,7 @@ async def test_app_coverage_probe_error_does_not_block_bind(
 
 
 # ---------------------------------------------------------------------------
-# D-07: a blank PAT field must not mean "no inline PAT exists" (T-09-11)
+# A blank PAT field must not mean "no inline PAT exists"
 # ---------------------------------------------------------------------------
 
 
@@ -1462,7 +1462,7 @@ async def test_blank_pat_bind_refused_when_stored_inline_pat_cannot_access_repo(
     """A repo bound with a blank PAT field must re-verify any already-stored
     inline PAT against the newly typed repo, and refuse the bind when that PAT
     can't access it -- never falling through to the App/public probes. This is
-    the D-07 regression guard: removing the mitigation block must make this
+    regression guard: removing the mitigation block must make this
     test fail (verified by temporary local revert per the plan's acceptance
     criteria)."""
     app_installed_called = False
@@ -1671,7 +1671,7 @@ async def test_blank_pat_bind_falls_through_to_public_check_without_stored_pat(
 
 
 # ---------------------------------------------------------------------------
-# D-01: modal submit returns to the launching view (EditView), not AgentSetupView
+# Modal submit returns to the launching view (EditView), not AgentSetupView
 # ---------------------------------------------------------------------------
 
 
@@ -1788,7 +1788,7 @@ async def test_add_skill_submit_returns_to_edit_view(
 
 
 # ---------------------------------------------------------------------------
-# D-06: Repo URL becomes optional — the PAT-only path
+# Repo URL becomes optional — the PAT-only path
 # ---------------------------------------------------------------------------
 
 
@@ -1830,7 +1830,7 @@ async def test_pat_only_submit_stores_pat_and_writes_no_binding(
     monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
 ) -> None:
     """A PAT submitted with no repo URL is verified via GET /user, stored, and
-    leaves agent_repo_binding untouched (D-06)."""
+    leaves agent_repo_binding untouched."""
     stored: dict[str, Any] = {}
     set_binding_called = False
     reconcile_called = False
