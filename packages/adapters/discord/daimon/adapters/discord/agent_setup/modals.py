@@ -31,7 +31,11 @@ from daimon.adapters.discord.agent_setup.write import (
     store_inline_pat,
     validate_model_id,
 )
-from daimon.adapters.discord.github_visibility import is_public_repo, pat_can_access_repo
+from daimon.adapters.discord.github_visibility import (
+    is_public_repo,
+    is_valid_pat,
+    pat_can_access_repo,
+)
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
@@ -177,12 +181,20 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
         )
 
 
-class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
-    """Bind repo URL + branch; optional inline PAT.
+class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
+    """Bind a repo URL, store a GitHub token, or both (D-06).
 
-    Per LD-04-01, persists via `agent_repo_binding.set_binding` — AgentSpec
-    does NOT carry repo_url. Per LD-04-02, modals cannot mix buttons with
-    TextInputs, so the Connect-GitHub button lives on a separate panel view.
+    Repo URL is optional: a token submitted with no repo is verified against
+    its own GitHub identity (`is_valid_pat`, no repo-scoped permission
+    needed), stored, and writes NO `agent_repo_binding` row — the GitHub
+    Copilot MCP mirror in `core/sessions.py` picks it up on the next session
+    with zero core changes. A repo submitted with no token still runs the
+    existing App-coverage / public-visibility probes; per D-07, it ALSO
+    re-verifies any already-stored inline PAT against the newly-typed repo
+    before trusting it, since that stored PAT — not App/public coverage — is
+    what will actually clone the repo. Per LD-04-01, the repo binding
+    persists via `agent_repo_binding.set_binding`, never on AgentSpec. Per
+    LD-04-02, modals cannot mix buttons with TextInputs.
     """
 
     def __init__(
@@ -197,8 +209,9 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
         self.runtime = runtime
         self.allowed_user_id = allowed_user_id
         self.url_in: discord.ui.TextInput[RepoAuthModal] = discord.ui.TextInput(
-            label="Repo URL",
-            placeholder="https://github.com/org/repo",
+            label="Repo URL (optional)",
+            placeholder="Leave blank to store only the token below",
+            required=False,
             max_length=1024,
         )
         self.branch_in: discord.ui.TextInput[RepoAuthModal] = discord.ui.TextInput(
@@ -207,7 +220,8 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
             max_length=255,
         )
         self.pat_in: discord.ui.TextInput[RepoAuthModal] = discord.ui.TextInput(
-            label="PAT (optional)",
+            label="Token (optional; also powers GitHub MCP)",
+            placeholder="ghp_… — clones the repo and powers the GitHub MCP server",
             required=False,
             max_length=255,
         )
@@ -220,10 +234,18 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
         branch = str(self.branch_in).strip() or "main"
         pat = str(self.pat_in).strip()
         agent_name = self.state.selected.name if self.state.selected else None
+        if not url and not pat:
+            # D-06: both fields blank must be refused, not written as an
+            # empty binding. Before defer() so the user gets an immediate
+            # validation reply.
+            await interaction.response.send_message(
+                "Enter a repo URL, a GitHub token, or both.", ephemeral=True
+            )
+            return
         _log.info(
             "agent_setup.repo_auth.submit",
             agent_name=agent_name,
-            repo_url=url,
+            repo_url=url or None,
             branch=branch,
             pat_masked=mask_tail(pat) if pat else None,
         )
@@ -255,121 +277,150 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
                 ma_agent_id=str(ma_agent.id),
             )
 
-            pat_last4: str | None = None
-            ma_secret_ref: str
             coverage_note: str | None = None
-            if pat:
-                # Verify the pasted PAT actually grants access to this repo BEFORE
-                # binding. Otherwise a guild could bind a repo it does not control
-                # with a junk PAT and, on the next webhook resync, ride the
-                # deployment's GitHub App installation token (keyed by repo, not
-                # tenant) to clone another tenant's private repo.
-                owner_repo = _owner_repo_from_url(url)
+            if not url:
+                # PAT-only path (D-06): the guard above guarantees `pat` is
+                # non-empty here. There's no repo to check access against yet,
+                # so verify only the token's own GitHub identity, store it,
+                # and write NO agent_repo_binding row — neither `inline-pat:`
+                # nor `anon:` applies when there is no repo, and no third ref
+                # may be invented. Nothing on the AgentSpec changed, so skip
+                # reconcile too.
                 async with httpx.AsyncClient() as http_client:
-                    has_access = await pat_can_access_repo(
-                        http_client, owner_repo=owner_repo, pat=pat
-                    )
-                if not has_access:
+                    token_valid = await is_valid_pat(http_client, pat=pat)
+                if not token_valid:
                     raise DaimonError(
-                        "That token can't access this repo (or the repo doesn't "
-                        "exist). Paste a PAT that has access, or connect GitHub."
+                        "GitHub rejected that token. Paste a valid personal "
+                        "access token (it must not be expired)."
                     )
-                # inline PAT is written as a per-agent credential keyed on
-                # agent_uuid (not account_id). Only this agent can resolve it.
-                ma_secret_ref = await store_inline_pat(
+                await store_inline_pat(
                     self.runtime,
                     account_id=self.state.account_id,
                     agent_id=agent_uuid,
                     plaintext_pat=pat,
                 )
-                pat_last4 = pat[-4:]
-            else:
-                owner_repo = _owner_repo_from_url(url)
-                # D-07: a blank PAT field does NOT mean "no inline PAT will
-                # clone this repo" -- an earlier repo-free submit (D-06) may
-                # already have stored one for this agent. sessions.py resolves
-                # per_agent_pat via get_pat(agent_id=...) unconditionally, and
-                # select_clone_auth gives it unconditional precedence over both
-                # the App and public paths -- so that stored PAT, not App/public
-                # coverage, is what will actually clone this repo. It must be
-                # re-verified against THIS repo before the bind is allowed to
-                # succeed; falling through to the App/public probes on failure
-                # would let a "successful" bind silently produce a broken or
-                # cross-tenant clone later.
-                existing_pat = await load_agent_inline_pat(self.runtime, agent_id=agent_uuid)
-                if existing_pat is not None:
-                    async with httpx.AsyncClient() as http_client:
-                        covers_new_repo = await pat_can_access_repo(
-                            http_client, owner_repo=owner_repo, pat=existing_pat
-                        )
-                    if not covers_new_repo:
-                        raise DaimonError(
-                            "This agent already has a stored GitHub token that "
-                            "can't access this repo. Paste a token that can, or "
-                            "clear the stored one, then bind again."
-                        )
-                    # The stored PAT covers this repo -> it (not App/public) is
-                    # what will clone it, so record that ref and skip both probes.
-                    ma_secret_ref = f"inline-pat:{agent_uuid}"
-                else:
-                    # No inline PAT -> probe GitHub App coverage first. If the
-                    # App is installed on the repo owner, App mode will clone it
-                    # (public or private) without the operator fallback PAT, so the
-                    # public-only visibility check is unnecessary. A probe failure
-                    # must never block the bind (T-97-12) -- it degrades to the
-                    # existing public-repo check, same as an App-less deployment.
-                    owner, repo_name = owner_repo.split("/", 1)
-                    app_covered = False
-                    async with httpx.AsyncClient() as http_client:
-                        try:
-                            app_covered = await is_app_installed_for_repo(
-                                http_client,
-                                app_id=self.runtime.settings.github.app_id,
-                                app_private_key=self.runtime.settings.github.app_private_key,
-                                owner=owner,
-                                repo=repo_name,
-                                now=int(time.time()),
-                            )
-                        except Exception:  # noqa: BLE001 -- T-97-12: a coverage probe is best-effort UI; ANY failure (HTTP, or a malformed App key raising from build_app_jwt) must degrade to the public-repo check, never block the bind.
-                            _log.warning(
-                                "agent_setup.repo_auth.app_coverage_probe_failed",
-                                agent_name=agent_name,
-                                repo_url=url,
-                            )
-                            coverage_note = "Couldn't verify App coverage."
-                        if app_covered:
-                            coverage_note = "✅ App-covered (clones via the configured GitHub App)"
-                        else:
-                            # No App coverage (or unverifiable) -> the only remaining
-                            # clone token will be the operator fallback PAT, which is
-                            # public-only. Verify the repo is public BEFORE writing an
-                            # anon: binding, so a private repo can never be cloned
-                            # cross-tenant with the operator token.
-                            public = await is_public_repo(http_client, owner_repo=owner_repo)
-                            if not public:
-                                raise DaimonError(
-                                    "This repo isn't visible to the shared service account "
-                                    "(it's private, or it doesn't exist) — paste a PAT or "
-                                    "connect your GitHub to bind it."
-                                )
-                    # No inline PAT -> no per-agent credential is written. The resync
-                    # path is agent-overlay-only and never consults a principal-default, so
-                    # mark the ref as anonymous rather than implying a fallback exists.
-                    ma_secret_ref = "anon:"
-
-            # LD-04-01: persist binding via the dedicated store.
-            async with self.runtime.sessionmaker.begin() as session:
-                await set_agent_repo_binding(
-                    session,
-                    tenant_id=tenant_id,
-                    agent_id=agent_uuid,
-                    repo_url=url,
-                    default_branch=branch,
-                    ma_secret_ref=ma_secret_ref,
+                self.state.pat_last4 = pat[-4:]
+                coverage_note = (
+                    "Token stored — no repo pinned. The GitHub MCP server "
+                    "picks it up on the next session."
                 )
+            else:
+                pat_last4: str | None = None
+                ma_secret_ref: str
+                if pat:
+                    # Verify the pasted PAT actually grants access to this repo BEFORE
+                    # binding. Otherwise a guild could bind a repo it does not control
+                    # with a junk PAT and, on the next webhook resync, ride the
+                    # deployment's GitHub App installation token (keyed by repo, not
+                    # tenant) to clone another tenant's private repo.
+                    owner_repo = _owner_repo_from_url(url)
+                    async with httpx.AsyncClient() as http_client:
+                        has_access = await pat_can_access_repo(
+                            http_client, owner_repo=owner_repo, pat=pat
+                        )
+                    if not has_access:
+                        raise DaimonError(
+                            "That token can't access this repo (or the repo doesn't "
+                            "exist). Paste a PAT that has access, or connect GitHub."
+                        )
+                    # inline PAT is written as a per-agent credential keyed on
+                    # agent_uuid (not account_id). Only this agent can resolve it.
+                    ma_secret_ref = await store_inline_pat(
+                        self.runtime,
+                        account_id=self.state.account_id,
+                        agent_id=agent_uuid,
+                        plaintext_pat=pat,
+                    )
+                    pat_last4 = pat[-4:]
+                else:
+                    owner_repo = _owner_repo_from_url(url)
+                    # D-07: a blank PAT field does NOT mean "no inline PAT will
+                    # clone this repo" -- an earlier repo-free submit (D-06) may
+                    # already have stored one for this agent. sessions.py resolves
+                    # per_agent_pat via get_pat(agent_id=...) unconditionally, and
+                    # select_clone_auth gives it unconditional precedence over both
+                    # the App and public paths -- so that stored PAT, not App/public
+                    # coverage, is what will actually clone this repo. It must be
+                    # re-verified against THIS repo before the bind is allowed to
+                    # succeed; falling through to the App/public probes on failure
+                    # would let a "successful" bind silently produce a broken or
+                    # cross-tenant clone later.
+                    existing_pat = await load_agent_inline_pat(self.runtime, agent_id=agent_uuid)
+                    if existing_pat is not None:
+                        async with httpx.AsyncClient() as http_client:
+                            covers_new_repo = await pat_can_access_repo(
+                                http_client, owner_repo=owner_repo, pat=existing_pat
+                            )
+                        if not covers_new_repo:
+                            raise DaimonError(
+                                "This agent already has a stored GitHub token that "
+                                "can't access this repo. Paste a token that can, or "
+                                "clear the stored one, then bind again."
+                            )
+                        # The stored PAT covers this repo -> it (not App/public) is
+                        # what will clone it, so record that ref and skip both probes.
+                        ma_secret_ref = f"inline-pat:{agent_uuid}"
+                    else:
+                        # No inline PAT -> probe GitHub App coverage first. If the
+                        # App is installed on the repo owner, App mode will clone it
+                        # (public or private) without the operator fallback PAT, so the
+                        # public-only visibility check is unnecessary. A probe failure
+                        # must never block the bind (T-97-12) -- it degrades to the
+                        # existing public-repo check, same as an App-less deployment.
+                        owner, repo_name = owner_repo.split("/", 1)
+                        app_covered = False
+                        async with httpx.AsyncClient() as http_client:
+                            try:
+                                app_covered = await is_app_installed_for_repo(
+                                    http_client,
+                                    app_id=self.runtime.settings.github.app_id,
+                                    app_private_key=self.runtime.settings.github.app_private_key,
+                                    owner=owner,
+                                    repo=repo_name,
+                                    now=int(time.time()),
+                                )
+                            except Exception:  # noqa: BLE001 -- T-97-12: a coverage probe is best-effort UI; ANY failure (HTTP, or a malformed App key raising from build_app_jwt) must degrade to the public-repo check, never block the bind.
+                                _log.warning(
+                                    "agent_setup.repo_auth.app_coverage_probe_failed",
+                                    agent_name=agent_name,
+                                    repo_url=url,
+                                )
+                                coverage_note = "Couldn't verify App coverage."
+                            if app_covered:
+                                coverage_note = (
+                                    "✅ App-covered (clones via the configured GitHub App)"
+                                )
+                            else:
+                                # No App coverage (or unverifiable) -> the only remaining
+                                # clone token will be the operator fallback PAT, which is
+                                # public-only. Verify the repo is public BEFORE writing an
+                                # anon: binding, so a private repo can never be cloned
+                                # cross-tenant with the operator token.
+                                public = await is_public_repo(http_client, owner_repo=owner_repo)
+                                if not public:
+                                    raise DaimonError(
+                                        "This repo isn't visible to the shared service account "
+                                        "(it's private, or it doesn't exist) — paste a PAT or "
+                                        "connect your GitHub to bind it."
+                                    )
+                        # No inline PAT -> no per-agent credential is written. The resync
+                        # path is agent-overlay-only and never consults a principal-default, so
+                        # mark the ref as anonymous rather than implying a fallback exists.
+                        ma_secret_ref = "anon:"
 
-            self.state.apply_repo_modal(url=url, branch=branch, pat_last4=pat_last4)
-            await call_reconcile_for_panel(self.runtime, self.state, tenant_id=tenant_id)
+                # LD-04-01: persist binding via the dedicated store.
+                async with self.runtime.sessionmaker.begin() as session:
+                    await set_agent_repo_binding(
+                        session,
+                        tenant_id=tenant_id,
+                        agent_id=agent_uuid,
+                        repo_url=url,
+                        default_branch=branch,
+                        ma_secret_ref=ma_secret_ref,
+                    )
+
+                self.state.apply_repo_modal(url=url, branch=branch, pat_last4=pat_last4)
+                await call_reconcile_for_panel(self.runtime, self.state, tenant_id=tenant_id)
 
             from daimon.adapters.discord.agent_setup.edit_view import EditView
 
@@ -400,7 +451,7 @@ class RepoAuthModal(discord.ui.Modal, title="Repo + Auth"):
         _log.info(
             "agent_setup.repo_auth.bound",
             agent_name=agent_name,
-            repo_url=url,
+            repo_url=url or None,
             branch=branch,
             pat_provided=bool(pat),
         )

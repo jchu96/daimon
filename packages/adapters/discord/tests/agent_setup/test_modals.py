@@ -1785,3 +1785,226 @@ async def test_add_skill_submit_returns_to_edit_view(
         "AddSkillModal submit must return to EditView, not AgentSetupView"
     )
     assert view_kwarg.allowed_user_id == 99, "the invoker gate must survive the round trip"
+
+
+# ---------------------------------------------------------------------------
+# D-06: Repo URL becomes optional — the PAT-only path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_refuses_submit_with_no_url_and_no_pat(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """Both fields blank must be refused before defer(), not written as an
+    empty binding."""
+    set_binding_called = False
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = ""  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    interaction.response.send_message.assert_called_once()
+    call_text = str(interaction.response.send_message.call_args)
+    assert "Enter a repo URL" in call_text, "user must see the validation copy"
+    interaction.response.defer.assert_not_called()
+    assert not set_binding_called, "a fully blank submit must never write a binding"
+
+
+@pytest.mark.asyncio
+async def test_pat_only_submit_stores_pat_and_writes_no_binding(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """A PAT submitted with no repo URL is verified via GET /user, stored, and
+    leaves agent_repo_binding untouched (D-06)."""
+    stored: dict[str, Any] = {}
+    set_binding_called = False
+    reconcile_called = False
+
+    async def fake_is_valid_pat(http_client: Any, *, pat: str) -> bool:
+        return True
+
+    async def fake_store_inline_pat(
+        runtime: Any, *, account_id: uuid.UUID, agent_id: uuid.UUID, plaintext_pat: str
+    ) -> str:
+        stored["agent_id"] = agent_id
+        stored["plaintext_pat"] = plaintext_pat
+        return f"inline-pat:{agent_id}"
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        nonlocal reconcile_called
+        reconcile_called = True
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "is_valid_pat", fake_is_valid_pat)
+    monkeypatch.setattr(modals_mod, "store_inline_pat", fake_store_inline_pat)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = ""  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = "ghp_pat_only_token_1234"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    assert stored.get("plaintext_pat") == "ghp_pat_only_token_1234", (
+        "the submitted token must reach store_inline_pat"
+    )
+    assert not set_binding_called, "a PAT-only submit must write no agent_repo_binding row"
+    assert not reconcile_called, "nothing on the AgentSpec changed; reconcile must not run"
+    assert state.pat_last4 == "1234", "state must show the stored token's last-4"
+    assert state.bound_repo_url is None, "a PAT-only submit must not pin a repo"
+    interaction.followup.send.assert_called_once()
+    call_text = str(interaction.followup.send.call_args)
+    assert "GitHub MCP" in call_text, "the user must see the GitHub MCP explanation"
+
+
+@pytest.mark.asyncio
+async def test_pat_only_submit_refused_when_github_rejects_token(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """GitHub rejecting the token (401 from GET /user) must refuse the store."""
+    store_called = False
+
+    async def fake_is_valid_pat(http_client: Any, *, pat: str) -> bool:
+        return False
+
+    async def fake_store_inline_pat(*args: Any, **kwargs: Any) -> str:
+        nonlocal store_called
+        store_called = True
+        return "inline-pat:unused"
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "is_valid_pat", fake_is_valid_pat)
+    monkeypatch.setattr(modals_mod, "store_inline_pat", fake_store_inline_pat)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = ""  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = "ghp_bad_token"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    assert not store_called, "a rejected token must never reach store_inline_pat"
+    interaction.followup.send.assert_called_once()
+    call_text = str(interaction.followup.send.call_args)
+    assert "rejected" in call_text.lower(), (
+        "the failure must surface through the existing followup.send error path"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pat_only_submit_does_not_call_repo_visibility_helpers(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """No repo given -> none of the repo-scoped visibility/App-coverage helpers
+    may be called."""
+    pat_access_called = False
+    is_public_called = False
+    app_installed_called = False
+
+    async def fake_is_valid_pat(http_client: Any, *, pat: str) -> bool:
+        return True
+
+    async def fake_pat_access(http_client: Any, *, owner_repo: str, pat: str) -> bool:
+        nonlocal pat_access_called
+        pat_access_called = True
+        return True
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        nonlocal is_public_called
+        is_public_called = True
+        return True
+
+    async def fake_app_installed(http_client: Any, **kwargs: Any) -> bool:
+        nonlocal app_installed_called
+        app_installed_called = True
+        return True
+
+    async def fake_store_inline_pat(*args: Any, **kwargs: Any) -> str:
+        return "inline-pat:test"
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "is_valid_pat", fake_is_valid_pat)
+    monkeypatch.setattr(modals_mod, "pat_can_access_repo", fake_pat_access)
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "is_app_installed_for_repo", fake_app_installed)
+    monkeypatch.setattr(modals_mod, "store_inline_pat", fake_store_inline_pat)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = ""  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = "ghp_no_repo_token"  # pyright: ignore[reportPrivateUsage]
+
+    await modal.on_submit(_interaction())
+
+    assert not pat_access_called, (
+        "pat_can_access_repo is repo-scoped; must not run when no repo is given"
+    )
+    assert not is_public_called, "is_public_repo is repo-scoped; must not run when no repo is given"
+    assert not app_installed_called, (
+        "is_app_installed_for_repo is repo-scoped; must not run when no repo is given"
+    )
+
+
+def test_repo_auth_modal_field_labels_fit_discord_limits(
+    tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """Every RepoAuthModal TextInput label/placeholder must respect Discord's
+    45/100-char caps, and the token field's label must mention GitHub MCP."""
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    for field in (modal.url_in, modal.branch_in, modal.pat_in):
+        assert len(field.label) <= 45, f"{field.label!r} exceeds Discord's 45-char label cap"
+        if field.placeholder is not None:
+            assert len(field.placeholder) <= 100, (
+                f"{field.placeholder!r} exceeds Discord's 100-char placeholder cap"
+            )
+    assert "GitHub MCP" in modal.pat_in.label, (
+        "the token field's label must mention the GitHub MCP server"
+    )
