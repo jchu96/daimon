@@ -1361,3 +1361,51 @@ def test_daimon_error_fork_site_is_not_captured() -> None:
     assert "_capture_panel_exception" not in daimon_clause, (
         "the DaimonError site must stay user-facing — never captured to Sentry (A4)"
     )
+
+
+# ---------------------------------------------------------------------------
+# D-10: shared on_timeout (root panel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_setup_view_timeout_replaces_the_panel(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    view = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
+    view.bind_render_interaction(mock_interaction, panel=state)
+
+    await view.on_timeout()
+
+    mock_interaction.edit_original_response.assert_called_once()
+    call_kwargs = mock_interaction.edit_original_response.call_args.kwargs
+    assert "content" not in call_kwargs, "the timeout edit must not override content"
+    expired_view = call_kwargs["view"]
+    walked = list(expired_view.walk_children())
+    assert not any(isinstance(c, discord.ui.Button) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert not any(isinstance(c, discord.ui.Select) for c in walked), (
+        "the expired replacement must carry no interactive children"
+    )
+    assert view.timeout == 600, "D-10 leaves timeout values unchanged"
+
+
+@pytest.mark.asyncio
+async def test_superseded_panel_view_does_not_rewrite_the_message(
+    account_id: uuid.UUID, mock_interaction: MagicMock
+) -> None:
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    view_a = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
+    view_a.bind_render_interaction(mock_interaction, panel=state)
+    view_b = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
+    view_b.bind_render_interaction(mock_interaction, panel=state)
+
+    await view_a.on_timeout()
+    mock_interaction.edit_original_response.assert_not_called()
+
+    await view_b.on_timeout()
+    mock_interaction.edit_original_response.assert_called_once()

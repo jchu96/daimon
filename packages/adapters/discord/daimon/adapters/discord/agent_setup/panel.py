@@ -18,6 +18,7 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel as _resolve_tenant
 from daimon.adapters.discord.agent_setup.write import (
@@ -402,7 +403,7 @@ async def rerender_root_panel(
             runtime=runtime,
             allowed_user_id=allowed_user_id,
             thumbnail_url=_get_thumbnail_url(interaction),
-        ),
+        ).bind_render_interaction(interaction, panel=state),
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -470,7 +471,7 @@ class _AgentPicker(discord.ui.Select["AgentSetupView"]):
                     runtime=self.view.runtime,
                     allowed_user_id=self.view.allowed_user_id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=self.view.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -506,7 +507,7 @@ def _get_thumbnail_url(interaction: discord.Interaction) -> str | None:
     return interaction.client.user.display_avatar.url
 
 
-class AgentSetupView(discord.ui.LayoutView):
+class AgentSetupView(ExpiringView, discord.ui.LayoutView):
     """F5 Components V2 agent-setup card.
 
     Container holds header, body, picker row, and (admins only) lifecycle row.
@@ -625,7 +626,7 @@ class AgentSetupView(discord.ui.LayoutView):
                 runtime=self.runtime,
                 allowed_user_id=self.allowed_user_id,
                 thumbnail_url=thumbnail_url,
-            ),
+            ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -793,7 +794,7 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:
@@ -900,7 +901,7 @@ class ForkAgentModal(discord.ui.Modal, title="Fork agent"):
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as err:

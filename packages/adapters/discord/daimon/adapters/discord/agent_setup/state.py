@@ -75,6 +75,10 @@ class PanelState:
     )
     # Deployment-level default injected from the runtime (config.yaml); not from DB.
     deployment_default: DeploymentDefault = dataclasses.field(default_factory=DeploymentDefault)
+    # Render generation of the single /agent-setup ephemeral. Bumped by
+    # ExpiringView.bind_render_interaction on every render; a view holding a
+    # stale generation is off screen and must not rewrite the message (D-10).
+    render_seq: int = 0
 
     def add_skill_repo_pending(self, url: str) -> None:
         """Mark a skill repo as in-flight; idempotent."""

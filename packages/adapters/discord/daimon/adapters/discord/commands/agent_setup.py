@@ -120,15 +120,14 @@ class AgentSetupCog(commands.Cog):
                 if interaction.client.user is not None
                 else None
             )
-            await interaction.followup.send(
+            await interaction.edit_original_response(
                 view=AgentSetupView(
                     state,
                     runtime=runtime,
                     allowed_user_id=interaction.user.id,
                     thumbnail_url=thumbnail_url,
-                ),
+                ).bind_render_interaction(interaction, panel=state),
                 allowed_mentions=discord.AllowedMentions.none(),
-                ephemeral=True,
             )
         except (DaimonError, anthropic.APIError, discord.HTTPException) as exc:
             await interaction.followup.send(render_error(exc, request_id=rid), ephemeral=True)
