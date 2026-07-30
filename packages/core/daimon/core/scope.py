@@ -6,6 +6,7 @@ No I/O, no SQLAlchemy imports. Imported by stores and adapters alike.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal
 
@@ -162,6 +163,38 @@ def _pick_environment(
     if default.environment_name:
         return default.environment_name, "deployment"
     return None, None
+
+
+def is_agent_reachable(
+    agent_name: str,
+    *,
+    tenant: TenantConfigRow | None,
+    channels: Sequence[ChannelConfigRow],
+    default: DeploymentDefault,
+) -> bool:
+    """Answer whether any user in the tenant can currently reach the named agent.
+
+    Reachability includes the deployment tier: on a fresh install with no
+    config rows at all, the agent named by the deployment default is reachable,
+    because that is what every mention resolves to via `_pick_agent`'s
+    fall-through. A tenant row in mode='agent' with a non-empty agent_name
+    overrides that fall-through for the whole tenant; a channel row only ever
+    overrides for its own channel and never suppresses the deployment tier
+    for the rest.
+
+    Deliberately blind to the agent's name, to any seeded/managed marker, and
+    to ownership stamps — it answers only whether the name is reachable
+    through the channel/tenant/deployment cascade, nothing about what the
+    agent is or who created it.
+    """
+    if any(row.mode == "agent" and row.agent_name == agent_name for row in channels):
+        return True
+    if tenant is not None and tenant.mode == "agent" and tenant.agent_name == agent_name:
+        return True
+    tenant_consumes_fallthrough = (
+        tenant is not None and tenant.mode == "agent" and bool(tenant.agent_name)
+    )
+    return default.agent_name == agent_name and not tenant_consumes_fallthrough
 
 
 def merge(
