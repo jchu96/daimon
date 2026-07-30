@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
+import uuid
 from collections.abc import AsyncIterator
 
 import httpx
@@ -24,6 +26,7 @@ from daimon.core.config import (
     McpSettings,
     Settings,
 )
+from daimon.core.mcp_auth import mint_jwt
 from daimon.core.stores import accounts
 from daimon.core.stores.domain import Role
 from daimon.testing.factories import make_account, make_tenant
@@ -36,6 +39,7 @@ from .factories import make_jwt
 pytestmark = pytest.mark.asyncio
 
 SECRET = "a" * 32
+_NOW = dt.datetime(2026, 4, 24, tzinfo=dt.UTC)
 
 INIT_BODY: dict[str, object] = {
     "jsonrpc": "2.0",
@@ -156,7 +160,15 @@ async def _seed_admin_and_user(
 async def test_non_admin_list_tools(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Non-admin tools/list returns only search_tools, call_tool, list_credentials."""
+    """Non-admin tools/list returns only search_tools, call_tool, list_credentials.
+
+    tools/list is NOT the discovery surface for individual tools — the BM25
+    search transform collapses the full catalog into these three meta-tools for
+    every session, admin included. Asserting that a specific mutating tool name
+    is absent from THIS response would be vacuously true for every tool in the
+    catalog, admin-gated or not, so that per-tool check lives against
+    search_tools instead (see test_non_admin_search_includes_relaxed_tool and
+    the other search_tools-based tests below)."""
     admin_token, user_token = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
 
@@ -168,37 +180,6 @@ async def test_non_admin_list_tools(
     for expected in ("search_tools", "call_tool", "list_credentials"):
         assert expected in tool_names, (
             f"Expected {expected!r} in non-admin tool list, got: {tool_names}"
-        )
-
-    # Admin tools must NOT appear. Every gated mutating tool is now admin-tagged
-    # (admin-tag sweep). Reads (list_agents, get_agent, list_skills, get_skill, etc.)
-    # stay visible to all sessions.
-    admin_tool_names = {
-        # agents.py mutating tools
-        "create_agent",
-        "update_agent",
-        "attach_mcp_server",
-        "fork_agent",
-        "archive_agent",
-        # skills.py mutating tools
-        "sync_skills",
-        "skills_sync",
-        "delete_skill",
-        "skills_delete",
-        # self_edit.py mutating tools
-        "self_write_file",
-        "self_delete_file",
-        "set_repo_binding",
-        "clear_repo_binding",
-        # environments.py mutating tools (reads are untagged + ungated,
-        # matching agents/skills — admin-tag/gate agreement)
-        "create_environment",
-        "update_environment",
-        "archive_environment",
-    }
-    for admin_tool in admin_tool_names:
-        assert admin_tool not in tool_names, (
-            f"Admin tool {admin_tool!r} visible to non-admin, tool_names={tool_names}"
         )
 
 
@@ -242,8 +223,8 @@ async def test_non_admin_call_admin_tool_blocked(
         params={
             "name": "call_tool",
             "arguments": {
-                "tool_name": "archive_agent",
-                "tool_args": {"name": "daimon"},
+                "name": "archive_agent",
+                "arguments": {"name": "daimon"},
             },
         },
     )
@@ -259,13 +240,36 @@ async def test_non_admin_call_admin_tool_blocked(
     )
 
 
-async def test_non_admin_search_excludes_fork_agent(
-    sessionmaker: async_sessionmaker[AsyncSession],
-) -> None:
-    """fork_agent is now admin-tagged — non-admin search must not surface it.
+RELAXED_TOOL_NAMES = (
+    "create_agent",
+    "update_agent",
+    "attach_mcp_server",
+    "fork_agent",
+    "set_repo_binding",
+    "clear_repo_binding",
+    "self_write_file",
+    "self_delete_file",
+)
+"""The eight tools whose blast radius is one agent, not the whole tenant —
+relaxed onto the open (non-admin-visible, non-admin-callable) surface."""
 
-    The impl gate remains as defense-in-depth, but the visibility layer
-    hides it from non-admin sessions before they can call it."""
+CHAT_REMOVAL_TOOL_NAMES = (
+    "detach_mcp_server",
+    "remove_skill",
+    "remove_env_credential",
+    "list_env_credential_keys",
+)
+"""The four chat-reachable removal tools: never admin-tagged, so they are
+discoverable by a non-admin session's search_tools like RELAXED_TOOL_NAMES,
+but also must never leak into a narrowed agent-chat session's tools/list."""
+
+
+@pytest.mark.parametrize("tool_name", CHAT_REMOVAL_TOOL_NAMES)
+async def test_non_admin_search_includes_chat_removal_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tool_name: str,
+) -> None:
+    """Each chat-removal tool is discoverable by a non-admin session via search_tools."""
     _, user_token = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
 
@@ -273,13 +277,132 @@ async def test_non_admin_search_excludes_fork_agent(
         app,
         token=user_token,
         method="tools/call",
-        params={"name": "search_tools", "arguments": {"query": "fork agent"}},
+        params={"name": "search_tools", "arguments": {"query": tool_name.replace("_", " ")}},
     )
     call_result = result.get("result", result)
     content = call_result.get("content", [])  # type: ignore[union-attr]
     output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
-    assert "fork_agent" not in output_text, (
-        f"fork_agent must NOT be discoverable by non-admin; got: {output_text!r}"
+    assert tool_name in output_text, (
+        f"{tool_name} must be discoverable by a non-admin session; got: {output_text!r}"
+    )
+
+
+async def test_agent_id_claim_session_discovers_none_of_the_chat_removal_tools(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A session narrowed to agent-chat tools (an agent_id claim) must not
+    discover any of the four chat-removal tools — being untagged (not
+    admin-only) must not accidentally grant agent-chat visibility."""
+    async with sessionmaker() as s, s.begin():
+        tenant = await make_tenant(s, platform="discord", workspace_id="agent-chat-removal-rbac")
+        account = await make_account(s, tenant=tenant)
+    token = mint_jwt(account_id=account.id, secret=SECRET.encode(), now=_NOW, agent_id=uuid.uuid4())
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(app, token=token, method="tools/list")
+    payload = result.get("result", result)
+    tool_names = {t["name"] for t in payload.get("tools", [])}  # type: ignore[union-attr]
+
+    assert not (set(CHAT_REMOVAL_TOOL_NAMES) & tool_names), (
+        f"an agent_id-claim session must not discover any chat-removal tool; got: {tool_names}"
+    )
+
+
+@pytest.mark.parametrize("tool_name", RELAXED_TOOL_NAMES)
+async def test_non_admin_search_includes_relaxed_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tool_name: str,
+) -> None:
+    """Each relaxed tool is discoverable by a non-admin session via search_tools."""
+    _, user_token = await _seed_admin_and_user(sessionmaker)
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(
+        app,
+        token=user_token,
+        method="tools/call",
+        params={"name": "search_tools", "arguments": {"query": tool_name.replace("_", " ")}},
+    )
+    call_result = result.get("result", result)
+    content = call_result.get("content", [])  # type: ignore[union-attr]
+    output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
+    assert tool_name in output_text, (
+        f"{tool_name} must be discoverable by a non-admin session; got: {output_text!r}"
+    )
+
+
+async def test_non_admin_call_relaxed_tool_reaches_impl(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A relaxed tool's call_tool invocation reaches its implementation for a
+    non-admin caller.
+
+    Only the absence of the two rejection outcomes is asserted: "not found"
+    (visibility would still be blocking it) and the Manage Server refusal (the
+    impl gate would still be firing). A tool-level validation error is an
+    acceptable — expected — outcome here, because what's being proven is that
+    the call reached the implementation at all, not that it fully succeeds
+    without any arguments."""
+    _, user_token = await _seed_admin_and_user(sessionmaker)
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(
+        app,
+        token=user_token,
+        method="tools/call",
+        params={
+            "name": "call_tool",
+            "arguments": {
+                "name": "self_write_file",
+                "arguments": {"key": "notes", "content": "hello"},
+            },
+        },
+    )
+    call_result = result.get("result", result)
+    content = call_result.get("content", [])  # type: ignore[union-attr]
+    output_text = " ".join(
+        item.get("text", "") for item in content if isinstance(item, dict)
+    ).lower()
+    assert "not found" not in output_text, (
+        f"self_write_file must be visible to a non-admin call_tool invocation; got: {output_text!r}"
+    )
+    assert "manage server" not in output_text, (
+        f"self_write_file must not be impl-gated for a non-admin caller; got: {output_text!r}"
+    )
+
+
+STILL_ADMIN_TOOL_NAMES = (
+    "set_agent_default",
+    "clear_agent_default",
+    "archive_agent",
+    "sync_skills",
+    "create_environment",
+    "update_environment",
+    "archive_environment",
+)
+"""Tools whose blast radius is the whole tenant — stay admin-only after this plan."""
+
+
+@pytest.mark.parametrize("tool_name", STILL_ADMIN_TOOL_NAMES)
+async def test_non_admin_search_excludes_remaining_admin_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tool_name: str,
+) -> None:
+    """Each tenant-wide tool stays invisible to a non-admin session's search_tools."""
+    _, user_token = await _seed_admin_and_user(sessionmaker)
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(
+        app,
+        token=user_token,
+        method="tools/call",
+        params={"name": "search_tools", "arguments": {"query": tool_name.replace("_", " ")}},
+    )
+    call_result = result.get("result", result)
+    content = call_result.get("content", [])  # type: ignore[union-attr]
+    output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
+    assert tool_name not in output_text, (
+        f"{tool_name} must NOT be discoverable by a non-admin session; got: {output_text!r}"
     )
 
 
@@ -362,8 +485,9 @@ async def test_admin_search_includes_admin_tools(
 async def test_admin_search_includes_fork_agent(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Admin search_tools('fork') returns fork_agent — proves IdentityMiddleware
-    enable_components re-enables newly-tagged tools for admin sessions."""
+    """Admin search_tools('fork') returns fork_agent — fork_agent is untagged
+    (open to every session) after this plan's relaxation, so it must remain
+    discoverable for admin sessions too."""
     admin_token, _ = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
 

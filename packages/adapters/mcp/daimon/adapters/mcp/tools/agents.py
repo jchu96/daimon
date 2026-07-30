@@ -24,6 +24,7 @@ from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
 )
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
+from daimon.adapters.mcp.tools import reachability
 from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
@@ -239,11 +240,12 @@ def _union_tools(spec_tools: list[Tool], ma_agent: BetaManagedAgentsAgent) -> li
 def _reject_system_agent(agent: BetaManagedAgentsAgent) -> None:
     """Reject system agents (no daimon_account stamp) from chat mutating tools.
 
-    Authorization boundary: _require_admin (already called first on every
-    mutating impl) + tenant-scoped lookup. Any stamped agent in the tenant is
-    admin-mutable. Unstamped agents are the read-only seeded/system class —
-    they lack a daimon_account key — and must be forked before chat tools can
-    edit them.
+    Unconditional — applies to admins too, with no bypass. A chat edit never
+    stamps the seeded agent's spec hash, so the reconcile pipeline's hash
+    short-circuit would skip the drifted agent forever the next time defaults
+    are applied. Unstamped agents are the read-only seeded/system class — they
+    lack a daimon_account key — and must be forked before chat tools can edit
+    them.
     """
     owner = agent.metadata.get(MA_METADATA_KEY_ACCOUNT)
     if owner is None:
@@ -332,7 +334,6 @@ async def _create_agent_impl(
     auth: AuthIdentity,
     spec: AgentSpec,
 ) -> AgentInfo:
-    _require_admin(auth)
     if spec.skills:
         raise ToolError(
             "create_agent: skills must be empty. To add skills, either sync a "
@@ -412,7 +413,6 @@ async def _update_agent_impl(
     mcp_servers: list[BetaManagedAgentsURLMCPServerParams] | None,
     skills: list[str | BetaManagedAgentsSkillParams] | None,
 ) -> AgentInfo:
-    _require_admin(auth)
     scalars: dict[str, Any] = {"model": model, "description": description, "system": system}
     list_fields = (tools, mcp_servers, skills)
     if all(v is None for v in scalars.values()) and all(v is None for v in list_fields):
@@ -421,6 +421,16 @@ async def _update_agent_impl(
     if agent is None:
         raise ToolError(f"agent '{name}' not found")
     _reject_system_agent(agent)
+
+    touched_fields = {field_name for field_name, value in scalars.items() if value is not None}
+    if tools is not None:
+        touched_fields.add("tools")
+    if mcp_servers is not None:
+        touched_fields.add("mcp_servers")
+    if skills is not None:
+        touched_fields.add("skills")
+    if touched_fields & reachability.REACHABILITY_GATED_FIELDS:
+        await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=name)
 
     # Resolve skill names outside the closure — name resolution does not depend on
     # the agent's current state and must not be repeated on each retry attempt.
@@ -496,7 +506,6 @@ async def _attach_mcp_server_impl(
     server_name: str,
     url: str,
 ) -> AgentInfo:
-    _require_admin(auth)
     # #142: guard the reserved daimon-mcp entry before even looking at the agent.
     # Also reject any URL that points at the deployment's own public_url under a
     # different name — that would make the next reconcile append a second daimon-mcp.
@@ -514,6 +523,7 @@ async def _attach_mcp_server_impl(
     if agent is None:
         raise ToolError(f"agent '{agent_name}' not found")
     _reject_system_agent(agent)
+    await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=agent_name)
 
     existing = list(agent.mcp_servers or [])
     # No-op check on the initially-found agent (acceptable: a concurrent change
@@ -577,7 +587,6 @@ async def _fork_agent_impl(
     source_name: str,
     new_name: str,
 ) -> AgentInfo:
-    _require_admin(auth)
     await _reject_guild_name_collision(runtime, auth, new_name)
     source = await find_agent_by_daimon_tag(
         runtime.client, tenant_id=auth.tenant_id, name=source_name
@@ -691,7 +700,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """
         return await _get_agent_impl(runtime, await _auth(ctx), name)
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def create_agent(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         name: str,
@@ -724,7 +733,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         )
         return await _create_agent_impl(runtime, await _auth(ctx), spec)
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def update_agent(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         name: str,
@@ -760,7 +769,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             skills=skills,
         )
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def attach_mcp_server(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         agent_name: str,
@@ -794,7 +803,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             url=url,
         )
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def fork_agent(ctx: Context, source_name: str, new_name: str) -> AgentInfo:  # pyright: ignore[reportUnusedFunction]
         """Clone an agent within the tenant pool under a new name."""
         return await _fork_agent_impl(runtime, await _auth(ctx), source_name, new_name)

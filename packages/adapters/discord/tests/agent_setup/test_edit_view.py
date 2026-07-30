@@ -15,7 +15,9 @@ from daimon.adapters.discord.agent_setup.edit_view import (
     build_edit_container,
 )
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
+from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.specs import AgentSpec
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 def _entry(name: str, model: str = "claude-sonnet-4-6") -> RosterEntry:
@@ -508,8 +510,9 @@ def test_env_vars_button_label_has_no_plus(account_id: uuid.UUID) -> None:
     assert "+ Env vars" not in labels, "the '+' prefix must be dropped from the Env vars button"
 
 
-def test_edit_view_env_vars_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
-    selected = _entry("sys")
+def test_edit_view_env_vars_button_always_enabled(account_id: uuid.UUID) -> None:
+    """Env vars are per-agent daimon state, never part of the agent spec, so the
+    button is always enabled — for the seeded/system agent exactly like any other."""
     selected = RosterEntry(
         name="sys",
         model="claude-sonnet-4-6",
@@ -521,14 +524,120 @@ def test_edit_view_env_vars_button_disabled_for_system_agent(account_id: uuid.UU
     runtime.settings.mcp.public_url = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
-    assert _find_button(view, "Env vars").disabled is True, (
-        "system agents see the Env vars button disabled (defensive)"
+    assert _find_button(view, "Env vars").disabled is False, (
+        "the seeded/system agent's Env vars button must be enabled"
     )
 
     user_selected = _entry("bot")
     user_state = PanelState(roster=[user_selected], selected=user_selected, account_id=account_id)
     user_view = EditView(user_state, runtime=runtime, allowed_user_id=42)
     assert _find_button(user_view, "Env vars").disabled is False, "user agents can open Env vars"
+
+
+# --- Spec-control reachability gate ---------------------------
+
+
+def _reachable_state(entry: RosterEntry, account_id: uuid.UUID, *, is_admin: bool) -> PanelState:
+    """A state whose selected agent IS reachable via the deployment default."""
+    from daimon.core.scope import DeploymentDefault
+
+    return PanelState(
+        roster=[entry],
+        selected=entry,
+        account_id=account_id,
+        is_admin=is_admin,
+        cascade_view=(None, []),
+        deployment_default=DeploymentDefault(agent_name=entry.name),
+    )
+
+
+def test_edit_view_non_admin_reachable_non_system_disables_spec_controls(
+    account_id: uuid.UUID,
+) -> None:
+    """A non-admin editing a reachable, non-system agent gets the five
+    spec-touching controls disabled; GitHub… and Env vars stay enabled."""
+    from daimon.core.specs import SkillRef
+
+    selected = _entry_with_mcps(
+        "bot",
+        [_mcp("user-mcp", "https://user.example.com/mcp")],
+        skills=[SkillRef(type="custom", skill_id="skill-a")],
+    )
+    state = _reachable_state(selected, account_id, is_admin=False)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is True, "Agent… must be disabled"
+    assert _find_button(view, "+ Add skill").disabled is True, "+ Add skill must be disabled"
+    assert _find_button(view, "+ Add MCP").disabled is True, "+ Add MCP must be disabled"
+    skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    assert skill_select.disabled is True, "skill remove select must be disabled"
+    assert mcp_select.disabled is True, "mcp remove select must be disabled"
+    assert _find_button(view, "GitHub…").disabled is False, "GitHub… must stay enabled"
+    assert _find_button(view, "Env vars").disabled is False, "Env vars must stay enabled"
+
+
+def test_edit_view_non_admin_unreachable_non_system_enables_spec_controls(
+    account_id: uuid.UUID,
+) -> None:
+    """A non-admin editing an agent nobody has scoped gets every spec control
+    enabled — it is their scratchpad."""
+    from daimon.core.specs import SkillRef
+
+    selected = _entry_with_mcps(
+        "bot",
+        [_mcp("user-mcp", "https://user.example.com/mcp")],
+        skills=[SkillRef(type="custom", skill_id="skill-a")],
+    )
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=False)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is False, "Agent… must be enabled"
+    assert _find_button(view, "+ Add skill").disabled is False, "+ Add skill must be enabled"
+    assert _find_button(view, "+ Add MCP").disabled is False, "+ Add MCP must be enabled"
+    skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    assert skill_select.disabled is False, "skill remove select must be enabled"
+    assert mcp_select.disabled is False, "mcp remove select must be enabled"
+
+
+def test_edit_view_admin_reachable_non_system_enables_spec_controls(account_id: uuid.UUID) -> None:
+    """An admin editing a reachable, non-system agent still gets the spec
+    controls enabled — the reachability gate is admin-exempt."""
+    selected = _entry("bot")
+    state = _reachable_state(selected, account_id, is_admin=True)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is False, "Agent… must be enabled for an admin"
+
+
+def test_edit_view_reachable_system_agent_disables_spec_controls_for_admin_too(
+    account_id: uuid.UUID,
+) -> None:
+    """is_system stays absolute: even an admin gets the spec controls disabled
+    on the seeded agent."""
+    selected = RosterEntry(
+        name="daimon",
+        model="claude-sonnet-4-6",
+        spec=AgentSpec(name="daimon", model="claude-sonnet-4-6", system=None),
+        is_system=True,
+    )
+    state = _reachable_state(selected, account_id, is_admin=True)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is True, (
+        "Agent… must stay disabled on a system agent even for an admin"
+    )
+    assert _find_button(view, "GitHub…").disabled is False, "GitHub… is not spec-gated"
+    assert _find_button(view, "Env vars").disabled is False, "Env vars is not spec-gated"
 
 
 # --- Back / open_edit_view edit-in-place -----------------------------------
@@ -633,3 +742,258 @@ async def test_open_edit_view_binds_the_render_interaction(
     await view_kwarg.on_timeout()
 
     mock_interaction.edit_original_response.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Click-time authz gate on the remove selects
+# ---------------------------------------------------------------------------
+
+
+def _non_admin_interaction(*, guild_id: int) -> MagicMock:
+    interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.user = MagicMock(spec=discord.Member)
+    interaction.user.id = 42
+    interaction.user.guild_permissions.administrator = False
+    interaction.user.guild_permissions.manage_guild = False
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)
+    interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    return interaction
+
+
+def _admin_interaction() -> MagicMock:
+    interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member)
+    interaction.user.id = 42
+    interaction.user.guild_permissions.administrator = True
+    interaction.user.guild_permissions.manage_guild = False
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)
+    interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    return interaction
+
+
+@pytest.mark.asyncio
+async def test_skill_remove_select_refuses_write_when_target_is_reachable_for_non_admin(
+    account_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    import daimon.adapters.discord.agent_setup.edit_view as edit_view_mod
+    from daimon.core.scope import DeploymentDefault
+    from daimon.core.specs import SkillRef
+    from daimon.testing.factories import make_tenant
+
+    async def unexpected_reconcile(rt: object, st: object, *, tenant_id: object) -> object:
+        raise AssertionError("reconcile must not run when the write is refused")
+
+    monkeypatch.setattr(edit_view_mod, "replace_agent_resources_for_panel", unexpected_reconcile)
+
+    guild_id = 910101
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    skills = [SkillRef(type="custom", skill_id="skill-a")]
+    selected = _entry_with("bot", skills=skills)
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.sessionmaker = db_session_factory
+    runtime.deployment_default = DeploymentDefault(agent_name="bot")
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    skill_select._values = ["0"]  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _non_admin_interaction(guild_id=guild_id)
+    await skill_select.callback(interaction)
+
+    assert state.selected is not None
+    remaining = {s.skill_id for s in state.selected.spec.skills}
+    assert "skill-a" in remaining, "skill must not be removed when the write is refused"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_skill_remove_select_refuses_write_on_system_agent_even_for_admin(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import daimon.adapters.discord.agent_setup.edit_view as edit_view_mod
+    from daimon.core.specs import SkillRef
+
+    async def unexpected_reconcile(rt: object, st: object, *, tenant_id: object) -> object:
+        raise AssertionError("reconcile must not run when the write is refused")
+
+    monkeypatch.setattr(edit_view_mod, "replace_agent_resources_for_panel", unexpected_reconcile)
+
+    skills = [SkillRef(type="custom", skill_id="skill-a")]
+    selected = RosterEntry(
+        name="daimon",
+        model="claude-sonnet-4-6",
+        spec=AgentSpec(name="daimon", model="claude-sonnet-4-6", skills=skills),
+        is_system=True,
+    )
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    skill_select._values = ["0"]  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _admin_interaction()
+    await skill_select.callback(interaction)
+
+    assert state.selected is not None
+    remaining = {s.skill_id for s in state.selected.spec.skills}
+    assert "skill-a" in remaining, "a system agent's skills must never be removed from the panel"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_remove_select_refuses_write_when_target_is_reachable_for_non_admin(
+    account_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    import daimon.adapters.discord.agent_setup.edit_view as edit_view_mod
+    from daimon.core.scope import DeploymentDefault
+    from daimon.testing.factories import make_tenant
+
+    async def unexpected_reconcile(rt: object, st: object, *, tenant_id: object) -> object:
+        raise AssertionError("reconcile must not run when the write is refused")
+
+    monkeypatch.setattr(edit_view_mod, "replace_agent_resources_for_panel", unexpected_reconcile)
+
+    guild_id = 910102
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry_with_mcps("bot", [_mcp("user-mcp", "https://user.example.com/mcp")])
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.sessionmaker = db_session_factory
+    runtime.deployment_default = DeploymentDefault(agent_name="bot")
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    mcp_select._values = ["0"]  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _non_admin_interaction(guild_id=guild_id)
+    await mcp_select.callback(interaction)
+
+    assert state.selected is not None
+    remaining = state.selected.spec.mcp_servers or []
+    assert len(remaining) == 1, "an MCP must not be removed when the write is refused"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_remove_select_refuses_write_on_system_agent_even_for_admin(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import daimon.adapters.discord.agent_setup.edit_view as edit_view_mod
+    from anthropic.types.beta.agent_create_params import Tool
+    from anthropic.types.beta.beta_managed_agents_mcp_toolset_params import (
+        BetaManagedAgentsMCPToolsetParams,
+    )
+
+    async def unexpected_reconcile(rt: object, st: object, *, tenant_id: object) -> object:
+        raise AssertionError("reconcile must not run when the write is refused")
+
+    monkeypatch.setattr(edit_view_mod, "replace_agent_resources_for_panel", unexpected_reconcile)
+
+    mcps = [_mcp("user-mcp", "https://user.example.com/mcp")]
+    tools: list[Tool] = [
+        BetaManagedAgentsMCPToolsetParams(
+            type="mcp_toolset",
+            mcp_server_name="user-mcp",
+            default_config={"permission_policy": {"type": "always_allow"}},
+        )
+    ]
+    selected = RosterEntry(
+        name="daimon",
+        model="claude-sonnet-4-6",
+        spec=AgentSpec(name="daimon", model="claude-sonnet-4-6", mcp_servers=mcps, tools=tools),
+        is_system=True,
+    )
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    mcp_select._values = ["0"]  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _admin_interaction()
+    await mcp_select.callback(interaction)
+
+    assert state.selected is not None
+    remaining = state.selected.spec.mcp_servers or []
+    assert len(remaining) == 1, "a system agent's mcp_servers must never be removed from the panel"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Env vars are a per-agent attachment, never part of the agent spec — the
+    new click-time gate must not reach this path even for a reachable agent
+    edited by a non-admin."""
+    from daimon.adapters.discord.agent_setup.credentials import PasteSecretModal
+    from daimon.core.ma_identity import derive_agent_uuid
+    from daimon.core.ma_resolver import new_resolver_cache
+    from daimon.core.notebooks._rate_limit import RateLimiter
+    from daimon.core.scope import DeploymentDefault
+    from daimon.core.stores.agent_files import get_agent_file
+    from daimon.testing.factories import make_tenant
+
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id="env-vars-still-open")
+    agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="agent_env_test")
+
+    settings = MagicMock()
+    settings.mcp.public_url = None
+    runtime = DiscordRuntime(
+        settings=settings,
+        anthropic=MagicMock(),
+        sessionmaker=db_session_factory,
+        notebook_rate_limiter=RateLimiter(max_requests=999),
+        billing_config=None,
+        # A non-admin caller editing the workspace's current default agent —
+        # env vars stay writable regardless.
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+        resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
+    )
+
+    async def _noop(_interaction: discord.Interaction) -> None:
+        return None
+
+    modal = PasteSecretModal(
+        runtime=runtime, tenant_id=tenant.id, agent_id=agent_id, on_added=_noop
+    )
+    modal.content_input._value = "XERO_API_KEY=abc123"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = MagicMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    await modal.on_submit(interaction)
+
+    async with db_session_factory() as session:
+        row = await get_agent_file(
+            session, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY"
+        )
+    assert row is not None, "env var write must succeed even on the workspace's default agent"

@@ -16,9 +16,21 @@ Handler contract:
     discipline (app.py acks before spawning this handler). All I/O wrapped in
     the boundary catch.
 
-Security:
-  - Every mutating branch re-resolves is_admin server-side post-ack and refuses
-    on False ("hiding ≠ gating" principle).
+Security — the gate follows the blast radius of what each branch touches,
+never a blanket admin check ("hiding ≠ gating" principle: every refusal is
+decided post-ack, server-side, never trusted from the rendered view):
+  - Always open, no refusal for any caller: new, fork, edit (L1→L2 push),
+    edit_repo_form, paste_secrets, remove_secret. Repo bindings and env
+    variables are per-agent attachments that never enter the agent spec;
+    building/configuring an unscoped agent has no tenant-wide blast radius.
+  - Field-conditional via the shared reachability gate in ``agent_setup.gate``:
+    remove_skill, remove_mcp, edit_agent_form, add_skill, add_mcp. These touch
+    the agent spec (system/model/skills/mcp_servers), so a non-admin is
+    refused only when the target agent is currently reachable (a channel or
+    workspace default) — an unreachable agent has no live gate to defend.
+  - Admin-only unconditionally, unchanged: delete, the three scope:* branches,
+    connect_mcp (mints a bearer token; token issuance stays outside what
+    this phase opens).
   - JWT values for connect-mcp: never logged, last4/presence only.
   - Stale agent: re-fetch tolerates missing agent → no write, re-render L1 with
     warning notice.
@@ -41,6 +53,7 @@ from daimon.adapters.slack.admin import (
     _dev_allow_all_admin,  # pyright: ignore[reportPrivateUsage]
     resolve_is_admin,
 )
+from daimon.adapters.slack.agent_setup import gate
 from daimon.adapters.slack.agent_setup.read import (
     load_agent_channel_ids,
     load_scope_hint,
@@ -91,6 +104,7 @@ from daimon.core.scope import (
     TenantScopeRef,
 )
 from daimon.core.specs import AgentSpec
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from slack_sdk.errors import SlackApiError
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -221,11 +235,14 @@ def _build_section_blocks(
     section_data: object,
     agent_name: str,
     is_admin: bool,
+    can_edit_spec: bool,
 ) -> list[dict[str, Any]]:
     """Build the per-section blocks from ``load_section_data`` output.
 
     Handles type mapping from the heterogeneous ``load_section_data`` return
-    to the specific builder signatures.
+    to the specific builder signatures. ``can_edit_spec`` gates the
+    spec-touching sections (agent/skills/mcps); repo_auth and secrets are
+    per-agent attachments and render their mutation controls unconditionally.
     """
     if section == "agent":
         info: dict[str, Any] = dict(section_data) if isinstance(section_data, dict) else {}  # type: ignore[arg-type]
@@ -233,34 +250,65 @@ def _build_section_blocks(
             agent_name=agent_name,
             model_id=str(info.get("model_id") or ""),
             system_prompt=str(info.get("system_prompt") or ""),
-            is_admin=is_admin,
+            can_edit_spec=can_edit_spec,
         )
     elif section == "repo_auth":
         return build_repo_auth_section(
             repo=None,
             pat_last4=None,
-            is_admin=is_admin,
         )
     elif section == "skills":
         names: list[str] = list(section_data) if isinstance(section_data, list) else []  # type: ignore[arg-type]
         return build_skills_section(
             skill_names=names,
             sync_pending=False,
-            is_admin=is_admin,
+            can_edit_spec=can_edit_spec,
         )
     elif section == "mcps":
         mcp_names: list[str] = list(section_data) if isinstance(section_data, list) else []  # type: ignore[arg-type]
         mcps = [{"name": n, "url": ""} for n in mcp_names]
-        return build_mcps_section(mcps=mcps, is_admin=is_admin)
+        return build_mcps_section(mcps=mcps, can_edit_spec=can_edit_spec, is_admin=is_admin)
     elif section == "secrets":
         secret_names: list[str] = list(section_data) if isinstance(section_data, list) else []  # type: ignore[arg-type]
         return build_secrets_section(
             agent_name=agent_name,
             secret_names=secret_names,
-            is_admin=is_admin,
         )
     else:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Spec-editability for un-gated renders (branches that don't call the shared
+# reachability gate but still need to know whether to render a section's
+# mutation controls -- e.g. `edit` and `remove_secret`, which are open to
+# every member and re-render a spec-touching section)
+# ---------------------------------------------------------------------------
+
+
+async def _compute_can_edit_spec(
+    runtime: SlackRuntime,
+    *,
+    is_admin: bool,
+    tenant_id: uuid.UUID,
+    agent_name: str,
+) -> bool:
+    """Whether the caller may change this agent's approved configuration.
+
+    True immediately for an admin (no DB read). Otherwise a single
+    reachability read decides: an unscoped agent has no live gate to
+    defend, so a member may still change its spec.
+    """
+    if is_admin:
+        return True
+    async with runtime.sessionmaker() as session:
+        reachable = await is_agent_reachable_in_tenant(
+            session,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            default=runtime.deployment_default,
+        )
+    return not reachable
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +522,10 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 )
                 return
 
+            can_edit_spec = await _compute_can_edit_spec(
+                runtime, is_admin=is_admin, tenant_id=tenant_id, agent_name=agent_name_for_tab
+            )
+
             async with runtime.sessionmaker() as session:
                 section_data = await load_section_data(
                     session,
@@ -488,6 +540,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 section_data=section_data,
                 agent_name=agent_name_for_tab,
                 is_admin=is_admin,
+                can_edit_spec=can_edit_spec,
             )
 
             # views.update — NEVER views.push (3-level cap, Structural Guarantee #2)
@@ -499,12 +552,16 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     team_id=team_id,
                     channel_id=channel_id,
                     is_admin=is_admin,
+                    can_edit_spec=can_edit_spec,
                     section_blocks=section_blocks,
                 ),
             )
 
         # -----------------------------------------------------------------------
         # Edit button — push to L2 (the ONLY transition that pushes to L2)
+        # Open to every member: building/configuring an unscoped
+        # agent needs no admin. can_edit_spec (admin, or the agent is not
+        # currently reachable) decides whether the agent-spec controls render.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__edit":
             agent_name_for_edit = selected_agent_name or ""
@@ -514,13 +571,6 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
 
             # Stale check.
             agents_check = await list_agents_by_tenant(runtime.anthropic, tenant_id=tenant_id)
@@ -540,6 +590,10 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 )
                 return
 
+            can_edit_spec = await _compute_can_edit_spec(
+                runtime, is_admin=is_admin, tenant_id=tenant_id, agent_name=agent_name_for_edit
+            )
+
             async with runtime.sessionmaker() as session:
                 agent_data = await load_section_data(
                     session,
@@ -554,7 +608,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 agent_name=agent_name_for_edit,
                 model_id=str(agent_info.get("model_id") or ""),
                 system_prompt=str(agent_info.get("system_prompt") or ""),
-                is_admin=is_admin,
+                can_edit_spec=can_edit_spec,
             )
 
             # views.push — Edit is the ONLY action that pushes to L2.
@@ -566,6 +620,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     team_id=team_id,
                     channel_id=channel_id,
                     is_admin=is_admin,
+                    can_edit_spec=can_edit_spec,
                     section_blocks=section_blocks,
                 ),
             )
@@ -841,19 +896,14 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Remove skill — MUTATION: re-resolve is_admin (T-83-10)
+        # Remove skill — field-conditional: skills are part of the agent
+        # spec, so this refuses a non-admin only when the target agent is
+        # currently reachable. Re-resolves via the shared gate post-ack.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__remove_skill":
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
 
             skill_to_remove: str = action.get("selected_option", {}).get("value") or ""
             if not skill_to_remove or skill_to_remove == "__none__":
@@ -861,6 +911,17 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
 
             agent_name_for_remove = selected_agent_name or ""
             if not agent_name_for_remove:
+                return
+
+            if await gate.refuse_if_reachable_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_remove,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             ma_agent = await find_agent_by_daimon_tag(
@@ -903,10 +964,12 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     section="skills",
                 )
             skill_names: list[str] = list(updated_data) if isinstance(updated_data, list) else []  # type: ignore[arg-type]
+            # Reaching here means the gate above proceeded: either admin, or
+            # the target was unreachable -- exactly can_edit_spec's definition.
             section_blocks = build_skills_section(
                 skill_names=skill_names,
                 sync_pending=False,
-                is_admin=is_admin,
+                can_edit_spec=True,
             )
             await client.views_update(  # pyright: ignore[reportUnknownMemberType]
                 view_id=view_id,
@@ -916,24 +979,20 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     team_id=team_id,
                     channel_id=channel_id,
                     is_admin=is_admin,
+                    can_edit_spec=True,
                     section_blocks=section_blocks,
                 ),
             )
 
         # -----------------------------------------------------------------------
-        # Remove MCP — MUTATION: re-resolve is_admin (T-83-10)
+        # Remove MCP — field-conditional: MCP servers are part of the
+        # agent spec, so this refuses a non-admin only when the target agent
+        # is currently reachable. Re-resolves via the shared gate post-ack.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__remove_mcp":
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
 
             mcp_to_remove: str = action.get("selected_option", {}).get("value") or ""
             if not mcp_to_remove or mcp_to_remove == "__none__":
@@ -941,6 +1000,17 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
 
             agent_name_for_remove = selected_agent_name or ""
             if not agent_name_for_remove:
+                return
+
+            if await gate.refuse_if_reachable_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_remove,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             ma_agent = await find_agent_by_daimon_tag(
@@ -984,7 +1054,11 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 )
             mcp_names: list[str] = list(updated_data) if isinstance(updated_data, list) else []  # type: ignore[arg-type]
             mcps_dicts = [{"name": n, "url": ""} for n in mcp_names]
-            section_blocks = build_mcps_section(mcps=mcps_dicts, is_admin=is_admin)
+            # Reaching here means the gate above proceeded: either admin, or
+            # the target was unreachable -- exactly can_edit_spec's definition.
+            section_blocks = build_mcps_section(
+                mcps=mcps_dicts, can_edit_spec=True, is_admin=is_admin
+            )
             await client.views_update(  # pyright: ignore[reportUnknownMemberType]
                 view_id=view_id,
                 view=build_l2_view(
@@ -993,24 +1067,21 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     team_id=team_id,
                     channel_id=channel_id,
                     is_admin=is_admin,
+                    can_edit_spec=True,
                     section_blocks=section_blocks,
                 ),
             )
 
         # -----------------------------------------------------------------------
-        # Remove secret — MUTATION: re-resolve is_admin (T-83-10)
+        # Remove secret — always open: env-variable credentials are a
+        # per-agent attachment, not part of the agent spec. No refusal for any
+        # caller; is_admin/can_edit_spec are resolved only for the L1 stale
+        # fallback and the L2 re-render's build_l2_view kwargs.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__remove_secret":
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
 
             secret_key_to_remove: str = action.get("selected_option", {}).get("value") or ""
             if not secret_key_to_remove or secret_key_to_remove == "__none__":
@@ -1047,6 +1118,10 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     key=secret_key_to_remove,
                 )
 
+            can_edit_spec = await _compute_can_edit_spec(
+                runtime, is_admin=is_admin, tenant_id=tenant_id, agent_name=agent_name_for_remove
+            )
+
             async with runtime.sessionmaker() as session:
                 updated_data = await load_section_data(
                     session,
@@ -1059,7 +1134,6 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             section_blocks = build_secrets_section(
                 agent_name=agent_name_for_remove,
                 secret_names=secret_names,
-                is_admin=is_admin,
             )
             await client.views_update(  # pyright: ignore[reportUnknownMemberType]
                 view_id=view_id,
@@ -1069,6 +1143,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     team_id=team_id,
                     channel_id=channel_id,
                     is_admin=is_admin,
+                    can_edit_spec=can_edit_spec,
                     section_blocks=section_blocks,
                 ),
             )
@@ -1170,20 +1245,10 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # New Agent — push L3 new-agent form (T-83-20: re-resolve is_admin)
+        # New Agent — push L3 new-agent form. Open to every member:
+        # creating an unscoped agent is not tenant-wide blast radius.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__new":
-            is_admin = await resolve_is_admin(
-                client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
-            )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
-
             await client.views_push(  # pyright: ignore[reportUnknownMemberType]
                 trigger_id=payload.get("trigger_id") or "",
                 view=build_l3_new_agent_form(
@@ -1194,23 +1259,17 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Fork Agent — push L3 fork-agent form (T-83-20/T-83-21)
+        # Fork Agent — push L3 fork-agent form. Open to every member:
+        # forking is a new, unscoped agent, same as New.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__fork":
-            is_admin = await resolve_is_admin(
-                client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
-            )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
-
             fork_source = selected_agent_name or ""
             if not fork_source:
                 return
+
+            is_admin = await resolve_is_admin(
+                client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
+            )
 
             # Stale check (T-83-21): verify source agent still exists.
             ma_agent = await find_agent_by_daimon_tag(
@@ -1240,7 +1299,9 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Edit Agent Form — push L3 edit-agent form (T-83-20/T-83-21)
+        # Edit Agent Form — push L3 edit-agent form. Field-conditional:
+        # touches system/model, part of the agent spec, so this refuses a
+        # non-admin only when the target agent is currently reachable.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__edit_agent_form":
             agent_name_for_edit = selected_agent_name or ""
@@ -1250,12 +1311,16 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
+
+            if await gate.refuse_if_reachable_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_edit,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             # Stale check (T-83-21).
@@ -1298,7 +1363,8 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Edit Repo Form — push L3 edit-repo form (T-83-20/T-83-21)
+        # Edit Repo Form — push L3 edit-repo form. Always open: the
+        # repo binding is a per-agent attachment, not part of the agent spec.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__edit_repo_form":
             agent_name_for_repo = selected_agent_name or ""
@@ -1308,13 +1374,6 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
 
             # Stale check (T-83-21).
             ma_agent = await find_agent_by_daimon_tag(
@@ -1344,7 +1403,9 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Add Skill — push L3 add-skill form (T-83-20/T-83-21)
+        # Add Skill — push L3 add-skill form. Field-conditional: skills
+        # are part of the agent spec, so this refuses a non-admin only when
+        # the target agent is currently reachable.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__add_skill":
             agent_name_for_skill = selected_agent_name or ""
@@ -1354,12 +1415,16 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
+
+            if await gate.refuse_if_reachable_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_skill,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             # Stale check (T-83-21).
@@ -1390,7 +1455,9 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Add MCP Server — push L3 add-mcp form (T-83-20/T-83-21)
+        # Add MCP Server — push L3 add-mcp form. Field-conditional:
+        # MCP servers are part of the agent spec, so this refuses a
+        # non-admin only when the target agent is currently reachable.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__add_mcp":
             agent_name_for_mcp = selected_agent_name or ""
@@ -1400,12 +1467,16 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
+
+            if await gate.refuse_if_reachable_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_mcp,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             # Stale check (T-83-21).
@@ -1436,7 +1507,9 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Paste Secrets — push L3 paste-secrets form (T-83-20/T-83-21)
+        # Paste Secrets — push L3 paste-secrets form. Always open:
+        # env-variable credentials are a per-agent attachment, not part of
+        # the agent spec.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__paste_secrets":
             agent_name_for_secrets = selected_agent_name or ""
@@ -1446,13 +1519,6 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             is_admin = await resolve_is_admin(
                 client, user_id=user_id, dev_allow_all=_dev_allow_all_admin(runtime)
             )
-            if not is_admin:
-                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id or user_id,
-                    user=user_id,
-                    text=":x: You no longer have permission to change agent setup.",
-                )
-                return
 
             # Stale check (T-83-21).
             ma_agent = await find_agent_by_daimon_tag(

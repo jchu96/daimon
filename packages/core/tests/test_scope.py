@@ -15,6 +15,7 @@ from daimon.core.scope import (
     ScopeContext,
     TenantConfigRow,
     _pick_agent,  # pyright: ignore[reportPrivateUsage]  # test seam
+    is_agent_reachable,
     merge,
 )
 
@@ -276,3 +277,110 @@ def test_scope_context_accepts_all_fields() -> None:
     assert ctx.tenant_id == tid
     assert ctx.channel_id == "c1"
     assert ctx.account_id == aid
+
+
+# ---------------------------------------------------------------------------
+# is_agent_reachable — reachability predicate over channel/tenant/deployment
+# ---------------------------------------------------------------------------
+
+
+def test_is_agent_reachable_true_for_deployment_default_on_fresh_install() -> None:
+    """No tenant row, no channel rows: the seeded deployment default is reachable."""
+    default = DeploymentDefault(agent_name="daimon", environment_name="default")
+    assert is_agent_reachable("daimon", tenant=None, channels=[], default=default), (
+        "the deployment-default agent must be reachable on a fresh install with no config rows"
+    )
+
+
+def test_is_agent_reachable_false_for_unrelated_name_on_fresh_install() -> None:
+    """No tenant row, no channel rows: an agent nobody named is not reachable."""
+    default = DeploymentDefault(agent_name="daimon", environment_name="default")
+    assert not is_agent_reachable("scratch", tenant=None, channels=[], default=default), (
+        "an agent that is neither scoped nor the deployment default must be unreachable"
+    )
+
+
+def test_is_agent_reachable_true_when_tenant_row_names_it() -> None:
+    """A tenant row in mode='agent' naming the agent makes it reachable."""
+    tid = uuid.uuid4()
+    tenant = TenantConfigRow(tenant_id=tid, agent_name="alpha", mode="agent")
+    assert is_agent_reachable("alpha", tenant=tenant, channels=[], default=DeploymentDefault()), (
+        "a tenant row naming the agent in mode='agent' must make it reachable"
+    )
+
+
+def test_is_agent_reachable_false_for_deployment_default_when_tenant_overrides() -> None:
+    """A tenant row that names a different agent consumes the fall-through."""
+    tid = uuid.uuid4()
+    tenant = TenantConfigRow(tenant_id=tid, agent_name="alpha", mode="agent")
+    default = DeploymentDefault(agent_name="daimon")
+    assert not is_agent_reachable("daimon", tenant=tenant, channels=[], default=default), (
+        "a tenant row overriding the agent must consume the deployment fall-through"
+    )
+
+
+def test_is_agent_reachable_true_for_default_when_tenant_row_is_user_active() -> None:
+    """A tenant row in mode='user_active' does not consume the fall-through."""
+    tid = uuid.uuid4()
+    tenant = TenantConfigRow(tenant_id=tid, agent_name="alpha", mode="user_active")
+    default = DeploymentDefault(agent_name="daimon")
+    assert is_agent_reachable("daimon", tenant=tenant, channels=[], default=default), (
+        "a non-agent-mode tenant row must not consume the deployment fall-through"
+    )
+
+
+def test_is_agent_reachable_true_for_default_when_tenant_agent_name_empty() -> None:
+    """A tenant row in mode='agent' with no agent_name does not consume the fall-through."""
+    tid = uuid.uuid4()
+    tenant = TenantConfigRow(tenant_id=tid, agent_name=None, mode="agent")
+    default = DeploymentDefault(agent_name="daimon")
+    assert is_agent_reachable("daimon", tenant=tenant, channels=[], default=default), (
+        "an empty agent_name on an agent-mode tenant row must not consume the fall-through, "
+        "matching _pick_agent's truthiness test"
+    )
+
+
+def test_is_agent_reachable_true_when_channel_row_names_it() -> None:
+    """A channel row in mode='agent' naming the agent makes it reachable."""
+    tid = uuid.uuid4()
+    channel = ChannelConfigRow(tenant_id=tid, channel_id="c1", agent_name="beta", mode="agent")
+    assert is_agent_reachable(
+        "beta", tenant=None, channels=[channel], default=DeploymentDefault()
+    ), "a channel row naming the agent in mode='agent' must make it reachable"
+
+
+def test_is_agent_reachable_true_for_default_alongside_a_channel_row() -> None:
+    """A channel row scoping one agent does not suppress the deployment default for others."""
+    tid = uuid.uuid4()
+    channel = ChannelConfigRow(tenant_id=tid, channel_id="c1", agent_name="beta", mode="agent")
+    default = DeploymentDefault(agent_name="daimon")
+    assert is_agent_reachable("daimon", tenant=None, channels=[channel], default=default), (
+        "a channel row cannot suppress the deployment tier for other channels"
+    )
+
+
+def test_is_agent_reachable_false_when_channel_row_is_user_active() -> None:
+    """A channel row in mode='user_active' does not make its agent_name reachable."""
+    tid = uuid.uuid4()
+    channel = ChannelConfigRow(
+        tenant_id=tid, channel_id="c1", agent_name="beta", mode="user_active"
+    )
+    assert not is_agent_reachable(
+        "beta", tenant=None, channels=[channel], default=DeploymentDefault()
+    ), "a user_active channel row must not make its agent_name reachable"
+
+
+def test_is_agent_reachable_false_when_no_default_and_no_rows() -> None:
+    """No deployment default and no rows at all: nothing is reachable."""
+    assert not is_agent_reachable(
+        "anything", tenant=None, channels=[], default=DeploymentDefault()
+    ), "with no default and no rows, no agent name should be reachable"
+
+
+def test_is_agent_reachable_is_case_sensitive() -> None:
+    """Matching is exact and case-sensitive."""
+    tid = uuid.uuid4()
+    tenant = TenantConfigRow(tenant_id=tid, agent_name="alpha", mode="agent")
+    assert not is_agent_reachable(
+        "Alpha", tenant=tenant, channels=[], default=DeploymentDefault()
+    ), "matching must be case-sensitive: 'Alpha' must not match a row named 'alpha'"

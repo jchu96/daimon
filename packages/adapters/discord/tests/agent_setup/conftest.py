@@ -5,15 +5,27 @@ from __future__ import annotations
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from daimon.testing.ma import make_stub_anthropic, stub_anthropic  # noqa: F401
 
 
 @pytest.fixture
 def mock_interaction() -> MagicMock:
-    """A discord.Interaction stand-in — Discord boundary mock (allowed)."""
+    """A discord.Interaction stand-in — Discord boundary mock (allowed).
+
+    ``user`` is spec'd as a live guild admin (``discord.Member`` with
+    ``administrator=True``) so `authz.refuse_if_reachable_and_not_admin`'s
+    real admin short-circuit passes without a DB read — these unit tests
+    otherwise carry no real Postgres session for it to read from. Tests that
+    need a non-admin caller build their own interaction (see
+    ``test_authz.py``, and the reachable/system negative cases in
+    test_modals.py / test_modals_mcp.py / test_edit_view.py).
+    """
     interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = 42
+    interaction.user.guild_permissions.administrator = True
     interaction.response.defer = AsyncMock()
     interaction.response.send_message = AsyncMock()
     interaction.response.send_modal = AsyncMock()

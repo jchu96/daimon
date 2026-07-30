@@ -40,10 +40,11 @@ from daimon.adapters.mcp.tools.agents import (
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.scope import DeploymentDefault
+from daimon.core.scope import DeploymentDefault, TenantScopeRef
 from daimon.core.specs import AgentSpec, SkillRef, SkillRepo
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
 from factories import make_ma_agent
@@ -76,12 +77,15 @@ def _runtime(
     public_url: str | None = None,
     session_factory: async_sessionmaker[AsyncSession] | MagicMock | None = None,
     fernet: MultiFernet | None = None,
+    deployment_default: DeploymentDefault | None = None,
 ) -> McpRuntime:
     return McpRuntime(
         session_factory=session_factory if session_factory is not None else MagicMock(),
         client=client,  # type: ignore[arg-type]
         settings=_make_settings(public_url=public_url),  # type: ignore[arg-type]
-        deployment_default=DeploymentDefault(),
+        deployment_default=deployment_default
+        if deployment_default is not None
+        else DeploymentDefault(),
         fernet=fernet,
     )
 
@@ -3977,3 +3981,347 @@ async def test_attach_mcp_server_maps_residual_conflict_to_tool_error() -> None:
             server_name="ext-mcp",
             url="https://external.example/mcp",
         )
+
+
+# ---------------------------------------------------------------------------
+# Reachability gate: non-admin edits to a currently-reachable (non-seeded) agent
+#
+# blast radius = one agent -> open; blast radius = the tenant -> admin. A
+# stamped (non-seeded) agent nobody has scoped is a member's own scratchpad;
+# the moment it is a channel or workspace default, its name-visible
+# configuration fields (system/model/skills/mcp_servers/tools) require admin
+# at call time. description stays open regardless — it is a label, not a
+# spec field.
+# ---------------------------------------------------------------------------
+
+
+def _scoped_agent_router(
+    *, tenant_id: uuid.UUID, account_id: uuid.UUID, agent_name: str
+) -> tuple[dict[str, Any], AsyncAnthropic]:
+    """MARouter + fake client for one stamped (non-system) agent; captures PATCH bodies."""
+    captured: dict[str, Any] = {}
+
+    def on_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        captured.update(json_body(req))
+        return httpx.Response(
+            200,
+            json=make_ma_agent(id="ag_scoped", name=agent_name, mcp_servers=[]).model_dump(
+                mode="json"
+            ),
+        )
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [
+                make_ma_agent(
+                    id="ag_scoped",
+                    name=agent_name,
+                    mcp_servers=[],
+                    metadata={
+                        "daimon_tenant": str(tenant_id),
+                        "daimon_name": agent_name,
+                        "daimon_account": str(account_id),
+                    },
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200,
+            json=make_ma_agent(id="ag_scoped", name=agent_name, mcp_servers=[]).model_dump(
+                mode="json"
+            ),
+        ),
+    )
+    router.add("POST", r"/v1/agents/([^/]+)", on_update)
+    return captured, build_fake_anthropic(router.dispatch)
+
+
+async def _make_tenant_with_default_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    agent_name: str | None,
+) -> uuid.UUID:
+    """Insert a real tenant; if `agent_name` is given, set it as the workspace default."""
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord")
+        if agent_name is not None:
+            await set_fields(
+                session,
+                scope=TenantScopeRef(tenant_id=tenant.id),
+                tenant_id=tenant.id,
+                agent_name=agent_name,
+                mode="agent",
+            )
+    return tenant.id
+
+
+async def test_update_agent_impl_rejects_non_admin_system_patch_when_agent_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    _, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    with pytest.raises(ToolError, match="Manage Server"):
+        await _update_agent_impl(
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            name="scoped-agent",
+            model=None,
+            description=None,
+            system="new system prompt",
+            tools=None,
+            mcp_servers=None,
+            skills=None,
+        )
+
+
+async def test_update_agent_impl_allows_non_admin_description_patch_when_agent_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    captured, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    await _update_agent_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        name="scoped-agent",
+        model=None,
+        description="a label, not a spec field",
+        system=None,
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    assert captured.get("description") == "a label, not a spec field", (
+        "description is not in the gated field set — it must reach MA even on a reachable agent"
+    )
+
+
+async def test_update_agent_impl_rejects_non_admin_skills_patch_when_agent_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    _, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    with pytest.raises(ToolError, match="Manage Server"):
+        await _update_agent_impl(
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            name="scoped-agent",
+            model=None,
+            description=None,
+            system=None,
+            tools=None,
+            mcp_servers=None,
+            skills=["some-skill"],
+        )
+
+
+async def test_update_agent_impl_rejects_non_admin_mcp_servers_patch_when_agent_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    _, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    with pytest.raises(ToolError, match="Manage Server"):
+        await _update_agent_impl(
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            name="scoped-agent",
+            model=None,
+            description=None,
+            system=None,
+            tools=None,
+            mcp_servers=[{"name": "ext", "type": "url", "url": "https://ext.example/mcp"}],
+            skills=None,
+        )
+
+
+async def test_update_agent_impl_rejects_non_admin_tools_patch_when_agent_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    _, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    with pytest.raises(ToolError, match="Manage Server"):
+        await _update_agent_impl(
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            name="scoped-agent",
+            model=None,
+            description=None,
+            system=None,
+            tools=[{"type": "agent_toolset_20260401"}],
+            mcp_servers=None,
+            skills=None,
+        )
+
+
+async def test_update_agent_impl_allows_non_admin_system_patch_when_agent_unreachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    captured, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="unscoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    await _update_agent_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        name="unscoped-agent",
+        model=None,
+        description=None,
+        system="new system prompt",
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    assert "new system prompt" in (captured.get("system") or ""), (
+        "an agent nobody has scoped is not gated — it's a member's own scratchpad"
+    )
+
+
+async def test_update_agent_impl_allows_admin_system_patch_when_agent_reachable_without_db_read() -> (
+    None
+):
+    """Admin short-circuits the reachability gate entirely — no config read required.
+
+    session_factory defaults to an unconfigured MagicMock(); if the gate tried
+    to open `async with runtime.session_factory()`, this test would error out
+    rather than merely fail an assertion.
+    """
+    account_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    _, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    result = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="scoped-agent",
+        model=None,
+        description=None,
+        system="new system prompt",
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    assert isinstance(result, AgentInfo), "admin update must succeed without any config read"
+
+
+async def test_attach_mcp_server_impl_rejects_non_admin_when_agent_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    _, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="scoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    with pytest.raises(ToolError, match="Manage Server"):
+        await _attach_mcp_server_impl(
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            agent_name="scoped-agent",
+            server_name="ctx7",
+            url="https://ctx7.example/mcp",
+        )
+
+
+async def test_attach_mcp_server_impl_allows_non_admin_when_agent_unreachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    captured, client = _scoped_agent_router(
+        tenant_id=tenant_id, account_id=account_id, agent_name="unscoped-agent"
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    await _attach_mcp_server_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="unscoped-agent",
+        server_name="ctx7",
+        url="https://ctx7.example/mcp",
+    )
+    assert "mcp_servers" in captured, "an unreachable agent's MCP attachment is not gated"
+
+
+async def test_fork_agent_impl_allows_non_admin_source_with_no_daimon_account(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Forking the seeded (unstamped) agent is the sanctioned escape hatch — it
+    must work for a non-admin caller exactly as it does for an admin."""
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    def on_retrieve(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        body = make_ma_agent(id="ag_src", name="daimon")
+        return httpx.Response(200, json=body.model_dump(mode="json"))
+
+    def on_create(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        body = make_ma_agent(id="ag_new", name="my-fork")
+        return httpx.Response(200, json=body.model_dump(mode="json"))
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [
+                make_ma_agent(
+                    id="ag_src",
+                    name="daimon",
+                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": "daimon"},
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add("GET", r"/v1/agents/([^/]+)", on_retrieve)
+    router.add("POST", r"/v1/agents", on_create)
+    client = build_fake_anthropic(router.dispatch)
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+    result = await _fork_agent_impl(
+        _runtime(client, session_factory=db_session_factory, fernet=fernet),
+        auth,
+        source_name="daimon",
+        new_name="my-fork",
+    )
+    assert isinstance(result, AgentInfo), (
+        "non-admin fork of the unstamped seeded agent must succeed"
+    )
