@@ -22,10 +22,7 @@ import structlog
 from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
-from daimon.adapters.mcp.tools._ctx import (
-    _auth,  # pyright: ignore[reportPrivateUsage]
-    _require_admin,  # pyright: ignore[reportPrivateUsage]
-)
+from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
 from daimon.core.broker import dispatch_mint_token
 from daimon.core.broker.errors import NoBindingError, ProviderConfigError
 from daimon.core.errors import StoreError
@@ -101,7 +98,6 @@ async def _self_write_file_impl(
     key: str,
     content: str,
 ) -> AgentFileRow:
-    _require_admin(auth)
     agent_id = _require_agent_id(auth)
     try:
         async with runtime.session_factory.begin() as session:
@@ -167,7 +163,6 @@ async def _self_delete_file_impl(
     *,
     key: str,
 ) -> dict[str, object]:
-    _require_admin(auth)
     agent_id = _require_agent_id(auth)
     # delete_agent_file is silently idempotent at the store layer (Pitfall 2).
     async with runtime.session_factory.begin() as session:
@@ -195,7 +190,6 @@ async def _set_repo_binding_impl(
     write → best-effort old vault credential delete. Vault upload happens
     BEFORE the DB write so a vault failure leaves no binding row.
     """
-    _require_admin(auth)
     agent_id = _require_agent_id(auth)
 
     # 1. Mint plaintext PAT via the broker. Deliberately does NOT opt into the
@@ -342,7 +336,6 @@ async def _clear_repo_binding_impl(
     auth: AuthIdentity,
 ) -> dict[str, bool]:
     """Remove the binding. Idempotent and tolerant of vault delete failure."""
-    _require_admin(auth)
     agent_id = _require_agent_id(auth)
 
     # Read the binding to capture the vault ref for best-effort cleanup.
@@ -407,7 +400,7 @@ async def _clear_repo_binding_impl(
 def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     """Register the 7 self-edit tools (4 file tools + 3 repo-binding tools)."""
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def self_write_file(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         key: str,
@@ -434,7 +427,7 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """List all keys + metadata for files in your private agent_files namespace."""
         return await _self_list_files_impl(runtime, await _auth(ctx))
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def self_delete_file(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         key: str,
@@ -442,7 +435,7 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """Delete a per-agent file by `key`. Idempotent — succeeds whether or not a file existed."""
         return await _self_delete_file_impl(runtime, await _auth(ctx), key=key)
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def set_repo_binding(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         repo_url: str,
@@ -469,7 +462,7 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """Return the current repo binding for your agent, or null if unbound."""
         return await _get_repo_binding_impl(runtime, await _auth(ctx))
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def clear_repo_binding(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
     ) -> dict[str, bool]:
