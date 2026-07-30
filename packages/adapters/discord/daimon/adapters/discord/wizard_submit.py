@@ -20,10 +20,15 @@ Three things are load-bearing about `callback`'s shape:
    "submitted". `DaimonBot._spawn` gives the turn its own tracked
    background task with its own failure logging instead.
 
-2. **The claim is one predicated UPDATE statement, not a read-then-write.**
-   `try_claim_submit`'s own row lock is what makes two concurrent Submit
-   taps produce exactly one winner -- the loser's WHERE clause simply
-   matches zero rows. No advisory lock, no read-your-own-write race window.
+2. **The claim is one predicated UPDATE statement, not a read-then-write,
+   and the spawn follows it immediately.** `try_claim_submit`'s own row lock
+   is what makes two concurrent Submit taps produce exactly one winner --
+   the loser's WHERE clause simply matches zero rows. No advisory lock, no
+   read-your-own-write race window. The claim is also irreversible, which is
+   why nothing that can fail is allowed between it and the spawn: the
+   collapse re-render runs AFTER the hand-off and swallows its own
+   `HTTPException`, so a transient Discord failure on a cosmetic edit can
+   never consume a submission without running the turn it claimed.
 
 3. **The collapsed screen carries no interactive components.** Once a row's
    status flips to submitted, `to_screen` returns the collapsed screen
@@ -186,24 +191,31 @@ class WizardSubmitButton(
                     now=now,
                 )
 
+            if claimed is not None:
+                # The claim is the point of no return, so the turn it paid
+                # for is handed off IMMEDIATELY after it -- nothing that can
+                # fail may sit between the two. A concurrent tap that lost
+                # the claim spawns nothing: a second turn here would be a
+                # second billed turn.
+                bot._spawn(  # pyright: ignore[reportPrivateUsage]  # DaimonBot's tracked fire-and-forget helper; see module docstring point 1 for why the turn must never be awaited here
+                    run_wizard_submit_turn(
+                        bot=bot, interaction=interaction, row=claimed, spec=spec, state=submitted
+                    )
+                )
+
             # Collapse to the read-only, button-free summary regardless of
             # who won the claim -- see the module docstring, point 2. Both a
             # winning and a losing concurrent tapper must see the SAME
-            # consistent, submitted-looking result.
-            await interaction.edit_original_response(
-                view=build_wizard_view(to_screen(spec, submitted))
-            )
-
-            if claimed is None:
-                # A concurrent tap already claimed this submission -- a
-                # second turn here would be a second billed turn.
-                return
-
-            bot._spawn(  # pyright: ignore[reportPrivateUsage]  # DaimonBot's tracked fire-and-forget helper; see module docstring point 1 for why the turn must never be awaited here
-                run_wizard_submit_turn(
-                    bot=bot, interaction=interaction, row=claimed, spec=spec, state=submitted
+            # consistent, submitted-looking result. Purely cosmetic, and
+            # caught here rather than at the callback's outer boundary: the
+            # row is already claimed, so the outer handler's "please try
+            # again" would invite a retry that can only ever be rejected.
+            try:
+                await interaction.edit_original_response(
+                    view=build_wizard_view(to_screen(spec, submitted))
                 )
-            )
+            except discord.HTTPException:
+                _log.exception("wizard_submit.collapse_edit_failed", short_id=row.id)
         except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own dispatcher swallows anything raised here
             _log.exception("wizard_submit.callback_failed", err_type=type(err).__name__)
             await _reply_or_followup(interaction, _CALLBACK_FAILED)

@@ -256,7 +256,7 @@ async def test_submit_by_a_non_requester_is_rejected_writes_nothing_spawns_nothi
 # --- ordering --------------------------------------------------------------------
 
 
-async def test_defer_precedes_the_claim_write_and_the_spawn(
+async def test_defer_precedes_the_spawn_which_precedes_the_collapse_edit(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     row = await _seed(db_session_factory, current_step=1)
@@ -268,7 +268,38 @@ async def test_defer_precedes_the_claim_write_and_the_spawn(
     assert await item.interaction_check(interaction) is True
     await item.callback(interaction)
 
-    assert call_order == ["defer", "edit", "spawn"], (
-        "the acknowledgement must land before the claim's collapsed re-render, which must "
-        "land before the turn is handed to the tracked background task"
+    assert call_order == ["defer", "spawn", "edit"], (
+        "the acknowledgement must land first, and the claimed turn must be handed to the "
+        "tracked background task before the cosmetic collapsed re-render -- nothing that "
+        "can fail may sit between the irreversible claim and the hand-off"
     )
+
+
+async def test_a_failing_collapse_edit_still_spawns_the_claimed_turn(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The claim is irreversible: once it commits, the user can never
+    resubmit, so a transient Discord failure on the purely cosmetic collapse
+    re-render must not cost them the turn they already paid for."""
+    row = await _seed(db_session_factory, current_step=1)
+    call_order: list[str] = []
+    bot = _fake_bot(db_session_factory, call_order)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot, call_order=call_order)
+    interaction.edit_original_response = AsyncMock(
+        side_effect=discord.HTTPException(MagicMock(status=500, reason="Server Error"), "boom")
+    )
+
+    item = await WizardSubmitButton.from_custom_id(interaction, MagicMock(), _submit_match(row.id))
+    assert await item.interaction_check(interaction) is True
+    await item.callback(interaction)
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after is not None
+    assert after.status == "submitted", "the claim still commits when the re-render fails"
+
+    assert len(bot.spawned) == 1, (
+        "a failed collapse edit must not prevent the claimed turn from being spawned"
+    )
+    interaction.followup.send.assert_not_awaited()
+    interaction.response.send_message.assert_not_awaited()
