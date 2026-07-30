@@ -12,8 +12,9 @@ ORM access for test setup.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
     BetaManagedAgentsSpanModelUsage,
@@ -42,6 +43,9 @@ from daimon.core.stores import (
     thread_sessions,
     usage_events,
 )
+from daimon.core.stores import (
+    wizard_session as wizard_session_store,
+)
 from daimon.core.stores.agent_memory_stores import insert_memory_store
 from daimon.core.stores.domain import (
     AccountRow,
@@ -60,8 +64,11 @@ from daimon.core.stores.domain import (
     TenantUserCapRow,
     ThreadSessionRow,
     UsageEventRow,
+    WizardSessionRow,
 )
 from daimon.core.stores.tenant_ledger import insert_entry
+from daimon.core.wizard.spec import Option, Step, StepKind, WizardSpec
+from daimon.core.wizard.state import new_short_id
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -470,3 +477,57 @@ async def make_mcp_token(
     row = await mcp_tokens.get_mcp_token(session, jti=jti)
     assert row is not None, "create_mcp_token_row must leave a resolvable row"
     return row
+
+
+async def make_wizard_session(
+    session: AsyncSession,
+    *,
+    tenant: TenantRow | None = None,
+    account: AccountRow | None = None,
+    short_id: str | None = None,
+    requester_platform_user_id: str = "U_WIZ",
+    channel_id: str | None = None,
+    message_id: str | None = None,
+    spec: dict[str, Any] | None = None,
+    answers: dict[str, list[str]] | None = None,
+    current_step: int = 0,
+    status: str = "open",
+    expires_at: datetime | None = None,
+    now: datetime | None = None,
+) -> WizardSessionRow:
+    """Insert a wizard_session row via `wizard_session.create_wizard_session`."""
+    tenant = tenant or await make_tenant(session)
+    account = account or await make_account(session, tenant=tenant)
+    short_id = short_id or new_short_id()
+    channel_id = channel_id if channel_id is not None else f"chan-{uuid.uuid4().hex[:8]}"
+    message_id = message_id if message_id is not None else f"msg-{uuid.uuid4().hex[:8]}"
+    now = now if now is not None else datetime.now(UTC)
+    expires_at = expires_at if expires_at is not None else now + timedelta(hours=1)
+    if spec is None:
+        default_spec = WizardSpec(
+            prompt="Pick one",
+            steps=[
+                Step(
+                    key="choice",
+                    question="Pick an option",
+                    kind=StepKind.CHOICE,
+                    options=[Option(label="A", value="a"), Option(label="B", value="b")],
+                )
+            ],
+        )
+        spec = default_spec.model_dump(mode="json")
+    return await wizard_session_store.create_wizard_session(
+        session,
+        short_id=short_id,
+        tenant_id=tenant.id,
+        account_id=account.id,
+        requester_platform_user_id=requester_platform_user_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        spec=spec,
+        answers=answers if answers is not None else {},
+        current_step=current_step,
+        status=status,
+        expires_at=expires_at,
+        now=now,
+    )
