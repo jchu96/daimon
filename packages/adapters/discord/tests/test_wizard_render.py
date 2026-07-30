@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import discord
 import pytest
 from daimon.adapters.discord.wizard_render import build_wizard_view
+from daimon.core.wizard.apply import apply
 from daimon.core.wizard.render import to_screen
 from daimon.core.wizard.spec import Option, Step, StepKind, WizardSpec
 from daimon.core.wizard.state import (
     NAV_CUSTOM_ID_PATTERN,
     SELECT_CUSTOM_ID_PATTERN,
     SUBMIT_CUSTOM_ID_PATTERN,
+    ActionKind,
+    WizardAction,
     WizardState,
 )
 
@@ -132,8 +137,6 @@ def test_image_with_only_a_handle_and_no_url_renders_no_gallery() -> None:
 def test_collapsed_screen_renders_no_action_rows_at_all() -> None:
     spec = _choice_spec()
     state = WizardState(short_id=_SHORT_ID, current_step=1, answers={"colour": ["red"]})
-    from daimon.core.wizard.apply import apply
-    from daimon.core.wizard.state import ActionKind, WizardAction
 
     submitted = apply(state, spec, WizardAction(kind=ActionKind.SUBMIT))
     screen = to_screen(spec, submitted)
@@ -151,9 +154,9 @@ def test_collapsed_screen_renders_no_action_rows_at_all() -> None:
     [_choice_spec, _multi_spec],
 )
 def test_has_components_v2_is_true_for_every_produced_view(
-    spec_factory: object,
+    spec_factory: Callable[[], WizardSpec],
 ) -> None:
-    spec = spec_factory()  # type: ignore[operator]  # parametrized factory callables
+    spec = spec_factory()
     screen = to_screen(spec, WizardState(short_id=_SHORT_ID))
 
     view = build_wizard_view(screen)
