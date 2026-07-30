@@ -645,6 +645,74 @@ def _terminal_embed(edits: list[tuple[Any, dict[str, Any]]]) -> discord.Embed:
     raise AssertionError("no terminal embed was flushed")
 
 
+class TestWasAnswered:
+    async def test_was_answered_is_false_when_no_terminal_hook_called(
+        self,
+    ) -> None:
+        """A lifecycle that never reached a terminal hook has not answered."""
+        lc, _sends, _edits = _make_lifecycle()
+
+        assert lc.was_answered is False, (
+            "a lifecycle with no terminal hook called must not report an answer"
+        )
+
+    async def test_was_answered_is_true_when_terminal_success_produces_final_text(self) -> None:
+        """A real text answer marks the turn as answered."""
+        lc, _sends, _edits = _make_lifecycle()
+        await lc.on_sse_event(_thinking_event())
+
+        state = TurnState(content=[TextBlock(kind="text", text="Hello response")])
+        await lc.on_terminal_success(state)
+
+        assert lc.was_answered is True, "a turn that produced final text must report an answer"
+
+    async def test_was_answered_is_true_when_terminal_success_has_tool_only_ending(self) -> None:
+        """Tool activity with no final text still counts as answered, and must
+        not be confused with a cancellation."""
+        lc, _sends, edits = _make_lifecycle()
+        await lc.on_sse_event(_thinking_event())
+
+        state = TurnState(
+            content=[
+                TextBlock(kind="text", text="I'll run that."),
+                ToolUseBlock(
+                    kind="tool_use", id="tu_1", type="agent.tool_use", name="bash", input={}
+                ),
+            ]
+        )
+        await lc.on_terminal_success(state)
+
+        assert lc.was_answered is True, "visible tool activity must report an answer"
+        assert all(e[1].get("content") != "Turn cancelled." for e in edits), (
+            "a turn with tool activity must not be rendered as a cancellation"
+        )
+
+    async def test_was_answered_is_false_when_terminal_success_has_empty_content(self) -> None:
+        """A cancelled turn -- no text, no tool activity -- must not report an
+        answer, and the rendered message must agree."""
+        lc, _sends, edits = _make_lifecycle()
+        await lc.on_sse_event(_thinking_event())
+
+        state = TurnState()  # completely empty content
+        await lc.on_terminal_success(state)
+
+        assert lc.was_answered is False, "a cancelled turn must not report an answer"
+        cancel_edit = edits[-1]
+        assert cancel_edit[1].get("content") == "Turn cancelled.", (
+            "a cancelled turn must render as 'Turn cancelled.'"
+        )
+
+    async def test_was_answered_is_false_when_terminal_failure(self) -> None:
+        """A failed turn must not report an answer."""
+        lc, _sends, _edits = _make_lifecycle()
+        await lc.on_sse_event(_thinking_event())
+
+        state = TurnState()
+        await lc.on_terminal_failure(state, Exception("boom"))
+
+        assert lc.was_answered is False, "a failed turn must not report an answer"
+
+
 class TestTurnSummaryFooter:
     async def test_priced_model_sets_cost_str(self) -> None:
         lc, _sends, edits = _make_lifecycle(model_id="claude-sonnet-4-6")
