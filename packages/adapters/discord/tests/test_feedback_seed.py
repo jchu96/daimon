@@ -10,6 +10,7 @@ inline what each file needs).
 
 from __future__ import annotations
 
+import re
 import types
 import uuid
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import httpx
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
 from anthropic.types.beta.beta_cloud_config import BetaCloudConfig
@@ -39,6 +41,7 @@ from daimon.core.stores import tenant_ledger
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.state import TextBlock, TurnState
 from daimon.testing.factories import make_tenant
+from daimon.testing.ma import MARouter, build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # --- unit tests: the helper alone -------------------------------------------
@@ -140,37 +143,52 @@ def _make_fake_session(session_id: str = "sess_test") -> BetaManagedAgentsSessio
     )
 
 
-def _make_fake_agent(name: str = "test-agent") -> BetaManagedAgentsAgent:
-    return BetaManagedAgentsAgent(
-        id="ag_test",
-        version=1,
-        name=name,
-        type="agent",
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
-        created_at=datetime(2026, 4, 28, tzinfo=UTC),
-        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
-        mcp_servers=[],
-        metadata={},
-        skills=[],
-        tools=[],
-    )
+def _build_ma_router() -> MARouter:
+    """Serve the agent/environment retrieves admission makes, transport-level.
 
+    A method-level `AsyncMock` on `client.beta.*` would accept any kwargs and
+    silently absorb SDK-signature drift, which is why the testing guideline
+    bans it; routing real Beta models through `httpx.MockTransport` runs the
+    SDK's own parameter validation and response parsing in every test.
+    """
 
-def _make_fake_environment(name: str = "test-env") -> BetaEnvironment:
-    return BetaEnvironment(
-        id="env_test",
-        name=name,
-        type="environment",
-        config=BetaCloudConfig(
-            type="cloud",
-            networking=BetaUnrestrictedNetwork(type="unrestricted"),
-            packages=BetaPackages(apt=[], cargo=[], gem=[], go=[], npm=[], pip=[]),
-        ),
-        created_at="2026-04-28T00:00:00Z",
-        updated_at="2026-04-28T00:00:00Z",
-        description="",
-        metadata={},
-    )
+    def _retrieve_agent(_request: httpx.Request, _match: re.Match[str]) -> httpx.Response:
+        agent = BetaManagedAgentsAgent(
+            id="ag_test",
+            version=1,
+            name="test-agent",
+            type="agent",
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
+            created_at=datetime(2026, 4, 28, tzinfo=UTC),
+            updated_at=datetime(2026, 4, 28, tzinfo=UTC),
+            mcp_servers=[],
+            metadata={},
+            skills=[],
+            tools=[],
+        )
+        return httpx.Response(200, json=agent.model_dump(mode="json"))
+
+    def _retrieve_environment(_request: httpx.Request, _match: re.Match[str]) -> httpx.Response:
+        environment = BetaEnvironment(
+            id="env_test",
+            name="test-env",
+            type="environment",
+            config=BetaCloudConfig(
+                type="cloud",
+                networking=BetaUnrestrictedNetwork(type="unrestricted"),
+                packages=BetaPackages(apt=[], cargo=[], gem=[], go=[], npm=[], pip=[]),
+            ),
+            created_at="2026-04-28T00:00:00Z",
+            updated_at="2026-04-28T00:00:00Z",
+            description="",
+            metadata={},
+        )
+        return httpx.Response(200, json=environment.model_dump(mode="json"))
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents/[^/]+", _retrieve_agent)
+    router.add("GET", r"/v1/environments/[^/]+", _retrieve_environment)
+    return router
 
 
 def _make_turn_deps(
@@ -199,9 +217,7 @@ def _make_runtime(sessionmaker: async_sessionmaker[AsyncSession]) -> DiscordRunt
     discord_settings = MagicMock()
     discord_settings.max_concurrent_turns_per_tenant = 100
     settings.discord = discord_settings
-    anthropic = AsyncMock()
-    anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())
-    anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
+    anthropic = build_stub_anthropic(_build_ma_router().dispatch)
     resolver_cache = new_resolver_cache()
     deployment_default = DeploymentDefault()
     return DiscordRuntime(
