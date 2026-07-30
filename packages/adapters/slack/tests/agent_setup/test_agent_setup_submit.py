@@ -846,7 +846,8 @@ async def test_run_edit_agent_submission_when_non_admin_and_reachable_refused(
         extra={"model": None, "system": "Attempted change."},
     )
 
-    assert calls == [], "a refused edit must never reach the MA"
+    writes = [c for c in calls if c[0] != "GET"]
+    assert writes == [], "a refused edit must never write to the MA"
 
     texts = _ephemeral_texts(client_fake)
     assert len(texts) == 1, "exactly one ephemeral should be posted on refusal"
@@ -1023,7 +1024,8 @@ async def test_run_add_mcp_submission_when_non_admin_and_reachable_refused(
         },
     )
 
-    assert calls == [], "a refused add-mcp must never reach the MA"
+    writes = [c for c in calls if c[0] != "GET"]
+    assert writes == [], "a refused add-mcp must never write to the MA"
 
     texts = _ephemeral_texts(client_fake)
     assert len(texts) == 1, "exactly one ephemeral should be posted on refusal"

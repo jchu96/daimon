@@ -1,9 +1,11 @@
 """Tests for daimon.adapters.slack.agent_setup.gate.
 
-Covers refuse_if_reachable_and_not_admin's three behaviors:
+Covers refuse_if_reachable_and_not_admin's four behaviors:
   - admin caller -> proceed, no DB session opened
   - non-admin + unreachable agent -> proceed, no ephemeral posted
   - non-admin + reachable agent -> refused, exactly one ephemeral posted
+  - any caller, including an admin, against a defaults-managed agent ->
+    refused, pointing at forking as the editable path
 
 All cases use a real Postgres schema (db_session_factory) + the
 transport-level FakeSlackWebClient from conftest (no AsyncMock on
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -22,8 +25,14 @@ import httpx
 import pytest
 import yarl
 from aioresponses import aioresponses as AioResponsesMock
+from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.slack.agent_setup.gate import refuse_if_reachable_and_not_admin
 from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.core.defaults.metadata import (
+    MA_METADATA_KEY_MANAGED,
+    MA_METADATA_KEY_NAME,
+    MA_METADATA_KEY_TENANT,
+)
 from daimon.testing.factories import make_tenant, make_tenant_config
 from daimon.testing.ma import build_fake_anthropic, make_fake_ma_handler
 from slack_sdk.web.async_client import AsyncWebClient
@@ -216,3 +225,93 @@ async def test_refuse_if_reachable_and_not_admin_when_non_admin_and_reachable_re
         assert "workspace-admin" in body.get("text", ""), (
             "ephemeral should name why the action was refused"
         )
+
+
+def _seeded_agent_handler(
+    *, tenant_id: uuid.UUID, agent_name: str
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Serve a single defaults-managed agent from the agent-list endpoint."""
+    payload = BetaManagedAgentsAgent(
+        id="agent_seeded_0000000000",
+        type="agent",
+        name=agent_name,
+        model={"id": "claude-sonnet-5"},  # type: ignore[arg-type]
+        metadata={
+            MA_METADATA_KEY_TENANT: str(tenant_id),
+            MA_METADATA_KEY_NAME: agent_name,
+            MA_METADATA_KEY_MANAGED: "true",
+        },
+        description=None,
+        archived_at=None,
+        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
+        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
+        version=1,
+        mcp_servers=[],
+        skills=[],
+        tools=[],
+        system=None,
+    ).model_dump(mode="json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return httpx.Response(200, json={"data": [payload], "has_more": False})
+        return httpx.Response(404, json={"error": {"message": "unexpected route"}})
+
+    return handler
+
+
+async def test_gate_refuses_a_workspace_admin_editing_the_defaults_managed_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A defaults-managed agent is off-limits to everyone, admins included.
+
+    Editing one from the panel never stamps the reconciler's spec hash, so the
+    edit would survive every later reconcile and drift the agent from the
+    shipped defaults permanently. The admin short-circuit must not reach it.
+    """
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await session.commit()
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _build_runtime(db_session_factory)
+        object.__setattr__(
+            runtime,
+            "anthropic",
+            build_fake_anthropic(
+                _seeded_agent_handler(tenant_id=tenant.id, agent_name=_AGENT_NAME)
+            ),
+        )
+
+        refused = await refuse_if_reachable_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+        )
+
+        assert refused is True, (
+            "an admin must still be refused against the workspace's built-in agent"
+        )
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        matches = mock.requests.get(post_key, [])
+        assert len(matches) == 1, f"expected exactly one ephemeral, got {len(matches)}"
+
+        _, kwargs = matches[0]
+        text = (kwargs.get("json") or {}).get("text", "")
+        assert "built-in agent" in text, "ephemeral should say the agent is built in"
+        assert "Fork" in text, "ephemeral should point at forking as the editable path"
