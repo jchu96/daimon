@@ -46,6 +46,7 @@ from daimon.adapters.mcp.tools import (
     time,
     vault,
 )
+from daimon.adapters.mcp.tools.agent_removal import register_agent_removal_tools
 from daimon.adapters.mcp.tools.channels import register_channel_tools
 from daimon.adapters.mcp.tools.cli_token import register_cli_token_tool
 from daimon.adapters.mcp.tools.credential_requests import register_credential_request_tools
@@ -257,6 +258,7 @@ def create_mcp_app(
         fernet=fernet,
     )
     agents.register_agent_tools(mcp, runtime)
+    register_agent_removal_tools(mcp, runtime)
     environments.register_environment_tools(mcp, runtime)
     vault.register_vault_tools(mcp, runtime)
     register_credential_request_tools(mcp, runtime)

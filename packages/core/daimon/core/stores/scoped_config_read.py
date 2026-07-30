@@ -16,6 +16,7 @@ from daimon.core.scope import (
     TenantConfigRow,
     UserConfigRow,
     UserScopeRef,
+    is_agent_reachable,
     merge,
 )
 from sqlalchemy import select
@@ -89,6 +90,24 @@ async def list_propagations_for_tenant(
         for ch in ch_orms
     ]
     return tenant_row, ch_rows
+
+
+async def is_agent_reachable_in_tenant(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent_name: str,
+    default: DeploymentDefault,
+) -> bool:
+    """Shell half of the reachability rule: answer for one tenant from the DB.
+
+    Reads the tenant's config rows via `list_propagations_for_tenant` and feeds
+    them straight into the pure `is_agent_reachable` predicate. Callers that
+    already hold the config rows in memory (the Discord panel's cascade view)
+    should call the pure predicate directly instead of paying for this read.
+    """
+    tenant_row, channel_rows = await list_propagations_for_tenant(session, tenant_id=tenant_id)
+    return is_agent_reachable(agent_name, tenant=tenant_row, channels=channel_rows, default=default)
 
 
 async def _fetch_user(session: AsyncSession, *, account_id: uuid.UUID) -> UserConfigRow | None:

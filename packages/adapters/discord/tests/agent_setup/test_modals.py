@@ -51,11 +51,14 @@ from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
-def _entry(name: str, *, mcp_servers: list[Any] | None = None) -> RosterEntry:
+def _entry(
+    name: str, *, mcp_servers: list[Any] | None = None, is_system: bool = False
+) -> RosterEntry:
     return RosterEntry(
         name=name,
         model="claude-sonnet-4-6",
         spec=AgentSpec(name=name, model="claude-sonnet-4-6", mcp_servers=mcp_servers),
+        is_system=is_system,
     )
 
 
@@ -69,6 +72,7 @@ def _runtime_for_view(
     public_url: HttpUrl | None = _DEFAULT_PUBLIC_URL,
     sessionmaker: Any = None,
     crypto_keys: tuple[str, ...] = (),
+    deployment_default: DeploymentDefault | None = None,
 ) -> DiscordRuntime:
     settings = MagicMock()
     # Real McpSettings so the app_root_url property (strips /mcp) computes for real.
@@ -89,19 +93,29 @@ def _runtime_for_view(
         sessionmaker=sessionmaker if sessionmaker is not None else MagicMock(),
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
-        deployment_default=DeploymentDefault(),
+        deployment_default=deployment_default
+        if deployment_default is not None
+        else DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
 
-def _interaction(user_id: int = 42) -> MagicMock:
+def _interaction(user_id: int = 42, *, is_admin: bool = True, guild_id: int = 12345) -> MagicMock:
+    """A discord.Interaction stand-in, a live guild admin by default so the
+    write-callback's authz gate short-circuits without a DB read. Tests
+    proving the reachable/system-agent refusal pass ``is_admin=False``."""
     interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = user_id
+    interaction.user.guild_permissions.administrator = is_admin
+    interaction.user.guild_permissions.manage_guild = False
     interaction.response.defer = AsyncMock()
     interaction.response.send_message = AsyncMock()
     interaction.response.send_modal = AsyncMock()
     interaction.response.edit_message = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)
     interaction.followup.send = AsyncMock()
     interaction.edit_original_response = AsyncMock()
     return interaction
@@ -2007,4 +2021,199 @@ def test_repo_auth_modal_field_labels_fit_discord_limits(
             )
     assert "GitHub MCP" in modal.pat_in.label, (
         "the token field's label must mention the GitHub MCP server"
+    )
+
+
+# ----- 13. Click-time authz gate on the spec-mutating write callbacks -------
+#
+# AgentSectionModal and AddSkillModal each carry a write to the agent spec
+# (system/model, skills). A non-admin caller must be refused at submit time
+# when the target is currently reachable or is a system agent — the guard is
+# re-derived from live state, never from any render-time snapshot.
+# RepoAuthModal is deliberately NOT gated (a per-agent attachment, not part
+# of the spec).
+
+
+@pytest.mark.asyncio
+async def test_agent_section_modal_refuses_write_when_target_is_reachable_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from daimon.testing.factories import make_tenant
+
+    reconcile_calls: list[str] = []
+
+    async def spy_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        reconcile_calls.append("called")
+        return MagicMock()
+
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", spy_reconcile)
+
+    guild_id = 910001
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry("a")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=uuid.uuid4(),
+        sessionmaker=db_session_factory,
+        deployment_default=DeploymentDefault(agent_name="a"),
+    )
+
+    modal = AgentSectionModal(state, runtime=runtime, allowed_user_id=42)
+    modal.model_in._value = "claude-sonnet-4-6"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    assert reconcile_calls == [], "reconcile must not run when the write is refused"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_section_modal_refuses_write_on_system_agent_even_for_admin(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    reconcile_calls: list[str] = []
+
+    async def spy_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        reconcile_calls.append("called")
+        return MagicMock()
+
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", spy_reconcile)
+
+    selected = _entry("daimon", is_system=True)
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = AgentSectionModal(state, runtime=runtime, allowed_user_id=42)
+    modal.model_in._value = "claude-sonnet-4-6"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=True)
+    await modal.on_submit(interaction)
+
+    assert reconcile_calls == [], "a system agent's spec must never be reconciled from the panel"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_add_skill_modal_refuses_write_when_target_is_reachable_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from daimon.testing.factories import make_tenant
+
+    async def unexpected_kickoff(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("skill sync must not be kicked off when the write is refused")
+
+    monkeypatch.setattr(modals_mod, "kick_off_skill_sync", unexpected_kickoff)
+
+    guild_id = 910002
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry("research-bot")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=uuid.uuid4(),
+        sessionmaker=db_session_factory,
+        deployment_default=DeploymentDefault(agent_name="research-bot"),
+    )
+
+    modal = AddSkillModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/skills-repo"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    assert state.pending_skill_repo_urls == [], (
+        "a refused submit must leave no pending-skill marker on the panel"
+    )
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_add_skill_modal_refuses_write_on_system_agent_even_for_admin(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    async def unexpected_kickoff(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("skill sync must not be kicked off when the write is refused")
+
+    monkeypatch.setattr(modals_mod, "kick_off_skill_sync", unexpected_kickoff)
+
+    selected = _entry("daimon", is_system=True)
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = AddSkillModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/skills-repo"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=True)
+    await modal.on_submit(interaction)
+
+    assert state.pending_skill_repo_urls == [], (
+        "a system agent's skills must never gain a pending-skill marker from the panel"
+    )
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_modal_still_writes_binding_on_reachable_system_agent_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """The repo binding is a per-agent attachment, never part of the agent
+    spec — the new click-time gate must not reach this path even
+    for a reachable system agent edited by a non-admin."""
+    set_binding_called = False
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        return True
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("daimon", is_system=True)
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    sm = MagicMock()
+    sm.begin.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    sm.begin.return_value.__aexit__ = AsyncMock(return_value=False)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=tenant_id,
+        sessionmaker=sm,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/public-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False)
+    await modal.on_submit(interaction)
+
+    assert set_binding_called, (
+        "repo binding must still write on a reachable system agent for a non-admin caller"
     )

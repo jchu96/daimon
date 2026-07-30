@@ -135,7 +135,8 @@ def test_build_l1_view_admin_includes_roster_select_block() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_l1_view_non_admin_omits_lifecycle_actions() -> None:
+def test_build_l1_view_non_admin_includes_new_fork_edit_but_not_delete() -> None:
+    """Non-admin view keeps the lifecycle block but omits Delete."""
     state = _roster_state("agent-a", "agent-b")
     view = build_l1_view(
         state,
@@ -146,9 +147,38 @@ def test_build_l1_view_non_admin_omits_lifecycle_actions() -> None:
         scope_hint="_(no default set)_",
     )
     block_ids = _block_ids(view)
-    assert "agent_setup__lifecycle_actions" not in block_ids, (
-        "non-admin view must NOT include agent_setup__lifecycle_actions (omission contract)"
+    assert "agent_setup__lifecycle_actions" in block_ids, (
+        "non-admin view must still include agent_setup__lifecycle_actions (New/Fork/Edit)"
     )
+
+    lifecycle_block = next(
+        b for b in view["blocks"] if b.get("block_id") == "agent_setup__lifecycle_actions"
+    )
+    action_ids = [e.get("action_id") for e in lifecycle_block["elements"]]
+    assert "agent_setup__new" in action_ids, "non-admin lifecycle row must include New"
+    assert "agent_setup__fork" in action_ids, "non-admin lifecycle row must include Fork"
+    assert "agent_setup__edit" in action_ids, "non-admin lifecycle row must include Edit"
+    assert "agent_setup__delete" not in action_ids, (
+        "non-admin lifecycle row must NOT include Delete (admin-only)"
+    )
+
+
+def test_build_l1_view_admin_lifecycle_includes_delete() -> None:
+    """Admin view's lifecycle row carries Delete alongside New/Fork/Edit."""
+    state = _roster_state("agent-a")
+    view = build_l1_view(
+        state,
+        is_admin=True,
+        team_id="T123",
+        channel_id="C456",
+        selected_agent_name="agent-a",
+        scope_hint="_(no default set)_",
+    )
+    lifecycle_block = next(
+        b for b in view["blocks"] if b.get("block_id") == "agent_setup__lifecycle_actions"
+    )
+    action_ids = [e.get("action_id") for e in lifecycle_block["elements"]]
+    assert "agent_setup__delete" in action_ids, "admin lifecycle row must include Delete"
 
 
 def test_build_l1_view_non_admin_omits_scope_actions() -> None:
@@ -164,6 +194,43 @@ def test_build_l1_view_non_admin_omits_scope_actions() -> None:
     block_ids = _block_ids(view)
     assert "agent_setup__scope_actions" not in block_ids, (
         "non-admin view must NOT include agent_setup__scope_actions (omission contract)"
+    )
+
+
+def test_build_l1_view_non_admin_has_no_scope_action_ids_anywhere() -> None:
+    """No `agent_setup__scope:*` action id anywhere in a non-admin payload."""
+    state = _roster_state("agent-a")
+    view = build_l1_view(
+        state,
+        is_admin=False,
+        team_id="T123",
+        channel_id="C456",
+        selected_agent_name="agent-a",
+        scope_hint="_(no default set)_",
+    )
+    serialized = json.dumps(view)
+    assert "agent_setup__scope:" not in serialized, (
+        "non-admin payload must contain no agent_setup__scope:* action id anywhere"
+    )
+
+
+def test_build_l1_view_non_admin_empty_roster_invites_creating_first_agent() -> None:
+    """Zero-agents copy is audience-neutral -- New is unconditional now."""
+    state = AgentSetupState(rows=[], over_cap_count=0)
+    view = build_l1_view(
+        state,
+        is_admin=False,
+        team_id="T123",
+        channel_id="C456",
+        selected_agent_name=None,
+        scope_hint="_(no default set)_",
+    )
+    serialized = json.dumps(view)
+    assert "No agents yet" in serialized, (
+        "empty-roster copy must invite creating the first agent for every viewer"
+    )
+    assert "have been set up for this workspace yet" not in serialized, (
+        "the old admin-only-creation copy must not appear for a non-admin"
     )
 
 
@@ -246,6 +313,7 @@ def test_build_l2_view_active_skills_tab_has_primary_style() -> None:
         team_id="T123",
         channel_id="C456",
         is_admin=True,
+        can_edit_spec=True,
         section_blocks=[],
     )
     # Find the section_tabs actions block
@@ -273,6 +341,7 @@ def test_build_l2_view_inactive_tabs_have_no_primary_style() -> None:
         team_id="T123",
         channel_id="C456",
         is_admin=True,
+        can_edit_spec=True,
         section_blocks=[],
     )
     tabs_block = next(
@@ -301,6 +370,7 @@ def test_build_l2_view_active_agent_tab_has_primary_style() -> None:
         team_id="T123",
         channel_id="C456",
         is_admin=True,
+        can_edit_spec=True,
         section_blocks=[],
     )
     tabs_block = next(
@@ -328,6 +398,7 @@ def test_build_l2_view_private_metadata_under_3000_chars() -> None:
         team_id="T" + "0" * 10,
         channel_id="C" + "0" * 10,
         is_admin=True,
+        can_edit_spec=True,
         section_blocks=[],
     )
     pm = view["private_metadata"]
@@ -341,6 +412,7 @@ def test_build_l2_view_private_metadata_has_no_tenant_id() -> None:
         team_id="T123",
         channel_id="C456",
         is_admin=False,
+        can_edit_spec=False,
         section_blocks=[],
     )
     pm = json.loads(view["private_metadata"])
@@ -357,7 +429,6 @@ def test_secrets_section_renders_key_names_as_chips_when_names_provided() -> Non
     blocks = build_secrets_section(
         agent_name="my-agent",
         secret_names=["XERO_API_KEY", "TOGGL_TOKEN"],
-        is_admin=True,
     )
     serialized = json.dumps(blocks)
     assert "XERO_API_KEY" in serialized, (
@@ -372,7 +443,6 @@ def test_secrets_section_never_renders_fictional_secret_value() -> None:
     blocks = build_secrets_section(
         agent_name="my-agent",
         secret_names=["XERO_API_KEY", "TOGGL_TOKEN"],
-        is_admin=True,
     )
     serialized = json.dumps(blocks)
     assert sentinel_value not in serialized, (
@@ -386,7 +456,6 @@ def test_secrets_section_empty_names_renders_empty_state() -> None:
     blocks = build_secrets_section(
         agent_name="my-agent",
         secret_names=[],
-        is_admin=True,
     )
     serialized = json.dumps(blocks)
     # The empty state copy is: "_-# + add your first secret_"
@@ -409,29 +478,167 @@ def test_secrets_section_keys_only_no_values_parameter_in_signature() -> None:
     )
 
 
-def test_secrets_section_non_admin_omits_mutation_actions() -> None:
-    """Non-admin secret section omits Add/Remove buttons."""
+def test_secrets_section_always_includes_mutation_actions() -> None:
+    """Secrets are a per-agent attachment: Add/Remove render for every
+    caller, regardless of admin status or reachability -- build_secrets_section
+    takes no is_admin/can_edit_spec parameter at all."""
     blocks = build_secrets_section(
         agent_name="my-agent",
         secret_names=["XERO_API_KEY"],
-        is_admin=False,
-    )
-    block_ids = [b.get("block_id", "") for b in blocks]
-    assert "agent_setup__secrets_actions" not in block_ids, (
-        "non-admin secrets section must not include agent_setup__secrets_actions"
-    )
-
-
-def test_secrets_section_admin_includes_mutation_actions() -> None:
-    """Admin secret section includes Add secrets / Remove secret buttons."""
-    blocks = build_secrets_section(
-        agent_name="my-agent",
-        secret_names=["XERO_API_KEY"],
-        is_admin=True,
     )
     block_ids = [b.get("block_id", "") for b in blocks]
     assert "agent_setup__secrets_actions" in block_ids, (
-        "admin secrets section must include agent_setup__secrets_actions"
+        "secrets section must always include agent_setup__secrets_actions"
+    )
+
+
+def test_repo_auth_section_always_includes_edit_action_id() -> None:
+    """Repo binding is a per-agent attachment: the edit action id
+    renders regardless of admin status or reachability -- build_repo_auth_section
+    takes no is_admin/can_edit_spec parameter at all."""
+    blocks = build_repo_auth_section(repo=None, pat_last4=None)
+    action_ids = [
+        e.get("action_id", "")
+        for block in blocks
+        if block.get("type") == "actions"
+        for e in block.get("elements", [])
+    ]
+    assert "agent_setup__edit_repo_form" in action_ids, (
+        "repo-auth section must always include the edit-repo action id"
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_skills_section / build_mcps_section — can_edit_spec gate
+# ---------------------------------------------------------------------------
+
+
+def test_build_skills_section_can_edit_spec_false_omits_add_and_remove() -> None:
+    blocks = build_skills_section(skill_names=["a-skill"], sync_pending=False, can_edit_spec=False)
+    action_ids = [
+        e.get("action_id", "")
+        for block in blocks
+        if block.get("type") == "actions"
+        for e in block.get("elements", [])
+    ]
+    assert "agent_setup__add_skill" not in action_ids, (
+        "can_edit_spec=False must omit the add-skill action id"
+    )
+    assert "agent_setup__remove_skill" not in action_ids, (
+        "can_edit_spec=False must omit the remove-skill action id"
+    )
+
+
+def test_build_skills_section_can_edit_spec_true_includes_add_and_remove() -> None:
+    blocks = build_skills_section(skill_names=["a-skill"], sync_pending=False, can_edit_spec=True)
+    action_ids = [
+        e.get("action_id", "")
+        for block in blocks
+        if block.get("type") == "actions"
+        for e in block.get("elements", [])
+    ]
+    assert "agent_setup__add_skill" in action_ids, (
+        "can_edit_spec=True must include the add-skill action id"
+    )
+    assert "agent_setup__remove_skill" in action_ids, (
+        "can_edit_spec=True must include the remove-skill action id"
+    )
+
+
+def test_build_mcps_section_can_edit_spec_false_omits_add_and_remove() -> None:
+    mcps = [{"name": "an-mcp", "url": "https://mcp.example.com"}]
+    blocks = build_mcps_section(mcps=mcps, can_edit_spec=False)
+    action_ids = [
+        e.get("action_id", "")
+        for block in blocks
+        if block.get("type") == "actions"
+        for e in block.get("elements", [])
+    ]
+    assert "agent_setup__add_mcp" not in action_ids, (
+        "can_edit_spec=False must omit the add-mcp action id"
+    )
+    assert "agent_setup__remove_mcp" not in action_ids, (
+        "can_edit_spec=False must omit the remove-mcp action id"
+    )
+
+
+def test_build_mcps_section_can_edit_spec_true_includes_add_and_remove() -> None:
+    mcps = [{"name": "an-mcp", "url": "https://mcp.example.com"}]
+    blocks = build_mcps_section(mcps=mcps, can_edit_spec=True)
+    action_ids = [
+        e.get("action_id", "")
+        for block in blocks
+        if block.get("type") == "actions"
+        for e in block.get("elements", [])
+    ]
+    assert "agent_setup__add_mcp" in action_ids, (
+        "can_edit_spec=True must include the add-mcp action id"
+    )
+    assert "agent_setup__remove_mcp" in action_ids, (
+        "can_edit_spec=True must include the remove-mcp action id"
+    )
+
+
+def test_build_mcps_section_connect_via_mcp_follows_is_admin_not_can_edit_spec() -> None:
+    """Connect via MCP mints a bearer token and stays admin-only unconditionally
+    (fact 5) -- a non-admin member editing an unreachable agent (can_edit_spec=True)
+    must not see it, since the dispatcher would always refuse the click."""
+    mcps = [{"name": "an-mcp", "url": "https://mcp.example.com"}]
+    blocks = build_mcps_section(mcps=mcps, can_edit_spec=True, is_admin=False)
+    action_ids = [
+        e.get("action_id", "")
+        for block in blocks
+        if block.get("type") == "actions"
+        for e in block.get("elements", [])
+    ]
+    assert "agent_setup__connect_mcp" not in action_ids, (
+        "connect_mcp must not render for a non-admin even when can_edit_spec is True"
+    )
+
+
+def test_build_l2_view_renders_agent_form_action_for_member_when_spec_editable() -> None:
+    """A member (is_admin=False) editing an unreachable agent (can_edit_spec=True)
+    still sees the agent-form action; an admin-only rule would hide it wrongly."""
+    section_blocks = build_agent_section(
+        agent_name="my-agent",
+        model_id="claude-sonnet-4-6",
+        system_prompt="hello",
+        can_edit_spec=True,
+    )
+    view = build_l2_view(
+        agent_name="my-agent",
+        active_section="agent",
+        team_id="T123",
+        channel_id="C456",
+        is_admin=False,
+        can_edit_spec=True,
+        section_blocks=section_blocks,
+    )
+    serialized = json.dumps(view)
+    assert "agent_setup__edit_agent_form" in serialized, (
+        "L2 view must render the agent-form action for a member when spec-editable"
+    )
+
+
+def test_build_l2_view_omits_agent_form_action_when_not_spec_editable() -> None:
+    section_blocks = build_agent_section(
+        agent_name="my-agent",
+        model_id="claude-sonnet-4-6",
+        system_prompt="hello",
+        can_edit_spec=False,
+    )
+    view = build_l2_view(
+        agent_name="my-agent",
+        active_section="agent",
+        team_id="T123",
+        channel_id="C456",
+        is_admin=False,
+        can_edit_spec=False,
+        section_blocks=section_blocks,
+    )
+    serialized = json.dumps(view)
+    assert "agent_setup__edit_agent_form" not in serialized, (
+        "L2 view must omit the agent-form action when the agent is not spec-editable"
     )
 
 
@@ -604,7 +811,7 @@ def test_build_agent_section_admin_uses_edit_agent_form_action_id() -> None:
         agent_name="my-agent",
         model_id="claude-sonnet-4-6",
         system_prompt="You are helpful.",
-        is_admin=True,
+        can_edit_spec=True,
     )
     all_action_ids = [
         element.get("action_id", "")
@@ -631,7 +838,6 @@ def test_build_repo_auth_section_admin_uses_edit_repo_form_action_id() -> None:
     blocks = build_repo_auth_section(
         repo="owner/repo",
         pat_last4="****abcd",
-        is_admin=True,
     )
     all_action_ids = [
         element.get("action_id", "")
@@ -705,7 +911,7 @@ def test_build_skills_section_remove_option_plain_text_carries_raw_name() -> Non
     appear verbatim in the option label.
     """
     raw_name = "a&b<c>"
-    blocks = build_skills_section(skill_names=[raw_name], sync_pending=False, is_admin=True)
+    blocks = build_skills_section(skill_names=[raw_name], sync_pending=False, can_edit_spec=True)
     # Find the remove-skill static_select
     remove_options: list[dict[str, object]] = []
     for block in blocks:
@@ -726,7 +932,7 @@ def test_build_mcps_section_remove_option_plain_text_carries_raw_name() -> None:
     """remove-mcp static_select option label must carry the raw MCP name verbatim."""
     raw_name = "a&b<c>"
     mcps = [{"name": raw_name, "url": "https://mcp.example.com"}]
-    blocks = build_mcps_section(mcps=mcps, is_admin=True)
+    blocks = build_mcps_section(mcps=mcps, can_edit_spec=True)
     remove_options: list[dict[str, object]] = []
     for block in blocks:
         if block.get("type") == "actions":
@@ -745,7 +951,7 @@ def test_build_mcps_section_remove_option_plain_text_carries_raw_name() -> None:
 def test_build_secrets_section_remove_option_plain_text_carries_raw_name() -> None:
     """remove-secret static_select option label must carry the raw secret key name verbatim."""
     raw_name = "a&b<c>"
-    blocks = build_secrets_section(agent_name="test-agent", secret_names=[raw_name], is_admin=True)
+    blocks = build_secrets_section(agent_name="test-agent", secret_names=[raw_name])
     remove_options: list[dict[str, object]] = []
     for block in blocks:
         if block.get("type") == "actions":

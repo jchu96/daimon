@@ -8,15 +8,20 @@ Two responsibilities per form:
    payload and whether the background run should proceed. No I/O.
 
 2. ``run_*_submission`` (async, background):
-   Runs AFTER the ack. Re-checks ``is_admin`` server-side (fail-closed),
-   calls the appropriate write.py path, then ``views_update`` the parent or
-   posts an ephemeral for slow-failure reports.
+   Runs AFTER the ack. Re-checks authorization server-side against fresh
+   state (fail-closed), calls the appropriate write.py path, then posts an
+   ephemeral confirming the write or reporting a slow-failure.
 
 Pattern mirrors ``privacy_panel/submit.py`` exactly — same Decision dataclass
 shape, same evaluate-then-spawn discipline, same boundary catch tuple.
 
 Threat register:
-- Every run_* re-checks resolve_is_admin before any write.
+- Creation (new agent, fork) and per-agent attachments (repo binding, env
+  variables) are open to every workspace member — there is nothing an admin
+  has approved for a brand-new agent, and attachments never enter the agent
+  spec. Configuration that touches the agent spec an admin approved (model,
+  system prompt, skills, MCP servers) re-checks the shared ``agent_setup.gate``
+  helper fresh, after the ack, before any MA request or store write.
 - Secret VALUES are validated then passed to the
   write layer only; they never appear in response_action payloads, error
   strings, block_ids, action_ids, or log lines.
@@ -34,8 +39,8 @@ import anthropic
 import structlog
 from daimon.adapters.slack.admin import (
     _dev_allow_all_admin,  # pyright: ignore[reportPrivateUsage]
-    resolve_is_admin,
 )
+from daimon.adapters.slack.agent_setup import gate
 from daimon.adapters.slack.agent_setup.state import decode_private_metadata
 from daimon.adapters.slack.agent_setup.write import (
     call_reconcile_for_panel,
@@ -549,35 +554,6 @@ def _allowed_model_ids() -> frozenset[str]:
 
 
 # ---------------------------------------------------------------------------
-# Background run helpers
-# ---------------------------------------------------------------------------
-
-
-async def _refuse_non_admin(
-    web_client: AsyncWebClient,
-    *,
-    team_id: str,
-    channel_id: str,
-    user_id: str,
-    dev_allow_all: bool = False,
-) -> bool:
-    """Re-check is_admin server-side; send ephemeral and return True if non-admin.
-
-    T-83-14: every mutating run_* calls this first. Returns True = caller
-    should return early (refused). Returns False = admin confirmed, proceed.
-    """
-    is_admin = await resolve_is_admin(web_client, user_id=user_id, dev_allow_all=dev_allow_all)
-    if not is_admin:
-        await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-            channel=channel_id,
-            user=user_id,
-            text=":x: You no longer have permission to change agent setup.",
-        )
-        return True
-    return False
-
-
-# ---------------------------------------------------------------------------
 # Background runs (post-ack I/O)
 # ---------------------------------------------------------------------------
 
@@ -594,20 +570,12 @@ async def run_new_agent_submission(
 ) -> None:
     """Post-ack: create a blank agent then refresh the L1 modal.
 
-    Re-checks is_admin before any write (T-83-14). Name-collision guard
-    lives in create_blank_agent (fast indexed MA read).
+    Creation is open to every workspace member: a new or forked agent has no
+    propagation row and no config tier pointing at it, so there is nothing
+    an admin has approved to protect. Name-collision guard lives in
+    create_blank_agent (fast indexed MA read).
     """
     try:
-        refused = await _refuse_non_admin(
-            web_client,
-            team_id=team_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            dev_allow_all=_dev_allow_all_admin(runtime),
-        )
-        if refused:
-            return
-
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
@@ -652,19 +620,11 @@ async def run_fork_agent_submission(
 ) -> None:
     """Post-ack: fork an existing agent then refresh the L1 modal.
 
-    Re-checks is_admin before any write (T-83-14).
+    Creation is open to every workspace member: the new fork has no
+    propagation row and no config tier pointing at it, so there is nothing
+    an admin has approved to protect.
     """
     try:
-        refused = await _refuse_non_admin(
-            web_client,
-            team_id=team_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            dev_allow_all=_dev_allow_all_admin(runtime),
-        )
-        if refused:
-            return
-
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
@@ -714,13 +674,20 @@ async def run_edit_agent_submission(
 ) -> None:
     """Post-ack: reconcile updated model/system for the agent.
 
-    Re-checks is_admin before any write (T-83-14). Name field is read-only
-    (rename-forbidden invariant, Structural Guarantee #6).
+    This form changes part of the configuration an admin approved (model,
+    system prompt), so it needs workspace-admin permission when the agent is
+    currently a default and is open otherwise — re-checked fresh against the
+    agent named by private_metadata, before any MA request. Name field is
+    read-only (rename-forbidden invariant, Structural Guarantee #6).
     """
     try:
-        refused = await _refuse_non_admin(
+        tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+        refused = await gate.refuse_if_reachable_and_not_admin(
+            runtime,
             web_client,
-            team_id=team_id,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
             channel_id=channel_id,
             user_id=user_id,
             dev_allow_all=_dev_allow_all_admin(runtime),
@@ -728,7 +695,6 @@ async def run_edit_agent_submission(
         if refused:
             return
 
-        tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
         ma_agent = await find_agent_by_daimon_tag(
@@ -750,12 +716,14 @@ async def run_edit_agent_submission(
             system_prompt=str(extra["system"]) if extra.get("system") else None,
         )
 
-        current_params = ma_agent.model_dump(mode="json")
         spec = AgentSpec.model_validate(
             {
                 "name": agent_name,
-                "model": updates.get("model") or current_params.get("model", "claude-sonnet-4-6"),
-                "system": updates.get("system") or current_params.get("system"),
+                # ma_agent.model.id, not a re-serialized dict — model is a
+                # nested {id, speed} object on the SDK response, not a bare
+                # string (mirrors the Discord panel's agent.model.id read).
+                "model": updates.get("model") or ma_agent.model.id,
+                "system": updates.get("system") or ma_agent.system,
             }
         )
         await call_reconcile_for_panel(
@@ -804,20 +772,12 @@ async def run_edit_repo_submission(
 ) -> None:
     """Post-ack: update repo binding and/or inline PAT for the agent.
 
-    Re-checks is_admin before any write (T-83-14).
-    Blank PAT field = keep stored token (never overwrites).
+    Repo binding and the inline PAT are per-agent attachments that never
+    enter the agent spec, so this form is open to every workspace member —
+    including against the workspace's current default agent. Blank PAT
+    field = keep stored token (never overwrites).
     """
     try:
-        refused = await _refuse_non_admin(
-            web_client,
-            team_id=team_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            dev_allow_all=_dev_allow_all_admin(runtime),
-        )
-        if refused:
-            return
-
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
@@ -952,13 +912,20 @@ async def run_add_skill_submission(
 ) -> None:
     """Post-ack: kick off skill sync for the given repo URL.
 
-    Re-checks is_admin before any write (T-83-14). Repo reachability is slow
-    I/O → accepted pre-ack; failures reported via ephemeral.
+    Skills are part of the configuration an admin approved, so this form
+    needs workspace-admin permission when the agent is currently a default
+    and is open otherwise — re-checked fresh, before the sync is queued.
+    Repo reachability is slow I/O → accepted pre-ack; failures reported via
+    ephemeral.
     """
     try:
-        refused = await _refuse_non_admin(
+        tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+        refused = await gate.refuse_if_reachable_and_not_admin(
+            runtime,
             web_client,
-            team_id=team_id,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
             channel_id=channel_id,
             user_id=user_id,
             dev_allow_all=_dev_allow_all_admin(runtime),
@@ -966,7 +933,6 @@ async def run_add_skill_submission(
         if refused:
             return
 
-        tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
         repo_url = str(extra.get("repo_url") or "")
@@ -1048,13 +1014,19 @@ async def run_add_mcp_submission(
 ) -> None:
     """Post-ack: add an MCP server entry to the agent and reconcile.
 
-    Re-checks is_admin before any write (T-83-14).
+    MCP servers are part of the configuration an admin approved, so this
+    form needs workspace-admin permission when the agent is currently a
+    default and is open otherwise — re-checked fresh, before the MA lookup.
     token: optional (write-only). Empty = keep stored credential.
     """
     try:
-        refused = await _refuse_non_admin(
+        tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+        refused = await gate.refuse_if_reachable_and_not_admin(
+            runtime,
             web_client,
-            team_id=team_id,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
             channel_id=channel_id,
             user_id=user_id,
             dev_allow_all=_dev_allow_all_admin(runtime),
@@ -1062,7 +1034,6 @@ async def run_add_mcp_submission(
         if refused:
             return
 
-        tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
         mcp_name = str(extra.get("mcp_name") or "")
@@ -1097,18 +1068,37 @@ async def run_add_mcp_submission(
             )
             return
 
-        current_params = ma_agent.model_dump(mode="json")  # pyright: ignore[reportUnknownMemberType]
-
-        existing_mcp_servers: list[dict[str, Any]] = list(current_params.get("mcp_servers") or [])
+        existing_mcp_servers: list[dict[str, Any]] = [
+            server.model_dump(mode="python") for server in ma_agent.mcp_servers
+        ]
         # BetaManagedAgentsURLMCPServerParams is a TypedDict — build the dict directly.
         existing_mcp_servers.append({"name": mcp_name, "type": "url", "url": mcp_url})
+
+        # AgentSpec requires a matching mcp_toolset entry for every declared
+        # mcp_servers name (otherwise MA's own update call 400s deep in the
+        # SDK) — carry the agent's existing tools forward and append the new
+        # server's toolset entry if it isn't already there.
+        existing_tools: list[dict[str, Any]] = [
+            tool.model_dump(mode="python") for tool in ma_agent.tools
+        ]
+        has_mcp_toolset_entry = any(
+            tool.get("type") == "mcp_toolset" and tool.get("mcp_server_name") == mcp_name
+            for tool in existing_tools
+        )
+        if not has_mcp_toolset_entry:
+            existing_tools.append({"type": "mcp_toolset", "mcp_server_name": mcp_name})
 
         spec = AgentSpec.model_validate(
             {
                 "name": agent_name,
-                "model": current_params.get("model", "claude-sonnet-4-6"),
-                "system": current_params.get("system"),
+                # ma_agent.model.id, not a re-serialized dict — model is a
+                # nested {id, speed} object on the SDK response, not a bare
+                # string (mirrors the edit-agent fix above and the Discord
+                # panel's agent.model.id read).
+                "model": ma_agent.model.id,
+                "system": ma_agent.system,
                 "mcp_servers": existing_mcp_servers,
+                "tools": existing_tools,
             }
         )
         await call_reconcile_for_panel(
@@ -1182,21 +1172,13 @@ async def run_paste_secrets_submission(
 ) -> None:
     """Post-ack: write validated secrets to agent_files store.
 
-    Re-checks is_admin before any write (T-83-14).
+    Env-variable credentials are a per-agent attachment that never enters
+    the agent spec, so this form is open to every workspace member —
+    including against the workspace's current default agent.
     CRITICAL: only key NAMES appear in logs and ephemeral.
     Secret values are consumed here and never propagated further.
     """
     try:
-        refused = await _refuse_non_admin(
-            web_client,
-            team_id=team_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            dev_allow_all=_dev_allow_all_admin(runtime),
-        )
-        if refused:
-            return
-
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
 
         ma_agent = await find_agent_by_daimon_tag(

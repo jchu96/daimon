@@ -11,6 +11,14 @@ Covers the five required behaviors from 83-05 plan:
 - (connect_mcp) agent_setup__connect_mcp sends chat.postEphemeral and does
              NOT call views.update or views.push
 
+Also covers the field-follows-the-gate authorization matrix (10-06): the
+always-open branches (new/fork/edit/edit_repo_form/paste_secrets/remove_secret),
+the admin-only-unconditional branches (delete/scope:*/connect_mcp), and the
+field-conditional branches gated by ``refuse_if_reachable_and_not_admin``
+(remove_skill/remove_mcp/edit_agent_form/add_skill/add_mcp) — each proved for
+a non-admin caller against a real reachable-vs-unreachable agent, written via
+``scoped_config_write.set_fields``, never by patching the predicate.
+
 All cases use a real Postgres schema (db_session_factory) + the transport-level
 FakeSlackWebClient from conftest (no AsyncMock on client.* methods).
 """
@@ -37,6 +45,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.scope import ChannelConfigRow, ChannelScopeRef, TenantScopeRef
 from daimon.core.stores.scoped_config_read import get_scope
+from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
@@ -191,6 +200,80 @@ def _make_ma_handler_with_agents(
         return httpx.Response(404, json={"error": f"unhandled {method} {path}"})
 
     return handler
+
+
+def _make_ma_handler_with_agents_and_update(
+    agents: list[dict[str, object]],
+) -> Any:
+    """Like ``_make_ma_handler_with_agents``, plus PATCH/POST update on
+    ``/v1/agents/{id}`` — needed by removal-write branches (remove_skill,
+    remove_mcp) that call ``update_agent_with_version_retry``."""
+    agent_store: dict[str, dict[str, object]] = {
+        str(ag["id"]): ag
+        for ag in agents  # type: ignore[index]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+
+        if method == "GET" and path == "/v1/agents":
+            return httpx.Response(
+                200,
+                json={"data": list(agent_store.values()), "has_more": False},
+            )
+        m = re.match(r"^/v1/agents/(?P<id>[^/]+)$", path)
+        if m and method == "GET":
+            agent_id_req = m.group("id")
+            if agent_id_req in agent_store:
+                return httpx.Response(200, json=agent_store[agent_id_req])
+            return httpx.Response(
+                404,
+                json={
+                    "type": "error",
+                    "error": {"type": "not_found_error", "message": "not found"},
+                },
+            )
+        if m and method in {"PATCH", "POST"}:
+            agent_id_req = m.group("id")
+            if agent_id_req not in agent_store:
+                return httpx.Response(
+                    404,
+                    json={
+                        "type": "error",
+                        "error": {"type": "not_found_error", "message": "not found"},
+                    },
+                )
+            body: dict[str, Any] = json.loads(request.content)
+            existing = agent_store[agent_id_req]
+            merged: dict[str, object] = {**existing, **body}
+            merged["version"] = int(existing.get("version", 1)) + 1  # type: ignore[arg-type]
+            agent_store[agent_id_req] = merged
+            return httpx.Response(200, json=merged)
+        if method == "GET" and path == "/v1/environments":
+            return httpx.Response(200, json={"data": [], "has_more": False})
+
+        return httpx.Response(404, json={"error": f"unhandled {method} {path}"})
+
+    return handler
+
+
+async def _mark_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    tenant_id: uuid.UUID,
+    agent_name: str,
+) -> None:
+    """Write a real tenant-scope propagation row so the named agent is
+    currently reachable — never patch the reachability predicate."""
+    async with db_session_factory() as session, session.begin():
+        await set_fields(
+            session,
+            scope=TenantScopeRef(tenant_id=tenant_id),
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            mode="agent",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -737,64 +820,24 @@ async def test_handle_agent_setup_action_paste_secrets_pushes_paste_secrets_form
 
 
 # ---------------------------------------------------------------------------
-# Test: non-admin agent_setup__new is refused with no views.push (T-83-20)
+# Test: agent_setup__new is open to every member, admin or not
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_handle_agent_setup_action_new_with_non_admin_sends_ephemeral_no_push(
+async def test_handle_agent_setup_action_new_with_non_admin_pushes_form_no_ephemeral(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: object,
 ) -> None:
-    """Non-admin agent_setup__new must send the permission-refused ephemeral and NOT views_push.
+    """agent_setup__new is always-open: a non-admin still gets the form pushed,
+    with no refusal ephemeral. Building an unscoped agent is not tenant-wide blast radius.
 
-    The default FakeSlackWebClient users.info returns is_admin=False (fail-closed baseline).
-    T-83-20: every new L3-open branch re-resolves is_admin and refuses on False.
+    The default FakeSlackWebClient users.info returns is_admin=False (fail-closed baseline
+    for OTHER, still-gated branches) -- this branch no longer checks admin at all.
     """
     _, fernet_key, _ = await _seed_team(db_session)
     runtime = _build_runtime(fernet_key, db_session_factory)
-
-    payload = _action_payload("agent_setup__new")
-    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
-
-    client_fake: Any = fake_slack_web_client
-    push_calls = client_fake.mock.requests.get(
-        ("POST", yarl.URL(f"{_SLACK_API_BASE}/views.push")), []
-    )
-    assert not push_calls, (
-        "non-admin agent_setup__new must NOT call views.push (T-83-20 admin gate)"
-    )
-
-    ephemeral_calls = client_fake.mock.requests.get(
-        ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral")), []
-    )
-    assert ephemeral_calls, (
-        "non-admin agent_setup__new must send a permission-refused ephemeral (T-83-20)"
-    )
-    last_call = ephemeral_calls[-1]
-    body_json: dict[str, Any] = last_call.kwargs.get("json") or {}
-    body_text: str = body_json.get("text") or ""
-    assert "no longer have permission" in body_text, (
-        "ephemeral text must mention lack of permission (T-83-20 fail-closed re-check)"
-    )
-
-
-@pytest.mark.asyncio
-async def test_handle_agent_setup_action_new_with_non_admin_but_dev_allow_all_pushes_form(
-    db_session: AsyncSession,
-    db_session_factory: async_sessionmaker[AsyncSession],
-    fake_slack_web_client: object,
-) -> None:
-    """dev_allow_all_admin opens the gate for a non-admin: agent_setup__new pushes the form.
-
-    The default FakeSlackWebClient users.info returns is_admin=False, so the only
-    reason the new-agent form opens is the DAIMON_SLACK__DEV_ALLOW_ALL_ADMIN
-    override threaded from settings — the testing escape hatch.
-    """
-    _, fernet_key, _ = await _seed_team(db_session)
-    runtime = _build_runtime(fernet_key, db_session_factory)
-    runtime.settings.slack.dev_allow_all_admin = True  # type: ignore[attr-defined]  # MagicMock settings
 
     payload = _action_payload("agent_setup__new")
     await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
@@ -802,7 +845,14 @@ async def test_handle_agent_setup_action_new_with_non_admin_but_dev_allow_all_pu
     client_fake: Any = fake_slack_web_client
     callback_id = _get_push_callback_id(client_fake)
     assert callback_id == "agent_setup__new_agent", (
-        f"non-admin with dev_allow_all_admin=True must push the new-agent form, got {callback_id!r}"
+        f"non-admin agent_setup__new must push the new-agent form, got {callback_id!r}"
+    )
+
+    ephemeral_calls = client_fake.mock.requests.get(
+        ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral")), []
+    )
+    assert not ephemeral_calls, (
+        "non-admin agent_setup__new must NOT send a refusal ephemeral (always open)"
     )
 
 
@@ -895,3 +945,567 @@ async def test_handle_agent_setup_action_scope_channel_writes_selected_channel_a
         f"#{_SELECTED_CHANNEL} (the selected/persisted channel), not #{_CHANNEL_ID} "
         f"(the invoking channel) — CR-03 regression guard"
     )
+
+
+# ---------------------------------------------------------------------------
+# Assertion helpers for the field-follows-the-gate matrix (10-06)
+# ---------------------------------------------------------------------------
+
+
+def _ephemeral_texts(client_fake: Any) -> list[str]:
+    calls = client_fake.mock.requests.get(
+        ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral")), []
+    )
+    texts: list[str] = []
+    for call in calls:
+        body: dict[str, Any] = call.kwargs.get("json") or {}
+        texts.append(str(body.get("text") or ""))
+    return texts
+
+
+def _has_push(client_fake: Any) -> bool:
+    return bool(
+        client_fake.mock.requests.get(("POST", yarl.URL(f"{_SLACK_API_BASE}/views.push")), [])
+    )
+
+
+def _has_update(client_fake: Any) -> bool:
+    return bool(
+        client_fake.mock.requests.get(("POST", yarl.URL(f"{_SLACK_API_BASE}/views.update")), [])
+    )
+
+
+def _assert_no_refusal(client_fake: Any) -> None:
+    texts = _ephemeral_texts(client_fake)
+    assert not any("no longer have permission" in t for t in texts), (
+        f"must NOT post the permission-refusal ephemeral, got ephemerals: {texts!r}"
+    )
+
+
+def _assert_reachability_refusal(client_fake: Any) -> None:
+    texts = _ephemeral_texts(client_fake)
+    assert any("workspace-admin" in t for t in texts), (
+        f"must post the reachability-refusal ephemeral naming why, got ephemerals: {texts!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Always-open branches: new, fork, edit, edit_repo_form,
+# paste_secrets, remove_secret -- no refusal for any caller, admin or not.
+# `new` is covered above; the remaining five follow.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_fork_non_admin_pushes_form_no_ephemeral(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload("agent_setup__fork", selected_agent_name=_AGENT_NAME)
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _get_push_callback_id(client_fake) == "agent_setup__fork_agent", (
+        "non-admin agent_setup__fork must push the fork-agent form"
+    )
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_edit_non_admin_pushes_l2_no_ephemeral(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload("agent_setup__edit", selected_agent_name=_AGENT_NAME)
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _has_push(client_fake), "non-admin agent_setup__edit must push L2"
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_edit_repo_form_non_admin_pushes_form_no_ephemeral(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__edit_repo_form", selected_agent_name=_AGENT_NAME, active_section="repo_auth"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _get_push_callback_id(client_fake) == "agent_setup__edit_repo", (
+        "non-admin agent_setup__edit_repo_form must push the edit-repo form"
+    )
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_paste_secrets_non_admin_pushes_form_no_ephemeral(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__paste_secrets", selected_agent_name=_AGENT_NAME, active_section="secrets"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _get_push_callback_id(client_fake) == "agent_setup__paste_secrets", (
+        "non-admin agent_setup__paste_secrets must push the paste-secrets form"
+    )
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_remove_secret_non_admin_writes_and_updates_no_ephemeral(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    """remove_secret is always open: env variables are a per-agent
+    attachment, never part of the agent spec -- even on a reachable agent."""
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload(
+        "agent_setup__remove_secret",
+        selected_agent_name=_AGENT_NAME,
+        active_section="secrets",
+        action_extra={"selected_option": {"value": "SOME_KEY"}},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _has_update(client_fake), (
+        "non-admin remove_secret on a reachable agent must still re-render L2"
+    )
+    _assert_no_refusal(client_fake)
+
+
+# ---------------------------------------------------------------------------
+# Admin-only-unconditional branches: delete, scope:channel, scope:clear,
+# connect_mcp -- unchanged behavior, refused for a non-admin regardless of
+# reachability. scope:workspace is already covered above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_delete_non_admin_refused_no_write(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload("agent_setup__delete", selected_agent_name=_AGENT_NAME)
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    texts = _ephemeral_texts(client_fake)
+    assert any("no longer have permission" in t for t in texts), (
+        "non-admin agent_setup__delete must be refused (admin-only, unconditional)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_scope_channel_non_admin_refused_no_write(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+
+    payload = _action_payload(
+        "agent_setup__scope:channel",
+        selected_agent_name=_AGENT_NAME,
+        action_extra={"selected_channel": _CHANNEL_ID},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    async with db_session_factory() as session:
+        row = await get_scope(
+            session, scope=ChannelScopeRef(tenant_id=tenant_id, channel_id=_CHANNEL_ID)
+        )
+    assert row is None, "non-admin scope:channel must not write a DB row (fail-closed)"
+
+    client_fake: Any = fake_slack_web_client
+    texts = _ephemeral_texts(client_fake)
+    assert any("no longer have permission" in t for t in texts), (
+        "non-admin agent_setup__scope:channel must be refused (admin-only, unconditional)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_scope_clear_non_admin_refused_no_write(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload("agent_setup__scope:clear", selected_agent_name=_AGENT_NAME)
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    async with db_session_factory() as session:
+        row = await get_scope(session, scope=TenantScopeRef(tenant_id=tenant_id))
+    assert row is not None and row.agent_name == _AGENT_NAME, (
+        "non-admin scope:clear must NOT clear the existing scope row (fail-closed)"
+    )
+
+    client_fake: Any = fake_slack_web_client
+    texts = _ephemeral_texts(client_fake)
+    assert any("no longer have permission" in t for t in texts), (
+        "non-admin agent_setup__scope:clear must be refused (admin-only, unconditional)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_connect_mcp_non_admin_refused_no_ephemeral_config(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    """connect_mcp mints a bearer token and stays admin-only unconditionally (fact 5)."""
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+
+    settings = MagicMock()
+    settings.crypto.keys = (SecretStr(fernet_key),)
+    settings.mcp.public_url = "https://mcp.example.com"
+    settings.mcp.jwt_secret = SecretStr("test-secret-32-bytes-long-padding!")
+    settings.github = MagicMock()
+    settings.github.app_id = None
+    settings.slack.dev_allow_all_admin = False
+    runtime = SlackRuntime(
+        settings=settings,
+        anthropic=build_fake_anthropic(handler),
+        sessionmaker=db_session_factory,
+        billing_config=None,
+        http_client=MagicMock(spec=httpx.AsyncClient),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+    )
+
+    payload = _action_payload("agent_setup__connect_mcp", selected_agent_name=_AGENT_NAME)
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    texts = _ephemeral_texts(client_fake)
+    assert any("no longer have permission" in t for t in texts), (
+        "non-admin agent_setup__connect_mcp must be refused (admin-only, unconditional)"
+    )
+    assert not any(":link: *Connect via MCP" in t for t in texts), (
+        "non-admin agent_setup__connect_mcp must NOT receive the MCP config ephemeral"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Field-conditional branches, gated by
+# refuse_if_reachable_and_not_admin: remove_skill, remove_mcp,
+# edit_agent_form, add_skill, add_mcp. Each proceeds for a non-admin when the
+# target agent is unreachable, and is refused when it is currently reachable
+# -- proved against a real propagation row (scoped_config_write.set_fields),
+# never by patching the predicate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_remove_skill_non_admin_unreachable_proceeds(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    agent_payload["skills"] = [{"type": "anthropic", "skill_id": "cli-auth"}]
+    handler = _make_ma_handler_with_agents_and_update([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__remove_skill",
+        selected_agent_name=_AGENT_NAME,
+        active_section="skills",
+        action_extra={"selected_option": {"value": "cli-auth"}},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_no_refusal(client_fake)
+    assert _has_update(client_fake), (
+        "non-admin remove_skill on an unreachable agent must proceed and re-render L2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_remove_skill_non_admin_reachable_refused(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload(
+        "agent_setup__remove_skill",
+        selected_agent_name=_AGENT_NAME,
+        active_section="skills",
+        action_extra={"selected_option": {"value": "cli-auth"}},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_reachability_refusal(client_fake)
+    assert not _has_update(client_fake), (
+        "non-admin remove_skill on a reachable agent must be refused before any re-render"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_remove_mcp_non_admin_unreachable_proceeds(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    agent_payload["mcp_servers"] = [{"name": "an-mcp", "url": "https://mcp.example.com"}]
+    handler = _make_ma_handler_with_agents_and_update([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__remove_mcp",
+        selected_agent_name=_AGENT_NAME,
+        active_section="mcps",
+        action_extra={"selected_option": {"value": "an-mcp"}},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_no_refusal(client_fake)
+    assert _has_update(client_fake), (
+        "non-admin remove_mcp on an unreachable agent must proceed and re-render L2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_remove_mcp_non_admin_reachable_refused(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload(
+        "agent_setup__remove_mcp",
+        selected_agent_name=_AGENT_NAME,
+        active_section="mcps",
+        action_extra={"selected_option": {"value": "an-mcp"}},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_reachability_refusal(client_fake)
+    assert not _has_update(client_fake), (
+        "non-admin remove_mcp on a reachable agent must be refused before any re-render"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_edit_agent_form_non_admin_unreachable_proceeds(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__edit_agent_form", selected_agent_name=_AGENT_NAME, active_section="agent"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _get_push_callback_id(client_fake) == "agent_setup__edit_agent", (
+        "non-admin edit_agent_form on an unreachable agent must push the edit-agent form"
+    )
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_edit_agent_form_non_admin_reachable_refused(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload(
+        "agent_setup__edit_agent_form", selected_agent_name=_AGENT_NAME, active_section="agent"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_reachability_refusal(client_fake)
+    assert not _has_push(client_fake), (
+        "non-admin edit_agent_form on a reachable agent must be refused before any push"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_add_skill_non_admin_unreachable_proceeds(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__add_skill", selected_agent_name=_AGENT_NAME, active_section="skills"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _get_push_callback_id(client_fake) == "agent_setup__add_skill", (
+        "non-admin add_skill on an unreachable agent must push the add-skill form"
+    )
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_add_skill_non_admin_reachable_refused(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload(
+        "agent_setup__add_skill", selected_agent_name=_AGENT_NAME, active_section="skills"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_reachability_refusal(client_fake)
+    assert not _has_push(client_fake), (
+        "non-admin add_skill on a reachable agent must be refused before any push"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_add_mcp_non_admin_unreachable_proceeds(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+
+    payload = _action_payload(
+        "agent_setup__add_mcp", selected_agent_name=_AGENT_NAME, active_section="mcps"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    assert _get_push_callback_id(client_fake) == "agent_setup__add_mcp", (
+        "non-admin add_mcp on an unreachable agent must push the add-mcp form"
+    )
+    _assert_no_refusal(client_fake)
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_add_mcp_non_admin_reachable_refused(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    runtime = _build_runtime(fernet_key, db_session_factory)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    payload = _action_payload(
+        "agent_setup__add_mcp", selected_agent_name=_AGENT_NAME, active_section="mcps"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    client_fake: Any = fake_slack_web_client
+    _assert_reachability_refusal(client_fake)
+    assert not _has_push(client_fake), (
+        "non-admin add_mcp on a reachable agent must be refused before any push"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_add_mcp_admin_on_reachable_agent_unaffected(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    """An admin caller is unaffected by reachability on a field-conditional branch."""
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    payload = _action_payload(
+        "agent_setup__add_mcp", selected_agent_name=_AGENT_NAME, active_section="mcps"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    assert _get_push_callback_id(client_fake) == "agent_setup__add_mcp", (
+        "admin add_mcp on a reachable agent must still push the add-mcp form"
+    )
+    _assert_no_refusal(client_fake)

@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import httpx
 import pytest
 from anthropic.types.beta import BetaManagedAgentsAgent
@@ -39,11 +40,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 _MA_AGENT_ID = "agent_mcp_modal_test_1234"
 
 
-def _entry(name: str) -> RosterEntry:
+def _entry(name: str, *, is_system: bool = False) -> RosterEntry:
     return RosterEntry(
         name=name,
         model="claude-sonnet-4-6",
         spec=AgentSpec(name=name, model="claude-sonnet-4-6"),
+        is_system=is_system,
     )
 
 
@@ -71,6 +73,7 @@ def _runtime(
     public_url: HttpUrl | None,
     jwt_secret: str | None,
     sessionmaker: Any = None,
+    deployment_default: DeploymentDefault | None = None,
 ) -> DiscordRuntime:
     settings = MagicMock()
     settings.mcp.public_url = public_url
@@ -88,27 +91,43 @@ def _runtime(
         sessionmaker=sessionmaker if sessionmaker is not None else MagicMock(),
         billing_config=None,
         notebook_rate_limiter=RateLimiter(max_requests=999),
-        deployment_default=DeploymentDefault(),
+        deployment_default=deployment_default
+        if deployment_default is not None
+        else DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
     )
 
 
-def _runtime_configured(*, anthropic: Any, sessionmaker: Any = None) -> DiscordRuntime:
+def _runtime_configured(
+    *,
+    anthropic: Any,
+    sessionmaker: Any = None,
+    deployment_default: DeploymentDefault | None = None,
+) -> DiscordRuntime:
     """Runtime with mcp.public_url and mcp.jwt_secret both set."""
     return _runtime(
         anthropic=anthropic,
         public_url=HttpUrl("https://mcp.example.com/mcp"),
         jwt_secret="x" * 32,
         sessionmaker=sessionmaker,
+        deployment_default=deployment_default,
     )
 
 
-def _interaction(user_id: int = 42) -> MagicMock:
+def _interaction(user_id: int = 42, *, is_admin: bool = True, guild_id: int = 12345) -> MagicMock:
+    """A discord.Interaction stand-in, a live guild admin by default so the
+    write-callback's authz gate short-circuits without a DB read. Tests
+    proving the reachable/system-agent refusal pass ``is_admin=False``."""
     interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = user_id
+    interaction.user.guild_permissions.administrator = is_admin
+    interaction.user.guild_permissions.manage_guild = False
     interaction.response.defer = AsyncMock()
     interaction.response.send_message = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)
     interaction.followup.send = AsyncMock()
     interaction.edit_original_response = AsyncMock()
     return interaction
@@ -566,3 +585,91 @@ async def test_add_mcp_submit_returns_to_edit_view(
         "AddMcpModal submit must return to EditView, not AgentSetupView"
     )
     assert view_kwarg.allowed_user_id == 99, "the invoker gate must survive the round trip"
+
+
+# ---------------------------------------------------------------------------
+# Click-time authz gate — the guard sits above the #142 reserved
+# name/own-endpoint checks and below them alphabetically: reserved-name still
+# fires first (see test_add_mcp_modal_rejects_reserved_name_...), and a
+# non-reserved, reachable or system target is refused before defer/reconcile.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_modal_refuses_write_when_target_is_reachable_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from daimon.testing.factories import make_tenant
+
+    async def unexpected_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        raise AssertionError("reconcile must not run when the write is refused")
+
+    monkeypatch.setattr(modals_mcp_mod, "call_reconcile_for_panel", unexpected_reconcile)
+
+    guild_id = 910003
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry("my-agent")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        guild_id=guild_id,
+        is_admin=False,
+    )
+    rt = _runtime_configured(
+        anthropic=build_stub_anthropic(),
+        sessionmaker=db_session_factory,
+        deployment_default=DeploymentDefault(agent_name="my-agent"),
+    )
+
+    modal = AddMcpModal(state, runtime=rt, allowed_user_id=42)
+    modal.name_in._value = "ext-mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.url_in._value = "https://ext.example.com/mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.token_in._value = "tok_test_1234"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    assert not (state.selected.spec.mcp_servers or []), (
+        "an MCP entry must not be appended when the write is refused"
+    )
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_modal_refuses_write_on_system_agent_even_for_admin(
+    monkeypatch: pytest.MonkeyPatch, account_id: uuid.UUID
+) -> None:
+    async def unexpected_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        raise AssertionError("reconcile must not run when the write is refused")
+
+    monkeypatch.setattr(modals_mcp_mod, "call_reconcile_for_panel", unexpected_reconcile)
+
+    selected = _entry("daimon", is_system=True)
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        guild_id=12345,
+        is_admin=True,
+    )
+    rt = _runtime_configured(anthropic=build_stub_anthropic())
+
+    modal = AddMcpModal(state, runtime=rt, allowed_user_id=42)
+    modal.name_in._value = "ext-mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.url_in._value = "https://ext.example.com/mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.token_in._value = "tok_test_5678"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=True)
+    await modal.on_submit(interaction)
+
+    assert not (state.selected.spec.mcp_servers or []), (
+        "a system agent's mcp_servers must never gain an entry from the panel"
+    )
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True

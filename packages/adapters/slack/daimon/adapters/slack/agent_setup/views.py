@@ -122,15 +122,19 @@ def build_l1_view(
 ) -> dict[str, Any]:
     """Build the L1 entry modal: roster static_select + lifecycle + scope picker.
 
-    Admin rendering includes lifecycle (New/Fork/Edit/Delete) and scope
-    (workspace / channel / clear) blocks. Non-admin rendering omits both.
+    The lifecycle actions block always carries New/Fork/Edit — building and
+    configuring an unscoped agent is open to every member. Delete is
+    appended to that same block only for an admin viewer. The scope
+    (workspace / channel / clear) block stays admin-only: scoping and
+    archiving are the operations with tenant-wide blast radius.
 
     Zero-agents state, >25 overflow, and no-agent-selected state are all
     handled per the UI-SPEC block inventory.
 
     Args:
         state:                 Panel state carrying the capped roster rows.
-        is_admin:              Whether the invoking user has admin permissions.
+        is_admin:              Whether the invoking user has admin permissions
+                                (gates Delete and the scope block only).
         team_id:               Slack workspace ID.
         channel_id:            Invoking channel (default for scope channel picker).
         selected_agent_name:   Currently-selected agent name, or None.
@@ -153,14 +157,12 @@ def build_l1_view(
     # Block 2: divider
     blocks.append({"type": "divider"})
 
-    # Zero-agents state
+    # Zero-agents state — same copy for every viewer: New is unconditional now,
+    # so any member can create the first agent.
     if not state.rows:
-        if is_admin:
-            empty_text = (
-                "_No agents yet. Use *New* to create your first agent, or_ `@bot help me set up`_._"
-            )
-        else:
-            empty_text = "_No agents have been set up for this workspace yet._"
+        empty_text = (
+            "_No agents yet. Use *New* to create your first agent, or_ `@bot help me set up`_._"
+        )
         blocks.append(
             {
                 "type": "section",
@@ -220,37 +222,42 @@ def build_l1_view(
                 }
             )
 
-        # Block 4: lifecycle actions (admin-only)
+        # Block 4: lifecycle actions. New/Fork/Edit are unconditional — any
+        # member may build and configure an unscoped agent. Delete stays
+        # admin-only and is appended only for an admin viewer.
+        lifecycle_elements: list[dict[str, Any]] = [
+            {
+                "type": "button",
+                "action_id": "agent_setup__new",
+                "text": {"type": "plain_text", "text": "New"},
+            },
+            {
+                "type": "button",
+                "action_id": "agent_setup__fork",
+                "text": {"type": "plain_text", "text": "Fork"},
+            },
+            {
+                "type": "button",
+                "action_id": "agent_setup__edit",
+                "text": {"type": "plain_text", "text": "Edit"},
+            },
+        ]
         if is_admin:
-            blocks.append(
+            lifecycle_elements.append(
                 {
-                    "type": "actions",
-                    "block_id": "agent_setup__lifecycle_actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "action_id": "agent_setup__new",
-                            "text": {"type": "plain_text", "text": "New"},
-                        },
-                        {
-                            "type": "button",
-                            "action_id": "agent_setup__fork",
-                            "text": {"type": "plain_text", "text": "Fork"},
-                        },
-                        {
-                            "type": "button",
-                            "action_id": "agent_setup__edit",
-                            "text": {"type": "plain_text", "text": "Edit"},
-                        },
-                        {
-                            "type": "button",
-                            "action_id": "agent_setup__delete",
-                            "text": {"type": "plain_text", "text": "Delete"},
-                            "style": "danger",
-                        },
-                    ],
+                    "type": "button",
+                    "action_id": "agent_setup__delete",
+                    "text": {"type": "plain_text", "text": "Delete"},
+                    "style": "danger",
                 }
             )
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": "agent_setup__lifecycle_actions",
+                "elements": lifecycle_elements,
+            }
+        )
 
         # Block 5: divider before scope section
         blocks.append({"type": "divider"})
@@ -366,6 +373,7 @@ def build_l2_view(
     team_id: str,
     channel_id: str,
     is_admin: bool,
+    can_edit_spec: bool,
     section_blocks: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the L2 section editor: header + tabs + section content.
@@ -381,6 +389,12 @@ def build_l2_view(
         team_id:         Slack workspace ID.
         channel_id:      Invoking channel (for ephemeral deliveries).
         is_admin:        Whether the invoking user has admin permissions.
+        can_edit_spec:   Whether the invoking user may change this agent's
+                          approved configuration right now (admin, or the
+                          agent is not currently reachable). Carried on the
+                          signature for callers building the section content
+                          from this same authorization decision; the section
+                          blocks passed in already reflect it.
         section_blocks:  Pre-built blocks for the active section's content.
 
     Returns:
@@ -441,15 +455,21 @@ def build_agent_section(
     agent_name: str,
     model_id: str,
     system_prompt: str,
-    is_admin: bool,
+    can_edit_spec: bool,
 ) -> list[dict[str, Any]]:
     """Build the Agent section blocks for the L2 editor.
+
+    The Edit prompt & model action touches ``system``/``model`` — fields the
+    reachability gate covers on a currently-scoped agent — so this
+    section's mutation control follows spec-editability, not admin-ness alone.
 
     Args:
         agent_name:    Name of the agent (read-only; rename = Fork + Delete).
         model_id:      MA model identifier.
         system_prompt: Full system prompt text (preview truncated to 200 chars).
-        is_admin:      Whether mutation actions should be included.
+        can_edit_spec: Whether the invoking user may change this agent's
+                       approved configuration right now (admin, or the agent
+                       is not currently reachable).
 
     Returns:
         List of Block Kit blocks for the Agent section.
@@ -485,7 +505,7 @@ def build_agent_section(
         },
     ]
 
-    if is_admin:
+    if can_edit_spec:
         blocks.append(
             {
                 "type": "actions",
@@ -510,14 +530,16 @@ def build_repo_auth_section(
     *,
     repo: str | None,
     pat_last4: str | None,
-    is_admin: bool,
 ) -> list[dict[str, Any]]:
     """Build the Repo+Auth section blocks for the L2 editor.
+
+    The repo binding and its PAT are a per-agent attachment, not part of the
+    agent spec an admin approves — the edit control renders for every
+    member, on every agent, regardless of admin status or reachability.
 
     Args:
         repo:      Owner/repo string, or None if not configured.
         pat_last4: Pre-masked PAT display string (e.g. ``****abcd``), or None.
-        is_admin:  Whether mutation actions should be included.
 
     Returns:
         List of Block Kit blocks for the Repo+Auth section.
@@ -544,20 +566,19 @@ def build_repo_auth_section(
         },
     ]
 
-    if is_admin:
-        blocks.append(
-            {
-                "type": "actions",
-                "block_id": "agent_setup__repo_actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "agent_setup__edit_repo_form",
-                        "text": {"type": "plain_text", "text": "Edit repo + auth"},
-                    },
-                ],
-            }
-        )
+    blocks.append(
+        {
+            "type": "actions",
+            "block_id": "agent_setup__repo_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "agent_setup__edit_repo_form",
+                    "text": {"type": "plain_text", "text": "Edit repo + auth"},
+                },
+            ],
+        }
+    )
 
     return blocks
 
@@ -566,14 +587,20 @@ def build_skills_section(
     *,
     skill_names: list[str],
     sync_pending: bool,
-    is_admin: bool,
+    can_edit_spec: bool,
 ) -> list[dict[str, Any]]:
     """Build the Skills section blocks for the L2 editor.
 
+    Skills are part of the agent spec an admin approves when the agent
+    becomes reachable, so the Add/Remove controls follow
+    spec-editability, not admin-ness alone.
+
     Args:
-        skill_names:  List of skill names currently attached to the agent.
-        sync_pending: Whether a skill-sync is in progress.
-        is_admin:     Whether mutation actions should be included.
+        skill_names:   List of skill names currently attached to the agent.
+        sync_pending:  Whether a skill-sync is in progress.
+        can_edit_spec: Whether the invoking user may change this agent's
+                       approved configuration right now (admin, or the agent
+                       is not currently reachable).
 
     Returns:
         List of Block Kit blocks for the Skills section.
@@ -605,7 +632,7 @@ def build_skills_section(
             }
         )
 
-    if is_admin:
+    if can_edit_spec:
         blocks.append(
             {
                 "type": "actions",
@@ -648,13 +675,27 @@ def build_skills_section(
 def build_mcps_section(
     *,
     mcps: list[dict[str, str]],
-    is_admin: bool,
+    can_edit_spec: bool,
+    is_admin: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the MCPs section blocks for the L2 editor.
 
+    MCP servers are part of the agent spec an admin approves when the agent
+    becomes reachable, so Add MCP server / Remove MCP follow
+    spec-editability, not admin-ness alone. Connect via MCP is a distinct
+    operation — it mints a long-lived revocable bearer token, and token
+    issuance stays admin-only unconditionally (outside the set of operations
+    this gate opens), so it renders only for ``is_admin`` regardless of
+    ``can_edit_spec``: showing it to a member who would always be refused at
+    the dispatcher is worse UX than omitting it.
+
     Args:
-        mcps:     List of MCP server dicts with keys ``name`` and ``url``.
-        is_admin: Whether mutation actions should be included.
+        mcps:          List of MCP server dicts with keys ``name`` and ``url``.
+        can_edit_spec: Whether the invoking user may change this agent's
+                       approved configuration right now (admin, or the agent
+                       is not currently reachable). Gates Add/Remove.
+        is_admin:      Whether the invoking user has admin permissions.
+                       Gates Connect via MCP only.
 
     Returns:
         List of Block Kit blocks for the MCPs section.
@@ -674,45 +715,54 @@ def build_mcps_section(
         },
     ]
 
+    mcps_action_elements: list[dict[str, Any]] = []
+    if can_edit_spec:
+        mcps_action_elements.append(
+            {
+                "type": "button",
+                "action_id": "agent_setup__add_mcp",
+                "text": {"type": "plain_text", "text": "Add MCP server"},
+            }
+        )
+        mcps_action_elements.append(
+            {
+                "type": "static_select",
+                "action_id": "agent_setup__remove_mcp",
+                "placeholder": {"type": "plain_text", "text": "Remove MCP…"},
+                "options": [
+                    {
+                        "text": {
+                            "type": "plain_text",
+                            "text": m["name"],
+                        },
+                        "value": m["name"],
+                    }
+                    for m in mcps
+                ]
+                if mcps
+                else [
+                    {
+                        "text": {"type": "plain_text", "text": "(none)"},
+                        "value": "__none__",
+                    }
+                ],
+            }
+        )
     if is_admin:
+        mcps_action_elements.append(
+            {
+                "type": "button",
+                "action_id": "agent_setup__connect_mcp",
+                "text": {"type": "plain_text", "text": "Connect via MCP"},
+            }
+        )
+
+    if mcps_action_elements:
         blocks.append(
             {
                 "type": "actions",
                 "block_id": "agent_setup__mcps_actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "agent_setup__add_mcp",
-                        "text": {"type": "plain_text", "text": "Add MCP server"},
-                    },
-                    {
-                        "type": "static_select",
-                        "action_id": "agent_setup__remove_mcp",
-                        "placeholder": {"type": "plain_text", "text": "Remove MCP…"},
-                        "options": [
-                            {
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": m["name"],
-                                },
-                                "value": m["name"],
-                            }
-                            for m in mcps
-                        ]
-                        if mcps
-                        else [
-                            {
-                                "text": {"type": "plain_text", "text": "(none)"},
-                                "value": "__none__",
-                            }
-                        ],
-                    },
-                    {
-                        "type": "button",
-                        "action_id": "agent_setup__connect_mcp",
-                        "text": {"type": "plain_text", "text": "Connect via MCP"},
-                    },
-                ],
+                "elements": mcps_action_elements,
             }
         )
 
@@ -723,9 +773,12 @@ def build_secrets_section(
     *,
     agent_name: str,
     secret_names: list[str],
-    is_admin: bool,
 ) -> list[dict[str, Any]]:
     """Build the Secrets section blocks for the L2 editor.
+
+    Env-variable credentials are a per-agent attachment, not part of the
+    agent spec an admin approves — Add/Remove render for every
+    member, on every agent, regardless of admin status or reachability.
 
     STRUCTURAL GUARANTEE: this function accepts
     ``secret_names: list[str]`` ONLY. Secret VALUES are never a parameter,
@@ -735,7 +788,6 @@ def build_secrets_section(
     Args:
         agent_name:   Name of the agent (used only for context, not rendered).
         secret_names: List of secret KEY NAMES (values never passed here).
-        is_admin:     Whether mutation actions should be included.
 
     Returns:
         List of Block Kit blocks for the Secrets section.
@@ -763,45 +815,44 @@ def build_secrets_section(
         },
     ]
 
-    if is_admin:
-        blocks.append(
-            {
-                "type": "actions",
-                "block_id": "agent_setup__secrets_actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "agent_setup__paste_secrets",
-                        "text": {"type": "plain_text", "text": "Add secrets"},
+    blocks.append(
+        {
+            "type": "actions",
+            "block_id": "agent_setup__secrets_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "agent_setup__paste_secrets",
+                    "text": {"type": "plain_text", "text": "Add secrets"},
+                },
+                {
+                    "type": "static_select",
+                    "action_id": "agent_setup__remove_secret",
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Remove secret…",
                     },
-                    {
-                        "type": "static_select",
-                        "action_id": "agent_setup__remove_secret",
-                        "placeholder": {
-                            "type": "plain_text",
-                            "text": "Remove secret…",
-                        },
-                        "options": [
-                            {
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": name,
-                                },
-                                "value": name,
-                            }
-                            for name in secret_names
-                        ]
-                        if secret_names
-                        else [
-                            {
-                                "text": {"type": "plain_text", "text": "(none)"},
-                                "value": "__none__",
-                            }
-                        ],
-                    },
-                ],
-            }
-        )
+                    "options": [
+                        {
+                            "text": {
+                                "type": "plain_text",
+                                "text": name,
+                            },
+                            "value": name,
+                        }
+                        for name in secret_names
+                    ]
+                    if secret_names
+                    else [
+                        {
+                            "text": {"type": "plain_text", "text": "(none)"},
+                            "value": "__none__",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
 
     return blocks
 
