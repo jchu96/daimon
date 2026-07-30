@@ -106,13 +106,21 @@ def _estimate_step_components(step: Step) -> int:
     Base 4 (container, head text, separator, pre-nav gap), +1 when the step
     carries an image, plus a per-kind body, plus the nav row and its buttons
     (back, next, and the custom opener when `allow_custom`).
+
+    A `choice` option that carries a `description` renders heavier than a
+    bare button: it needs its own text element alongside the button (a
+    described option is a small section, not a single node), so it costs 2
+    components instead of 1. Ignoring this would silently undercount any
+    choice step that uses descriptions -- exactly the gap this ceiling
+    exists to catch before the renderer does.
     """
     total = 4
     if step.image_handle is not None:
         total += 1
     if step.kind is StepKind.CHOICE:
         num_options = len(step.options)
-        total += ceil(num_options / MAX_BUTTONS_PER_ROW) + num_options
+        option_weight = sum(2 if option.description is not None else 1 for option in step.options)
+        total += ceil(num_options / MAX_BUTTONS_PER_ROW) + option_weight
     elif step.kind is StepKind.MULTI:
         total += 2
     else:  # StepKind.TEXT
