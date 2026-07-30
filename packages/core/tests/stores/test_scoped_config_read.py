@@ -16,6 +16,7 @@ from daimon.core.scope import (
 )
 from daimon.core.stores.scoped_config_read import (
     get_scope,
+    is_agent_reachable_in_tenant,
     list_propagations_for_tenant,
     resolve,
 )
@@ -435,3 +436,96 @@ async def test_cross_tenant_isolation(db_session: AsyncSession) -> None:
     assert result_a.agent_name == "agent-for-a", (
         "resolving tenant A must return its own tenant_config agent_name"
     )
+
+
+# ---------------------------------------------------------------------------
+# is_agent_reachable_in_tenant tests
+# ---------------------------------------------------------------------------
+
+
+async def test_is_agent_reachable_in_tenant_true_for_deployment_default_on_fresh_tenant(
+    db_session: AsyncSession,
+) -> None:
+    """A tenant with no config rows at all still answers True for the deployment default."""
+    t = await make_tenant(db_session)
+    reachable = await is_agent_reachable_in_tenant(
+        db_session, tenant_id=t.id, agent_name="daimon", default=_DEFAULT
+    )
+    assert reachable, (
+        "the deployment-default agent must be reachable on a tenant with no config rows"
+    )
+
+
+async def test_is_agent_reachable_in_tenant_false_for_unrelated_name(
+    db_session: AsyncSession,
+) -> None:
+    """A fresh tenant answers False for a name that is neither scoped nor the default."""
+    t = await make_tenant(db_session)
+    reachable = await is_agent_reachable_in_tenant(
+        db_session, tenant_id=t.id, agent_name="scratch", default=_DEFAULT
+    )
+    assert not reachable, "an unscoped, non-default agent name must be unreachable"
+
+
+async def test_is_agent_reachable_in_tenant_true_after_channel_propagation(
+    db_session: AsyncSession,
+) -> None:
+    """After scoping an agent to one channel, that agent answers True for the tenant."""
+    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+
+    t = await make_tenant(db_session)
+    await set_fields(
+        db_session,
+        scope=ChannelScopeRef(tenant_id=t.id, channel_id="c1"),
+        tenant_id=t.id,
+        agent_name="Y",
+    )
+    reachable = await is_agent_reachable_in_tenant(
+        db_session, tenant_id=t.id, agent_name="Y", default=_DEFAULT
+    )
+    assert reachable, "an agent scoped to a channel row must be reachable in the tenant"
+
+
+async def test_is_agent_reachable_in_tenant_false_for_default_after_tenant_propagation(
+    db_session: AsyncSession,
+) -> None:
+    """After scoping the tenant to a different agent, the deployment default stops answering True."""
+    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+
+    t = await make_tenant(db_session)
+    await set_fields(
+        db_session,
+        scope=TenantScopeRef(tenant_id=t.id),
+        tenant_id=t.id,
+        agent_name="Y",
+    )
+    reachable = await is_agent_reachable_in_tenant(
+        db_session, tenant_id=t.id, agent_name=_DEFAULT.agent_name or "", default=_DEFAULT
+    )
+    assert not reachable, (
+        "a tenant-scope propagation to a different agent must consume the deployment fall-through"
+    )
+
+
+async def test_is_agent_reachable_in_tenant_is_isolated_per_tenant(
+    db_session: AsyncSession,
+) -> None:
+    """One tenant scoping an agent must not make it reachable in a sibling tenant."""
+    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+
+    t1 = await make_tenant(db_session)
+    t2 = await make_tenant(db_session)
+    await set_fields(
+        db_session,
+        scope=ChannelScopeRef(tenant_id=t1.id, channel_id="c1"),
+        tenant_id=t1.id,
+        agent_name="Y",
+    )
+    reachable_t1 = await is_agent_reachable_in_tenant(
+        db_session, tenant_id=t1.id, agent_name="Y", default=DeploymentDefault()
+    )
+    reachable_t2 = await is_agent_reachable_in_tenant(
+        db_session, tenant_id=t2.id, agent_name="Y", default=DeploymentDefault()
+    )
+    assert reachable_t1, "the tenant that scoped agent Y must answer True for Y"
+    assert not reachable_t2, "a sibling tenant that never scoped agent Y must answer False for Y"
