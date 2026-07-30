@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 from daimon.adapters.discord.credential_button import CredentialRequestButton
 from daimon.adapters.discord.feedback_button import FeedbackButton
 from daimon.adapters.discord.feedback_modal import FeedbackModal
@@ -33,6 +34,8 @@ def _interaction(*, client: Any) -> MagicMock:
     interaction.client = client
     interaction.response.send_message = AsyncMock()
     interaction.response.send_modal = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)
+    interaction.followup.send = AsyncMock()
     return interaction
 
 
@@ -102,6 +105,29 @@ async def test_callback_when_send_modal_raises_replies_once_and_swallows_the_err
         "failure reply must tell the user opening the form failed"
     )
     kwargs = interaction.response.send_message.call_args.kwargs
+    assert kwargs.get("ephemeral") is True, "the failure reply must be ephemeral"
+
+
+async def test_callback_when_the_interaction_was_already_responded_replies_via_followup() -> None:
+    """The apology must not itself raise InteractionResponded inside the catch.
+
+    An unconditional `response.send_message` here raises a second time and
+    vanishes into discord.py's dispatcher, so the user gets neither the modal
+    nor the apology -- exactly what the catch exists to prevent.
+    """
+    item = FeedbackButton(feedback_id=str(uuid.uuid4()))
+    bot = _fake_bot(MagicMock())
+    interaction = _interaction(client=bot)
+    interaction.response.send_modal = AsyncMock(
+        side_effect=discord.InteractionResponded(MagicMock())
+    )
+    interaction.response.is_done = MagicMock(return_value=True)
+
+    await item.callback(interaction)  # must not raise
+
+    interaction.response.send_message.assert_not_awaited()
+    interaction.followup.send.assert_awaited_once()
+    kwargs = interaction.followup.send.call_args.kwargs
     assert kwargs.get("ephemeral") is True, "the failure reply must be ephemeral"
 
 

@@ -114,4 +114,14 @@ class FeedbackButton(
             )
         except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own dispatcher swallows anything raised here
             _log.exception("feedback_button.callback_failed", err_type=type(err).__name__)
-            await interaction.response.send_message(_CALLBACK_FAILED, ephemeral=True)
+            # The caught error may have left the interaction already responded
+            # (`send_modal` raising `discord.InteractionResponded`, or failing
+            # after the response type was set). An unconditional
+            # `send_message` would then raise a SECOND time from inside this
+            # handler and vanish into the same dispatcher, leaving the user
+            # with neither the modal nor the apology. Same guard
+            # `FeedbackModal.on_error` uses.
+            if interaction.response.is_done():
+                await interaction.followup.send(_CALLBACK_FAILED, ephemeral=True)
+            else:
+                await interaction.response.send_message(_CALLBACK_FAILED, ephemeral=True)
