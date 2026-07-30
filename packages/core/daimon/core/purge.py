@@ -12,9 +12,12 @@ github_oauth_states (both kinds where the table permits) -> credential_requests
 (both kinds, platform-user-scoped like github_oauth_states) -> wizard_session
 (both kinds, platform-user-scoped like credential_requests) -> routines
 (platform only) -> principal_links -> principal row. Account-level deletes
-(mcp_tokens, user_configs, accounts) run in `purge_account` after all principal
-rows are gone; mcp_tokens is keyed by account_id and is deleted before
-delete_account so its NO-ACTION/CASCADE FK to accounts.id is satisfied.
+(mcp_tokens, message_feedback, user_configs, accounts) run in `purge_account`
+after all principal rows are gone; mcp_tokens and message_feedback are keyed
+by account_id and are deleted before delete_account so their CASCADE FKs to
+accounts.id are satisfied. message_feedback is deleted by an account-id
+predicate OR'd with the account's (tenant, platform-user) keys, because a
+vote cast before the person had an account row carries a null account id.
 
 wizard_session rides the platform-user-scoped delete path rather than an
 accounts.id cascade: the row's identity key is the requester's platform user
@@ -66,6 +69,7 @@ from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
+from daimon.core.stores import message_feedback as message_feedback_store
 from daimon.core.stores import routines as routines_store
 from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
@@ -101,6 +105,7 @@ class PurgeReport(BaseModel):
     slack_turn_contexts: int = 0
     credential_requests: int = 0
     wizard_sessions: int = 0
+    message_feedback: int = 0
 
     def merge(self, other: PurgeReport) -> PurgeReport:
         return PurgeReport(
@@ -119,6 +124,7 @@ class PurgeReport(BaseModel):
             slack_turn_contexts=self.slack_turn_contexts + other.slack_turn_contexts,
             credential_requests=self.credential_requests + other.credential_requests,
             wizard_sessions=self.wizard_sessions + other.wizard_sessions,
+            message_feedback=self.message_feedback + other.message_feedback,
         )
 
 
@@ -362,6 +368,15 @@ async def purge_account(
         mcp_tokens_count = await mcp_tokens_store.delete_tokens_for_account(
             session, account_id=account_id
         )
+        # message_feedback: account-id-keyed OR'd with the account's
+        # (tenant, platform-user) keys — a vote cast before the person had an
+        # accounts row carries a null account_id and is only reachable via the
+        # platform-user key. CLI principals contribute no keys: reactions only
+        # ever come from a platform user, so cli_list is not walked here.
+        platform_user_keys = [(pp.tenant_id, pp.external_id) for pp in pp_list]
+        message_feedback_count = await message_feedback_store.delete_message_feedback_for_account(
+            session, account_id=account_id, platform_user_keys=platform_user_keys
+        )
         # slack_turn_contexts (D-07): keyed by (tenant_id, account_id), not
         # principal_id. Loop every tenant the account's principals belong to —
         # mirrors the upstream session-deletion loop below.
@@ -379,6 +394,7 @@ async def purge_account(
         db_report = report.merge(
             PurgeReport(
                 mcp_tokens=mcp_tokens_count,
+                message_feedback=message_feedback_count,
                 user_configs=user_cfg_count,
                 accounts=account_count,
                 slack_turn_contexts=slack_turn_contexts_count,

@@ -18,6 +18,7 @@ from daimon.core._models import (
     Base,
     CliPrincipal,
     McpToken,
+    MessageFeedback,
     PlatformPrincipal,
     Routine,
     UserConfig,
@@ -33,6 +34,7 @@ from daimon.core.stores import agent_github_binding as agent_github_binding_stor
 from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
+from daimon.core.stores import message_feedback as message_feedback_store
 from daimon.core.stores import routines as routines_store
 from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
@@ -506,6 +508,70 @@ async def test_purge_erases_submitted_and_abandoned_wizard_sessions(
     )
 
 
+async def test_collect_purge_preview_message_feedback_matches_purge_account_including_null_account(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Preview counts message_feedback and agrees with purge_account's actual
+    deletion count — including the null-account-id vote, the whole point of
+    this test."""
+    tenant = await make_tenant(db_session, workspace_id="pv-msg-feedback")
+    account = await make_account(db_session, tenant=tenant)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="PV_FEEDBACK_TARGET",
+        tenant=tenant,
+        account=account,
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        message_id="pv-msg-1",
+        channel_id="C1",
+        platform_user_id="PV_FEEDBACK_TARGET",
+        account_id=account.id,
+        ma_session_id=None,
+        vote="up",
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        message_id="pv-msg-2",
+        channel_id="C1",
+        platform_user_id="PV_FEEDBACK_TARGET",
+        account_id=None,
+        ma_session_id=None,
+        vote="down",
+    )
+    await db_session.commit()
+
+    preview = await collect_purge_preview(sm=db_session_factory, account_id=account.id)
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert preview.message_feedback.count == 2, (
+        "preview must count both the account-keyed vote and the null-account "
+        "vote reachable via the platform-user key"
+    )
+    assert preview.message_feedback.count == report.db.message_feedback, (
+        "preview and purge must agree on message_feedback"
+    )
+
+    remaining = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(MessageFeedback)
+            .where(MessageFeedback.tenant_id == tenant.id)
+        )
+    ).scalar_one()
+    assert remaining == 0, (
+        "purge must erase every message_feedback row for this account, including "
+        "the one whose account_id was NULL at vote time"
+    )
+
+
 async def test_collect_purge_preview_matches_purge_account_coverage_field_for_field() -> None:
     """If `PurgeReport` grows a new int field, `PurgePreview` MUST mirror it.
 
@@ -535,6 +601,7 @@ async def test_collect_purge_preview_matches_purge_account_coverage_field_for_fi
         "slack_turn_contexts": "slack_turn_contexts",
         "credential_requests": "credential_requests",
         "wizard_sessions": "wizard_sessions",
+        "message_feedback": "message_feedback",
     }
 
     uncovered = report_fields - set(mapping.keys())
@@ -578,6 +645,7 @@ async def test_purge_covers_every_account_or_principal_scoped_table() -> None:
         "agent_github_binding": "principal_id",
         "mcp_tokens": "account_id FK -> accounts.id",
         "wizard_session": "account_id FK -> accounts.id",
+        "message_feedback": "account_id FK -> accounts.id",
     }
     # Intentional exclusions, each justified inline.
     allowlist: frozenset[str] = frozenset(

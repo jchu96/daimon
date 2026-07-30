@@ -22,6 +22,7 @@ from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
+from daimon.core.stores import message_feedback as message_feedback_store
 from daimon.core.stores import routines as routines_store
 from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
@@ -68,6 +69,7 @@ class PurgePreview(BaseModel):
     slack_turn_contexts: PurgePreviewRow
     credential_requests: PurgePreviewRow
     wizard_sessions: PurgePreviewRow
+    message_feedback: PurgePreviewRow
 
 
 def _format_platform_principal(p: PlatformPrincipalRow) -> str:
@@ -308,6 +310,20 @@ async def collect_purge_preview(
             )
         wizard_sessions = PurgePreviewRow(count=wizard_sessions_total, example=None)
 
+        # 14. message_feedback — account-scoped (keyed by account_id, not
+        # principal), OR'd with the account's (tenant, platform-user) keys
+        # exactly as purge_account's delete does, since a vote cast before the
+        # person had an accounts row carries a null account_id. The argument
+        # shapes here are identical to purge_account's call by contract — any
+        # divergence makes this preview lie about what erasure will remove.
+        message_feedback_platform_user_keys = [(pp.tenant_id, pp.external_id) for pp in pp_list]
+        message_feedback_count = await message_feedback_store.count_message_feedback_for_account(
+            session,
+            account_id=account_id,
+            platform_user_keys=message_feedback_platform_user_keys,
+        )
+        message_feedback = PurgePreviewRow(count=message_feedback_count, example=None)
+
     return PurgePreview(
         linked_principals=linked_principals,
         principal_links=principal_links,
@@ -323,4 +339,5 @@ async def collect_purge_preview(
         slack_turn_contexts=slack_turn_contexts,
         credential_requests=credential_requests,
         wizard_sessions=wizard_sessions,
+        message_feedback=message_feedback,
     )
