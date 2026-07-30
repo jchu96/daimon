@@ -52,6 +52,7 @@ from daimon.adapters.mcp.tools.credential_requests import register_credential_re
 from daimon.adapters.mcp.tools.media import register_media_tools
 from daimon.adapters.mcp.tools.notebook import register_notebook_tools
 from daimon.adapters.mcp.tools.propagation import register_propagation_tools
+from daimon.adapters.mcp.tools.wizard import register_wizard_tools
 from daimon.adapters.mcp.webhooks import build_github_webhook, build_stripe_webhook
 from daimon.core.billing import BillingConfig, load_billing_config
 from daimon.core.config import Settings, load_settings
@@ -259,6 +260,7 @@ def create_mcp_app(
     environments.register_environment_tools(mcp, runtime)
     vault.register_vault_tools(mcp, runtime)
     register_credential_request_tools(mcp, runtime)
+    register_wizard_tools(mcp, runtime)
     skills.register_skill_tools(mcp, runtime)
     sessions.register_sessions_tools(mcp, runtime)
     agent_chat.register_agent_chat_tools(mcp, runtime)
