@@ -270,8 +270,8 @@ class WizardSpec(BaseModel):
                 raise ValueError(
                     f"step {index} ({step.key!r}) shares image_handle "
                     f"{step.image_handle!r} with step {earlier_index}; each step's "
-                    f"image_handle must be unique because the post path maps returned "
-                    f"attachments back to steps by filename"
+                    f"image_handle must be unique because the post path uploads one "
+                    f"file per handle and maps the returned attachments back by position"
                 )
             seen_handles[step.image_handle] = index
 

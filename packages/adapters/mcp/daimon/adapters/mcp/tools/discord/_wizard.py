@@ -217,17 +217,21 @@ async def _post_wizard_impl(  # pyright: ignore[reportUnusedFunction]
             raise ToolError("channel does not support sending messages")
         sent = await channel.send(view=view, files=files)
 
-    url_by_filename = {attachment.filename: attachment.url for attachment in sent.attachments}
-    image_urls: dict[str, str] = {}
-    for handle, file in files_by_handle.items():
-        url = url_by_filename.get(file.filename)
-        if url is None:
-            logger.warning(
-                "wizard post %s: no attachment url returned for image handle %r",
-                sent.id,
-                handle,
-            )
-            continue
-        image_urls[handle] = url
+    # Mapped by position, not by filename: a file's display name is slugged
+    # from the agent-supplied image title, so two steps titled the same thing
+    # upload under one filename and would both resolve to whichever
+    # attachment came last. discord.py sends files in list order and Discord
+    # returns attachments in that same order, so index i belongs to handle i.
+    image_urls = {
+        handle: attachment.url
+        for handle, attachment in zip(handles, sent.attachments, strict=False)
+    }
+    missing = [handle for handle in handles if handle not in image_urls]
+    if missing:
+        logger.warning(
+            "wizard post %s: no attachment url returned for image handles %r",
+            sent.id,
+            missing,
+        )
 
     return PostedWizard(message_id=str(sent.id), image_urls=image_urls)

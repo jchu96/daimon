@@ -389,6 +389,68 @@ async def test_post_wizard_returns_a_url_for_every_uploaded_handle(
     ), "the later step's handle must also resolve, even though it isn't displayed"
 
 
+async def test_post_wizard_maps_same_named_attachments_to_distinct_handles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file's display name is slugged from the agent-supplied title, so two
+    steps whose images share a title upload under one filename -- each handle
+    must still resolve to its own attachment."""
+    store = FileStore(base_dir=tmp_path)
+    handle1 = store.put(data=b"PNGDATA1", mime_type="image/png", title="chart")
+    handle2 = store.put(data=b"PNGDATA2", mime_type="image/png", title="chart")
+    assert store.get(handle1.id).display_filename == store.get(handle2.id).display_filename, (
+        "the two handles must genuinely collide on filename for this test to mean anything"
+    )
+    spec = _two_image_spec_for(handle1.id, handle2.id)
+
+    async def handler(route: discord.http.Route, kwargs: dict[str, Any]) -> Any:
+        if route.path == "/guilds/{guild_id}":
+            return _guild_payload()
+        if route.path == "/guilds/{guild_id}/roles":
+            return [_everyone_role("111", _VIEW_CHANNEL | _SEND_MESSAGES)]
+        if route.path == "/guilds/{guild_id}/members/{member_id}":
+            return _member_payload()
+        if route.path == "/channels/{channel_id}":
+            return _text_channel_payload()
+        if route.method == "POST" and route.path == "/channels/{channel_id}/messages":
+            return _message_payload(
+                message_id="9203",
+                attachments=[
+                    {
+                        "id": "8001",
+                        "filename": "chart.png",
+                        "url": "https://cdn.discordapp.com/attachments/1/2/chart.png?ex=first",
+                        "proxy_url": "https://media.discordapp.net/attachments/1/2/chart.png?ex=first",
+                        "size": 8,
+                    },
+                    {
+                        "id": "8002",
+                        "filename": "chart.png",
+                        "url": "https://cdn.discordapp.com/attachments/1/3/chart.png?ex=second",
+                        "proxy_url": "https://media.discordapp.net/attachments/1/3/chart.png?ex=second",
+                        "size": 8,
+                    },
+                ],
+            )
+        raise AssertionError(f"unexpected route {route.method} {route.path}")
+
+    patch_discord_http(monkeypatch, handler)
+    posted_wizard = await _post_wizard_impl(
+        _runtime_with_discord_token(file_store=store),
+        _auth(),
+        channel_id="222",
+        spec=spec,
+        short_id="abcd1234",
+    )
+
+    assert posted_wizard.image_urls[handle1.id] == (
+        "https://cdn.discordapp.com/attachments/1/2/chart.png?ex=first"
+    ), "the first step's handle must resolve to the first uploaded attachment"
+    assert posted_wizard.image_urls[handle2.id] == (
+        "https://cdn.discordapp.com/attachments/1/3/chart.png?ex=second"
+    ), "the second step must not inherit the first step's image"
+
+
 async def test_post_wizard_rejects_a_missing_file_handle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
