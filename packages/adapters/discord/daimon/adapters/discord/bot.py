@@ -21,6 +21,7 @@ from daimon.adapters.discord.context import (
     build_delta_xml,
 )
 from daimon.adapters.discord.errors import generate_request_id, render_error
+from daimon.adapters.discord.feedback_seed import seed_feedback_reactions
 from daimon.adapters.discord.gating import should_process_message
 from daimon.adapters.discord.lifecycle import DiscordTurnLifecycle
 from daimon.adapters.discord.permissions import check_missing_permissions
@@ -1175,3 +1176,10 @@ class DaimonBot(commands.Bot):
                         watermark_message_id=final_lifecycle.final_message_id,
                     )
                     await _wm_session.commit()
+            # The lifecycle flag below excludes a cancelled turn, which also
+            # reaches this branch with a non-None final_message_id -- seeding
+            # the vote affordance under a cancellation notice is exactly what
+            # this guard prevents. Not gated on mapping_id, which is about
+            # session mapping, not whether the turn actually answered.
+            if final_lifecycle.was_answered and final_lifecycle.final_message_id is not None:
+                await seed_feedback_reactions(thread, message_id=final_lifecycle.final_message_id)
