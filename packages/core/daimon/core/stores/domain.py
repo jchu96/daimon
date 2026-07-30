@@ -413,6 +413,43 @@ class CredentialRequestRow(BaseModel):
     used_at: datetime | None
 
 
+class MessageFeedbackRow(BaseModel):
+    """Pydantic row for MessageFeedback — one thumbs-up/down reaction vote.
+
+    `vote` is a bare `str` at the store boundary, the same narrowing
+    precedent `CredentialRequestRow.kind` already sets — the `Vote` literal
+    lives in `daimon.core.message_feedback`, not here.
+    """
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    account_id: uuid.UUID | None
+    platform: str
+    message_id: str
+    channel_id: str
+    platform_user_id: str
+    ma_session_id: str | None
+    vote: str
+    feedback_text: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RecordVoteResult(BaseModel):
+    """Return of `record_vote`: the upserted row plus the voter's prior vote.
+
+    `previous_vote` is the value the voter had recorded for this message
+    before this call, and is `None` when this is their first vote on it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    row: MessageFeedbackRow
+    previous_vote: str | None
+
+
 class WizardSessionRow(BaseModel):
     """Pydantic row for WizardSession — one multi-step wizard form's durable state."""
 
