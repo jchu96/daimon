@@ -61,6 +61,7 @@ from daimon.core.stores.tenants import get_tenant
 from daimon.core.tenant_balance import is_over_balance
 from daimon.core.usage_recording import record_turn_usage
 from daimon.core.usage_sweep import sweep_headless_usage
+from daimon.core.wizard_sweep import sweep_expired_wizard_sessions
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -310,6 +311,18 @@ async def _sweep_headless_usage(
         log.exception("scheduler.usage_sweep.failed")
 
 
+async def _sweep_wizard_sessions(sm: async_sessionmaker[AsyncSession]) -> None:
+    """Abandon expired open wizard_session rows once. Boundary catch: a sweep
+    failure must not kill the scheduler loop — the next tick retries.
+
+    No `anthropic.APIError` in the catch: this sweep makes no upstream call.
+    """
+    try:
+        await sweep_expired_wizard_sessions(sm, now=datetime.now(UTC))
+    except SQLAlchemyError:
+        log.exception("scheduler.wizard_sweep.failed")
+
+
 def _validate_mcp_settings(settings: Settings) -> None:
     """Single-tenant deployments require both ``settings.mcp.jwt_secret`` and
     ``settings.mcp.public_url`` so each routine fire can bind the daimon-mcp
@@ -426,6 +439,7 @@ async def run(
             )
             await _sweep_pending_files(client, sm)
             await _sweep_headless_usage(client, sm, markup=settings.billing.markup)
+            await _sweep_wizard_sessions(sm)
             return 0
 
         while not stop_event.is_set():
@@ -440,6 +454,7 @@ async def run(
             )
             await _sweep_pending_files(client, sm)
             await _sweep_headless_usage(client, sm, markup=settings.billing.markup)
+            await _sweep_wizard_sessions(sm)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop_event.wait(), timeout=scheduler_settings.tick_interval_s
