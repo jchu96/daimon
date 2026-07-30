@@ -225,6 +225,40 @@ def test_build_action_maps_select_to_set_multi() -> None:
     )
 
 
+def test_build_action_rejects_a_select_value_the_step_does_not_declare() -> None:
+    """Interaction payloads are untrusted on this path: the button branch
+    validates its option index against the spec, so the select branch must
+    validate its values the same way."""
+    with pytest.raises(ValueError, match="does not declare"):
+        build_action("s1_sel", spec=_SPEC, values=["cheese", "anchovies"], text=None)
+
+
+def test_build_action_rejects_a_select_against_a_non_multi_step() -> None:
+    with pytest.raises(ValueError, match="choice step"):
+        build_action("s0_sel", spec=_SPEC, values=["red"], text=None)
+
+
+def test_build_action_rejects_more_select_values_than_the_step_allows() -> None:
+    capped_spec = WizardSpec(
+        prompt="Order form",
+        steps=[
+            Step(
+                key="toppings",
+                question="Pick toppings",
+                kind=StepKind.MULTI,
+                options=[
+                    Option(label="Cheese", value="cheese"),
+                    Option(label="Olives", value="olives"),
+                ],
+                max=1,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="above step"):
+        build_action("s0_sel", spec=capped_spec, values=["cheese", "olives"], text=None)
+
+
 def test_build_action_maps_choice_button_to_select_choice_with_looked_up_value() -> None:
     action = build_action("s0_c1", spec=_SPEC, values=[], text=None)
 

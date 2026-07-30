@@ -297,6 +297,28 @@ async def test_select_change_records_every_chosen_value_and_does_not_advance(
     assert after.current_step == 1, "a multi-select change must not advance the step"
 
 
+async def test_select_change_carrying_an_undeclared_value_writes_nothing(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A modified client can put anything in a select's values -- the tap must
+    be refused rather than recorded under the step's key."""
+    row = await _seed(db_session_factory, current_step=1)
+    bot = _fake_bot(db_session_factory)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot)
+
+    item = await WizardSelect.from_custom_id(
+        interaction, MagicMock(), _select_match(row.id, "s1_sel")
+    )
+    item.item._values = ["cheese", "anchovies"]  # pyright: ignore[reportPrivateUsage]  # simulates a real dispatch's _refresh_state without running the full ViewStore machinery
+    assert await item.interaction_check(interaction) is True
+    await item.callback(interaction)
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after == row, "a forged select value must leave the row byte-identical"
+    interaction.edit_original_response.assert_not_awaited()
+
+
 async def test_back_tap_from_step_one_returns_to_step_zero(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

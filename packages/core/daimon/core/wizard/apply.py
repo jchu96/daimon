@@ -136,6 +136,32 @@ def build_action(
         step_index = int(select_match.group("step"))
         if not (0 <= step_index < len(spec.steps)):
             raise ValueError(f"action {action!r} names step {step_index}, out of range for spec")
+        # The values arrive from the interaction payload, which this dispatch
+        # path treats as untrusted (the custom_id carries no state and the
+        # requester is re-checked on every tap). The button path already
+        # validates its option index against the spec; without the checks
+        # below the select path would be the one place that records whatever
+        # the client sent.
+        step = spec.steps[step_index]
+        if step.kind is not StepKind.MULTI:
+            raise ValueError(
+                f"action {action!r} is a multi-select on step {step_index}, which is a "
+                f"{step.kind.value} step"
+            )
+        allowed_values = {option.value for option in step.options}
+        unknown = [value for value in values if value not in allowed_values]
+        if unknown:
+            # Custom entries only ever arrive through ADD_CUSTOM; a select can
+            # only ever return values the spec itself declared.
+            raise ValueError(
+                f"action {action!r} carries values {unknown!r} that step {step_index} "
+                f"does not declare as options"
+            )
+        if step.max is not None and len(values) > step.max:
+            raise ValueError(
+                f"action {action!r} carries {len(values)} values, above step "
+                f"{step_index}'s `max` of {step.max}"
+            )
         return WizardAction(kind=ActionKind.SET_MULTI, step_index=step_index, values=list(values))
 
     nav_match = _NAV_ACTION_RE.match(action)
