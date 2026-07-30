@@ -34,6 +34,7 @@ from daimon.adapters.discord.vision import (
     is_vision_image_attachment,
 )
 from daimon.core.config import Settings
+from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.provisioning import provision_tenant, reconcile_tenant_defaults
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_tenant_uuid
@@ -304,15 +305,28 @@ class DaimonBot(commands.Bot):
                 tenant_id=tenant_id,
                 public_url=public_url,
             )
-            if report.is_failure():
-                await set_provision_status(
-                    self.runtime.sessionmaker, tenant_id=tenant_id, status="failed"
-                )
-            else:
-                await set_provision_status(
-                    self.runtime.sessionmaker, tenant_id=tenant_id, status="ready"
-                )
-            embed = _build_snag_embed() if report.is_failure() else _build_ready_embed()
+            seed_ok = not report.is_failure()
+            if seed_ok:
+                agent_name = self.runtime.deployment_default.agent_name
+                if agent_name is None:
+                    log.info("guild_seed_roster_check_skipped", tenant_id=str(tenant_id))
+                else:
+                    default_agent = await find_agent_by_daimon_tag(
+                        self.runtime.anthropic, tenant_id=tenant_id, name=agent_name
+                    )
+                    if default_agent is None:
+                        seed_ok = False
+                        log.warning(
+                            "guild_seed_default_agent_missing",
+                            tenant_id=str(tenant_id),
+                            agent_name=agent_name,
+                        )
+            await set_provision_status(
+                self.runtime.sessionmaker,
+                tenant_id=tenant_id,
+                status="ready" if seed_ok else "failed",
+            )
+            embed = _build_ready_embed() if seed_ok else _build_snag_embed()
             await self._post_to_guild(guild, embed)
         except (DaimonError, _anthropic.APIError, discord.HTTPException) as exc:
             log.warning("guild_seed_failed", tenant_id=str(tenant_id), error=str(exc))
