@@ -534,7 +534,7 @@ def test_edit_view_env_vars_button_always_enabled(account_id: uuid.UUID) -> None
     assert _find_button(user_view, "Env vars").disabled is False, "user agents can open Env vars"
 
 
-# --- Spec-control reachability gate (FIRST-04/05) ---------------------------
+# --- Spec-control reachability gate ---------------------------
 
 
 def _reachable_state(entry: RosterEntry, account_id: uuid.UUID, *, is_admin: bool) -> PanelState:
@@ -745,7 +745,7 @@ async def test_open_edit_view_binds_the_render_interaction(
 
 
 # ---------------------------------------------------------------------------
-# Click-time authz gate on the remove selects (FIRST-04/05)
+# Click-time authz gate on the remove selects
 # ---------------------------------------------------------------------------
 
 
@@ -950,7 +950,7 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
 ) -> None:
     """Env vars are a per-agent attachment, never part of the agent spec — the
     new click-time gate must not reach this path even for a reachable agent
-    edited by a non-admin (D-09/D-17)."""
+    edited by a non-admin."""
     from daimon.adapters.discord.agent_setup.credentials import PasteSecretModal
     from daimon.core.ma_identity import derive_agent_uuid
     from daimon.core.ma_resolver import new_resolver_cache
@@ -972,7 +972,7 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
         # A non-admin caller editing the workspace's current default agent —
-        # env vars stay writable regardless (D-09).
+        # env vars stay writable regardless.
         deployment_default=DeploymentDefault(agent_name="daimon"),
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn

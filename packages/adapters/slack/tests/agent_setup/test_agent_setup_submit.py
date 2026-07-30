@@ -527,7 +527,7 @@ async def _mark_reachable(
     tenant_id: Any,
     agent_name: str,
 ) -> None:
-    """Write a real tenant-scope propagation row (D-09) so the named agent is
+    """Write a real tenant-scope propagation row so the named agent is
     currently reachable — never patch the reachability predicate."""
     async with db_session_factory() as session, session.begin():
         await set_fields(
@@ -658,7 +658,7 @@ async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_de
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Repo binding is a per-agent attachment, so it stays open for a
-    non-admin even against the workspace's currently-default agent (D-09)."""
+    non-admin even against the workspace's currently-default agent."""
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding
 
@@ -723,7 +723,7 @@ async def test_run_paste_secrets_submission_when_non_admin_and_agent_is_workspac
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Env variables are a per-agent attachment, so they stay open for a
-    non-admin even against the workspace's currently-default agent (D-09)."""
+    non-admin even against the workspace's currently-default agent."""
     async with db_session_factory() as session:
         tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
         tenant_id = tenant.id

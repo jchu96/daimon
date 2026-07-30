@@ -588,7 +588,7 @@ async def test_add_mcp_submit_returns_to_edit_view(
 
 
 # ---------------------------------------------------------------------------
-# Click-time authz gate (FIRST-04/05) — the guard sits above the #142 reserved
+# Click-time authz gate — the guard sits above the #142 reserved
 # name/own-endpoint checks and below them alphabetically: reserved-name still
 # fires first (see test_add_mcp_modal_rejects_reserved_name_...), and a
 # non-reserved, reachable or system target is refused before defer/reconcile.

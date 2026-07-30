@@ -559,7 +559,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
 
         # -----------------------------------------------------------------------
         # Edit button — push to L2 (the ONLY transition that pushes to L2)
-        # Open to every member (D-06/D-09): building/configuring an unscoped
+        # Open to every member: building/configuring an unscoped
         # agent needs no admin. can_edit_spec (admin, or the agent is not
         # currently reachable) decides whether the agent-spec controls render.
         # -----------------------------------------------------------------------
@@ -896,7 +896,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Remove skill — field-conditional (D-09): skills are part of the agent
+        # Remove skill — field-conditional: skills are part of the agent
         # spec, so this refuses a non-admin only when the target agent is
         # currently reachable. Re-resolves via the shared gate post-ack.
         # -----------------------------------------------------------------------
@@ -985,7 +985,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Remove MCP — field-conditional (D-09): MCP servers are part of the
+        # Remove MCP — field-conditional: MCP servers are part of the
         # agent spec, so this refuses a non-admin only when the target agent
         # is currently reachable. Re-resolves via the shared gate post-ack.
         # -----------------------------------------------------------------------
@@ -1073,7 +1073,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Remove secret — always open (D-09): env-variable credentials are a
+        # Remove secret — always open: env-variable credentials are a
         # per-agent attachment, not part of the agent spec. No refusal for any
         # caller; is_admin/can_edit_spec are resolved only for the L1 stale
         # fallback and the L2 re-render's build_l2_view kwargs.
@@ -1245,7 +1245,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # New Agent — push L3 new-agent form. Open to every member (D-06):
+        # New Agent — push L3 new-agent form. Open to every member:
         # creating an unscoped agent is not tenant-wide blast radius.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__new":
@@ -1259,7 +1259,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Fork Agent — push L3 fork-agent form. Open to every member (D-06):
+        # Fork Agent — push L3 fork-agent form. Open to every member:
         # forking is a new, unscoped agent, same as New.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__fork":
@@ -1299,7 +1299,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Edit Agent Form — push L3 edit-agent form. Field-conditional (D-09):
+        # Edit Agent Form — push L3 edit-agent form. Field-conditional:
         # touches system/model, part of the agent spec, so this refuses a
         # non-admin only when the target agent is currently reachable.
         # -----------------------------------------------------------------------
@@ -1363,7 +1363,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Edit Repo Form — push L3 edit-repo form. Always open (D-09): the
+        # Edit Repo Form — push L3 edit-repo form. Always open: the
         # repo binding is a per-agent attachment, not part of the agent spec.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__edit_repo_form":
@@ -1403,7 +1403,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Add Skill — push L3 add-skill form. Field-conditional (D-09): skills
+        # Add Skill — push L3 add-skill form. Field-conditional: skills
         # are part of the agent spec, so this refuses a non-admin only when
         # the target agent is currently reachable.
         # -----------------------------------------------------------------------
@@ -1455,7 +1455,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Add MCP Server — push L3 add-mcp form. Field-conditional (D-09):
+        # Add MCP Server — push L3 add-mcp form. Field-conditional:
         # MCP servers are part of the agent spec, so this refuses a
         # non-admin only when the target agent is currently reachable.
         # -----------------------------------------------------------------------
@@ -1507,7 +1507,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Paste Secrets — push L3 paste-secrets form. Always open (D-09):
+        # Paste Secrets — push L3 paste-secrets form. Always open:
         # env-variable credentials are a per-agent attachment, not part of
         # the agent spec.
         # -----------------------------------------------------------------------

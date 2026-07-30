@@ -460,7 +460,7 @@ def build_agent_section(
     """Build the Agent section blocks for the L2 editor.
 
     The Edit prompt & model action touches ``system``/``model`` — fields the
-    reachability gate covers on a currently-scoped agent (D-09) — so this
+    reachability gate covers on a currently-scoped agent — so this
     section's mutation control follows spec-editability, not admin-ness alone.
 
     Args:
@@ -534,7 +534,7 @@ def build_repo_auth_section(
     """Build the Repo+Auth section blocks for the L2 editor.
 
     The repo binding and its PAT are a per-agent attachment, not part of the
-    agent spec an admin approves (D-09) — the edit control renders for every
+    agent spec an admin approves — the edit control renders for every
     member, on every agent, regardless of admin status or reachability.
 
     Args:
@@ -592,7 +592,7 @@ def build_skills_section(
     """Build the Skills section blocks for the L2 editor.
 
     Skills are part of the agent spec an admin approves when the agent
-    becomes reachable (D-09), so the Add/Remove controls follow
+    becomes reachable, so the Add/Remove controls follow
     spec-editability, not admin-ness alone.
 
     Args:
@@ -681,7 +681,7 @@ def build_mcps_section(
     """Build the MCPs section blocks for the L2 editor.
 
     MCP servers are part of the agent spec an admin approves when the agent
-    becomes reachable (D-09), so Add MCP server / Remove MCP follow
+    becomes reachable, so Add MCP server / Remove MCP follow
     spec-editability, not admin-ness alone. Connect via MCP is a distinct
     operation — it mints a long-lived revocable bearer token, and token
     issuance stays admin-only unconditionally (outside the set of operations
@@ -777,7 +777,7 @@ def build_secrets_section(
     """Build the Secrets section blocks for the L2 editor.
 
     Env-variable credentials are a per-agent attachment, not part of the
-    agent spec an admin approves (D-09) — Add/Remove render for every
+    agent spec an admin approves — Add/Remove render for every
     member, on every agent, regardless of admin status or reachability.
 
     STRUCTURAL GUARANTEE: this function accepts

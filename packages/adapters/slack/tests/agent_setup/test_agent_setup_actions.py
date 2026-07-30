@@ -264,7 +264,7 @@ async def _mark_reachable(
     tenant_id: uuid.UUID,
     agent_name: str,
 ) -> None:
-    """Write a real tenant-scope propagation row (D-09) so the named agent is
+    """Write a real tenant-scope propagation row so the named agent is
     currently reachable — never patch the reachability predicate."""
     async with db_session_factory() as session, session.begin():
         await set_fields(
@@ -820,7 +820,7 @@ async def test_handle_agent_setup_action_paste_secrets_pushes_paste_secrets_form
 
 
 # ---------------------------------------------------------------------------
-# Test: agent_setup__new is open to every member, admin or not (D-06/D-09)
+# Test: agent_setup__new is open to every member, admin or not
 # ---------------------------------------------------------------------------
 
 
@@ -830,7 +830,7 @@ async def test_handle_agent_setup_action_new_with_non_admin_pushes_form_no_ephem
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: object,
 ) -> None:
-    """agent_setup__new is always-open (D-06): a non-admin still gets the form pushed,
+    """agent_setup__new is always-open: a non-admin still gets the form pushed,
     with no refusal ephemeral. Building an unscoped agent is not tenant-wide blast radius.
 
     The default FakeSlackWebClient users.info returns is_admin=False (fail-closed baseline
@@ -990,7 +990,7 @@ def _assert_reachability_refusal(client_fake: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Always-open branches (D-06/D-09): new, fork, edit, edit_repo_form,
+# Always-open branches: new, fork, edit, edit_repo_form,
 # paste_secrets, remove_secret -- no refusal for any caller, admin or not.
 # `new` is covered above; the remaining five follow.
 # ---------------------------------------------------------------------------
@@ -1088,7 +1088,7 @@ async def test_handle_agent_setup_action_remove_secret_non_admin_writes_and_upda
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: object,
 ) -> None:
-    """remove_secret is always open (D-09): env variables are a per-agent
+    """remove_secret is always open: env variables are a per-agent
     attachment, never part of the agent spec -- even on a reachable agent."""
     tenant_id, fernet_key, _ = await _seed_team(db_session)
     agent_payload = _agent_payload(tenant_id=tenant_id)
@@ -1236,7 +1236,7 @@ async def test_handle_agent_setup_action_connect_mcp_non_admin_refused_no_epheme
 
 
 # ---------------------------------------------------------------------------
-# Field-conditional branches (D-09), gated by
+# Field-conditional branches, gated by
 # refuse_if_reachable_and_not_admin: remove_skill, remove_mcp,
 # edit_agent_form, add_skill, add_mcp. Each proceeds for a non-admin when the
 # target agent is unreachable, and is refused when it is currently reachable

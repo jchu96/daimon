@@ -2171,7 +2171,7 @@ async def test_repo_auth_modal_still_writes_binding_on_reachable_system_agent_fo
     monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
 ) -> None:
     """The repo binding is a per-agent attachment, never part of the agent
-    spec (D-09/D-17) — the new click-time gate must not reach this path even
+    spec — the new click-time gate must not reach this path even
     for a reachable system agent edited by a non-admin."""
     set_binding_called = False
 

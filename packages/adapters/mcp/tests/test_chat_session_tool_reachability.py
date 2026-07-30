@@ -105,7 +105,7 @@ CHAT_TURN_TOOL_REACHABILITY: dict[str, ExpectedOutcome] = {
     # docstring).
     "request_mcp_credential": ExpectedOutcome(discoverable=True),
     "request_env_credential": ExpectedOutcome(discoverable=True),
-    # routines.py — ungated per D-03; needs a platform user identity, which
+    # routines.py — ungated by design; needs a platform user identity, which
     # this Discord-shaped session carries.
     "create_routine": ExpectedOutcome(discoverable=True),
 }

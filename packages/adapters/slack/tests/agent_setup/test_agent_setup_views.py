@@ -136,7 +136,7 @@ def test_build_l1_view_admin_includes_roster_select_block() -> None:
 
 
 def test_build_l1_view_non_admin_includes_new_fork_edit_but_not_delete() -> None:
-    """Non-admin view keeps the lifecycle block but omits Delete (D-06/D-09)."""
+    """Non-admin view keeps the lifecycle block but omits Delete."""
     state = _roster_state("agent-a", "agent-b")
     view = build_l1_view(
         state,
@@ -159,7 +159,7 @@ def test_build_l1_view_non_admin_includes_new_fork_edit_but_not_delete() -> None
     assert "agent_setup__fork" in action_ids, "non-admin lifecycle row must include Fork"
     assert "agent_setup__edit" in action_ids, "non-admin lifecycle row must include Edit"
     assert "agent_setup__delete" not in action_ids, (
-        "non-admin lifecycle row must NOT include Delete (admin-only, D-06)"
+        "non-admin lifecycle row must NOT include Delete (admin-only)"
     )
 
 
@@ -479,7 +479,7 @@ def test_secrets_section_keys_only_no_values_parameter_in_signature() -> None:
 
 
 def test_secrets_section_always_includes_mutation_actions() -> None:
-    """Secrets are a per-agent attachment (D-09): Add/Remove render for every
+    """Secrets are a per-agent attachment: Add/Remove render for every
     caller, regardless of admin status or reachability -- build_secrets_section
     takes no is_admin/can_edit_spec parameter at all."""
     blocks = build_secrets_section(
@@ -493,7 +493,7 @@ def test_secrets_section_always_includes_mutation_actions() -> None:
 
 
 def test_repo_auth_section_always_includes_edit_action_id() -> None:
-    """Repo binding is a per-agent attachment (D-09): the edit action id
+    """Repo binding is a per-agent attachment: the edit action id
     renders regardless of admin status or reachability -- build_repo_auth_section
     takes no is_admin/can_edit_spec parameter at all."""
     blocks = build_repo_auth_section(repo=None, pat_last4=None)
@@ -509,7 +509,7 @@ def test_repo_auth_section_always_includes_edit_action_id() -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_skills_section / build_mcps_section — can_edit_spec gate (D-09)
+# build_skills_section / build_mcps_section — can_edit_spec gate
 # ---------------------------------------------------------------------------
 
 
