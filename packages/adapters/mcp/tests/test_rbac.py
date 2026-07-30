@@ -219,8 +219,8 @@ async def test_non_admin_call_admin_tool_blocked(
         params={
             "name": "call_tool",
             "arguments": {
-                "tool_name": "archive_agent",
-                "tool_args": {"name": "daimon"},
+                "name": "archive_agent",
+                "arguments": {"name": "daimon"},
             },
         },
     )
@@ -295,8 +295,8 @@ async def test_non_admin_call_relaxed_tool_reaches_impl(
         params={
             "name": "call_tool",
             "arguments": {
-                "tool_name": "self_write_file",
-                "tool_args": {"key": "notes", "content": "hello"},
+                "name": "self_write_file",
+                "arguments": {"key": "notes", "content": "hello"},
             },
         },
     )
