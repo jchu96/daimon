@@ -9,7 +9,12 @@ from typing import Any
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
-from daimon.core.scope import ChannelConfigRow, DeploymentDefault, TenantConfigRow
+from daimon.core.scope import (
+    ChannelConfigRow,
+    DeploymentDefault,
+    TenantConfigRow,
+    is_agent_reachable,
+)
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.domain import AgentRepoBindingRow
 
@@ -231,6 +236,26 @@ class PanelState:
         else:
             self.selected = self.roster[min(idx, len(self.roster) - 1)]
         return self.selected
+
+    def is_selected_reachable(self) -> bool:
+        """Whether some channel or the workspace currently resolves to the
+        selected agent, including through the deployment default fall-through.
+
+        This is a distinct question from `RosterEntry.is_system`: reachability
+        is a live cascade property (does anything currently point at this
+        agent), while `is_system` is a provenance marker (was this agent
+        created by the defaults seed). They coincide for the seeded agent on
+        a fresh install, but one never implies the other.
+        """
+        if self.selected is None:
+            return False
+        tenant_row, channel_rows = self.cascade_view
+        return is_agent_reachable(
+            self.selected.name,
+            tenant=tenant_row,
+            channels=channel_rows,
+            default=self.deployment_default,
+        )
 
     @classmethod
     def initial(

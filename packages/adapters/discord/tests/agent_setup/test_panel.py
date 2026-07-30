@@ -867,6 +867,103 @@ def test_member_roster_matches_admin_and_no_mutation_buttons(account_id: uuid.UU
 
 
 # ---------------------------------------------------------------------------
+# PanelState.is_selected_reachable
+# ---------------------------------------------------------------------------
+
+
+def test_is_selected_reachable_false_when_nothing_selected(account_id: uuid.UUID) -> None:
+    """No selection → not reachable (nothing to be reachable)."""
+    from daimon.core.scope import DeploymentDefault
+
+    state = PanelState(
+        roster=[],
+        selected=None,
+        account_id=account_id,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    assert state.is_selected_reachable() is False, "no selection must never be reachable"
+
+
+def test_is_selected_reachable_true_via_deployment_default(account_id: uuid.UUID) -> None:
+    """Fresh install, no config rows: the deployment default's agent is reachable."""
+    from daimon.core.scope import DeploymentDefault
+
+    selected = _entry("daimon")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        cascade_view=(None, []),
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    assert state.is_selected_reachable() is True, (
+        "the deployment default's agent must be reachable on a fresh install"
+    )
+
+
+def test_is_selected_reachable_false_when_deployment_default_names_other_agent(
+    account_id: uuid.UUID,
+) -> None:
+    """Fresh install, no config rows: an agent the deployment default does NOT
+    name is not reachable."""
+    from daimon.core.scope import DeploymentDefault
+
+    selected = _entry("research-bot")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        cascade_view=(None, []),
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    assert state.is_selected_reachable() is False, (
+        "an agent not named by the deployment default must not be reachable"
+    )
+
+
+def test_is_selected_reachable_true_via_channel_row(account_id: uuid.UUID) -> None:
+    """A channel row in mode='agent' naming the selected agent makes it reachable."""
+    from daimon.core.scope import ChannelConfigRow, DeploymentDefault
+
+    selected = _entry("alice")
+    ch_row = ChannelConfigRow(
+        tenant_id=uuid.UUID(int=0), channel_id="1001", agent_name="alice", mode="agent"
+    )
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        cascade_view=(None, [ch_row]),
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    assert state.is_selected_reachable() is True, (
+        "a channel row naming the selected agent must make it reachable"
+    )
+
+
+def test_is_selected_reachable_false_when_tenant_row_names_other_agent(
+    account_id: uuid.UUID,
+) -> None:
+    """A tenant row in mode='agent' naming a different agent suppresses the
+    deployment-default fall-through for the selected (unnamed) agent."""
+    from daimon.core.scope import DeploymentDefault, TenantConfigRow
+
+    selected = _entry("daimon")
+    tenant_row = TenantConfigRow(tenant_id=uuid.UUID(int=0), agent_name="bob", mode="agent")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        cascade_view=(tenant_row, []),
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    assert state.is_selected_reachable() is False, (
+        "a tenant row naming a different agent must suppress the deployment "
+        "default's reachability for the selected agent"
+    )
+
+
+# ---------------------------------------------------------------------------
 # interaction_check
 # ---------------------------------------------------------------------------
 
