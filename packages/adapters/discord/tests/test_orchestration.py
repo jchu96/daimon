@@ -897,6 +897,9 @@ class TestSetupHook:
         privacy_mod.PrivacyCog = mock_privacy_cog  # type: ignore[attr-defined]
         memory_mod = types.ModuleType("daimon.adapters.discord.commands.memory")
         memory_mod.MemoryCog = mock_memory_cog  # type: ignore[attr-defined]
+        mock_feedback_reaction_cog = MagicMock()
+        feedback_reactions_mod = types.ModuleType("daimon.adapters.discord.feedback_reactions")
+        feedback_reactions_mod.FeedbackReactionCog = mock_feedback_reaction_cog  # type: ignore[attr-defined]
 
         add_cog_calls: list[object] = []
 
@@ -914,17 +917,19 @@ class TestSetupHook:
                 "daimon.adapters.discord.commands.billing": billing_mod,
                 "daimon.adapters.discord.commands.privacy": privacy_mod,
                 "daimon.adapters.discord.commands.memory": memory_mod,
+                "daimon.adapters.discord.feedback_reactions": feedback_reactions_mod,
             },
         ):
             await bot.setup_hook()
 
-        assert len(add_cog_calls) == 6, "setup_hook should add exactly 6 Cogs"
+        assert len(add_cog_calls) == 7, "setup_hook should add exactly 7 Cogs"
         mock_help_cog.assert_called_once_with(bot)
         mock_agent_setup_cog.assert_called_once_with(bot)
         mock_routines_cog.assert_called_once_with(bot)
         mock_billing_cog.assert_called_once_with(bot)
         mock_privacy_cog.assert_called_once_with(bot)
         mock_memory_cog.assert_called_once_with(bot)
+        mock_feedback_reaction_cog.assert_called_once_with(bot)
 
 
 class TestBillingAdmissionGate:
