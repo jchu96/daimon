@@ -120,6 +120,33 @@ def test_custom_text_on_multi_step_appends_and_stays() -> None:
     assert new_state.current_step == 1, "custom text on a multi step must not advance"
 
 
+def test_custom_text_on_a_multi_step_at_its_max_is_a_no_op() -> None:
+    """`max` gates the select's max_values, but nothing stops a user
+    reopening the custom-text modal -- the transition has to hold the line,
+    or the recorded answers grow without bound."""
+    capped_spec = WizardSpec(
+        prompt="Order form",
+        steps=[
+            Step(
+                key="toppings",
+                question="Pick toppings",
+                kind=StepKind.MULTI,
+                options=[
+                    Option(label="Cheese", value="cheese"),
+                    Option(label="Olives", value="olives"),
+                ],
+                max=2,
+            )
+        ],
+    )
+    state = WizardState(short_id="abcd1234", answers={"toppings": ["cheese", "Anchovies"]})
+    action = WizardAction(kind=ActionKind.ADD_CUSTOM, step_index=0, text="Pineapple")
+
+    new_state = apply(state, capped_spec, action)
+
+    assert new_state == state, "an append past the step's declared max must change nothing"
+
+
 @pytest.mark.parametrize("raw_text", ["", "   ", "\t\n"])
 def test_custom_text_empty_or_whitespace_raises(raw_text: str) -> None:
     state = _state(current_step=0)

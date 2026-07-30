@@ -32,6 +32,14 @@ from daimon.core.wizard.state import WizardState
 _MARKDOWN_CONTROL_CHARS = "*_~`|>#-[]()"
 _UNANSWERED_DISPLAY = "—"  # em dash
 
+# A summary is rendered into one TextDisplay, which Discord caps at 4000
+# characters. A 20-step form with long typed answers can exceed that, and an
+# oversized body makes the review AND the post-submit collapse re-render fail
+# — the latter on a form whose submission has already been claimed. Truncate
+# with headroom instead.
+MAX_SUMMARY_CHARS = 3800
+_TRUNCATION_MARKER = "\n… (answers truncated for display)"
+
 
 _ZERO_WIDTH_SPACE = "​"
 
@@ -66,7 +74,13 @@ def _label_for_value(spec_step_options: list[tuple[str, str]], value: str) -> st
 
 
 def summarize_answers(spec: WizardSpec, state: WizardState) -> str:
-    """Return a human-readable, escaped, one-line-per-step summary."""
+    """Return a human-readable, escaped, one-line-per-step summary, truncated
+    to `MAX_SUMMARY_CHARS`.
+
+    Truncation is display-only: the full answers still reach the agent
+    through `format_answer_block`, which carries no ceiling because it is
+    message text, not a component.
+    """
     lines: list[str] = []
     for step in spec.steps:
         recorded = state.answers.get(step.key)
@@ -78,7 +92,13 @@ def summarize_answers(spec: WizardSpec, state: WizardState) -> str:
             escape_discord_markup(_label_for_value(option_pairs, value)) for value in recorded
         ]
         lines.append(f"**{step.question}**: {', '.join(display_values)}")
-    return "\n".join(lines)
+    summary = "\n".join(lines)
+    if len(summary) <= MAX_SUMMARY_CHARS:
+        return summary
+    # rstrip("\\") so the cut cannot end on a lone backslash that would then
+    # escape the marker's own newline.
+    head = summary[: MAX_SUMMARY_CHARS - len(_TRUNCATION_MARKER)].rstrip("\\")
+    return f"{head}{_TRUNCATION_MARKER}"
 
 
 def format_answer_block(spec: WizardSpec, state: WizardState) -> str:

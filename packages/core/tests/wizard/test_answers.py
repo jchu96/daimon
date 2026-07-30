@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from daimon.core.wizard.answers import (
+    MAX_SUMMARY_CHARS,
     escape_discord_markup,
     format_answer_block,
     summarize_answers,
@@ -137,4 +138,29 @@ def test_escape_discord_markup_neutralizes_here_and_role_mention() -> None:
     assert "@​here" in escaped
     assert "<@​&12345\\>" in escaped, (
         "the mass-mention sequence is neutralized; > is still escaped like any other control char"
+    )
+
+
+def test_summary_is_truncated_to_the_text_display_budget() -> None:
+    """An unbounded summary makes the review screen -- and the post-submit
+    collapse re-render, on an already-claimed submission -- fail to render."""
+    long_spec = WizardSpec(
+        prompt="Order form",
+        steps=[
+            Step(key=f"k{i}", question=f"Question {i}", kind=StepKind.TEXT, options=[])
+            for i in range(20)
+        ],
+    )
+    state = WizardState(short_id="abcd1234", answers={f"k{i}": ["x" * 200] for i in range(20)})
+
+    summary = summarize_answers(long_spec, state)
+
+    assert len(summary) <= MAX_SUMMARY_CHARS, (
+        "the summary must stay inside the budget a TextDisplay can carry"
+    )
+    assert summary.endswith("(answers truncated for display)"), (
+        "a truncated summary must say so rather than silently losing answers"
+    )
+    assert not summary.endswith("\\\n… (answers truncated for display)"), (
+        "the cut must not end on a lone backslash that would escape the marker's newline"
     )

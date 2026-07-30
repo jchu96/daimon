@@ -85,6 +85,12 @@ def apply(state: WizardState, spec: WizardSpec, action: WizardAction) -> WizardS
                 raise ValueError("add_custom action carries empty or whitespace-only text")
             step = spec.steps[step_index]
             if step.kind is StepKind.MULTI:
+                if step.max is not None and len(state.answers.get(step.key, [])) >= step.max:
+                    # `max` gates the select's max_values, but nothing stops a
+                    # user reopening the custom-text modal; without this an
+                    # append loop violates the form's own declared ceiling and
+                    # grows the recorded answers without bound.
+                    return state
                 return _append_answer(state, step.key, text)
             new_state = _with_answer(state, step.key, [text])
             return dataclasses.replace(new_state, current_step=_clamp_step(step_index + 1, spec))
