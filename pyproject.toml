@@ -90,6 +90,7 @@ source_modules = [
     "daimon.core.skills",
     "daimon.core.specs",
     "daimon.core.turn",
+    "daimon.core.wizard",
 ]
 forbidden_modules = ["daimon.core._models"]
 # Stores are the sanctioned abstraction layer between adapters and the ORM.
