@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
+import uuid
 from collections.abc import AsyncIterator
 
 import httpx
@@ -24,6 +26,7 @@ from daimon.core.config import (
     McpSettings,
     Settings,
 )
+from daimon.core.mcp_auth import mint_jwt
 from daimon.core.stores import accounts
 from daimon.core.stores.domain import Role
 from daimon.testing.factories import make_account, make_tenant
@@ -36,6 +39,7 @@ from .factories import make_jwt
 pytestmark = pytest.mark.asyncio
 
 SECRET = "a" * 32
+_NOW = dt.datetime(2026, 4, 24, tzinfo=dt.UTC)
 
 INIT_BODY: dict[str, object] = {
     "jsonrpc": "2.0",
@@ -248,6 +252,60 @@ RELAXED_TOOL_NAMES = (
 )
 """The eight tools whose blast radius is one agent, not the whole tenant —
 relaxed onto the open (non-admin-visible, non-admin-callable) surface."""
+
+CHAT_REMOVAL_TOOL_NAMES = (
+    "detach_mcp_server",
+    "remove_skill",
+    "remove_env_credential",
+    "list_env_credential_keys",
+)
+"""The four chat-reachable removal tools: never admin-tagged, so they are
+discoverable by a non-admin session's search_tools like RELAXED_TOOL_NAMES,
+but also must never leak into a narrowed agent-chat session's tools/list."""
+
+
+@pytest.mark.parametrize("tool_name", CHAT_REMOVAL_TOOL_NAMES)
+async def test_non_admin_search_includes_chat_removal_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tool_name: str,
+) -> None:
+    """Each chat-removal tool is discoverable by a non-admin session via search_tools."""
+    _, user_token = await _seed_admin_and_user(sessionmaker)
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(
+        app,
+        token=user_token,
+        method="tools/call",
+        params={"name": "search_tools", "arguments": {"query": tool_name.replace("_", " ")}},
+    )
+    call_result = result.get("result", result)
+    content = call_result.get("content", [])  # type: ignore[union-attr]
+    output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
+    assert tool_name in output_text, (
+        f"{tool_name} must be discoverable by a non-admin session; got: {output_text!r}"
+    )
+
+
+async def test_agent_id_claim_session_discovers_none_of_the_chat_removal_tools(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A session narrowed to agent-chat tools (an agent_id claim) must not
+    discover any of the four chat-removal tools — being untagged (not
+    admin-only) must not accidentally grant agent-chat visibility."""
+    async with sessionmaker() as s, s.begin():
+        tenant = await make_tenant(s, platform="discord", workspace_id="agent-chat-removal-rbac")
+        account = await make_account(s, tenant=tenant)
+    token = mint_jwt(account_id=account.id, secret=SECRET.encode(), now=_NOW, agent_id=uuid.uuid4())
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(app, token=token, method="tools/list")
+    payload = result.get("result", result)
+    tool_names = {t["name"] for t in payload.get("tools", [])}  # type: ignore[union-attr]
+
+    assert not (set(CHAT_REMOVAL_TOOL_NAMES) & tool_names), (
+        f"an agent_id-claim session must not discover any chat-removal tool; got: {tool_names}"
+    )
 
 
 @pytest.mark.parametrize("tool_name", RELAXED_TOOL_NAMES)
