@@ -27,6 +27,7 @@ from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
 from daimon.core.stores import tenants as tenants_store
 from daimon.core.stores import user_skills as user_skills_store
+from daimon.core.stores import wizard_session as wizard_session_store
 from daimon.core.stores.domain import CliPrincipalRow, PlatformPrincipalRow
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -66,6 +67,7 @@ class PurgePreview(BaseModel):
     slack_user_tokens: PurgePreviewRow
     slack_turn_contexts: PurgePreviewRow
     credential_requests: PurgePreviewRow
+    wizard_sessions: PurgePreviewRow
 
 
 def _format_platform_principal(p: PlatformPrincipalRow) -> str:
@@ -284,6 +286,28 @@ async def collect_purge_preview(
             )
         credential_requests = PurgePreviewRow(count=credential_requests_total, example=None)
 
+        # 14. wizard_sessions — requester_platform_user_id-scoped, same shape as
+        # credential_requests above. Keyed by (platform_user_id, tenant_id),
+        # mirroring _purge_principal_in_session's actual tenant-scoped delete
+        # call exactly, so this preview agrees field-for-field with what
+        # purge_account actually deletes. Dedup avoids double-counting when two
+        # principals under the account share a (platform_user_id, tenant_id) key.
+        wizard_session_keys: set[tuple[str, uuid.UUID]] = set()
+        for pp in pp_list:
+            wizard_session_keys.add((pp.external_id, pp.tenant_id))
+        for cli in cli_list:
+            wizard_session_keys.add((cli.os_user, cli.tenant_id))
+        wizard_sessions_total = 0
+        for platform_user_id, key_tenant_id in wizard_session_keys:
+            wizard_sessions_total += (
+                await wizard_session_store.count_wizard_sessions_for_platform_user(
+                    session,
+                    platform_user_id=platform_user_id,
+                    tenant_id=key_tenant_id,
+                )
+            )
+        wizard_sessions = PurgePreviewRow(count=wizard_sessions_total, example=None)
+
     return PurgePreview(
         linked_principals=linked_principals,
         principal_links=principal_links,
@@ -298,4 +322,5 @@ async def collect_purge_preview(
         slack_user_tokens=slack_user_tokens,
         slack_turn_contexts=slack_turn_contexts,
         credential_requests=credential_requests,
+        wizard_sessions=wizard_sessions,
     )

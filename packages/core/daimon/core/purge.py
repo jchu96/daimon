@@ -9,11 +9,18 @@ Registry note: the per-store delete sequence is hardcoded inside
 appending one helper call here plus one int field on `PurgeReport`. Current
 sequence: user_skills -> github_credentials -> agent_github_binding ->
 github_oauth_states (both kinds where the table permits) -> credential_requests
-(both kinds, platform-user-scoped like github_oauth_states) -> routines
+(both kinds, platform-user-scoped like github_oauth_states) -> wizard_session
+(both kinds, platform-user-scoped like credential_requests) -> routines
 (platform only) -> principal_links -> principal row. Account-level deletes
 (mcp_tokens, user_configs, accounts) run in `purge_account` after all principal
 rows are gone; mcp_tokens is keyed by account_id and is deleted before
 delete_account so its NO-ACTION/CASCADE FK to accounts.id is satisfied.
+
+wizard_session rides the platform-user-scoped delete path rather than an
+accounts.id cascade: the row's identity key is the requester's platform user
+id (a Discord/Slack tap must resolve back to a form regardless of whether an
+account row exists yet), and the nullable accounts FK on the table exists only
+to make the schema-reflecting drift guard see the table, not to delete through.
 
 credential_requests carries a Discord snowflake in requester_platform_user_id
 with no cleanup sweep by design (the table is one row per credential request,
@@ -64,6 +71,7 @@ from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
 from daimon.core.stores import tenants as tenants_store
 from daimon.core.stores import user_skills as user_skills_store
+from daimon.core.stores import wizard_session as wizard_session_store
 from daimon.core.stores.domain import CliPrincipalRow, PlatformPrincipalRow
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -92,6 +100,7 @@ class PurgeReport(BaseModel):
     slack_user_tokens: int = 0
     slack_turn_contexts: int = 0
     credential_requests: int = 0
+    wizard_sessions: int = 0
 
     def merge(self, other: PurgeReport) -> PurgeReport:
         return PurgeReport(
@@ -109,6 +118,7 @@ class PurgeReport(BaseModel):
             slack_user_tokens=self.slack_user_tokens + other.slack_user_tokens,
             slack_turn_contexts=self.slack_turn_contexts + other.slack_turn_contexts,
             credential_requests=self.credential_requests + other.credential_requests,
+            wizard_sessions=self.wizard_sessions + other.wizard_sessions,
         )
 
 
@@ -161,6 +171,13 @@ async def _purge_principal_in_session(
                 tenant_id=principal.tenant_id,
             )
         )
+        # wizard_session carries the same non-globally-unique platform_user_id
+        # caveat as credential_requests above — always tenant-scoped.
+        wizard_sessions_count = await wizard_session_store.delete_wizard_sessions_for_platform_user(
+            session,
+            platform_user_id=principal.external_id,
+            tenant_id=principal.tenant_id,
+        )
     else:
         routines_count = 0
         kind = "cli"
@@ -189,6 +206,14 @@ async def _purge_principal_in_session(
                 platform_user_id=principal.os_user,
                 tenant_id=principal.tenant_id,
             )
+        )
+        # CLI principals never own wizard_session rows in practice (the wizard
+        # flow is Discord/Slack-only), so this always reports 0 — kept for
+        # symmetry with the platform branch and future-proofing.
+        wizard_sessions_count = await wizard_session_store.delete_wizard_sessions_for_platform_user(
+            session,
+            platform_user_id=principal.os_user,
+            tenant_id=principal.tenant_id,
         )
 
     # user_skills and github_credentials are keyed by principal_id alone — both
@@ -233,6 +258,7 @@ async def _purge_principal_in_session(
         agent_github_binding=agent_github_binding_count,
         slack_user_tokens=slack_user_tokens_count,
         credential_requests=credential_requests_count,
+        wizard_sessions=wizard_sessions_count,
     )
 
 
