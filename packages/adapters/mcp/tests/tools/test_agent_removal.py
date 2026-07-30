@@ -13,11 +13,15 @@ from daimon.adapters.mcp.auth.resolver import AuthIdentity, Role
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.agent_removal import (
     _detach_mcp_server_impl,
+    _list_env_credential_keys_impl,
+    _remove_env_credential_impl,
     _remove_skill_impl,
 )
 from daimon.adapters.mcp.tools.agents import AgentInfo
 from daimon.core.defaults.mcp_merge import DAIMON_MCP_SERVER_NAME
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault, TenantScopeRef
+from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
@@ -516,3 +520,306 @@ async def test_remove_skill_impl_allows_non_admin_when_agent_unreachable(
         skill_id="skill_x",
     )
     assert captured.get("skills") == [], "an unreachable agent's skill removal is not gated"
+
+
+# ---------------------------------------------------------------------------
+# list_env_credential_keys / remove_env_credential
+# ---------------------------------------------------------------------------
+
+
+def _agent_only_router(
+    *,
+    tenant_id: uuid.UUID,
+    agent_name: str,
+    agent_id: str,
+    account_id: uuid.UUID | None,
+) -> AsyncAnthropic:
+    metadata = {"daimon_tenant": str(tenant_id), "daimon_name": agent_name}
+    if account_id is not None:
+        metadata["daimon_account"] = str(account_id)
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _r, _m: list_response(
+            [make_ma_agent(id=agent_id, name=agent_name, metadata=metadata).model_dump(mode="json")]
+        ),
+    )
+    return build_fake_anthropic(router.dispatch)
+
+
+def _multi_agent_router(
+    *, tenant_id: uuid.UUID, agents: list[tuple[str, str, uuid.UUID | None]]
+) -> AsyncAnthropic:
+    """agents: list of (agent_id, agent_name, account_id)."""
+    payloads: list[dict[str, Any]] = []
+    for agent_id, agent_name, account_id in agents:
+        metadata = {"daimon_tenant": str(tenant_id), "daimon_name": agent_name}
+        if account_id is not None:
+            metadata["daimon_account"] = str(account_id)
+        payloads.append(
+            make_ma_agent(id=agent_id, name=agent_name, metadata=metadata).model_dump(mode="json")
+        )
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response(payloads))
+    return build_fake_anthropic(router.dispatch)
+
+
+async def test_list_env_credential_keys_impl_returns_sorted_key_names_only(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = "ag_env"
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="demo", agent_id=agent_id, account_id=uuid.uuid4()
+    )
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_id)
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", id=tenant_id)
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="ZKEY", content="v1"
+        )
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="AKEY", content="v2"
+        )
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="MKEY", content="v3"
+        )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    result = await _list_env_credential_keys_impl(
+        _runtime(client, session_factory=db_session_factory), auth, agent_name="demo"
+    )
+    assert result == ["AKEY", "MKEY", "ZKEY"], "must return only the three key names, sorted"
+
+
+async def test_list_env_credential_keys_impl_returns_empty_list_when_none_set(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="demo", agent_id="ag_empty", account_id=uuid.uuid4()
+    )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    result = await _list_env_credential_keys_impl(
+        _runtime(client, session_factory=db_session_factory), auth, agent_name="demo"
+    )
+    assert result == [], "no variables set must return an empty list, not an error"
+
+
+async def test_list_env_credential_keys_impl_raises_when_agent_not_found(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response([]))
+    client = build_fake_anthropic(router.dispatch)
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    with pytest.raises(ToolError, match="not found"):
+        await _list_env_credential_keys_impl(
+            _runtime(client, session_factory=db_session_factory), auth, agent_name="ghost"
+        )
+
+
+async def test_list_env_credential_keys_impl_never_returns_a_stored_value(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = "ag_secret"
+    distinctive_value = "sk-super-secret-distinctive-value-9f2a"
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="demo", agent_id=agent_id, account_id=uuid.uuid4()
+    )
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_id)
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", id=tenant_id)
+        await put_agent_file(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="API_KEY",
+            content=distinctive_value,
+        )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    result = await _list_env_credential_keys_impl(
+        _runtime(client, session_factory=db_session_factory), auth, agent_name="demo"
+    )
+    assert result == ["API_KEY"]
+    assert distinctive_value not in str(result), (
+        "the listing must never surface the stored value under any name"
+    )
+
+
+async def test_list_env_credential_keys_impl_callable_by_non_admin_on_default_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="scoped-agent", agent_id="ag_scoped", account_id=account_id
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    result = await _list_env_credential_keys_impl(
+        _runtime(client, session_factory=db_session_factory), auth, agent_name="scoped-agent"
+    )
+    assert result == [], "the listing is not reachability-gated, even on a default agent"
+
+
+async def test_remove_env_credential_impl_removes_existing_key(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = "ag_env"
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="demo", agent_id=agent_id, account_id=uuid.uuid4()
+    )
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_id)
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", id=tenant_id)
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="API_KEY", content="v1"
+        )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    runtime = _runtime(client, session_factory=db_session_factory)
+    result = await _remove_env_credential_impl(runtime, auth, agent_name="demo", key="API_KEY")
+    assert result.removed is True
+    assert result.agent_name == "demo"
+    assert result.key == "API_KEY"
+
+    remaining = await _list_env_credential_keys_impl(runtime, auth, agent_name="demo")
+    assert remaining == [], "a follow-up listing must no longer contain the removed key"
+
+
+async def test_remove_env_credential_impl_is_idempotent_when_key_absent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="demo", agent_id="ag_env2", account_id=uuid.uuid4()
+    )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    result = await _remove_env_credential_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="demo",
+        key="NEVER_SET",
+    )
+    assert result.removed is False, "removing an absent key must succeed idempotently"
+
+
+async def test_remove_env_credential_impl_raises_when_agent_not_found(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response([]))
+    client = build_fake_anthropic(router.dispatch)
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    with pytest.raises(ToolError, match="not found"):
+        await _remove_env_credential_impl(
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            agent_name="ghost",
+            key="API_KEY",
+        )
+
+
+async def test_remove_env_credential_impl_callable_by_non_admin_on_default_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="scoped-agent", agent_id="ag_scoped2", account_id=account_id
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    result = await _remove_env_credential_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="scoped-agent",
+        key="ANY_KEY",
+    )
+    assert result.removed is False, "removal is not reachability-gated, even on a default agent"
+
+
+async def test_remove_env_credential_impl_succeeds_against_seeded_agent_with_no_daimon_account(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = "ag_seeded"
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="daimon", agent_id=agent_id, account_id=None
+    )
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_id)
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", id=tenant_id)
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="SEEDED_KEY", content="v1"
+        )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    result = await _remove_env_credential_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="daimon",
+        key="SEEDED_KEY",
+    )
+    assert result.removed is True, "the system-agent guard must not apply to env-variable removal"
+
+
+async def test_remove_env_credential_impl_isolates_between_agents_in_same_tenant(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_a_id, agent_b_id = "ag_a", "ag_b"
+    client = _multi_agent_router(
+        tenant_id=tenant_id,
+        agents=[
+            (agent_a_id, "agent-a", uuid.uuid4()),
+            (agent_b_id, "agent-b", uuid.uuid4()),
+        ],
+    )
+    agent_a_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_a_id)
+    agent_b_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_b_id)
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", id=tenant_id)
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_a_uuid, key="SHARED", content="a-value"
+        )
+        await put_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_b_uuid, key="SHARED", content="b-value"
+        )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    runtime = _runtime(client, session_factory=db_session_factory)
+    result = await _remove_env_credential_impl(runtime, auth, agent_name="agent-a", key="SHARED")
+    assert result.removed is True
+
+    remaining = await _list_env_credential_keys_impl(runtime, auth, agent_name="agent-b")
+    assert remaining == ["SHARED"], "removing from agent-a must not affect agent-b's SHARED key"

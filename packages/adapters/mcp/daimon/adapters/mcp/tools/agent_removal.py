@@ -1,17 +1,20 @@
-"""Agent removal tools: detach_mcp_server, remove_skill.
+"""Agent removal tools: detach_mcp_server, remove_skill, remove_env_credential,
+list_env_credential_keys.
 
 ``register_agent_removal_tools(mcp, runtime)`` wires the ``@mcp.tool`` closures
 for this group; each closure delegates to a module-private ``_*_impl``
 coroutine that can be unit-tested without a FastMCP Context.
 
-A sibling of ``agents.py`` rather than more of it: these tools close a gap
-between what the ``/agent-setup`` panel can do to an agent and what chatting
-with the agent can do — detach an attached MCP server and detach an attached
-skill.
+A sibling of ``agents.py`` rather than more of it: these four tools close the
+last gap between what the ``/agent-setup`` panel can do to an agent and what
+chatting with the agent can do — detach an attached MCP server, detach an
+attached skill, remove an env variable, and enumerate the env variable key
+names currently set (never their values).
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import cast
 
 import anthropic
@@ -34,8 +37,23 @@ from daimon.adapters.mcp.tools.agents import (
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.ma import update_agent_with_version_retry
+from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.stores.agent_files import delete_agent_file, list_agent_files
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import BaseModel, ConfigDict
+
+
+class RemoveEnvCredentialResult(BaseModel):
+    """Result of ``remove_env_credential``. Never carries a value."""
+
+    model_config = ConfigDict(frozen=True)
+
+    agent_name: str
+    key: str
+    removed: bool
+    """True if the key was present and deleted; False if it was already absent
+    (the delete is idempotent, so the call still succeeds either way)."""
 
 
 async def _detach_mcp_server_impl(
@@ -149,6 +167,57 @@ async def _remove_skill_impl(
     return await _build_agent_info(runtime.client, updated, tenant_id=auth.tenant_id)
 
 
+async def _list_env_credential_keys_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    agent_name: str,
+) -> list[str]:
+    # Deliberately NOT reachability-gated and NOT _reject_system_agent-guarded:
+    # env variables are per-agent daimon rows keyed (tenant_id, agent_id, key)
+    # that never enter the MA agent spec, so neither the spec-drift guard nor
+    # the approved-configuration gate applies. This is a read; the ungated-
+    # reads convention (_ctx.py's _require_admin docstring) covers it too.
+    agent = await find_agent_by_daimon_tag(
+        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    )
+    if agent is None:
+        raise ToolError(f"agent '{agent_name}' not found")
+    agent_id: uuid.UUID = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
+    async with runtime.session_factory() as session:
+        rows = await list_agent_files(session, tenant_id=auth.tenant_id, agent_id=agent_id)
+    return [row.key for row in rows]
+
+
+async def _remove_env_credential_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    agent_name: str,
+    key: str,
+) -> RemoveEnvCredentialResult:
+    # Same rationale as _list_env_credential_keys_impl above: env variables
+    # are per-agent daimon rows outside the MA spec, so neither
+    # _reject_system_agent nor require_admin_for_reachable_agent applies here
+    # — and the existing chat credential button already writes these rows for
+    # the seeded agent, so gating removal would leave a write with no
+    # matching delete.
+    agent = await find_agent_by_daimon_tag(
+        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    )
+    if agent is None:
+        raise ToolError(f"agent '{agent_name}' not found")
+    agent_id: uuid.UUID = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
+    async with runtime.session_factory.begin() as session:
+        # The store delete is idempotent (no raise when absent) — read first
+        # so the result can report a truthful removed flag instead of an
+        # unconditional success.
+        rows = await list_agent_files(session, tenant_id=auth.tenant_id, agent_id=agent_id)
+        was_present = any(row.key == key for row in rows)
+        await delete_agent_file(session, tenant_id=auth.tenant_id, agent_id=agent_id, key=key)
+    return RemoveEnvCredentialResult(agent_name=agent_name, key=key, removed=was_present)
+
+
 def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     @mcp.tool
     async def detach_mcp_server(  # pyright: ignore[reportUnusedFunction]
@@ -189,4 +258,36 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """
         return await _remove_skill_impl(
             runtime, await _auth(ctx), agent_name=agent_name, skill_id=skill_id
+        )
+
+    @mcp.tool
+    async def remove_env_credential(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        agent_name: str,
+        key: str,
+    ) -> RemoveEnvCredentialResult:
+        """Remove one environment variable from an agent.
+
+        Idempotent: removing a key that is not currently set still succeeds
+        — the result's ``removed`` flag reports whether the key was actually
+        present. To ADD a variable, use ``request_env_credential`` instead;
+        entry always goes through the private modal flow, never through chat.
+        """
+        return await _remove_env_credential_impl(
+            runtime, await _auth(ctx), agent_name=agent_name, key=key
+        )
+
+    @mcp.tool
+    async def list_env_credential_keys(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        agent_name: str,
+    ) -> list[str]:
+        """List the environment variable KEY NAMES currently set on an agent.
+
+        Returns names only, never a value — so the agent can see what is
+        configured without a value ever entering chat. To add a variable,
+        use ``request_env_credential``.
+        """
+        return await _list_env_credential_keys_impl(
+            runtime, await _auth(ctx), agent_name=agent_name
         )
