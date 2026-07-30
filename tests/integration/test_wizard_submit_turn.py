@@ -82,6 +82,7 @@ _ENV_ID = "env_wizard_submit_test"
 _MODEL_ID = "claude-sonnet-4-6"
 _AGENT_TEXT = "Thanks -- here's your plan!"
 _REQUESTER_ID = "700000000000000001"
+_MESSAGE_ID = "900000000000000003"
 
 
 def _spec() -> WizardSpec:
@@ -248,6 +249,7 @@ def _interaction(
     )  # no spec=Member -> isinstance(..., Member) is False, is_admin=False
     interaction.user.id = int(user_id)
     interaction.client = client
+    interaction.message.id = int(_MESSAGE_ID)
     interaction.channel = channel
     interaction.guild_id = guild_id
     interaction.guild = MagicMock(spec=discord.Guild)
@@ -316,6 +318,7 @@ async def _seed_review_row(
             session,
             tenant=tenant,
             requester_platform_user_id=_REQUESTER_ID,
+            message_id=_MESSAGE_ID,
             spec=_spec().model_dump(mode="json"),
             answers={"colour": ["red"]},
             current_step=1,  # one past the last step index -> the review screen

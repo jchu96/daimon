@@ -18,7 +18,10 @@ compares `str(interaction.user.id)` against the row's stored
 `requester_platform_user_id` and fails closed on any lookup miss, an
 already-submitted row, or an abandoned/expired row. That comparison is the
 ONLY authorization on this write path -- mirroring `CredentialRequestButton`,
-the one existing precedent.
+the one existing precedent. It is joined by one binding check: the tap must
+come from the message the row was posted as, so a stateless custom_id cannot
+be replayed against a component on some other message, in some other channel
+or guild.
 
 `from_custom_id`, `interaction_check`, and `callback` (on both dynamic-item
 classes) each catch broadly and log via structlog, because discord.py's own
@@ -96,12 +99,28 @@ async def _authorize_tap(row: WizardSessionRow | None, interaction: discord.Inte
     """Shared requester/lifecycle gate for `WizardNavButton` and `WizardSelect`.
 
     Sends the matching ephemeral rejection and returns False for: a missing
-    row, a non-requester tap, an already-submitted row, or an abandoned or
-    past-expiry row. This replaces what would otherwise be a silent no-op on
-    a stale form. Returns True only for the requester tapping an open,
-    unexpired row.
+    row, a tap that did not come from the row's own message, a non-requester
+    tap, an already-submitted row, or an abandoned or past-expiry row. This
+    replaces what would otherwise be a silent no-op on a stale form. Returns
+    True only for the requester tapping an open, unexpired row on the message
+    the form was posted as.
     """
     if row is None:
+        await interaction.response.send_message(_NOT_AVAILABLE, ephemeral=True)
+        return False
+    message = interaction.message
+    if message is not None and str(message.id) != row.message_id:
+        # A custom_id carries no state, so nothing else stops the requester
+        # replaying their own form's id against a component on some other
+        # message -- in another channel or another guild -- which would run
+        # and bill the turn somewhere the form never was. The row records the
+        # message it was posted as; fail closed when they disagree.
+        _log.warning(
+            "wizard.message_mismatch",
+            short_id=row.id,
+            expected_message_id=row.message_id,
+            actual_message_id=str(message.id),
+        )
         await interaction.response.send_message(_NOT_AVAILABLE, ephemeral=True)
         return False
     if str(interaction.user.id) != row.requester_platform_user_id:

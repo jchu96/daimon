@@ -36,6 +36,7 @@ pytestmark = pytest.mark.asyncio
 
 _REQUESTER_ID = "100000000000000001"
 _OTHER_USER_ID = "200000000000000002"
+_MESSAGE_ID = "900000000000000001"
 
 
 def _two_step_spec() -> dict[str, Any]:
@@ -68,10 +69,11 @@ def _fake_bot(sessionmaker: async_sessionmaker[AsyncSession]) -> Any:
     return SimpleNamespace(runtime=SimpleNamespace(sessionmaker=sessionmaker))
 
 
-def _interaction(*, user_id: str, client: Any) -> MagicMock:
+def _interaction(*, user_id: str, client: Any, message_id: str = _MESSAGE_ID) -> MagicMock:
     interaction = MagicMock()
     interaction.user.id = int(user_id)
     interaction.client = client
+    interaction.message.id = int(message_id)
     interaction.response.send_message = AsyncMock()
     interaction.response.send_modal = AsyncMock()
     interaction.response.defer = AsyncMock()
@@ -108,6 +110,7 @@ async def _seed(
         return await make_wizard_session(
             session,
             requester_platform_user_id=requester_platform_user_id,
+            message_id=_MESSAGE_ID,
             spec=_two_step_spec(),
             answers=answers,
             current_step=current_step,
@@ -150,6 +153,31 @@ async def test_interaction_check_rejects_a_different_user_with_no_state_change(
     assert allowed is False, "a non-requester tap must be rejected"
     message = interaction.response.send_message.call_args.args[0]
     assert "someone else" in message, "rejection must say the form was for someone else"
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after == row, "a rejected tap must leave the row byte-identical -- no state change"
+
+
+async def test_interaction_check_rejects_a_tap_from_a_different_message(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A custom_id carries no state, so the requester replaying their own
+    form's id against a component on another message -- in another channel or
+    guild -- would otherwise bind and bill the turn wherever they replayed
+    it."""
+    row = await _seed(db_session_factory)
+    bot = _fake_bot(db_session_factory)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot, message_id="800000000000000009")
+
+    item = await WizardNavButton.from_custom_id(
+        interaction, MagicMock(), _nav_match(row.id, "next")
+    )
+    allowed = await item.interaction_check(interaction)
+
+    assert allowed is False, "a tap that did not come from the form's own message must be rejected"
+    message = interaction.response.send_message.call_args.args[0]
+    assert "no longer available" in message
 
     async with db_session_factory() as session:
         after = await get_wizard_session(session, short_id=row.id)

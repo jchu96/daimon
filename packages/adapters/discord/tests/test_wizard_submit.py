@@ -30,6 +30,7 @@ pytestmark = pytest.mark.asyncio
 
 _REQUESTER_ID = "300000000000000001"
 _OTHER_USER_ID = "400000000000000002"
+_MESSAGE_ID = "900000000000000002"
 
 
 def _one_step_spec() -> dict[str, Any]:
@@ -74,10 +75,17 @@ def _fake_bot(
     return bot
 
 
-def _interaction(*, user_id: str, client: Any, call_order: list[str] | None = None) -> MagicMock:
+def _interaction(
+    *,
+    user_id: str,
+    client: Any,
+    call_order: list[str] | None = None,
+    message_id: str = _MESSAGE_ID,
+) -> MagicMock:
     interaction = MagicMock()
     interaction.user.id = int(user_id)
     interaction.client = client
+    interaction.message.id = int(message_id)
     interaction.response.send_message = AsyncMock()
 
     # is_done() tracks the deferral the way a real InteractionResponse does,
@@ -118,6 +126,7 @@ async def _seed(
         return await make_wizard_session(
             session,
             requester_platform_user_id=requester_platform_user_id,
+            message_id=_MESSAGE_ID,
             spec=_one_step_spec(),
             answers=answers if answers is not None else {"colour": ["red"]},
             current_step=current_step,
@@ -294,6 +303,32 @@ async def test_submit_by_a_non_requester_is_rejected_writes_nothing_spawns_nothi
         after = await get_wizard_session(session, short_id=row.id)
     assert after == row, "a rejected tap must leave the row byte-identical -- no state change"
     assert bot.spawned == [], "a rejected tap must never spawn a turn"
+
+
+async def test_submit_from_a_different_message_is_rejected_and_claims_nothing(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Replaying the form's custom_id against a component on another message
+    would bind and bill the turn in that message's channel while charging the
+    tenant the form belongs to."""
+    row = await _seed(db_session_factory, current_step=1)
+    call_order: list[str] = []
+    bot = _fake_bot(db_session_factory, call_order)
+    interaction = _interaction(
+        user_id=_REQUESTER_ID, client=bot, call_order=call_order, message_id="800000000000000009"
+    )
+
+    item = await WizardSubmitButton.from_custom_id(interaction, MagicMock(), _submit_match(row.id))
+    allowed = await item.interaction_check(interaction)
+
+    assert allowed is False, "a submit that did not come from the form's own message is rejected"
+    message = interaction.response.send_message.call_args.args[0]
+    assert "no longer available" in message
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after == row, "a rejected submit must leave the row byte-identical"
+    assert bot.spawned == [], "a rejected submit must never spawn a turn"
 
 
 # --- ordering --------------------------------------------------------------------
