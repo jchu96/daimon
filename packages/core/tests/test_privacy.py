@@ -527,6 +527,14 @@ async def test_purge_covers_every_account_or_principal_scoped_table() -> None:
             # Billing carve-outs retained for integrity.
             "usage_events",
             "tenant_user_caps",
+            # account_id carries a real (nullable) FK purely so this drift
+            # guard can see the table (see WizardSession's docstring); the
+            # FK itself is not the deletion mechanism. Erasure runs via
+            # `delete_wizard_sessions_for_platform_user`, a
+            # platform-user-scoped delete mirroring `credential_requests`.
+            # Wiring that helper into `purge_account` (moving this entry to
+            # `purged`) is follow-up work, not yet landed.
+            "wizard_session",
         }
     )
 

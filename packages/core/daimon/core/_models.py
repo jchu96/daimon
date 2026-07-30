@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -28,7 +29,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -852,6 +853,72 @@ class CredentialRequest(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WizardSession(Base):
+    """Durable state for one multi-step wizard form (`daimon.core.wizard`).
+
+    The process that posts a wizard's first screen (the MCP tool handler) is
+    never the process that receives its taps (the Discord bot's interaction
+    dispatcher), and a bot restart can land between any two taps on the same
+    form — so `answers` and `current_step` are read from and written to this
+    row on every tap. They are never derived from the message content and
+    never held in process memory; the row IS the state.
+
+    `account_id` deliberately carries a real (nullable) FK to `accounts.id`,
+    unlike the neighbouring handshake table `credential_requests`, whose
+    `account_id` has no FK at all. The schema-reflecting purge drift guard
+    (`test_purge_covers_every_account_or_principal_scoped_table`) only
+    notices a table if it has an `accounts.id` FK or a `principal_id`
+    column — being invisible to it means nothing mechanically forces a
+    future refactor to keep erasing these rows. Nullability does not exempt
+    a column from being a foreign key for that check. `ondelete="SET NULL"`
+    rather than `CASCADE` because erasure is actually driven by
+    `delete_wizard_sessions_for_platform_user` (a platform-user-scoped
+    delete, mirroring `credential_requests`), not by an accounts.id cascade;
+    the FK exists for the drift guard's visibility, not as the deletion
+    mechanism.
+
+    `requester_platform_user_id` is the actual authorization key for every
+    tap: the dispatcher compares it exactly against the tapping user's
+    platform id before honouring any button or select on this row.
+    """
+
+    __tablename__ = "wizard_session"
+    __table_args__ = (
+        Index(
+            "ix_wizard_session_tenant_requester",
+            "tenant_id",
+            "requester_platform_user_id",
+        ),
+        Index("ix_wizard_session_status_expires_at", "status", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    requester_platform_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # dict[str, Any]: a serialized WizardSpec, validated back into the real
+    # Pydantic model at read time — not a typing shortcut.
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    answers: Mapped[dict[str, list[str]]] = mapped_column(JSONB, nullable=False)
+    current_step: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class SlackEventDedup(Base):
