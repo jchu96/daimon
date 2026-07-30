@@ -572,6 +572,77 @@ async def test_collect_purge_preview_message_feedback_matches_purge_account_incl
     )
 
 
+async def test_a_vote_in_a_tenant_without_a_principal_is_erased_by_a_purge_run_there(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Pins the documented remediation for the one erasure residue class.
+
+    A bystander's vote never mints a principal, so a person with an account in
+    guild A who reacts in guild B leaves a row attributable only by
+    (tenant_B, user) — out of reach of an erasure invoked from guild A. The
+    carve-out in `daimon.core.purge`'s docstring says the remedy is to run the
+    purge inside guild B, which mints a principal there. This test is what
+    keeps that promise honest.
+    """
+    tenant_a = await make_tenant(db_session, workspace_id="pv-residue-guild-a")
+    tenant_b = await make_tenant(db_session, workspace_id="pv-residue-guild-b")
+    account = await make_account(db_session, tenant=tenant_a)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="PV_RESIDUE_USER",
+        tenant=tenant_a,
+        account=account,
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant_b.id,
+        platform="discord",
+        message_id="pv-residue-1",
+        channel_id="C1",
+        platform_user_id="PV_RESIDUE_USER",
+        account_id=None,
+        ma_session_id=None,
+        vote="down",
+    )
+    await db_session.commit()
+
+    from_guild_a = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert from_guild_a.db.message_feedback == 0, (
+        "a purge invoked from guild A cannot reach a guild-B vote with no principal there"
+    )
+
+    # The documented remediation: taking any action in guild B that mints a
+    # principal brings (tenant_B, user) into the key set.
+    remediation_account = await make_account(db_session, tenant=tenant_b)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="PV_RESIDUE_USER",
+        tenant=tenant_b,
+        account=remediation_account,
+    )
+    await db_session.commit()
+
+    preview = await collect_purge_preview(sm=db_session_factory, account_id=remediation_account.id)
+    from_guild_b = await purge_account(sm=db_session_factory, account_id=remediation_account.id)
+
+    assert preview.message_feedback.count == 1, (
+        "the guild-local preview must show the residual vote the person can now erase"
+    )
+    assert from_guild_b.db.message_feedback == 1, "the guild-local purge must erase it"
+    remaining = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(MessageFeedback)
+            .where(MessageFeedback.tenant_id == tenant_b.id)
+        )
+    ).scalar_one()
+    assert remaining == 0, "no residue may survive the documented remediation path"
+
+
 async def test_collect_purge_preview_matches_purge_account_coverage_field_for_field() -> None:
     """If `PurgeReport` grows a new int field, `PurgePreview` MUST mirror it.
 

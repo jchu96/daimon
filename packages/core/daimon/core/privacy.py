@@ -9,6 +9,16 @@ the Anthropic workspace and are not enumerated here.
 Adding a new account- or principal-scoped table that `purge_account` learns to
 delete MUST update this module too, or the preview undercounts. The schema-
 reflecting drift-guard test in `tests/test_privacy.py` enforces this at CI time.
+
+Scope of "every row": both this preview and the purge it mirrors are scoped to
+the account's OWN principals. One residue class follows from that and is
+documented in full under `daimon.core.purge`'s carve-outs — message_feedback
+rows cast in a tenant where the person has no principal (a vote by a bystander
+carries account_id = NULL and no principal is minted for it) are neither
+previewed nor deleted by a run invoked from another tenant. The remediation is
+guild-local and self-service: running this same privacy purge inside that guild
+mints a principal there, which brings its (tenant, platform-user) key into
+scope and erases those rows.
 """
 
 from __future__ import annotations

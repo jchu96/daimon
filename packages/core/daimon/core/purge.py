@@ -60,6 +60,23 @@ Deliberate carve-outs:
   so account purge does NOT touch them — archiving one because a single member
   invoked erasure would destroy the guild's shared agent memory. They may
   retain information about the purged user.
+- message_feedback rows cast in a tenant where the person has NO principal are
+  out of reach of an erasure run from another tenant. This is the one table
+  that records rows for someone with no principal anywhere: the reaction path
+  deliberately never mints one for a bystander, so a vote (and any free text
+  they then submit) lands with account_id = NULL, attributable only by
+  (tenant_id, platform_user_id). An erasure invoked in guild A derives its
+  platform-user keys from the account's own principals, which do not include
+  (tenant_B, user), so guild B's row survives. Unlike the tenant-scoped
+  oauth-state ghost rows above, these are durable and hold free text.
+  Remediation is guild-local and self-service: running the privacy purge
+  inside guild B mints a tenant-B principal, which brings (tenant_B, user)
+  into the key set and erases those rows. Deliberately not closed by a
+  platform-scoped, tenant-agnostic predicate: it would be correct only for
+  platforms whose external ids are globally unique (Discord snowflakes, not
+  Slack workspace-scoped user ids), so it would make erasure's blast radius
+  depend on the platform — a worse contract than one documented, reachable
+  remediation path.
 """
 
 from __future__ import annotations
