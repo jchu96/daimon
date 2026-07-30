@@ -508,8 +508,9 @@ def test_env_vars_button_label_has_no_plus(account_id: uuid.UUID) -> None:
     assert "+ Env vars" not in labels, "the '+' prefix must be dropped from the Env vars button"
 
 
-def test_edit_view_env_vars_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
-    selected = _entry("sys")
+def test_edit_view_env_vars_button_always_enabled(account_id: uuid.UUID) -> None:
+    """Env vars are per-agent daimon state, never part of the agent spec, so the
+    button is always enabled — for the seeded/system agent exactly like any other."""
     selected = RosterEntry(
         name="sys",
         model="claude-sonnet-4-6",
@@ -521,14 +522,120 @@ def test_edit_view_env_vars_button_disabled_for_system_agent(account_id: uuid.UU
     runtime.settings.mcp.public_url = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
-    assert _find_button(view, "Env vars").disabled is True, (
-        "system agents see the Env vars button disabled (defensive)"
+    assert _find_button(view, "Env vars").disabled is False, (
+        "the seeded/system agent's Env vars button must be enabled"
     )
 
     user_selected = _entry("bot")
     user_state = PanelState(roster=[user_selected], selected=user_selected, account_id=account_id)
     user_view = EditView(user_state, runtime=runtime, allowed_user_id=42)
     assert _find_button(user_view, "Env vars").disabled is False, "user agents can open Env vars"
+
+
+# --- Spec-control reachability gate (FIRST-04/05) ---------------------------
+
+
+def _reachable_state(entry: RosterEntry, account_id: uuid.UUID, *, is_admin: bool) -> PanelState:
+    """A state whose selected agent IS reachable via the deployment default."""
+    from daimon.core.scope import DeploymentDefault
+
+    return PanelState(
+        roster=[entry],
+        selected=entry,
+        account_id=account_id,
+        is_admin=is_admin,
+        cascade_view=(None, []),
+        deployment_default=DeploymentDefault(agent_name=entry.name),
+    )
+
+
+def test_edit_view_non_admin_reachable_non_system_disables_spec_controls(
+    account_id: uuid.UUID,
+) -> None:
+    """A non-admin editing a reachable, non-system agent gets the five
+    spec-touching controls disabled; GitHub… and Env vars stay enabled."""
+    from daimon.core.specs import SkillRef
+
+    selected = _entry_with_mcps(
+        "bot",
+        [_mcp("user-mcp", "https://user.example.com/mcp")],
+        skills=[SkillRef(type="custom", skill_id="skill-a")],
+    )
+    state = _reachable_state(selected, account_id, is_admin=False)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is True, "Agent… must be disabled"
+    assert _find_button(view, "+ Add skill").disabled is True, "+ Add skill must be disabled"
+    assert _find_button(view, "+ Add MCP").disabled is True, "+ Add MCP must be disabled"
+    skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    assert skill_select.disabled is True, "skill remove select must be disabled"
+    assert mcp_select.disabled is True, "mcp remove select must be disabled"
+    assert _find_button(view, "GitHub…").disabled is False, "GitHub… must stay enabled"
+    assert _find_button(view, "Env vars").disabled is False, "Env vars must stay enabled"
+
+
+def test_edit_view_non_admin_unreachable_non_system_enables_spec_controls(
+    account_id: uuid.UUID,
+) -> None:
+    """A non-admin editing an agent nobody has scoped gets every spec control
+    enabled — it is their scratchpad."""
+    from daimon.core.specs import SkillRef
+
+    selected = _entry_with_mcps(
+        "bot",
+        [_mcp("user-mcp", "https://user.example.com/mcp")],
+        skills=[SkillRef(type="custom", skill_id="skill-a")],
+    )
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=False)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is False, "Agent… must be enabled"
+    assert _find_button(view, "+ Add skill").disabled is False, "+ Add skill must be enabled"
+    assert _find_button(view, "+ Add MCP").disabled is False, "+ Add MCP must be enabled"
+    skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
+    assert skill_select.disabled is False, "skill remove select must be enabled"
+    assert mcp_select.disabled is False, "mcp remove select must be enabled"
+
+
+def test_edit_view_admin_reachable_non_system_enables_spec_controls(account_id: uuid.UUID) -> None:
+    """An admin editing a reachable, non-system agent still gets the spec
+    controls enabled — the reachability gate is admin-exempt."""
+    selected = _entry("bot")
+    state = _reachable_state(selected, account_id, is_admin=True)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is False, "Agent… must be enabled for an admin"
+
+
+def test_edit_view_reachable_system_agent_disables_spec_controls_for_admin_too(
+    account_id: uuid.UUID,
+) -> None:
+    """is_system stays absolute: even an admin gets the spec controls disabled
+    on the seeded agent."""
+    selected = RosterEntry(
+        name="daimon",
+        model="claude-sonnet-4-6",
+        spec=AgentSpec(name="daimon", model="claude-sonnet-4-6", system=None),
+        is_system=True,
+    )
+    state = _reachable_state(selected, account_id, is_admin=True)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    assert _find_button(view, "Agent…").disabled is True, (
+        "Agent… must stay disabled on a system agent even for an admin"
+    )
+    assert _find_button(view, "GitHub…").disabled is False, "GitHub… is not spec-gated"
+    assert _find_button(view, "Env vars").disabled is False, "Env vars is not spec-gated"
 
 
 # --- Back / open_edit_view edit-in-place -----------------------------------

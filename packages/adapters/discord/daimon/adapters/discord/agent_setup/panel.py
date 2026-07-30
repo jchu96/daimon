@@ -310,10 +310,9 @@ def build_panel_container(
     turn lifecycle uses theme.COLOR_BLURPLE).
     """
     if state.selected is None:
-        if state.is_admin:
-            copy = "_This server has no agents yet._ Use **New** to create the first one."
-        else:
-            copy = "_This server has no agents yet._\n\nView only — ask an admin to change defaults"
+        # Every member can create an agent — the copy is identical for admins
+        # and members alike (no "View only" variant on an empty roster).
+        copy = "_This server has no agents yet._ Use **New** to create the first one."
         return discord.ui.Container(discord.ui.TextDisplay(copy))
 
     selected = state.selected
@@ -510,11 +509,12 @@ def _get_thumbnail_url(interaction: discord.Interaction) -> str | None:
 class AgentSetupView(ExpiringView, discord.ui.LayoutView):
     """F5 Components V2 agent-setup card.
 
-    Container holds header, body, picker row, and (admins only) lifecycle row.
-    Member gating is structural: non-admins get a container WITHOUT the lifecycle
-    row — built that way, not cleared after the fact.
-
-    Mutation buttons only appear when state.is_admin.
+    Container holds header, body, picker row, a member row (New / Fork / Edit —
+    unconditional, every member can build and configure an agent), and, admins
+    only, an admin row (Set as default… / Delete / Connect via MCP — reachability
+    and destructive controls stay admin-gated). The split is structural: a
+    member's container never contains the admin row's components at all, not a
+    disabled flag on an otherwise-present button.
     """
 
     def __init__(
@@ -539,30 +539,44 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
         picker_row.add_item(picker)
         container.add_item(picker_row)
 
+        # Member row: New / Fork / Edit — unconditional. Building and
+        # configuring an unreachable agent is open to every member; only
+        # making one reachable, or destroying one, is admin-gated below.
+        selected = state.selected
+        has_selection = selected is not None
+        is_system = bool(selected and selected.is_system)
+
+        member_row: discord.ui.ActionRow[AgentSetupView] = discord.ui.ActionRow()
+
+        new_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
+            label="New", style=discord.ButtonStyle.success
+        )
+        new_btn.callback = self._on_new  # type: ignore[method-assign]
+
+        fork_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
+            label="Fork", style=discord.ButtonStyle.success
+        )
+        fork_btn.callback = self._on_fork  # type: ignore[method-assign]
+
+        self.edit_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
+            label="Edit",
+            style=discord.ButtonStyle.primary,
+            disabled=not has_selection,
+        )
+        self.edit_btn.callback = self._on_edit  # type: ignore[method-assign]
+
+        member_row.add_item(new_btn)
+        member_row.add_item(fork_btn)
+        member_row.add_item(self.edit_btn)
+        container.add_item(hairline())
+        container.add_item(member_row)
+
         if state.is_admin:
-            # Lifecycle row: New / Fork / Edit / Set as default… / Delete.
-            selected = state.selected
-            has_selection = selected is not None
-            is_system = bool(selected and selected.is_system)
-
-            lifecycle_row: discord.ui.ActionRow[AgentSetupView] = discord.ui.ActionRow()
-
-            new_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
-                label="New", style=discord.ButtonStyle.success
-            )
-            new_btn.callback = self._on_new  # type: ignore[method-assign]
-
-            fork_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
-                label="Fork", style=discord.ButtonStyle.success
-            )
-            fork_btn.callback = self._on_fork  # type: ignore[method-assign]
-
-            self.edit_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
-                label="Edit",
-                style=discord.ButtonStyle.primary,
-                disabled=(not has_selection) or is_system,
-            )
-            self.edit_btn.callback = self._on_edit  # type: ignore[method-assign]
+            # Admin row: Set as default… / Delete / Connect via MCP. All three
+            # touch tenant-wide reachability, destroy an agent, or mint a
+            # long-lived credential — blast radius beyond one member's own
+            # agent, so these stay admin-only.
+            admin_row: discord.ui.ActionRow[AgentSetupView] = discord.ui.ActionRow()
 
             self.set_default_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
                 label="Set as default…",
@@ -578,25 +592,17 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
             )
             self.delete_btn.callback = self._on_delete  # type: ignore[method-assign]
 
-            lifecycle_row.add_item(new_btn)
-            lifecycle_row.add_item(fork_btn)
-            lifecycle_row.add_item(self.edit_btn)
-            lifecycle_row.add_item(self.set_default_btn)
-            lifecycle_row.add_item(self.delete_btn)
-            container.add_item(hairline())
-            container.add_item(lifecycle_row)
-
-            # Connect row: hooks a coding agent (Claude Code, etc.) up to the
-            # selected agent over MCP. Own row — the lifecycle row is full at 5.
-            connect_row: discord.ui.ActionRow[AgentSetupView] = discord.ui.ActionRow()
             self.connect_mcp_btn: discord.ui.Button[AgentSetupView] = discord.ui.Button(
                 label="🔌 Connect via MCP",
                 style=discord.ButtonStyle.primary,
                 disabled=(not has_selection) or is_system,
             )
             self.connect_mcp_btn.callback = self._on_connect_via_mcp  # type: ignore[method-assign]
-            connect_row.add_item(self.connect_mcp_btn)
-            container.add_item(connect_row)
+
+            admin_row.add_item(self.set_default_btn)
+            admin_row.add_item(self.delete_btn)
+            admin_row.add_item(self.connect_mcp_btn)
+            container.add_item(admin_row)
 
         self.add_item(container)
 

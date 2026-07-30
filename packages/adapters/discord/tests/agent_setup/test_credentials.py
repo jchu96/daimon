@@ -93,7 +93,7 @@ def _remove_select(view: discord.ui.LayoutView) -> discord.ui.Select[Any]:
 
 def test_container_header_and_subtext() -> None:
     view_container = build_credentials_container(
-        agent_name="bot", secret_names=["XERO_API_KEY", "TOGGL_TOKEN"], is_system=False
+        agent_name="bot", secret_names=["XERO_API_KEY", "TOGGL_TOKEN"]
     )
     texts = [
         child.content
@@ -109,9 +109,7 @@ def test_container_header_and_subtext() -> None:
 
 
 def test_container_chips_on_one_line() -> None:
-    container = build_credentials_container(
-        agent_name="bot", secret_names=["A_KEY", "B_KEY"], is_system=False
-    )
+    container = build_credentials_container(agent_name="bot", secret_names=["A_KEY", "B_KEY"])
     # Collect text displays (skip the header which is first)
     displays = [
         child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
@@ -127,7 +125,7 @@ def test_container_chips_on_one_line() -> None:
 def test_container_d09_values_never_reach_tree() -> None:
     """build_credentials_container takes names only; no secret value can appear."""
     container = build_credentials_container(
-        agent_name="bot", secret_names=["XERO_API_KEY", "TOGGL_TOKEN"], is_system=False
+        agent_name="bot", secret_names=["XERO_API_KEY", "TOGGL_TOKEN"]
     )
     all_text = " ".join(
         child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
@@ -136,7 +134,7 @@ def test_container_d09_values_never_reach_tree() -> None:
 
 
 def test_container_empty_state_shows_hint() -> None:
-    container = build_credentials_container(agent_name="bot", secret_names=[], is_system=False)
+    container = build_credentials_container(agent_name="bot", secret_names=[])
     displays = [
         child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
     ]
@@ -147,7 +145,7 @@ def test_container_empty_state_shows_hint() -> None:
 
 
 def test_container_no_none_copy_in_empty_state() -> None:
-    container = build_credentials_container(agent_name="bot", secret_names=[], is_system=False)
+    container = build_credentials_container(agent_name="bot", secret_names=[])
     displays = [
         child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
     ]
@@ -167,7 +165,6 @@ def test_subview_renders_remove_select_add_and_back(account_id: uuid.UUID) -> No
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A", "B"],
-        is_system=False,
     )
     select = _remove_select(view)
     assert select.placeholder == "✕ Remove a var…", "single remove-select with house placeholder"
@@ -189,7 +186,6 @@ def test_subview_header_and_subtext(account_id: uuid.UUID) -> None:
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A"],
-        is_system=False,
     )
     text = _container_all_text(view)
     assert "## 🔑 Env vars — " in text, "container header present"
@@ -206,7 +202,6 @@ def test_subview_chips_on_one_line(account_id: uuid.UUID) -> None:
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A_KEY", "B_KEY"],
-        is_system=False,
     )
     text_displays = _walk_text_displays(view)
     chips_displays = [td for td in text_displays if "`A_KEY`" in td.content]
@@ -224,7 +219,6 @@ def test_subview_d09_values_never_reach_tree(account_id: uuid.UUID) -> None:
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["XERO_API_KEY"],
-        is_system=False,
     )
     all_text = _container_all_text(view)
     assert _SECRET_VALUE not in all_text, "no secret value may appear anywhere in the view"
@@ -239,7 +233,6 @@ def test_subview_remove_select_option_carries_key_name_never_value(account_id: u
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["XERO_API_KEY"],
-        is_system=False,
     )
     select = _remove_select(view)
     option = select.options[0]
@@ -254,7 +247,10 @@ def test_subview_remove_select_option_carries_key_name_never_value(account_id: u
     assert "XERO_API_KEY" not in select.custom_id, "key name never persisted in a custom_id"
 
 
-def test_subview_system_agent_disables_mutations_but_not_back(account_id: uuid.UUID) -> None:
+def test_subview_system_agent_enables_mutations(account_id: uuid.UUID) -> None:
+    """Env vars are per-agent daimon state, never part of the agent spec, so a
+    system agent's remove select and add button are enabled exactly like a
+    user agent's — provenance does not gate this sub-view."""
     entry = _entry("sys", is_system=True)
     view = CredentialsSubView(
         runtime=MagicMock(spec=DiscordRuntime),
@@ -263,11 +259,14 @@ def test_subview_system_agent_disables_mutations_but_not_back(account_id: uuid.U
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A", "B"],
-        is_system=True,
     )
-    assert _remove_select(view).disabled is True, "system agents cannot remove secrets"
-    assert _button_by_label(view, "+ Add env vars").disabled is True, "system add disabled"
-    assert _button_by_label(view, "← Back").disabled is False, "back stays enabled (read-only)"
+    assert _remove_select(view).disabled is False, (
+        "a system agent's remove select must be enabled when it has variables"
+    )
+    assert _button_by_label(view, "+ Add env vars").disabled is False, (
+        "a system agent's add button must be enabled below the cap"
+    )
+    assert _button_by_label(view, "← Back").disabled is False, "back stays enabled"
 
 
 def test_subview_empty_state_disables_select(account_id: uuid.UUID) -> None:
@@ -279,7 +278,6 @@ def test_subview_empty_state_disables_select(account_id: uuid.UUID) -> None:
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=[],
-        is_system=False,
     )
     select = _remove_select(view)
     assert select.disabled is True, "no-secrets select is disabled"
@@ -426,7 +424,6 @@ async def test_remove_deletes_the_key_and_rerenders(
         tenant_id=tenant.id,
         agent_id=agent_id,
         secret_names=["XERO_API_KEY", "KEEP_ME"],
-        is_system=False,
     )
 
     interaction = MagicMock()
@@ -475,7 +472,6 @@ async def test_back_replaces_with_editview_in_place(account_id: uuid.UUID) -> No
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A"],
-        is_system=False,
     )
 
     interaction = MagicMock()
@@ -564,7 +560,9 @@ async def test_editview_env_vars_button_opens_subview(
     assert _SECRET_VALUE not in all_text, "the opened view lists the key masked, never its value"
 
 
-def test_editview_has_env_vars_button_disabled_for_system_agent(account_id: uuid.UUID) -> None:
+def test_editview_env_vars_button_enabled_for_system_agent(account_id: uuid.UUID) -> None:
+    """Env vars are per-agent daimon state, never part of the agent spec, so
+    the button is enabled for the seeded/system agent exactly like any other."""
     settings = MagicMock()
     settings.mcp.public_url = None
     runtime = DiscordRuntime(
@@ -585,8 +583,9 @@ def test_editview_has_env_vars_button_disabled_for_system_agent(account_id: uuid
     )
     sys_view = EditView(_state(sys_entry, account_id), runtime=runtime, allowed_user_id=42)
     sys_buttons = {b.label: b for b in _walk_buttons(sys_view) if b.label is not None}
-    assert sys_buttons["Env vars"].disabled is True, (
-        "system agents see the Env vars button disabled (defensive)"
+    assert sys_buttons["Env vars"].disabled is False, (
+        "the seeded/system agent's Env vars button must be enabled — env vars "
+        "are not part of the agent spec"
     )
 
     user_entry = RosterEntry(
@@ -615,7 +614,6 @@ async def test_credentials_view_timeout_replaces_the_subview(account_id: uuid.UU
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A"],
-        is_system=False,
     )
     interaction = MagicMock()
     interaction.edit_original_response = AsyncMock()
@@ -660,7 +658,6 @@ async def test_credentials_rerender_rebinds_the_current_interaction(
         tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         secret_names=["A"],
-        is_system=False,
     )
 
     first_interaction = MagicMock()

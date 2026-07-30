@@ -51,12 +51,16 @@ def build_credentials_container(
     *,
     agent_name: str,
     secret_names: list[str],
-    is_system: bool,
 ) -> discord.ui.Container[discord.ui.LayoutView]:
     """Pure: render the Credentials container from key NAMES only.
 
     Never receives or renders a secret value — every value is omitted entirely
     Key names render as `KEY` chips on a single line separated by · .
+
+    Env variables are per-agent daimon state (agent_files, keyed by
+    tenant/agent/key) and are never part of the agent spec, so provenance
+    (system-agent or not) does not gate them — every member, on every agent,
+    including the seeded default, can view and manage this sub-view.
     """
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container()
     container.add_item(
@@ -193,7 +197,6 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         tenant_id: uuid.UUID,
         agent_id: uuid.UUID,
         secret_names: list[str],
-        is_system: bool,
     ) -> None:
         super().__init__(timeout=300)
         self._runtime = runtime
@@ -202,7 +205,6 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         self._tenant_id = tenant_id
         self._agent_id = agent_id
         self._secret_names = secret_names
-        self._is_system = is_system
         self._build_items()
 
     def _agent_name(self) -> str:
@@ -214,11 +216,10 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         container = build_credentials_container(
             agent_name=self._agent_name(),
             secret_names=self._secret_names,
-            is_system=self._is_system,
         )
 
         # ✕ Remove a var… select (cap 20, glyph in placeholder not emoji=).
-        remove_select = _build_remove_select(self._secret_names, is_system=self._is_system)
+        remove_select = _build_remove_select(self._secret_names)
         remove_select.callback = self._make_remove_cb(remove_select)  # type: ignore[method-assign]
 
         select_row: discord.ui.ActionRow[CredentialsSubView] = discord.ui.ActionRow()
@@ -231,7 +232,7 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         add_btn: discord.ui.Button[CredentialsSubView] = discord.ui.Button(
             label="+ Add env vars",
             style=discord.ButtonStyle.success,
-            disabled=self._is_system or len(self._secret_names) >= _SECRET_CAP,
+            disabled=len(self._secret_names) >= _SECRET_CAP,
         )
         add_btn.callback = self._on_add  # type: ignore[method-assign]
         btn_row.add_item(add_btn)
@@ -327,14 +328,13 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         )
 
 
-def _build_remove_select(
-    secret_names: list[str], *, is_system: bool
-) -> discord.ui.Select[CredentialsSubView]:
+def _build_remove_select(secret_names: list[str]) -> discord.ui.Select[CredentialsSubView]:
     """✕ Remove a var… select listing every key (no cap).
 
     Each option's ``label``/``value`` carries ONLY the secret KEY NAME — never a
-    value, never a per-key custom_id. Disabled (empty placeholder) when
-    there are no secrets; disabled (mutation-blocked) for system agents.
+    value, never a per-key custom_id. Disabled (empty placeholder) only when
+    there are no secrets — env vars are per-agent daimon state, never part of
+    the agent spec, so provenance does not gate removal here.
     """
     if len(secret_names) == 0:
         return discord.ui.Select(
@@ -349,5 +349,5 @@ def _build_remove_select(
         min_values=1,
         max_values=1,
         options=[discord.SelectOption(label=f"✕ {key}"[:100], value=key) for key in secret_names],
-        disabled=is_system,
+        disabled=False,
     )

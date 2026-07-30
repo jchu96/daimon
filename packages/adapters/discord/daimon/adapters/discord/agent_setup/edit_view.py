@@ -103,7 +103,7 @@ class BackButton(discord.ui.Button[discord.ui.LayoutView]):
 class _SkillRemoveSelect(discord.ui.Select["EditView"]):
     """Select: pick a skill to remove (pick-to-remove, no confirm)."""
 
-    def __init__(self, state: PanelState) -> None:
+    def __init__(self, state: PanelState, *, disabled: bool = False) -> None:
         skills = state.selected.spec.skills if state.selected is not None else []
         if len(skills) == 0:
             super().__init__(
@@ -123,7 +123,7 @@ class _SkillRemoveSelect(discord.ui.Select["EditView"]):
             min_values=1,
             max_values=1,
             options=options,
-            disabled=False,
+            disabled=disabled,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -179,7 +179,9 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
     into the full unfiltered list.
     """
 
-    def __init__(self, state: PanelState, *, public_url: str | None) -> None:
+    def __init__(
+        self, state: PanelState, *, public_url: str | None, disabled: bool = False
+    ) -> None:
         mcps = (state.selected.spec.mcp_servers if state.selected is not None else None) or []
         options: list[discord.SelectOption] = []
         for idx, entry in enumerate(mcps):
@@ -204,7 +206,7 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
             min_values=1,
             max_values=1,
             options=options,
-            disabled=False,
+            disabled=disabled,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -298,12 +300,26 @@ class EditView(ExpiringView, discord.ui.LayoutView):
             if not _is_default_mcp(e, public_url)
         )
 
+        # is_system gates the spec controls unconditionally — the seeded
+        # agent's prompt/model/skills/mcp_servers stay panel-un-editable for
+        # everyone, admin included (a panel edit never stamps
+        # daimon_spec_hash, so reconcile would skip the drift forever).
+        # spec_editable gates the same controls on reachability instead: an
+        # agent nobody has scoped is every member's scratchpad; once some
+        # channel or the workspace points at it, only an admin may change its
+        # spec. Env vars and GitHub… are per-agent attachments, never part of
+        # the spec, so neither guard applies to them.
+        is_system = bool(state.selected and state.selected.is_system)
+        spec_editable = state.is_admin or not state.is_selected_reachable()
+        spec_controls_disabled = is_system or not spec_editable
+
         # Button row 1: Agent… · GitHub… · Env vars.
         field_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
 
         agent_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="Agent…",
             style=discord.ButtonStyle.secondary,
+            disabled=spec_controls_disabled,
         )
         agent_btn.callback = self._on_agent  # type: ignore[method-assign]
         field_row.add_item(agent_btn)
@@ -315,14 +331,9 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         github_btn.callback = self._on_github  # type: ignore[method-assign]
         field_row.add_item(github_btn)
 
-        # Defensive read-only gate: system agents can never reach EditView (the
-        # main panel disables Edit for them), so this `disabled` is belt-and-
-        # braces (defensive).
-        is_system = bool(state.selected and state.selected.is_system)
         env_vars_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="Env vars",
             style=discord.ButtonStyle.secondary,
-            disabled=is_system,
         )
         env_vars_btn.callback = self._on_env_vars  # type: ignore[method-assign]
         field_row.add_item(env_vars_btn)
@@ -335,7 +346,7 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         add_skill_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="+ Add skill",
             style=discord.ButtonStyle.success,
-            disabled=skill_count >= _SKILL_CAP,
+            disabled=(skill_count >= _SKILL_CAP) or spec_controls_disabled,
         )
         add_skill_btn.callback = self._on_add_skill  # type: ignore[method-assign]
         btn_row.add_item(add_skill_btn)
@@ -343,7 +354,7 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         add_mcp_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="+ Add MCP",
             style=discord.ButtonStyle.success,
-            disabled=user_mcp_count >= _MCP_CAP,
+            disabled=(user_mcp_count >= _MCP_CAP) or spec_controls_disabled,
         )
         add_mcp_btn.callback = self._on_add_mcp  # type: ignore[method-assign]
         btn_row.add_item(add_mcp_btn)
@@ -359,11 +370,13 @@ class EditView(ExpiringView, discord.ui.LayoutView):
 
         # Select row 3: skill remove; row 4: MCP remove.
         skill_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
-        skill_row.add_item(_SkillRemoveSelect(state))
+        skill_row.add_item(_SkillRemoveSelect(state, disabled=spec_controls_disabled))
         container.add_item(skill_row)
 
         mcp_row: discord.ui.ActionRow[EditView] = discord.ui.ActionRow()
-        mcp_row.add_item(_McpRemoveSelect(state, public_url=public_url))
+        mcp_row.add_item(
+            _McpRemoveSelect(state, public_url=public_url, disabled=spec_controls_disabled)
+        )
         container.add_item(mcp_row)
 
         self.add_item(container)
@@ -438,7 +451,6 @@ class EditView(ExpiringView, discord.ui.LayoutView):
                 tenant_id=tenant_id,
                 agent_id=agent_id,
                 secret_names=secret_names,
-                is_system=selected.is_system,
             ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )

@@ -543,15 +543,17 @@ def test_empty_roster_container_shows_no_agents_copy_for_admin(account_id: uuid.
     assert "New" in text, "empty-roster admin copy must mention New"
 
 
-def test_empty_roster_container_shows_view_only_for_member(account_id: uuid.UUID) -> None:
-    """Empty roster member copy: shows view-only hint."""
+def test_empty_roster_container_shows_new_copy_for_member_too(account_id: uuid.UUID) -> None:
+    """Empty roster member copy: every member can create, so the copy invites
+    creating the first agent — no 'View only' variant on an empty roster."""
     state = PanelState.initial(
         roster=[], account_id=account_id, platform_principal_id=uuid.uuid4(), is_admin=False
     )
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
-    assert "View only" in text or "ask an admin" in text, (
-        "empty-roster member copy must mention view-only or ask an admin"
+    assert "New" in text, "empty-roster member copy must mention New, same as the admin copy"
+    assert "View only" not in text, (
+        "the empty-roster branch must not show the view-only variant to anyone"
     )
 
 
@@ -675,8 +677,9 @@ def test_empty_roster_disables_edit_and_delete(account_id: uuid.UUID) -> None:
     assert new_btn.disabled is False, "New must remain enabled on empty roster"
 
 
-def test_seeded_agent_disables_edit_and_delete(account_id: uuid.UUID) -> None:
-    """UX-25-02: system agent must disable Edit + Delete; Fork remains enabled."""
+def test_seeded_agent_enables_edit_disables_delete(account_id: uuid.UUID) -> None:
+    """A system agent's Edit is enabled (it is now the only door to its env
+    vars); Delete stays disabled; Fork remains enabled."""
     selected = RosterEntry(
         name="daimon",
         model="claude-sonnet-4-6",
@@ -686,11 +689,10 @@ def test_seeded_agent_disables_edit_and_delete(account_id: uuid.UUID) -> None:
     state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=True)
     view = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
 
-    for label in ("Edit", "Delete"):
-        btn = _find_button(view, label)
-        assert btn.disabled is True, (
-            f"{label} must be disabled on a system agent (only Fork is the escape hatch)"
-        )
+    edit_btn = _find_button(view, "Edit")
+    assert edit_btn.disabled is False, "Edit must be enabled on a system agent"
+    delete_btn = _find_button(view, "Delete")
+    assert delete_btn.disabled is True, "Delete must stay disabled on a system agent"
     fork_btn = _find_button(view, "Fork")
     assert fork_btn.disabled is False, "Fork must remain enabled (escape hatch)"
 
@@ -707,26 +709,6 @@ def test_edit_btn_disabled_when_no_selection(account_id: uuid.UUID) -> None:
     view = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
     btn = _find_button(view, "Edit")
     assert btn.disabled is True, "Edit must be disabled when no agent selected"
-
-
-def test_edit_btn_disabled_for_system_agent(account_id: uuid.UUID) -> None:
-    """Edit must be disabled for system agents (use Fork instead)."""
-    selected = RosterEntry(
-        name="daimon",
-        model="claude-sonnet-4-6",
-        spec=AgentSpec(name="daimon", model="claude-sonnet-4-6"),
-        is_system=True,
-    )
-    state = PanelState(
-        roster=[selected],
-        selected=selected,
-        account_id=account_id,
-        platform_principal_id=uuid.uuid4(),
-        is_admin=True,
-    )
-    view = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
-    btn = _find_button(view, "Edit")
-    assert btn.disabled is True, "Edit must be disabled on system agents (use Fork)"
 
 
 def test_admin_view_has_set_default_button(account_id: uuid.UUID) -> None:
@@ -757,8 +739,10 @@ def test_admin_view_has_set_default_button(account_id: uuid.UUID) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_read_only_view_hides_mutation_buttons(account_id: uuid.UUID) -> None:
-    """Member (is_admin=False) panel has NO mutation buttons; picker IS present."""
+def test_read_only_view_shows_build_buttons_hides_admin_buttons(account_id: uuid.UUID) -> None:
+    """Member (is_admin=False) panel has New/Fork/Edit (build controls) but NO
+    Set as default…/Delete/Connect via MCP (reachability + destructive controls);
+    picker IS present."""
     from daimon.core.scope import ChannelConfigRow, TenantConfigRow
 
     ch_row = ChannelConfigRow(agent_name="alice", channel_id="1001", tenant_id=uuid.UUID(int=0))
@@ -775,9 +759,13 @@ def test_read_only_view_hides_mutation_buttons(account_id: uuid.UUID) -> None:
 
     all_buttons = _walk_buttons(view)
     btn_labels = [b.label for b in all_buttons if b.label is not None]
-    for mutation_label in ("New", "Fork", "Edit", "Delete", "Set as default…"):
-        assert mutation_label not in btn_labels, (
-            f"member view must not contain {mutation_label!r} button (mutation hidden for non-admins)"
+    for build_label in ("New", "Fork", "Edit"):
+        assert build_label in btn_labels, (
+            f"member view must contain {build_label!r} button — build/configure is unconditional"
+        )
+    for admin_label in ("Set as default…", "Delete", "🔌 Connect via MCP"):
+        assert admin_label not in btn_labels, (
+            f"member view must not contain {admin_label!r} button (admin-only)"
         )
     selects = _walk_selects(view)
     assert len(selects) == 1, "member view must still have the agent picker"
@@ -824,8 +812,9 @@ def test_read_only_body_shows_cascade_ladder(account_id: uuid.UUID) -> None:
     )
 
 
-def test_member_roster_matches_admin_and_no_mutation_buttons(account_id: uuid.UUID) -> None:
-    """SC-4: member view shows same roster as admin but no mutation buttons."""
+def test_member_roster_matches_admin_and_hides_only_admin_buttons(account_id: uuid.UUID) -> None:
+    """SC-4: member view shows same roster as admin; build buttons are shared,
+    only the admin-only row (Set as default…/Delete/Connect via MCP) differs."""
     roster = [_entry("alice"), _entry("bob"), _entry("charlie")]
 
     admin_state = PanelState.initial(
@@ -855,9 +844,13 @@ def test_member_roster_matches_admin_and_no_mutation_buttons(account_id: uuid.UU
 
     member_buttons = _walk_buttons(member_view)
     member_btn_labels = [b.label for b in member_buttons if b.label is not None]
-    for mutation_label in ("New", "Fork", "Edit", "Delete", "Set as default…"):
-        assert mutation_label not in member_btn_labels, (
-            f"SC-4: member view must not contain {mutation_label!r} button"
+    for build_label in ("New", "Fork", "Edit"):
+        assert build_label in member_btn_labels, (
+            f"SC-4: member view must contain {build_label!r} button"
+        )
+    for admin_label in ("Delete", "Set as default…", "🔌 Connect via MCP"):
+        assert admin_label not in member_btn_labels, (
+            f"SC-4: member view must not contain {admin_label!r} button"
         )
 
     member_selects = _walk_selects(member_view)
