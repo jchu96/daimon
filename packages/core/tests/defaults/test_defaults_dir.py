@@ -62,20 +62,30 @@ def test_defaults_skills_parse() -> None:
 
 
 def test_defaults_daimon_agent_guidance_routes_credentials_to_request_tools() -> None:
-    """The daimon agent's guidance must name both credential-request tools and
-    no longer route credential entry to the /agent-setup panel — replacing the
-    setup-panel redirect was the whole point of the request_env_credential /
-    request_mcp_credential tools."""
+    """The daimon agent's guidance — its system prompt plus its referenced
+    skills — must name both credential-request tools and no line anywhere in
+    that combined guidance may route credential *entry* to the /agent-setup
+    panel — replacing the setup-panel redirect was the whole point of the
+    request_env_credential / request_mcp_credential tools. The mechanism now
+    lives in the workspace-setup skill rather than the system prompt itself
+    (the prompt keeps only the no-plaintext rule), so this checks the union
+    of both, not the system prompt alone."""
     specs = load_agent_specs(DEFAULTS / "agents")
     daimon = next(s for s in specs if s.name == "daimon")
-    system = daimon.system or ""
-    assert "request_env_credential" in system, (
+    skill_names = {ref.skill_id for ref in daimon.skills if ref.type == "custom"}
+    skill_bodies = [
+        load_skill_spec(d)[1]
+        for d in load_skill_paths(DEFAULTS / "skills")
+        if load_skill_spec(d)[0].name in skill_names
+    ]
+    combined = "\n".join([daimon.system or "", *skill_bodies])
+    assert "request_env_credential" in combined, (
         "guidance must name request_env_credential for ad hoc env secrets"
     )
-    assert "request_mcp_credential" in system, (
+    assert "request_mcp_credential" in combined, (
         "guidance must name request_mcp_credential for auth-required MCP servers"
     )
-    for line in system.splitlines():
+    for line in combined.splitlines():
         if "/agent-setup" not in line:
             continue
         lowered = line.lower()
