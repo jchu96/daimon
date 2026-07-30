@@ -365,6 +365,52 @@ async def test_delete_for_account_with_matching_platform_user_key_also_deletes_n
     )
 
 
+async def test_delete_for_platform_user_ignores_account_id_and_stays_tenant_scoped(
+    db_session: AsyncSession,
+) -> None:
+    """The principal-scoped delete must not reach the account's rows elsewhere.
+
+    Purging ONE principal erases that person's votes in that tenant only —
+    including the null-account ones — while the same account's rows under
+    another tenant survive for that tenant's own principal to carry.
+    """
+    tenant_a = await make_tenant(db_session, workspace_id="mf-store-guild-a")
+    tenant_b = await make_tenant(db_session, workspace_id="mf-store-guild-b")
+    account = await make_account(db_session, tenant=tenant_a)
+    for tenant_id, message_id, account_id in (
+        (tenant_a.id, "msg-13", account.id),
+        (tenant_a.id, "msg-14", None),
+        (tenant_b.id, "msg-15", account.id),
+    ):
+        await store.record_vote(
+            db_session,
+            tenant_id=tenant_id,
+            platform="discord",
+            message_id=message_id,
+            channel_id="chan-1",
+            platform_user_id="voter-shared",
+            account_id=account_id,
+            ma_session_id=None,
+            vote="down",
+        )
+
+    deleted = await store.delete_message_feedback_for_platform_user(
+        db_session, tenant_id=tenant_a.id, platform_user_id="voter-shared"
+    )
+
+    assert deleted == 2, "both of tenant A's rows must go, account-keyed and null-account alike"
+    surviving = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(MessageFeedback)
+            .where(MessageFeedback.tenant_id == tenant_b.id)
+        )
+    ).scalar_one()
+    assert surviving == 1, (
+        "the same account's row under another tenant must survive a per-principal delete"
+    )
+
+
 async def test_count_for_account_matches_subsequent_delete(
     db_session: AsyncSession,
 ) -> None:

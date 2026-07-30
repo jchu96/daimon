@@ -125,6 +125,36 @@ async def attach_feedback_text(
     return MessageFeedbackRow.model_validate(orm)
 
 
+async def delete_message_feedback_for_platform_user(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    platform_user_id: str,
+) -> int:
+    """Delete one platform user's vote rows in one tenant. Idempotent.
+
+    The principal-scoped counterpart to
+    `delete_message_feedback_for_account`: keyed by the identity a vote
+    actually carries, so it reaches rows written before the voter had an
+    `accounts` row. Deliberately does NOT OR in an account-id predicate —
+    purging ONE principal must not erase the same account's votes cast under
+    a different tenant or a different platform identity.
+
+    Tenant-scoped for the same reason `credential_requests` and
+    `wizard_session` are: `platform_user_id` is not globally unique across
+    platforms (Slack user ids are workspace-scoped).
+    """
+    result = await session.execute(
+        delete(MessageFeedback).where(
+            MessageFeedback.tenant_id == tenant_id,
+            MessageFeedback.platform_user_id == platform_user_id,
+        )
+    )
+    rowcount = cast(CursorResult[Any], result).rowcount
+    await session.flush()
+    return rowcount
+
+
 def _account_or_platform_user_predicate(
     *, account_id: uuid.UUID, platform_user_keys: Sequence[tuple[uuid.UUID, str]]
 ) -> ColumnElement[bool]:

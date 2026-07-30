@@ -10,14 +10,22 @@ appending one helper call here plus one int field on `PurgeReport`. Current
 sequence: user_skills -> github_credentials -> agent_github_binding ->
 github_oauth_states (both kinds where the table permits) -> credential_requests
 (both kinds, platform-user-scoped like github_oauth_states) -> wizard_session
-(both kinds, platform-user-scoped like credential_requests) -> routines
-(platform only) -> principal_links -> principal row. Account-level deletes
-(mcp_tokens, message_feedback, user_configs, accounts) run in `purge_account`
-after all principal rows are gone; mcp_tokens and message_feedback are keyed
-by account_id and are deleted before delete_account so their CASCADE FKs to
+(both kinds, platform-user-scoped like credential_requests) -> message_feedback
+(platform only, platform-user-scoped) -> routines (platform only) ->
+principal_links -> principal row. Account-level deletes (mcp_tokens,
+message_feedback, user_configs, accounts) run in `purge_account` after all
+principal rows are gone; mcp_tokens and message_feedback are keyed by
+account_id and are deleted before delete_account so their CASCADE FKs to
 accounts.id are satisfied. message_feedback is deleted by an account-id
 predicate OR'd with the account's (tenant, platform-user) keys, because a
 vote cast before the person had an account row carries a null account id.
+
+message_feedback is the one table deleted on BOTH paths, because it is the
+one table whose rows can carry either identity key. The principal path
+deletes only the principal's own (tenant, platform-user) rows; the account
+path then sweeps whatever the account-id predicate still reaches. The two
+passes cannot double-count — the second only sees what the first left — so
+the summed report still equals `collect_purge_preview`'s single count.
 
 wizard_session rides the platform-user-scoped delete path rather than an
 accounts.id cascade: the row's identity key is the requester's platform user
@@ -184,6 +192,21 @@ async def _purge_principal_in_session(
             platform_user_id=principal.external_id,
             tenant_id=principal.tenant_id,
         )
+        # message_feedback carries the SAME (tenant, platform-user) identity key
+        # as the three tables above, so it must be purged on this path too:
+        # a vote row can carry account_id = NULL (the reaction path never mints
+        # a principal), leaving votes AND their attached free text behind if
+        # only the account-level pass in purge_account deleted them.
+        # Deliberately the narrow platform-user-keyed helper, not the
+        # account-keyed one: purging ONE principal must not erase the same
+        # account's votes under another tenant.
+        message_feedback_count = (
+            await message_feedback_store.delete_message_feedback_for_platform_user(
+                session,
+                tenant_id=principal.tenant_id,
+                platform_user_id=principal.external_id,
+            )
+        )
     else:
         routines_count = 0
         kind = "cli"
@@ -221,6 +244,12 @@ async def _purge_principal_in_session(
             platform_user_id=principal.os_user,
             tenant_id=principal.tenant_id,
         )
+        # A vote is always cast by a platform user reacting in a guild, so a
+        # CLI principal owns no message_feedback rows — nothing to delete, and
+        # no symmetric call here: os_user is not a reaction identity, and
+        # running one would risk deleting an unrelated platform user's rows
+        # that happen to share the string.
+        message_feedback_count = 0
 
     # user_skills and github_credentials are keyed by principal_id alone — both
     # principal kinds own rows in these tables.
@@ -265,6 +294,7 @@ async def _purge_principal_in_session(
         slack_user_tokens=slack_user_tokens_count,
         credential_requests=credential_requests_count,
         wizard_sessions=wizard_sessions_count,
+        message_feedback=message_feedback_count,
     )
 
 
