@@ -20,15 +20,52 @@ layer sets it automatically from the view's own contents. A components-v2
 message also cannot carry `content`, `embed`, `embeds`, `stickers`, or
 `poll` -- which is why the screen's head text is rendered as a `TextDisplay`
 component instead of message content.
+
+Reuses `_credential_button.py`'s exact require/resolve/permission-check
+order (itself borrowed from `_send.py`'s `_send_message_impl`) rather than
+re-implementing any of it, so posting a wizard carries the same
+channel-visibility discipline as every other message this adapter sends.
+
+The invariant that makes cross-process re-rendering possible: the process
+that redraws a later step runs elsewhere (the bot, on a tap) and cannot read
+this process's file store, so whatever a later render needs has to be
+resolvable from anywhere. That is what the content-delivery addresses this
+module captures are for -- every step's image is therefore uploaded exactly
+once, here, on the first post, even though only step one's image is
+referenced by a component on this message.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import discord
-from daimon.core.wizard.render import Screen, ScreenButton
-from daimon.core.wizard.state import build_custom_id
+from daimon.adapters.mcp.auth.resolver import AuthIdentity
+from daimon.adapters.mcp.runtime import McpRuntime
+from daimon.adapters.mcp.tools.discord._client import (
+    _require_bot_token,  # pyright: ignore[reportPrivateUsage]
+    _require_discord_identity,  # pyright: ignore[reportPrivateUsage]
+    _require_guild_channel,  # pyright: ignore[reportPrivateUsage]
+    _require_guild_id,  # pyright: ignore[reportPrivateUsage]
+    _resolve_channel,  # pyright: ignore[reportPrivateUsage]
+    _resolve_member,  # pyright: ignore[reportPrivateUsage]
+    rest_client,  # pyright: ignore[reportPrivateUsage]
+)
+from daimon.adapters.mcp.tools.discord._send import (
+    _build_files_from_handles,  # pyright: ignore[reportPrivateUsage]
+)
+from daimon.adapters.mcp.tools.discord._visibility import (
+    _check_send_permission,  # pyright: ignore[reportPrivateUsage]
+    _ensure_thread_parent_cached,  # pyright: ignore[reportPrivateUsage]
+)
+from daimon.core.wizard.render import Screen, ScreenButton, to_screen
+from daimon.core.wizard.spec import WizardSpec
+from daimon.core.wizard.state import WizardState, build_custom_id
+from fastmcp.exceptions import ToolError
+
+logger = logging.getLogger(__name__)
 
 _ACCENT_COLOURS: dict[str, int] = {
     "blurple": 0x5865F2,
@@ -117,3 +154,80 @@ def build_wizard_view(
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
     return view
+
+
+@dataclass(frozen=True)
+class PostedWizard:
+    """What posting a wizard's first screen returns to its caller.
+
+    `image_urls` maps every uploaded step's `image_handle` to the
+    content-delivery address Discord minted for it -- the durable reference
+    a later re-render (running in the other process, on a tap) resolves the
+    image from, since it never sees this process's file store.
+    """
+
+    message_id: str
+    image_urls: dict[str, str]
+
+
+async def _post_wizard_impl(  # pyright: ignore[reportUnusedFunction]
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    channel_id: str,
+    spec: WizardSpec,
+    short_id: str,
+) -> PostedWizard:
+    """Post a wizard's first screen, uploading every step's image.
+
+    Only step one's image is referenced by a component; every other step's
+    image still rides this same attachment set so its content-delivery
+    address is captured now, before any tap, since a later render cannot
+    reach this process's file store.
+    """
+    _require_discord_identity(auth)
+    guild_id = _require_guild_id(auth)
+    bot_token = _require_bot_token(runtime)
+
+    handles = [step.image_handle for step in spec.steps if step.image_handle is not None]
+    files: list[discord.File] = []
+    if handles:
+        file_store = runtime.file_store
+        if file_store is None:
+            raise ToolError(
+                "file_handles requires the media file store to be configured "
+                "(set DAIMON_GEMINI__API_KEY on the mcp process)"
+            )
+        files = await _build_files_from_handles(handles, store=file_store)
+    files_by_handle = dict(zip(handles, files, strict=True))
+
+    rendered_screen = to_screen(spec, WizardState(short_id=short_id))
+    view = build_wizard_view(rendered_screen, files=files_by_handle)
+
+    async with rest_client(bot_token) as c:
+        _, member = await _resolve_member(c, guild_id, _require_discord_identity(auth))
+        raw_channel = await _resolve_channel(c, channel_id)
+        channel = _require_guild_channel(raw_channel, guild_id)
+        if isinstance(channel, discord.Thread):
+            # Thread.permissions_for needs the parent in the guild cache;
+            # the per-call REST client starts with an empty one.
+            await _ensure_thread_parent_cached(channel)
+        _check_send_permission(channel, member)
+        if not isinstance(channel, discord.abc.Messageable):
+            raise ToolError("channel does not support sending messages")
+        sent = await channel.send(view=view, files=files)
+
+    url_by_filename = {attachment.filename: attachment.url for attachment in sent.attachments}
+    image_urls: dict[str, str] = {}
+    for handle, file in files_by_handle.items():
+        url = url_by_filename.get(file.filename)
+        if url is None:
+            logger.warning(
+                "wizard post %s: no attachment url returned for image handle %r",
+                sent.id,
+                handle,
+            )
+            continue
+        image_urls[handle] = url
+
+    return PostedWizard(message_id=str(sent.id), image_urls=image_urls)
