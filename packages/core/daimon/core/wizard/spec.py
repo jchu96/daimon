@@ -36,6 +36,16 @@ MAX_BUTTONS_PER_ROW: Final[int] = 5
 MAX_LABEL_CHARS: Final[int] = 80
 MAX_STEPS: Final[int] = 20
 MAX_IMAGES: Final[int] = 10
+# A step screen's head text is one TextDisplay carrying the prompt, a
+# "Step N of M" line, and the question.
+MAX_TEXT_DISPLAY_CHARS: Final[int] = 4000
+# Room for the "\nStep NN of NN\n" line the renderer inserts between the
+# prompt and the question.
+HEAD_TEXT_OVERHEAD_CHARS: Final[int] = 32
+# A multi step's question is rendered as the select's placeholder.
+MAX_SELECT_PLACEHOLDER_CHARS: Final[int] = 150
+MAX_SELECT_OPTION_DESCRIPTION_CHARS: Final[int] = 100
+MAX_SELECT_OPTION_VALUE_CHARS: Final[int] = 100
 
 
 class StepKind(StrEnum):
@@ -177,6 +187,41 @@ class WizardSpec(BaseModel):
                         f"{len(option.label)} characters long, exceeding Discord's "
                         f"{MAX_LABEL_CHARS}-character button label limit; shorten it"
                     )
+                if len(option.value) > MAX_SELECT_OPTION_VALUE_CHARS:
+                    raise ValueError(
+                        f"step {index} ({step.key!r}) has an option value "
+                        f"{len(option.value)} characters long, exceeding Discord's "
+                        f"{MAX_SELECT_OPTION_VALUE_CHARS}-character option value "
+                        f"limit; shorten it"
+                    )
+                if (
+                    option.description is not None
+                    and len(option.description) > MAX_SELECT_OPTION_DESCRIPTION_CHARS
+                ):
+                    raise ValueError(
+                        f"step {index} ({step.key!r}) has an option description "
+                        f"{len(option.description)} characters long, exceeding "
+                        f"Discord's {MAX_SELECT_OPTION_DESCRIPTION_CHARS}-character "
+                        f"option description limit; shorten it"
+                    )
+
+        head_budget = MAX_TEXT_DISPLAY_CHARS - HEAD_TEXT_OVERHEAD_CHARS
+        for index, step in enumerate(self.steps):
+            head_chars = len(self.prompt) + len(step.question)
+            if head_chars > head_budget:
+                raise ValueError(
+                    f"step {index} ({step.key!r}) renders a head text of {head_chars} "
+                    f"characters (prompt plus question), exceeding the {head_budget}-"
+                    f"character budget within Discord's {MAX_TEXT_DISPLAY_CHARS}-"
+                    f"character text limit; shorten the prompt or the question"
+                )
+            if step.kind is StepKind.MULTI and len(step.question) > MAX_SELECT_PLACEHOLDER_CHARS:
+                raise ValueError(
+                    f"step {index} ({step.key!r}) is a multi step whose question is "
+                    f"{len(step.question)} characters long; a multi step's question "
+                    f"is rendered as the select placeholder, which Discord caps at "
+                    f"{MAX_SELECT_PLACEHOLDER_CHARS} characters; shorten it"
+                )
 
         for index, step in enumerate(self.steps):
             if step.kind is not StepKind.MULTI:
@@ -190,6 +235,15 @@ class WizardSpec(BaseModel):
                 raise ValueError(
                     f"step {index} ({step.key!r}) has `max` {step.max} above its "
                     f"{len(step.options)} available options; lower `max` or add more options"
+                )
+            # Checked independently of `max`: when `max` is None the renderer
+            # derives max_values from the option count, so a `min` above that
+            # count is a select no user could ever satisfy -- and one Discord
+            # refuses to render at all.
+            if step.min is not None and step.min > len(step.options):
+                raise ValueError(
+                    f"step {index} ({step.key!r}) has `min` {step.min} above its "
+                    f"{len(step.options)} available options; lower `min` or add more options"
                 )
             if step.min is not None and step.max is not None and step.min > step.max:
                 raise ValueError(

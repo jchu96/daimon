@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import pytest
 from daimon.core.wizard.spec import (
+    HEAD_TEXT_OVERHEAD_CHARS,
+    MAX_SELECT_OPTION_DESCRIPTION_CHARS,
+    MAX_SELECT_OPTION_VALUE_CHARS,
     MAX_SELECT_OPTIONS,
+    MAX_SELECT_PLACEHOLDER_CHARS,
     MAX_STEPS,
+    MAX_TEXT_DISPLAY_CHARS,
     Option,
     Step,
     StepKind,
@@ -129,6 +134,79 @@ def test_multi_max_above_option_count_rejected() -> None:
             steps=[Step(key="k", question="q", kind=StepKind.MULTI, options=options, min=0, max=5)],
         )
     assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_multi_min_above_option_count_rejected_when_max_is_unset() -> None:
+    # With `max` unset the renderer derives max_values from the option count,
+    # so min=3 against 2 options would emit min_values > max_values.
+    options = [Option(label="a", value="a"), Option(label="b", value="b")]
+
+    with pytest.raises(ValidationError, match="available options") as exc_info:
+        WizardSpec(
+            prompt="p",
+            steps=[Step(key="k", question="q", kind=StepKind.MULTI, options=options, min=3)],
+        )
+    assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_oversized_option_value_rejected() -> None:
+    option = Option(label="a", value="v" * (MAX_SELECT_OPTION_VALUE_CHARS + 1))
+
+    with pytest.raises(ValidationError, match="option value") as exc_info:
+        WizardSpec(
+            prompt="p", steps=[Step(key="k", question="q", kind=StepKind.CHOICE, options=[option])]
+        )
+    assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_oversized_option_description_rejected() -> None:
+    option = Option(
+        label="a", value="a", description="d" * (MAX_SELECT_OPTION_DESCRIPTION_CHARS + 1)
+    )
+
+    with pytest.raises(ValidationError, match="option description") as exc_info:
+        WizardSpec(
+            prompt="p", steps=[Step(key="k", question="q", kind=StepKind.CHOICE, options=[option])]
+        )
+    assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_oversized_head_text_rejected() -> None:
+    question = "q" * (MAX_TEXT_DISPLAY_CHARS - HEAD_TEXT_OVERHEAD_CHARS)
+
+    with pytest.raises(ValidationError, match="head text") as exc_info:
+        WizardSpec(prompt="p", steps=[Step(key="k", question=question, kind=StepKind.TEXT)])
+    assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_multi_question_above_the_placeholder_limit_rejected() -> None:
+    options = [Option(label="a", value="a")]
+    question = "q" * (MAX_SELECT_PLACEHOLDER_CHARS + 1)
+
+    with pytest.raises(ValidationError, match="placeholder") as exc_info:
+        WizardSpec(
+            prompt="p",
+            steps=[Step(key="k", question=question, kind=StepKind.MULTI, options=options)],
+        )
+    assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_a_long_question_is_accepted_on_a_non_multi_step() -> None:
+    """Only a multi step's question becomes a select placeholder; the same
+    length on a choice step renders as ordinary head text."""
+    spec = WizardSpec(
+        prompt="p",
+        steps=[
+            Step(
+                key="k",
+                question="q" * (MAX_SELECT_PLACEHOLDER_CHARS + 1),
+                kind=StepKind.CHOICE,
+                options=[Option(label="a", value="a")],
+            )
+        ],
+    )
+
+    assert len(spec.steps) == 1
 
 
 def test_too_many_image_bearing_steps_rejected() -> None:
