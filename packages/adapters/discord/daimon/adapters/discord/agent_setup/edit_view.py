@@ -12,6 +12,7 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup import authz
 from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.modals import (
     AddMcpModal,
@@ -129,6 +130,10 @@ class _SkillRemoveSelect(discord.ui.Select["EditView"]):
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         if self.view is None or self.values[0] == "__none__":
             return
+        if await authz.refuse_if_reachable_and_not_admin(
+            interaction, runtime=self.view.runtime, entry=self.view.state.selected
+        ):
+            return
         await interaction.response.defer()
         index = int(self.values[0])
         agent_name = self.view.state.selected.name if self.view.state.selected else None
@@ -211,6 +216,10 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         if self.view is None or self.values[0] == "__none__":
+            return
+        if await authz.refuse_if_reachable_and_not_admin(
+            interaction, runtime=self.view.runtime, entry=self.view.state.selected
+        ):
             return
         await interaction.response.defer()
         # Snapshot the selected RosterEntry BEFORE the in-memory mutation —

@@ -8,6 +8,7 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup import authz
 from daimon.adapters.discord.agent_setup.state import PanelState
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel
 from daimon.adapters.discord.agent_setup.write import call_reconcile_for_panel, mask_tail
@@ -76,6 +77,10 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
         _rejection = get_reserved_mcp_rejection(server_name=name, url=url, public_url=_public_url)
         if _rejection is not None:
             await interaction.response.send_message(_rejection, ephemeral=True)
+            return
+        if await authz.refuse_if_reachable_and_not_admin(
+            interaction, runtime=self.runtime, entry=self.state.selected
+        ):
             return
         await interaction.response.defer()
         server_entry = BetaManagedAgentsURLMCPServerParams(name=name, type="url", url=url)

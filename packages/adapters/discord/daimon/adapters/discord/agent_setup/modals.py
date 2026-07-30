@@ -20,6 +20,7 @@ import time
 
 import httpx
 import structlog
+from daimon.adapters.discord.agent_setup import authz
 from daimon.adapters.discord.agent_setup.modals_mcp import AddMcpModal as AddMcpModal
 from daimon.adapters.discord.agent_setup.state import PanelState
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel
@@ -144,6 +145,10 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
         error = validate_model_id(model_value)
         if error is not None:
             await interaction.response.send_message(error, ephemeral=True)
+            return
+        if await authz.refuse_if_reachable_and_not_admin(
+            interaction, runtime=self.runtime, entry=self.state.selected
+        ):
             return
         await interaction.response.defer()
         try:
@@ -487,9 +492,14 @@ class AddSkillModal(discord.ui.Modal, title="Add skill repo"):
             agent_name=agent_name,
             repo_url=url,
         )
-        await interaction.response.defer()
         if selected is None or not url:
+            await interaction.response.defer()
             return
+        if await authz.refuse_if_reachable_and_not_admin(
+            interaction, runtime=self.runtime, entry=selected
+        ):
+            return
+        await interaction.response.defer()
         tenant_id = await resolve_tenant_for_panel(self.runtime, interaction)
         try:
             self.state.add_skill_repo_pending(url)
