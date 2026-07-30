@@ -27,6 +27,7 @@ from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.errors import DaimonError
 from daimon.core.stores.identity import get_or_create_platform_principal
+from daimon.core.stores.tenants import get_tenant
 
 import discord
 from discord import Interaction, app_commands
@@ -34,6 +35,17 @@ from discord.ext import commands
 
 log = structlog.get_logger()
 BotInteraction = Interaction[commands.Bot]
+
+
+def _not_ready_message(provision_status: str) -> str:
+    """Pure: copy for a tenant that isn't ready for the roster panel yet.
+
+    An unrecognized status fails closed to the same message as "pending"
+    rather than falling through to the panel.
+    """
+    if provision_status == "failed":
+        return "Setup hit a snag — check the message I posted in this server, then try again."
+    return "This install is still being set up — try again in a moment."
 
 
 def _get_runtime(interaction: BotInteraction) -> DiscordRuntime:
@@ -68,6 +80,15 @@ class AgentSetupCog(commands.Cog):
             is_admin = is_guild_admin(interaction)
             tenant_id = await resolve_tenant_for_interaction(interaction.client, interaction)
             assert tenant_id is not None, "require_registered_guild guarantees a tenant"
+            async with runtime.sessionmaker() as session:
+                tenant_row = await get_tenant(session, tenant_id)
+            assert tenant_row is not None, "require_registered_guild guarantees a tenant row"
+            if tenant_row.provision_status != "ready":
+                await interaction.edit_original_response(
+                    content=_not_ready_message(tenant_row.provision_status),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
             async with runtime.sessionmaker() as session:
                 principal = await get_or_create_platform_principal(
                     session,
