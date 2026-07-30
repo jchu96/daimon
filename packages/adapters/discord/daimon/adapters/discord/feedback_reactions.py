@@ -22,9 +22,10 @@ reaction, direct-message, custom-emoji, and emoji-match gates with zero
 I/O; (3) `is_bot_authored`, tri-state -- `True`/`False` resolve
 immediately, `None` means the gateway omitted the undocumented, possibly-
 absent `message_author_id` field and this module falls back to one bounded
-message fetch, logging its use since that field could stop arriving
-without notice, where a failure means the author is unverifiable and
-records NOTHING -- never "assume ours"; (4) derive the tenant id (pure)
+message fetch, memoized per message id (see `_AUTHOR_CACHE_MAX_ENTRIES`),
+logging its use since that field could stop arriving without notice, where
+a failure means the author is unverifiable and records NOTHING -- never
+"assume ours"; (4) derive the tenant id (pure)
 and open one transaction to read the tenant, resolve a best-effort
 session/account attribution, and upsert the vote; (5) on a genuinely new
 down-vote, open the private follow-up (`_send_feedback_prompt`).
@@ -55,6 +56,16 @@ from discord.ext import commands
 
 log = structlog.get_logger()
 
+# Cap on the per-process memo of resolved author verdicts. The fallback is
+# rare today, but if `message_author_id` ever stops arriving then EVERY
+# thumbs reaction bot-wide -- overwhelmingly on human-authored messages --
+# costs a REST fetch competing with turn posting under discord.py's shared
+# rate limiter, and one person cycling add/remove on a single message
+# repeats it. Eviction is by insertion order, not recency: the access
+# pattern is a burst of reactions on a message that was just posted, so an
+# LRU's bookkeeping would buy nothing over a plain bounded dict.
+_AUTHOR_CACHE_MAX_ENTRIES = 1024
+
 
 class FeedbackReactionCog(commands.Cog):
     """Listens for a thumbs-up/down reaction on a bot message and records it.
@@ -66,6 +77,10 @@ class FeedbackReactionCog(commands.Cog):
 
     def __init__(self, bot: DaimonBot) -> None:
         self._bot = bot
+        # message id -> "the bot wrote it", populated only by a fetch that
+        # actually resolved an author. Per-process and deliberately not
+        # persisted: it is a REST-amplification bound, not a source of truth.
+        self._author_is_bot: dict[int, bool] = {}
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
@@ -158,18 +173,30 @@ class FeedbackReactionCog(commands.Cog):
     async def _is_bot_message_via_fetch(
         self, payload: discord.RawReactionActionEvent, *, bot_user_id: int
     ) -> bool:
-        """Resolve the undecidable case by fetching the message once.
+        """Resolve the undecidable case by fetching the message once per message.
 
         The gateway field this falls back from (`message_author_id`) is
         undocumented by Discord and may stop arriving without notice, so
         every use of this fallback is logged with its own distinct event so
-        a production rollout can tell whether this path is rare or common.
+        a production rollout can tell whether this path is rare or common --
+        the event fires on a memo hit too, so it keeps measuring how often
+        the field is missing rather than how often we fetch.
 
         Returns False (record nothing) whenever the author cannot be
         verified: a channel that cannot be resolved, or a fetch that raises.
-        An unverifiable author must never resolve to "assume ours".
+        An unverifiable author must never resolve to "assume ours". Those
+        outcomes are deliberately NOT memoized -- an unresolvable channel or
+        a transient fetch failure would otherwise permanently suppress every
+        later vote on that message.
         """
-        log.info("feedback.author_fallback_used", message_id=str(payload.message_id))
+        memoized = self._author_is_bot.get(payload.message_id)
+        log.info(
+            "feedback.author_fallback_used",
+            message_id=str(payload.message_id),
+            memoized=memoized is not None,
+        )
+        if memoized is not None:
+            return memoized
         try:
             channel = self._bot.get_channel(payload.channel_id)
             if channel is None:
@@ -180,7 +207,15 @@ class FeedbackReactionCog(commands.Cog):
         except discord.HTTPException:
             log.info("feedback.author_unverifiable", message_id=str(payload.message_id))
             return False
-        return message.author.id == bot_user_id
+        is_bot_message = message.author.id == bot_user_id
+        self._memoize_author(payload.message_id, is_bot_message)
+        return is_bot_message
+
+    def _memoize_author(self, message_id: int, is_bot_message: bool) -> None:
+        """Record one resolved verdict, dropping the oldest entry past the cap."""
+        if len(self._author_is_bot) >= _AUTHOR_CACHE_MAX_ENTRIES:
+            del self._author_is_bot[next(iter(self._author_is_bot))]
+        self._author_is_bot[message_id] = is_bot_message
 
     async def _send_feedback_prompt(
         self, payload: discord.RawReactionActionEvent, *, feedback_id: uuid.UUID

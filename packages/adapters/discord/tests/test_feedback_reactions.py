@@ -262,6 +262,117 @@ async def test_fallback_fetch_message_raises_not_found_writes_nothing_and_does_n
     assert calls == [], "an unverifiable author must never resolve to 'assume ours'"
 
 
+async def test_fallback_fetches_once_for_repeated_reactions_on_the_same_message(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The memo is the bound on REST amplification if the gateway field goes away."""
+    await make_tenant(db_session, workspace_id=str(_GUILD_ID))
+    await db_session.commit()
+    _spy_on_record_vote(monkeypatch)
+    fetched_message = MagicMock()
+    fetched_message.author.id = 123456  # human-authored: the common case
+    fake_channel = MagicMock(spec=discord.abc.Messageable)
+    fake_channel.fetch_message = AsyncMock(return_value=fetched_message)
+    bot = _fake_bot(
+        sessionmaker=db_session_factory, get_channel=MagicMock(return_value=fake_channel)
+    )
+    cog = FeedbackReactionCog(bot)
+    payload = _build_payload(
+        message_id=1016,
+        channel_id=2001,
+        user_id=_REACTOR_ID,
+        guild_id=_GUILD_ID,
+        emoji_name="\N{THUMBS DOWN SIGN}",
+        message_author_id=None,
+    )
+
+    await cog.on_raw_reaction_add(payload)
+    await cog.on_raw_reaction_add(payload)
+    await cog.on_raw_reaction_add(payload)
+
+    assert fake_channel.fetch_message.await_count == 1, (
+        "a resolved author verdict must be reused, not re-fetched on every reaction"
+    )
+
+
+async def test_fallback_refetches_after_a_failed_fetch_is_not_memoized(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure must not permanently suppress later votes on that message."""
+    await make_tenant(db_session, workspace_id=str(_GUILD_ID))
+    await db_session.commit()
+    calls = _spy_on_record_vote(monkeypatch)
+    fetched_message = MagicMock()
+    fetched_message.author.id = _BOT_USER_ID
+    fake_channel = MagicMock(spec=discord.abc.Messageable)
+    fake_channel.fetch_message = AsyncMock(
+        side_effect=[
+            discord.NotFound(MagicMock(status=404), "message not found"),
+            fetched_message,
+        ]
+    )
+    bot = _fake_bot(
+        sessionmaker=db_session_factory, get_channel=MagicMock(return_value=fake_channel)
+    )
+    cog = FeedbackReactionCog(bot)
+    payload = _build_payload(
+        message_id=1017,
+        channel_id=2001,
+        user_id=_REACTOR_ID,
+        guild_id=_GUILD_ID,
+        emoji_name="\N{THUMBS DOWN SIGN}",
+        message_author_id=None,
+    )
+
+    await cog.on_raw_reaction_add(payload)
+    await cog.on_raw_reaction_add(payload)
+
+    assert fake_channel.fetch_message.await_count == 2, "a failed fetch must not be memoized"
+    assert len(calls) == 1, "the retry that resolved a bot author must record the vote"
+
+
+async def test_the_author_memo_is_bounded_and_evicts_the_oldest_message(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins that the memo cannot grow without bound across a long-running process."""
+    await make_tenant(db_session, workspace_id=str(_GUILD_ID))
+    await db_session.commit()
+    _spy_on_record_vote(monkeypatch)
+    monkeypatch.setattr(feedback_reactions, "_AUTHOR_CACHE_MAX_ENTRIES", 2)
+    fetched_message = MagicMock()
+    fetched_message.author.id = 123456
+    fake_channel = MagicMock(spec=discord.abc.Messageable)
+    fake_channel.fetch_message = AsyncMock(return_value=fetched_message)
+    bot = _fake_bot(
+        sessionmaker=db_session_factory, get_channel=MagicMock(return_value=fake_channel)
+    )
+    cog = FeedbackReactionCog(bot)
+
+    def _payload_for(message_id: int) -> discord.RawReactionActionEvent:
+        return _build_payload(
+            message_id=message_id,
+            channel_id=2001,
+            user_id=_REACTOR_ID,
+            guild_id=_GUILD_ID,
+            emoji_name="\N{THUMBS DOWN SIGN}",
+            message_author_id=None,
+        )
+
+    for message_id in (1018, 1019, 1020):
+        await cog.on_raw_reaction_add(_payload_for(message_id))
+    await cog.on_raw_reaction_add(_payload_for(1018))
+
+    assert fake_channel.fetch_message.await_count == 4, (
+        "the oldest entry must be evicted at the cap, so the first message re-fetches"
+    )
+
+
 async def test_fast_path_does_not_call_fetch_message(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
