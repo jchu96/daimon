@@ -517,6 +517,83 @@ async def test_two_concurrent_submits_bill_exactly_one_turn(
     )
 
 
+# --- per-tenant concurrency cap ---------------------------------------------------
+
+
+async def test_a_submit_turn_claims_and_releases_a_per_tenant_in_flight_slot(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """A wizard turn costs the same upstream capacity as a mention turn, so it
+    counts against the same cap -- and must give the slot back."""
+    tenant = await _seed_funded_tenant(db_session, workspace_id="800006001")
+    row = await _seed_review_row(db_session_factory, tenant=tenant)
+
+    channel = _make_channel(thread_id=5006, parent_id=4006)
+    sent_events: list[dict[str, Any]] = []
+    stream_hits: list[str] = []
+    router = _build_router(str(tenant.id), sent_events=sent_events, stream_hits=stream_hits)
+    runtime = _make_runtime(db_session_factory, router)
+    bot = _make_bot(runtime)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot, channel=channel, guild_id=123)
+
+    with patch("daimon.core.turn.prepare.create_session") as mock_create_session:
+        mock_create_session.return_value = _make_fake_session(session_id="sess_fresh_slot")
+        item = await WizardSubmitButton.from_custom_id(
+            interaction, MagicMock(), _submit_match(row.id)
+        )
+        assert await item.interaction_check(interaction) is True
+        await item.callback(interaction)
+        await asyncio.gather(*list(bot._bg_tasks))  # pyright: ignore[reportPrivateUsage]  # asserting the spawn contract
+
+    assert stream_hits, "the turn must actually have run"
+    assert bot._inflight == {}, (  # pyright: ignore[reportPrivateUsage]  # asserting the cap bookkeeping contract
+        "the in-flight slot the turn claimed must be released once it finishes"
+    )
+
+
+async def test_a_submit_over_the_per_tenant_cap_runs_no_turn_and_says_so(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    tenant = await _seed_funded_tenant(db_session, workspace_id="800007001")
+    row = await _seed_review_row(db_session_factory, tenant=tenant)
+
+    channel = _make_channel(thread_id=5007, parent_id=4007)
+    sent_events: list[dict[str, Any]] = []
+    stream_hits: list[str] = []
+    router = _build_router(str(tenant.id), sent_events=sent_events, stream_hits=stream_hits)
+    runtime = _make_runtime(db_session_factory, router)
+    runtime.settings.discord.max_concurrent_turns_per_tenant = 1
+    bot = _make_bot(runtime)
+    bot._inflight[tenant.id] = 1  # pyright: ignore[reportPrivateUsage]  # simulates a mention turn already holding this tenant's only slot
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot, channel=channel, guild_id=123)
+
+    with patch("daimon.core.turn.prepare.create_session"):
+        item = await WizardSubmitButton.from_custom_id(
+            interaction, MagicMock(), _submit_match(row.id)
+        )
+        assert await item.interaction_check(interaction) is True
+        await item.callback(interaction)
+        await asyncio.gather(*list(bot._bg_tasks))  # pyright: ignore[reportPrivateUsage]  # asserting the spawn contract
+
+    assert stream_hits == [], "an over-cap submit must never reach the SSE turn stream"
+    assert bot._inflight == {tenant.id: 1}, (  # pyright: ignore[reportPrivateUsage]  # asserting the cap bookkeeping contract
+        "a refused turn must not claim (or release) a slot it never took"
+    )
+
+    posted_texts = [
+        call.args[0]
+        for call in channel.send.call_args_list
+        if call.args and isinstance(call.args[0], str)
+    ]
+    assert any("recorded" in text and "in flight" in text for text in posted_texts), (
+        f"the refusal must say the answers were recorded and the server is busy, "
+        f"got: {posted_texts}"
+    )
+
+    usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
+    assert usage_rows == [], "an over-cap refusal must write zero usage_events rows"
+
+
 # --- post-hoc admission refusal -------------------------------------------------
 
 

@@ -35,6 +35,12 @@ Three things are load-bearing about `callback`'s shape:
    (`button_rows=()`), so a submitted form's message can never be tapped
    again -- there is nothing left on it to dispatch a tap to.
 
+The two gates a wizard turn DOES share with the mention path: `bot.draining`
+(checked in `callback`, before the one-shot claim, so a refused submit leaves
+a form that is still tappable after the restart) and the per-tenant
+`_inflight` cap (claimed and released in `run_wizard_submit_turn`, because a
+wizard turn costs the same upstream capacity as a mention turn).
+
 Accepted limitation, deliberately not addressed here: a submit-spawned turn
 does not participate in the mention path's per-thread `_processing`/`_pending`
 queueing (`bot.py`'s `_drain_pending_for_thread`). That queue only mention
@@ -42,7 +48,9 @@ turns feed and drain; half-registering a wizard turn into it would strand
 mentions that arrive while the wizard turn runs, with nothing left to drain
 them. The practical effect is that a wizard turn and a mention turn can run
 concurrently against the same thread's session -- an accepted trade-off, not
-a bug, for the first cut of this feature.
+a bug, for the first cut of this feature. It also means `_drain_and_close`
+(which polls `_processing`) does not wait for an already-running wizard turn;
+the drain gate above is what keeps new ones from starting.
 """
 
 from __future__ import annotations
@@ -79,6 +87,7 @@ from daimon.core.stores.domain import Role, WizardSessionRow
 from daimon.core.stores.thread_sessions import update_watermark
 from daimon.core.stores.wizard_session import try_claim_submit
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
+from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import run_prepared_turn
@@ -103,6 +112,11 @@ _log = structlog.get_logger()
 
 _CALLBACK_FAILED = "Something went wrong submitting this form -- please try again."
 _CHECK_FAILED = "Something went wrong checking this form -- please try again."
+_DRAINING = "I'm restarting right now -- submit this form again in a moment."
+_OVER_CAP = (
+    "Your answers were recorded, but this server has too many chats in flight "
+    "right now -- ask again in the thread in a moment."
+)
 
 
 class WizardSubmitButton(
@@ -180,6 +194,14 @@ class WizardSubmitButton(
                     view=build_wizard_view(to_screen(spec, submitted)),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                return
+
+            if bot.draining:
+                # Checked BEFORE the claim: the claim is one-shot, so
+                # refusing here leaves the form intact and tappable once a
+                # fresh process picks it up. The mention path rejects the
+                # same way in `on_message`.
+                await _reply_or_followup(interaction, _DRAINING)
                 return
 
             now = datetime.now(UTC)
@@ -276,9 +298,15 @@ async def run_wizard_submit_turn(
     boundary (the same one `_handle_mention` uses) because nothing above a
     fire-and-forget background task will otherwise report a failure to the
     user.
+
+    Claims a per-tenant in-flight slot the same way `on_message` does, and
+    releases it in the same `finally` that unbinds the log context: a wizard
+    turn costs the same upstream capacity as a mention turn, so it must count
+    against the same cap.
     """
     rid = generate_request_id()
     structlog.contextvars.bind_contextvars(rid=rid)
+    inflight_claimed = False
     try:
         # The form lives in the conversation the resumed turn should
         # continue -- no new thread is created here.
@@ -292,6 +320,27 @@ async def run_wizard_submit_turn(
         else:
             parent_channel_id = str(channel.id)
         thread_id = str(channel.id)
+
+        discord_settings = bot.runtime.settings.discord
+        assert discord_settings is not None, (
+            "run_wizard_submit_turn called without discord settings -- entrypoint must "
+            "validate at boot"
+        )
+
+        # --- Per-tenant concurrency cap, claimed exactly as `on_message`
+        # claims it: read-check-increment with no await in between, and one
+        # matching release in this function's `finally`. The claim already
+        # committed, so an over-cap submit says the answers were recorded
+        # rather than pretending nothing happened. ---
+        count = bot._inflight.get(row.tenant_id, 0)  # pyright: ignore[reportPrivateUsage]  # the per-tenant cap bookkeeping DaimonBot owns; a wizard turn must count against the same cap the mention path claims
+        if not should_admit_turn(
+            current_in_flight=count, cap=discord_settings.max_concurrent_turns_per_tenant
+        ):
+            _log.info("wizard_submit.skipped.over_cap", tenant_id=str(row.tenant_id))
+            await channel.send(_OVER_CAP)
+            return
+        bot._inflight[row.tenant_id] = count + 1  # pyright: ignore[reportPrivateUsage]  # see the read above
+        inflight_claimed = True
 
         # --- Stage one: admission -- D-01 admit(). Same three branches
         # _orchestrate has, prefixed with a sentence saying the answers were
@@ -373,11 +422,6 @@ async def run_wizard_submit_turn(
             )
             await role_session.commit()
 
-        discord_settings = bot.runtime.settings.discord
-        assert discord_settings is not None, (
-            "run_wizard_submit_turn called without discord settings -- entrypoint must "
-            "validate at boot"
-        )
         if discord_settings.per_caller_thread_sessions:
             session_account_id = admission.account_id
         else:
@@ -499,4 +543,6 @@ async def run_wizard_submit_turn(
         _log.exception("wizard_submit.turn_failed_unexpected", error=str(exc), short_id=row.id)
         await _render_wizard_turn_error(interaction, tenant_id=row.tenant_id, rid=rid, exc=exc)
     finally:
+        if inflight_claimed:
+            bot._release_inflight(row.tenant_id)  # pyright: ignore[reportPrivateUsage]  # the matching release for the claim above
         structlog.contextvars.unbind_contextvars("rid")

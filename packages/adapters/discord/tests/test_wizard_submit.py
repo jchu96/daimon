@@ -48,7 +48,12 @@ def _one_step_spec() -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
-def _fake_bot(sessionmaker: async_sessionmaker[AsyncSession], call_order: list[str]) -> Any:
+def _fake_bot(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    call_order: list[str],
+    *,
+    draining: bool = False,
+) -> Any:
     """A minimal stand-in for DaimonBot -- `.runtime.sessionmaker` is real,
     `._spawn` records the coroutine (appending to `call_order`) and closes it
     without running it, so `run_wizard_submit_turn`'s own behaviour is never
@@ -61,7 +66,10 @@ def _fake_bot(sessionmaker: async_sessionmaker[AsyncSession], call_order: list[s
         coro.close()
 
     bot = SimpleNamespace(
-        runtime=SimpleNamespace(sessionmaker=sessionmaker), _spawn=_spawn, spawned=spawned
+        runtime=SimpleNamespace(sessionmaker=sessionmaker),
+        _spawn=_spawn,
+        spawned=spawned,
+        draining=draining,
     )
     return bot
 
@@ -71,10 +79,19 @@ def _interaction(*, user_id: str, client: Any, call_order: list[str] | None = No
     interaction.user.id = int(user_id)
     interaction.client = client
     interaction.response.send_message = AsyncMock()
-    interaction.response.defer = AsyncMock(
-        side_effect=(lambda *a, **k: call_order.append("defer")) if call_order is not None else None
-    )
-    interaction.response.is_done = MagicMock(return_value=False)
+
+    # is_done() tracks the deferral the way a real InteractionResponse does,
+    # so `_reply_or_followup` picks the followup once the callback has
+    # acknowledged -- which is the only route a post-defer reply can take.
+    deferred: list[bool] = []
+
+    def _defer(*_args: Any, **_kwargs: Any) -> None:
+        deferred.append(True)
+        if call_order is not None:
+            call_order.append("defer")
+
+    interaction.response.defer = AsyncMock(side_effect=_defer)
+    interaction.response.is_done = MagicMock(side_effect=lambda: bool(deferred))
     interaction.edit_original_response = AsyncMock(
         side_effect=(lambda *a, **k: call_order.append("edit")) if call_order is not None else None
     )
@@ -227,6 +244,32 @@ async def test_two_sequential_submits_the_second_claims_nothing_and_spawns_nothi
         after = await get_wizard_session(session, short_id=row.id)
     assert after is not None
     assert after.status == "submitted"
+
+
+async def test_a_submit_during_drain_claims_nothing_and_leaves_the_form_tappable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The claim is one-shot, so refusing before it (unlike the mention path,
+    which has nothing to preserve) leaves a form the user can submit again
+    once a fresh process picks it up."""
+    row = await _seed(db_session_factory, current_step=1)
+    call_order: list[str] = []
+    bot = _fake_bot(db_session_factory, call_order, draining=True)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot, call_order=call_order)
+
+    item = await WizardSubmitButton.from_custom_id(interaction, MagicMock(), _submit_match(row.id))
+    assert await item.interaction_check(interaction) is True
+    await item.callback(interaction)
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after is not None
+    assert after.status == "open", "a submit refused during drain must not consume the claim"
+
+    assert bot.spawned == [], "no turn may start while the process is draining"
+    interaction.edit_original_response.assert_not_awaited()
+    message = interaction.followup.send.call_args.args[0]
+    assert "restarting" in message, "the refusal must say the bot is restarting"
 
 
 # --- authorization -------------------------------------------------------------
