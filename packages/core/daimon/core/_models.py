@@ -855,6 +855,70 @@ class CredentialRequest(Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MessageFeedback(Base):
+    """One row per (tenant, message, voter) thumbs-up/down reaction vote.
+
+    `platform_user_id` is the real identity key, not `account_id`: a person
+    who reacts without ever having taken a turn has no `accounts` row, so
+    `account_id` resolves to NULL, and NULL cannot serve as an upsert conflict
+    target. `account_id` is kept as a nullable best-effort foreign key so
+    later reads can join, and so an account-scoped erasure reaches these rows
+    directly.
+
+    `ma_session_id` is a hint, not a join key. It is resolved at write time
+    from the most recent live session in the reacted-to channel. When one
+    caller owns the thread — the ordinary case, because threads are created
+    per mention — it is exact. When several callers hold live sessions in the
+    same thread it names the most recently created one, which may not be the
+    session that authored the specific message. Any future analysis must
+    treat it accordingly.
+
+    `tenant_id` is NOT NULL and cascades on tenant teardown; a reaction with
+    no resolvable tenant is dropped upstream rather than stored with a null
+    isolation key.
+    """
+
+    __tablename__ = "message_feedback"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "message_id",
+            "platform_user_id",
+            name="uq_message_feedback_tenant_message_user",
+        ),
+        Index("message_feedback_tenant_idx", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    ma_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vote: Mapped[str] = mapped_column(Text, nullable=False)
+    feedback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class WizardSession(Base):
     """Durable state for one multi-step wizard form (`daimon.core.wizard`).
 

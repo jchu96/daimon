@@ -13,6 +13,11 @@ existing thread cold-creates a fresh per-caller session on the next turn.
 
 No unique constraint on thread identity — recreate intentionally inserts a
 second row while marking the old row 'dead'.
+
+Two read helpers exist for deliberately different purposes:
+`get_live_thread_session` is the turn pipeline's caller-scoped lookup (see the
+security invariant above); `get_latest_thread_session` drops the account_id
+predicate and exists only to give message feedback an attribution hint.
 """
 
 from __future__ import annotations
@@ -49,6 +54,40 @@ async def get_live_thread_session(
                 ThreadSession.platform == platform,
                 ThreadSession.thread_id == thread_id,
                 ThreadSession.account_id == account_id,
+                ThreadSession.status == "live",
+            )
+            .order_by(ThreadSession.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if orm is None:
+        return None
+    return ThreadSessionRow.model_validate(orm)
+
+
+async def get_latest_thread_session(
+    session: AsyncSession,
+    *,
+    tenant_id: _uuid.UUID,
+    platform: str,
+    thread_id: str,
+) -> ThreadSessionRow | None:
+    """Return the newest live row for (tenant_id, platform, thread_id), or None.
+
+    Deliberately NOT the session-lookup used by the turn pipeline — dropping
+    the `account_id` predicate that `get_live_thread_session` applies also
+    drops the caller-isolation guarantee that predicate exists to provide.
+    This helper exists for attribution hints only (message feedback resolving
+    which session likely authored a reacted-to message) and must never be
+    used to bind or resume a session.
+    """
+    orm = (
+        await session.execute(
+            select(ThreadSession)
+            .where(
+                ThreadSession.tenant_id == tenant_id,
+                ThreadSession.platform == platform,
+                ThreadSession.thread_id == thread_id,
                 ThreadSession.status == "live",
             )
             .order_by(ThreadSession.created_at.desc())

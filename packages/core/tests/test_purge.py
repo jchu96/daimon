@@ -22,6 +22,7 @@ from daimon.core._models import (
     Account,
     ChannelConfig,
     CliPrincipal,
+    MessageFeedback,
     PlatformPrincipal,
     PrincipalLink,
     Routine,
@@ -39,6 +40,7 @@ from daimon.core.purge import (
 from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
+from daimon.core.stores import message_feedback as message_feedback_store
 from daimon.core.stores import routines as routines_store
 from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
@@ -51,7 +53,7 @@ from daimon.testing.factories import (
     make_tenant,
 )
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .factories.github import make_oauth_state
@@ -1497,3 +1499,166 @@ async def test_purge_principal_credential_requests_does_not_delete_same_user_in_
         db_session, platform_user_id="shared-user-id", tenant_id=tenant_b.id
     )
     assert surviving == 1, "the other tenant's same-user-id row must survive"
+
+
+async def test_purge_principal_platform_deletes_message_feedback_including_null_account_rows(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A platform purge must not strand the votes (and free text) it can attribute.
+
+    The null-account row is the whole point: the reaction path deliberately
+    never mints a principal, so a vote cast before the person took a turn is
+    reachable only through the (tenant, platform-user) key this purge owns.
+    """
+    tenant = await make_tenant(db_session, workspace_id="mf-purge-principal")
+    account = await make_account(db_session, tenant=tenant)
+    pp = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="user-voter",
+        tenant=tenant,
+        account=account,
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        message_id="mf-purge-1",
+        channel_id="C1",
+        platform_user_id="user-voter",
+        account_id=account.id,
+        ma_session_id=None,
+        vote="up",
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        message_id="mf-purge-2",
+        channel_id="C1",
+        platform_user_id="user-voter",
+        account_id=None,
+        ma_session_id=None,
+        vote="down",
+    )
+    # A bystander's vote in the same tenant must survive.
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        message_id="mf-purge-1",
+        channel_id="C1",
+        platform_user_id="user-bystander",
+        account_id=None,
+        ma_session_id=None,
+        vote="down",
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=pp.id, kind="platform")
+
+    assert report.db.message_feedback == 2, (
+        "both the account-keyed and the null-account vote must be deleted and reported"
+    )
+    remaining = (
+        (
+            await db_session.execute(
+                select(MessageFeedback.platform_user_id).where(
+                    MessageFeedback.tenant_id == tenant.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert list(remaining) == ["user-bystander"], "only the purged voter's rows may be deleted"
+
+
+async def test_purge_principal_message_feedback_does_not_delete_same_user_in_other_tenant(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Tenant-scoped like every other platform-user-keyed delete on this path."""
+    tenant_a = await make_tenant(db_session, workspace_id="mf-purge-guild-a")
+    tenant_b = await make_tenant(db_session, workspace_id="mf-purge-guild-b")
+    account_a = await make_account(db_session, tenant=tenant_a)
+    pp_a = await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="shared-voter-id",
+        tenant=tenant_a,
+        account=account_a,
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant_a.id,
+        platform="discord",
+        message_id="mf-cross-1",
+        channel_id="C1",
+        platform_user_id="shared-voter-id",
+        account_id=account_a.id,
+        ma_session_id=None,
+        vote="down",
+    )
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant_b.id,
+        platform="discord",
+        message_id="mf-cross-2",
+        channel_id="C1",
+        platform_user_id="shared-voter-id",
+        account_id=None,
+        ma_session_id=None,
+        vote="down",
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=pp_a.id, kind="platform")
+
+    assert report.db.message_feedback == 1, "only tenant A's vote row must be deleted"
+    surviving = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(MessageFeedback)
+            .where(MessageFeedback.tenant_id == tenant_b.id)
+        )
+    ).scalar_one()
+    assert surviving == 1, "the other tenant's same-user-id vote must survive"
+
+
+async def test_purge_principal_cli_message_feedback_reports_zero(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Votes only ever come from a platform user, so a CLI purge reports zero."""
+    tenant = await make_tenant(db_session, workspace_id="mf-purge-cli")
+    account = await make_account(db_session, tenant=tenant)
+    cli = await make_cli_principal(db_session, os_user="mf-cli", tenant=tenant, account=account)
+    await message_feedback_store.record_vote(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        message_id="mf-cli-1",
+        channel_id="C1",
+        platform_user_id="mf-cli",
+        account_id=account.id,
+        ma_session_id=None,
+        vote="down",
+    )
+    await db_session.commit()
+
+    report = await purge_principal(sm=db_session_factory, principal_id=cli.id, kind="cli")
+
+    assert report.db.message_feedback == 0, "a CLI principal owns no vote rows"
+    surviving = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(MessageFeedback)
+            .where(MessageFeedback.tenant_id == tenant.id)
+        )
+    ).scalar_one()
+    assert surviving == 1, (
+        "an os_user string must never be treated as a reaction identity and delete a "
+        "platform user's votes"
+    )

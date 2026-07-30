@@ -10,11 +10,22 @@ appending one helper call here plus one int field on `PurgeReport`. Current
 sequence: user_skills -> github_credentials -> agent_github_binding ->
 github_oauth_states (both kinds where the table permits) -> credential_requests
 (both kinds, platform-user-scoped like github_oauth_states) -> wizard_session
-(both kinds, platform-user-scoped like credential_requests) -> routines
-(platform only) -> principal_links -> principal row. Account-level deletes
-(mcp_tokens, user_configs, accounts) run in `purge_account` after all principal
-rows are gone; mcp_tokens is keyed by account_id and is deleted before
-delete_account so its NO-ACTION/CASCADE FK to accounts.id is satisfied.
+(both kinds, platform-user-scoped like credential_requests) -> message_feedback
+(platform only, platform-user-scoped) -> routines (platform only) ->
+principal_links -> principal row. Account-level deletes (mcp_tokens,
+message_feedback, user_configs, accounts) run in `purge_account` after all
+principal rows are gone; mcp_tokens and message_feedback are keyed by
+account_id and are deleted before delete_account so their CASCADE FKs to
+accounts.id are satisfied. message_feedback is deleted by an account-id
+predicate OR'd with the account's (tenant, platform-user) keys, because a
+vote cast before the person had an account row carries a null account id.
+
+message_feedback is the one table deleted on BOTH paths, because it is the
+one table whose rows can carry either identity key. The principal path
+deletes only the principal's own (tenant, platform-user) rows; the account
+path then sweeps whatever the account-id predicate still reaches. The two
+passes cannot double-count — the second only sees what the first left — so
+the summed report still equals `collect_purge_preview`'s single count.
 
 wizard_session rides the platform-user-scoped delete path rather than an
 accounts.id cascade: the row's identity key is the requester's platform user
@@ -49,6 +60,23 @@ Deliberate carve-outs:
   so account purge does NOT touch them — archiving one because a single member
   invoked erasure would destroy the guild's shared agent memory. They may
   retain information about the purged user.
+- message_feedback rows cast in a tenant where the person has NO principal are
+  out of reach of an erasure run from another tenant. This is the one table
+  that records rows for someone with no principal anywhere: the reaction path
+  deliberately never mints one for a bystander, so a vote (and any free text
+  they then submit) lands with account_id = NULL, attributable only by
+  (tenant_id, platform_user_id). An erasure invoked in guild A derives its
+  platform-user keys from the account's own principals, which do not include
+  (tenant_B, user), so guild B's row survives. Unlike the tenant-scoped
+  oauth-state ghost rows above, these are durable and hold free text.
+  Remediation is guild-local and self-service: running the privacy purge
+  inside guild B mints a tenant-B principal, which brings (tenant_B, user)
+  into the key set and erases those rows. Deliberately not closed by a
+  platform-scoped, tenant-agnostic predicate: it would be correct only for
+  platforms whose external ids are globally unique (Discord snowflakes, not
+  Slack workspace-scoped user ids), so it would make erasure's blast radius
+  depend on the platform — a worse contract than one documented, reachable
+  remediation path.
 """
 
 from __future__ import annotations
@@ -66,6 +94,7 @@ from daimon.core.stores import github_credentials as github_credentials_store
 from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import identity as identity_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
+from daimon.core.stores import message_feedback as message_feedback_store
 from daimon.core.stores import routines as routines_store
 from daimon.core.stores import slack_turn_contexts as slack_turn_contexts_store
 from daimon.core.stores import slack_user_tokens as slack_user_tokens_store
@@ -101,6 +130,7 @@ class PurgeReport(BaseModel):
     slack_turn_contexts: int = 0
     credential_requests: int = 0
     wizard_sessions: int = 0
+    message_feedback: int = 0
 
     def merge(self, other: PurgeReport) -> PurgeReport:
         return PurgeReport(
@@ -119,6 +149,7 @@ class PurgeReport(BaseModel):
             slack_turn_contexts=self.slack_turn_contexts + other.slack_turn_contexts,
             credential_requests=self.credential_requests + other.credential_requests,
             wizard_sessions=self.wizard_sessions + other.wizard_sessions,
+            message_feedback=self.message_feedback + other.message_feedback,
         )
 
 
@@ -178,6 +209,21 @@ async def _purge_principal_in_session(
             platform_user_id=principal.external_id,
             tenant_id=principal.tenant_id,
         )
+        # message_feedback carries the SAME (tenant, platform-user) identity key
+        # as the three tables above, so it must be purged on this path too:
+        # a vote row can carry account_id = NULL (the reaction path never mints
+        # a principal), leaving votes AND their attached free text behind if
+        # only the account-level pass in purge_account deleted them.
+        # Deliberately the narrow platform-user-keyed helper, not the
+        # account-keyed one: purging ONE principal must not erase the same
+        # account's votes under another tenant.
+        message_feedback_count = (
+            await message_feedback_store.delete_message_feedback_for_platform_user(
+                session,
+                tenant_id=principal.tenant_id,
+                platform_user_id=principal.external_id,
+            )
+        )
     else:
         routines_count = 0
         kind = "cli"
@@ -215,6 +261,12 @@ async def _purge_principal_in_session(
             platform_user_id=principal.os_user,
             tenant_id=principal.tenant_id,
         )
+        # A vote is always cast by a platform user reacting in a guild, so a
+        # CLI principal owns no message_feedback rows — nothing to delete, and
+        # no symmetric call here: os_user is not a reaction identity, and
+        # running one would risk deleting an unrelated platform user's rows
+        # that happen to share the string.
+        message_feedback_count = 0
 
     # user_skills and github_credentials are keyed by principal_id alone — both
     # principal kinds own rows in these tables.
@@ -259,6 +311,7 @@ async def _purge_principal_in_session(
         slack_user_tokens=slack_user_tokens_count,
         credential_requests=credential_requests_count,
         wizard_sessions=wizard_sessions_count,
+        message_feedback=message_feedback_count,
     )
 
 
@@ -362,6 +415,15 @@ async def purge_account(
         mcp_tokens_count = await mcp_tokens_store.delete_tokens_for_account(
             session, account_id=account_id
         )
+        # message_feedback: account-id-keyed OR'd with the account's
+        # (tenant, platform-user) keys — a vote cast before the person had an
+        # accounts row carries a null account_id and is only reachable via the
+        # platform-user key. CLI principals contribute no keys: reactions only
+        # ever come from a platform user, so cli_list is not walked here.
+        platform_user_keys = [(pp.tenant_id, pp.external_id) for pp in pp_list]
+        message_feedback_count = await message_feedback_store.delete_message_feedback_for_account(
+            session, account_id=account_id, platform_user_keys=platform_user_keys
+        )
         # slack_turn_contexts (D-07): keyed by (tenant_id, account_id), not
         # principal_id. Loop every tenant the account's principals belong to —
         # mirrors the upstream session-deletion loop below.
@@ -379,6 +441,7 @@ async def purge_account(
         db_report = report.merge(
             PurgeReport(
                 mcp_tokens=mcp_tokens_count,
+                message_feedback=message_feedback_count,
                 user_configs=user_cfg_count,
                 accounts=account_count,
                 slack_turn_contexts=slack_turn_contexts_count,

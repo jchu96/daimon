@@ -21,6 +21,7 @@ from daimon.adapters.discord.context import (
     build_delta_xml,
 )
 from daimon.adapters.discord.errors import generate_request_id, render_error
+from daimon.adapters.discord.feedback_seed import seed_feedback_reactions
 from daimon.adapters.discord.gating import should_process_message
 from daimon.adapters.discord.lifecycle import DiscordTurnLifecycle
 from daimon.adapters.discord.permissions import check_missing_permissions
@@ -230,6 +231,7 @@ class DaimonBot(commands.Bot):
         from daimon.adapters.discord.commands.memory import MemoryCog
         from daimon.adapters.discord.commands.privacy import PrivacyCog
         from daimon.adapters.discord.commands.routines import RoutinesCog
+        from daimon.adapters.discord.feedback_reactions import FeedbackReactionCog
 
         await self.add_cog(HelpCog(self))
         await self.add_cog(AgentSetupCog(self))
@@ -237,6 +239,7 @@ class DaimonBot(commands.Bot):
         await self.add_cog(BillingCog(self))
         await self.add_cog(PrivacyCog(self))
         await self.add_cog(MemoryCog(self))
+        await self.add_cog(FeedbackReactionCog(self))
 
         # One-time CLASS registration (not per-button) for the chat-initiated
         # credential-request button. Imported here, not at module level, since
@@ -264,6 +267,14 @@ class DaimonBot(commands.Bot):
         from daimon.adapters.discord.wizard_submit import WizardSubmitButton
 
         self.add_dynamic_items(WizardSubmitButton)
+
+        # A feedback button is delivered into a direct message and must
+        # still dispatch after this process restarts, so it needs the same
+        # class-level registration rather than a live view. Local import for
+        # the same cycle reason as above.
+        from daimon.adapters.discord.feedback_button import FeedbackButton
+
+        self.add_dynamic_items(FeedbackButton)
 
     async def _post_to_guild(self, guild: discord.Guild, embed: discord.Embed) -> None:
         """Post an embed via the fallback chain: text channel → DM owner → skip."""
@@ -1165,3 +1176,10 @@ class DaimonBot(commands.Bot):
                         watermark_message_id=final_lifecycle.final_message_id,
                     )
                     await _wm_session.commit()
+            # The lifecycle flag below excludes a cancelled turn, which also
+            # reaches this branch with a non-None final_message_id -- seeding
+            # the vote affordance under a cancellation notice is exactly what
+            # this guard prevents. Not gated on mapping_id, which is about
+            # session mapping, not whether the turn actually answered.
+            if final_lifecycle.was_answered and final_lifecycle.final_message_id is not None:
+                await seed_feedback_reactions(thread, message_id=final_lifecycle.final_message_id)

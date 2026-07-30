@@ -124,6 +124,7 @@ class DiscordTurnLifecycle:
         self._terminal: bool = False
         self._cancel_view = cancel_view
         self._persisted_sealed_indices: set[int] = set()
+        self._was_answered: bool = False
 
     async def post_initial(self) -> None:
         """Post the initial thinking embed immediately, before the turn starts.
@@ -236,12 +237,14 @@ class DiscordTurnLifecycle:
             # If content is entirely empty (cancellation), show "Turn cancelled."
             has_tool_activity = any(isinstance(block, ToolUseBlock) for block in state.content)
             if has_tool_activity:
+                self._was_answered = True
                 log.info("turn.terminal_success", has_text=False, tool_only=True)
                 return
             await self._edit(self._message_ref, content="Turn cancelled.", embed=None, view=None)
             log.info("turn.terminal_success", has_text=False)
             return
 
+        self._was_answered = True
         chunks = split_for_discord_safe(response_text)
         # Clean replace: first chunk replaces the embed
         await self._edit(self._message_ref, content=chunks[0], embed=None, view=None)
@@ -280,3 +283,15 @@ class DiscordTurnLifecycle:
         if self._message_ref is None:
             return None
         return str(self._message_ref.id)
+
+    @property
+    def was_answered(self) -> bool:
+        """Whether the turn actually produced an answer.
+
+        False until a terminal success produced either a text answer or
+        visible tool activity. A cancelled turn and a failed turn both leave
+        this False. Callers need this to tell "the turn ended without error"
+        apart from "the turn actually answered" -- the two are NOT the same,
+        because a cancellation reaches this class through the success hook.
+        """
+        return self._was_answered
