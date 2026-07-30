@@ -7,10 +7,23 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
+from daimon.adapters.discord import views
 from daimon.adapters.discord.views import (
     CancelView,
     GuardedView,
 )
+
+
+def test_module_docstring_names_both_persistent_button_exceptions() -> None:
+    docstring = views.__doc__ or ""
+    assert "CredentialRequestButton" in docstring, (
+        "this docstring is the only place the view-persistence rule is written down, "
+        "so a persistent component that does not appear here is an undocumented exception"
+    )
+    assert "FeedbackButton" in docstring, (
+        "this docstring is the only place the view-persistence rule is written down, "
+        "so a new persistent component that does not appear here is an undocumented exception"
+    )
 
 
 def _mock_interaction(*, user_id: int) -> MagicMock:
