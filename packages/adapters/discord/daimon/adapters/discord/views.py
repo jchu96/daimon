@@ -7,16 +7,20 @@ All Views are non-persistent (VIEW-04): no custom_id, no bot.add_view(). CancelV
 timeout=None -- lifecycle manages removal.
 
 The documented exceptions: the chat-initiated credential-request button
-(`daimon.adapters.discord.credential_button.CredentialRequestButton`) and the
+(`daimon.adapters.discord.credential_button.CredentialRequestButton`), the
 wizard's navigation button and multi-select
 (`daimon.adapters.discord.wizard.WizardNavButton`,
-`daimon.adapters.discord.wizard.WizardSelect`) ARE persistent -- each carries
-a custom_id and is registered as a `discord.ui.DynamicItem` class in
-`setup_hook`. This is necessary because the process that posts the message
-(the MCP server, for both the credential button and the wizard's first
-screen) is not the process that dispatches its click (this bot) -- there is
-no live in-memory View instance to attach a non-persistent handler to. Every
-other interactive component in this adapter stays non-persistent.
+`daimon.adapters.discord.wizard.WizardSelect`), and the private-feedback
+button (`daimon.adapters.discord.feedback_button.FeedbackButton`) ARE
+persistent -- each carries a custom_id and is registered as a
+`discord.ui.DynamicItem` class in `setup_hook`. The credential button and the
+wizard's first screen are posted by the MCP server, a different process from
+the one that dispatches their click (this bot) -- there is no live in-memory
+View instance to attach a non-persistent handler to. `FeedbackButton` is
+persistent for a related but distinct reason: it is delivered into a direct
+message and must still dispatch after this bot process restarts, so there is
+again no live View instance to rely on. Every other interactive component in
+this adapter stays non-persistent.
 """
 
 from __future__ import annotations

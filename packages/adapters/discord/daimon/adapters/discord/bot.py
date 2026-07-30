@@ -265,6 +265,14 @@ class DaimonBot(commands.Bot):
 
         self.add_dynamic_items(WizardSubmitButton)
 
+        # A feedback button is delivered into a direct message and must
+        # still dispatch after this process restarts, so it needs the same
+        # class-level registration rather than a live view. Local import for
+        # the same cycle reason as above.
+        from daimon.adapters.discord.feedback_button import FeedbackButton
+
+        self.add_dynamic_items(FeedbackButton)
+
     async def _post_to_guild(self, guild: discord.Guild, embed: discord.Embed) -> None:
         """Post an embed via the fallback chain: text channel → DM owner → skip."""
         channel = _pick_post_channel(guild)
