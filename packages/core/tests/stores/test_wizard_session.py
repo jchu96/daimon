@@ -47,6 +47,7 @@ async def test_update_wizard_state_on_open_unexpired_row_returns_one_and_persist
         short_id=created.id,
         answers={"choice": ["a"]},
         current_step=1,
+        expected_updated_at=created.updated_at,
         now=now,
     )
 
@@ -69,6 +70,7 @@ async def test_update_wizard_state_returns_zero_for_submitted_row(
         short_id=created.id,
         answers={"choice": ["a"]},
         current_step=1,
+        expected_updated_at=created.updated_at,
         now=datetime.now(UTC),
     )
 
@@ -94,6 +96,7 @@ async def test_update_wizard_state_returns_zero_for_expired_row(
         short_id=created.id,
         answers={"choice": ["a"]},
         current_step=1,
+        expected_updated_at=created.updated_at,
         now=now,
     )
 
@@ -118,11 +121,48 @@ async def test_update_wizard_state_returns_zero_for_deleted_row(
         short_id=created.id,
         answers={"choice": ["a"]},
         current_step=1,
+        expected_updated_at=created.updated_at,
         now=datetime.now(UTC),
     )
 
     assert rowcount == 0, "a tap on a purged row must write nothing"
     assert (await store.get_wizard_session(db_session, short_id=created.id)) is None
+
+
+async def test_update_wizard_state_returns_zero_when_the_row_changed_since_it_was_read(
+    db_session: AsyncSession,
+) -> None:
+    """Two taps computed from the same base row: the second must lose rather
+    than overwrite the first's answer with state that predates it."""
+    created = await make_wizard_session(db_session, answers={}, current_step=0)
+    first_now = created.updated_at + timedelta(seconds=1)
+    second_now = created.updated_at + timedelta(seconds=2)
+
+    first = await store.update_wizard_state(
+        db_session,
+        short_id=created.id,
+        answers={"choice": ["a"]},
+        current_step=1,
+        expected_updated_at=created.updated_at,
+        now=first_now,
+    )
+    second = await store.update_wizard_state(
+        db_session,
+        short_id=created.id,
+        answers={},
+        current_step=1,
+        expected_updated_at=created.updated_at,
+        now=second_now,
+    )
+
+    assert first == 1, "the tap that read the current row must win"
+    assert second == 0, "a tap computed from a superseded row must write nothing"
+    refetched = await store.get_wizard_session(db_session, short_id=created.id)
+    assert refetched is not None
+    assert refetched.answers == {"choice": ["a"]}, (
+        "the losing tap must not erase the answer the winning tap recorded"
+    )
+    assert refetched.updated_at == first_now
 
 
 async def test_try_claim_submit_returns_row_on_first_call_and_none_on_second(

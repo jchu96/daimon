@@ -82,15 +82,26 @@ async def update_wizard_state(
     short_id: str,
     answers: dict[str, list[str]],
     current_step: int,
+    expected_updated_at: datetime,
     now: datetime,
 ) -> int:
-    """Persist a tap's new answers/step, iff the row is open and unexpired.
+    """Persist a tap's new answers/step, iff the row is open, unexpired, and
+    unchanged since the caller read it.
 
     Deliberately not a read-modify-write: one UPDATE statement predicated on
-    `id == short_id AND status == "open" AND expires_at > now`. A tap on a
-    row that was already purged, submitted, or expired therefore writes
-    nothing and reports a rowcount of 0 — the caller decides what to tell
-    the user, rather than this store assuming the row still exists.
+    `id == short_id AND status == "open" AND expires_at > now AND
+    updated_at == expected_updated_at`. A tap on a row that was already
+    purged, submitted, or expired therefore writes nothing and reports a
+    rowcount of 0 — the caller decides what to tell the user, rather than
+    this store assuming the row still exists.
+
+    `expected_updated_at` is the optimistic-concurrency token, and it is what
+    makes the predicate cover content as well as lifecycle: every caller
+    computes its new answers/step from a row it read earlier, so without it
+    two near-simultaneous taps both write from the same base row and the
+    second silently erases the first's effect. `updated_at` advances on every
+    write here (and on the submit claim), so a losing tap matches zero rows
+    and gets the same rowcount 0 a lifecycle miss produces.
     """
     stmt = (
         update(WizardSession)
@@ -98,6 +109,7 @@ async def update_wizard_state(
             WizardSession.id == short_id,
             WizardSession.status == "open",
             WizardSession.expires_at > now,
+            WizardSession.updated_at == expected_updated_at,
         )
         .values(answers=answers, current_step=current_step, updated_at=now)
     )

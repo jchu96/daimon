@@ -339,6 +339,40 @@ async def test_tap_on_a_row_deleted_between_read_and_write_edits_nothing(
     interaction.followup.send.assert_awaited_once()
 
 
+async def test_second_tap_computed_from_the_same_base_row_is_refused_as_stale(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A double-click: both taps read the row before either writes. The
+    second one's answers/step predate the first's write, so it must be
+    refused rather than silently erasing what the first recorded."""
+    row = await _seed(db_session_factory, current_step=0)
+    bot = _fake_bot(db_session_factory)
+    interaction_a = _interaction(user_id=_REQUESTER_ID, client=bot)
+    interaction_b = _interaction(user_id=_REQUESTER_ID, client=bot)
+
+    option_tap = await WizardNavButton.from_custom_id(
+        interaction_a, MagicMock(), _nav_match(row.id, "s0_c0")
+    )
+    next_tap = await WizardNavButton.from_custom_id(
+        interaction_b, MagicMock(), _nav_match(row.id, "next")
+    )
+    assert await option_tap.interaction_check(interaction_a) is True
+    assert await next_tap.interaction_check(interaction_b) is True
+
+    await option_tap.callback(interaction_a)
+    await next_tap.callback(interaction_b)
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after is not None
+    assert after.answers["colour"] == ["red"], (
+        "the second tap must not erase the answer the first tap recorded"
+    )
+    interaction_b.edit_original_response.assert_not_awaited()
+    stale_message = interaction_b.followup.send.call_args.args[0]
+    assert "changed" in stale_message, "the losing tap must say the form changed under it"
+
+
 async def test_opener_action_responds_with_a_modal_and_performs_no_write(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -402,6 +436,38 @@ async def test_whitespace_only_modal_text_writes_nothing_and_replies(
     assert after == row, "whitespace-only text must not change the row"
 
 
+async def test_modal_submit_writes_from_a_re_read_row_not_its_open_time_snapshot(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The modal-open-to-submit window is user-paced and unbounded, so every
+    tap that lands in it must survive the eventual typed answer."""
+    row = await _seed(db_session_factory, current_step=0)
+    bot = _fake_bot(db_session_factory)
+    modal = WizardCustomTextModal(bot=bot, row=row, step_index=1, question="Which toppings?")
+    modal.answer_input._value = "pineapple"  # pyright: ignore[reportPrivateUsage]  # simulates the user's typed text
+
+    # While the modal sits open, an ordinary tap records the choice step's
+    # answer and advances -- the snapshot the modal holds is now stale.
+    tap_interaction = _interaction(user_id=_REQUESTER_ID, client=bot)
+    tap = await WizardNavButton.from_custom_id(
+        tap_interaction, MagicMock(), _nav_match(row.id, "s0_c0")
+    )
+    assert await tap.interaction_check(tap_interaction) is True
+    await tap.callback(tap_interaction)
+
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot)
+    await modal.on_submit(interaction)
+
+    async with db_session_factory() as session:
+        after = await get_wizard_session(session, short_id=row.id)
+    assert after is not None
+    assert after.answers["colour"] == ["red"], (
+        "the modal's write must not erase the answer recorded while it was open"
+    )
+    assert after.answers["toppings"] == ["pineapple"], "the typed text must still be recorded"
+    interaction.edit_original_response.assert_awaited_once()
+
+
 # --- state durability ---------------------------------------------------------
 
 
@@ -422,6 +488,7 @@ async def test_reconstructing_from_custom_id_reflects_a_write_by_another_session
             short_id=row.id,
             answers=row.answers,
             current_step=1,
+            expected_updated_at=row.updated_at,
             now=datetime.now(UTC),
         )
     assert rowcount == 1

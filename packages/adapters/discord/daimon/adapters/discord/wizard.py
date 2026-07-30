@@ -141,6 +141,12 @@ async def _apply_and_render(
     predicated UPDATE and is not bounded by the 3s ack budget. Raises
     `ValueError` when `build_action`/`apply` reject the action (e.g. empty
     typed text) -- callers that can produce that case catch it narrowly.
+
+    `row` is both the state the transition is computed from and the
+    optimistic-concurrency token the write is predicated on (`row.updated_at`),
+    so a second tap that lands between this one's read and write loses
+    instead of silently erasing the first's answer. Callers must therefore
+    pass a freshly read row, never a snapshot held across a user-paced wait.
     """
     spec = WizardSpec.model_validate(row.spec)
     state = WizardState(
@@ -158,12 +164,13 @@ async def _apply_and_render(
             short_id=row.id,
             answers=new_state.answers,
             current_step=new_state.current_step,
+            expected_updated_at=row.updated_at,
             now=now,
         )
     if rowcount == 0:
-        # The row changed under this tap (expired, erased, or submitted
-        # elsewhere) -- leave the message alone rather than re-rendering a
-        # screen that no longer matches the row's real status.
+        # The row changed under this tap (expired, erased, submitted, or
+        # written by a tap that landed first) -- leave the message alone
+        # rather than re-rendering a screen that no longer matches the row.
         await interaction.followup.send(_STALE, ephemeral=True)
         return
     await interaction.edit_original_response(view=build_wizard_view(to_screen(spec, new_state)))
@@ -388,6 +395,12 @@ class WizardCustomTextModal(discord.ui.Modal):
     `CredentialRequestButton.callback`. Its own `on_submit` runs the same
     rebuild / `build_action` / `apply` / `update_wizard_state` /
     `edit_original_response` sequence as the dynamic items above.
+
+    The row captured at modal-open time is kept only for its short id: the
+    window between opening this modal and submitting it is user-paced and
+    unbounded, so `on_submit` re-reads the row rather than writing from a
+    snapshot that every select and nav tap made in the meantime has already
+    invalidated.
     """
 
     def __init__(
@@ -410,11 +423,15 @@ class WizardCustomTextModal(discord.ui.Modal):
             # For a component-originated modal submit, the deferred update
             # and `edit_original_response` target the wizard message itself.
             await interaction.response.defer()
+            row = await _load_row(self._bot, self._row.id)
+            if row is None:
+                await interaction.followup.send(_NOT_AVAILABLE, ephemeral=True)
+                return
             text = str(self.answer_input.value or "")
             action = f"s{self._step_index}_custom"
             try:
                 await _apply_and_render(
-                    interaction, bot=self._bot, row=self._row, action=action, values=[], text=text
+                    interaction, bot=self._bot, row=row, action=action, values=[], text=text
                 )
             except ValueError:
                 # The pure transition already refuses empty/whitespace text
