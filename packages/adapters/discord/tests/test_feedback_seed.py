@@ -80,6 +80,30 @@ async def test_seed_when_first_add_reaction_raises_forbidden_returns_normally() 
     await seed_feedback_reactions(channel, message_id="123")  # must not raise
 
 
+async def test_seed_when_add_reaction_raises_a_connection_error_returns_normally() -> None:
+    """An aiohttp/OSError surviving discord.py's retry loop is not an HTTPException.
+
+    It runs after the answer was already delivered, so letting it escape would
+    post a "turn failed" message under a successful answer.
+    """
+    partial = MagicMock()
+    partial.add_reaction = AsyncMock(side_effect=OSError("connection reset by peer"))
+    channel = MagicMock()
+    channel.get_partial_message = MagicMock(return_value=partial)
+
+    await seed_feedback_reactions(channel, message_id="123")  # must not raise
+
+
+async def test_seed_when_add_reaction_raises_on_a_closed_session_returns_normally() -> None:
+    """Shutdown drain: aiohttp raises RuntimeError once the session is closed."""
+    partial = MagicMock()
+    partial.add_reaction = AsyncMock(side_effect=RuntimeError("Session is closed"))
+    channel = MagicMock()
+    channel.get_partial_message = MagicMock(return_value=partial)
+
+    await seed_feedback_reactions(channel, message_id="123")  # must not raise
+
+
 async def test_seed_is_a_no_op_for_a_channel_type_without_get_partial_message() -> None:
     channel = MagicMock(spec=[])  # no attributes at all, including get_partial_message
 

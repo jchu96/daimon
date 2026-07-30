@@ -13,6 +13,16 @@ that forbids it must let the turn complete normally rather than change the
 bot's advertised required-permission set. `discord.Forbidden` (a subclass of
 `discord.HTTPException`) is exactly what a missing-permission channel raises,
 and it is caught here and only logged.
+
+This module is therefore a boundary in the sense `guideline:architecture`
+means it, despite being three lines of I/O: every caller runs it AFTER the
+answer has been delivered and the watermark written, so anything escaping it
+reaches the turn's error boundary and posts a "turn failed" message directly
+underneath a successfully delivered answer. `discord.HTTPException` is not
+the only way `add_reaction` fails -- an `OSError`/`aiohttp` connection error
+surviving discord.py's internal retry loop, or a `RuntimeError` from a
+closed client session during shutdown drain, both bypass it -- so the catch
+is deliberately as wide as the "never raises" contract it implements.
 """
 
 from __future__ import annotations
@@ -46,5 +56,10 @@ async def seed_feedback_reactions(channel: discord.abc.Messageable, *, message_i
         partial = get_partial_message(int(message_id))
         await partial.add_reaction(THUMBS_UP)
         await partial.add_reaction(THUMBS_DOWN)
-    except discord.HTTPException as exc:
-        log.warning("feedback.seed_failed", message_id=message_id, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 -- best-effort affordance running after the answer was delivered; a seed failure must never surface as a turn failure (see module docstring)
+        log.warning(
+            "feedback.seed_failed",
+            message_id=message_id,
+            err_type=type(exc).__name__,
+            error=str(exc),
+        )
