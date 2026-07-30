@@ -26,6 +26,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
 from daimon.adapters.scheduler.main import (
     _build_fire,  # pyright: ignore[reportPrivateUsage]  # test seam for balance gate + debit binding
     _CapsAdapter,  # pyright: ignore[reportPrivateUsage]  # named test seam for cap wiring
+    _sweep_wizard_sessions,  # pyright: ignore[reportPrivateUsage]  # test seam for the wizard sweep wrapper
     _validate_mcp_settings,  # pyright: ignore[reportPrivateUsage]  # boot-validation seam
 )
 from daimon.core.billing import BillingConfig
@@ -41,6 +42,7 @@ from daimon.core.stores.routines import create_routine, get_routine
 from daimon.core.usage_recording import record_turn_usage
 from daimon.testing.factories import make_tenant
 from pydantic import SecretStr
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _TEST_BILLING = BillingConfig(
@@ -752,3 +754,39 @@ async def test_fire_closure_threads_public_url_from_settings(
         )
 
     await fake_client.close()
+
+
+async def test_sweep_wizard_sessions_swallows_sqlalchemy_error(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A SQLAlchemyError from the core sweep must not propagate — the wrapper's
+    named boundary catch exists so a DB hiccup cannot kill the scheduler loop."""
+    with unittest.mock.patch(
+        "daimon.adapters.scheduler.main.sweep_expired_wizard_sessions",
+        side_effect=SQLAlchemyError("boom"),
+    ):
+        await _sweep_wizard_sessions(db_session_factory)  # must not raise
+
+
+async def test_sweep_wizard_sessions_forwards_sessionmaker_and_returns_cleanly(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Happy path: the wrapper forwards the injected sessionmaker to the core
+    sweep and returns without raising."""
+    captured_sm: list[async_sessionmaker[AsyncSession]] = []
+
+    async def fake_sweep(
+        sm: async_sessionmaker[AsyncSession], *, now: datetime, limit: int = 500
+    ) -> int:
+        captured_sm.append(sm)
+        return 0
+
+    with unittest.mock.patch(
+        "daimon.adapters.scheduler.main.sweep_expired_wizard_sessions",
+        side_effect=fake_sweep,
+    ):
+        await _sweep_wizard_sessions(db_session_factory)
+
+    assert captured_sm == [db_session_factory], (
+        "wrapper must forward the injected sessionmaker to the core sweep unchanged"
+    )

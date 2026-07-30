@@ -82,3 +82,12 @@ from daimon.adapters.mcp.tools.discord._send import (
 from daimon.adapters.mcp.tools.discord._send import (
     _send_message_impl as _send_message_impl,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.discord._wizard import (
+    PostedWizard as PostedWizard,
+)
+from daimon.adapters.mcp.tools.discord._wizard import (
+    _post_wizard_impl as _post_wizard_impl,  # pyright: ignore[reportPrivateUsage]
+)
+from daimon.adapters.mcp.tools.discord._wizard import (
+    build_wizard_view as build_wizard_view,
+)

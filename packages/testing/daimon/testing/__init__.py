@@ -12,6 +12,7 @@ from daimon.testing.factories import (
     make_tenant_user_cap,
     make_thread_session,
     make_usage_event,
+    make_wizard_session,
 )
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
@@ -53,6 +54,7 @@ __all__ = [
     "make_tenant_user_cap",
     "make_thread_session",
     "make_usage_event",
+    "make_wizard_session",
     "send_events_response",
     "sse_response",
     "stub_anthropic",

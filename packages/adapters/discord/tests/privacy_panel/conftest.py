@@ -35,6 +35,7 @@ def _make_preview(**overrides: Any) -> PurgePreview:
         "slack_user_tokens": PurgePreviewRow(count=0, example=None),
         "slack_turn_contexts": PurgePreviewRow(count=0, example=None),
         "credential_requests": PurgePreviewRow(count=0, example=None),
+        "wizard_sessions": PurgePreviewRow(count=0, example=None),
     }
     base.update(overrides)
     return PurgePreview(**base)

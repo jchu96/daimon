@@ -249,6 +249,22 @@ class DaimonBot(commands.Bot):
 
         self.add_dynamic_items(CredentialRequestButton)
 
+        # Same rationale as CredentialRequestButton above: the wizard's
+        # first screen is posted by the MCP process, and every tap on it
+        # lands here. wizard.py imports DaimonBot at module level -- local
+        # import avoids the same cycle credential_button.py would hit.
+        from daimon.adapters.discord.wizard import WizardNavButton, WizardSelect
+
+        self.add_dynamic_items(WizardNavButton, WizardSelect)
+
+        # The Submit button gets its own dispatch class (claiming the
+        # submission and starting a billed turn) rather than sharing
+        # WizardNavButton/WizardSelect's registration -- see
+        # wizard_submit.py's module docstring. Same local-import rationale.
+        from daimon.adapters.discord.wizard_submit import WizardSubmitButton
+
+        self.add_dynamic_items(WizardSubmitButton)
+
     async def _post_to_guild(self, guild: discord.Guild, embed: discord.Embed) -> None:
         """Post an embed via the fallback chain: text channel → DM owner → skip."""
         channel = _pick_post_channel(guild)

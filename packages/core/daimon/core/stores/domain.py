@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -411,6 +411,26 @@ class CredentialRequestRow(BaseModel):
     created_at: datetime
     expires_at: datetime
     used_at: datetime | None
+
+
+class WizardSessionRow(BaseModel):
+    """Pydantic row for WizardSession — one multi-step wizard form's durable state."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: str
+    tenant_id: uuid.UUID
+    account_id: uuid.UUID | None
+    requester_platform_user_id: str
+    channel_id: str
+    message_id: str
+    spec: dict[str, Any]
+    answers: dict[str, list[str]]
+    current_step: int
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
 
 
 class McpTokenRow(BaseModel):

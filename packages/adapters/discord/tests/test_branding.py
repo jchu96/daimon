@@ -88,6 +88,7 @@ def _make_preview() -> PurgePreview:
         slack_user_tokens=zero,
         slack_turn_contexts=zero,
         credential_requests=zero,
+        wizard_sessions=zero,
     )
 
 

@@ -43,6 +43,7 @@ from daimon.testing.factories import (
     make_cli_principal,
     make_platform_principal,
     make_tenant,
+    make_wizard_session,
 )
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -438,6 +439,73 @@ async def test_collect_purge_preview_credential_requests_matches_purge_account(
     )
 
 
+async def test_collect_purge_preview_wizard_sessions_matches_purge_account(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Preview counts wizard_sessions and agrees with purge_account's actual
+    deletion count — the right-to-erasure parity contract."""
+    tenant = await make_tenant(db_session, workspace_id="pv-wizard")
+    account = await make_account(db_session, tenant=tenant)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="PV_WIZARD_TARGET",
+        tenant=tenant,
+        account=account,
+    )
+    await make_wizard_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        requester_platform_user_id="PV_WIZARD_TARGET",
+    )
+    await db_session.commit()
+
+    preview = await collect_purge_preview(sm=db_session_factory, account_id=account.id)
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert preview.wizard_sessions.count == 1, (
+        "must count the platform principal's wizard_session row"
+    )
+    assert preview.wizard_sessions.count == report.db.wizard_sessions, (
+        "preview and purge must agree on wizard_sessions"
+    )
+
+
+async def test_purge_erases_submitted_and_abandoned_wizard_sessions(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Erasure must not apply a lifecycle filter: open, submitted, and
+    abandoned wizard_session rows all carry the user's typed answers and must
+    all be gone after purge_account."""
+    tenant = await make_tenant(db_session, workspace_id="pv-wizard-lifecycle")
+    account = await make_account(db_session, tenant=tenant)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="PV_WIZARD_LIFECYCLE",
+        tenant=tenant,
+        account=account,
+    )
+    for status in ("open", "submitted", "abandoned"):
+        await make_wizard_session(
+            db_session,
+            tenant=tenant,
+            account=account,
+            requester_platform_user_id="PV_WIZARD_LIFECYCLE",
+            status=status,
+        )
+    await db_session.commit()
+
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert report.db.wizard_sessions == 3, (
+        "purge must delete open, submitted, AND abandoned wizard_session rows"
+    )
+
+
 async def test_collect_purge_preview_matches_purge_account_coverage_field_for_field() -> None:
     """If `PurgeReport` grows a new int field, `PurgePreview` MUST mirror it.
 
@@ -466,6 +534,7 @@ async def test_collect_purge_preview_matches_purge_account_coverage_field_for_fi
         "slack_user_tokens": "slack_user_tokens",
         "slack_turn_contexts": "slack_turn_contexts",
         "credential_requests": "credential_requests",
+        "wizard_sessions": "wizard_sessions",
     }
 
     uncovered = report_fields - set(mapping.keys())
@@ -508,6 +577,7 @@ async def test_purge_covers_every_account_or_principal_scoped_table() -> None:
         "github_credentials": "principal_id",
         "agent_github_binding": "principal_id",
         "mcp_tokens": "account_id FK -> accounts.id",
+        "wizard_session": "account_id FK -> accounts.id",
     }
     # Intentional exclusions, each justified inline.
     allowlist: frozenset[str] = frozenset(
