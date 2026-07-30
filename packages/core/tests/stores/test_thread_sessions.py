@@ -17,6 +17,7 @@ from daimon.core._models import ThreadSession
 from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.thread_sessions import (
     create_thread_session,
+    get_latest_thread_session,
     get_live_thread_session,
     mark_dead,
     update_watermark,
@@ -341,3 +342,81 @@ async def test_create_thread_session_persists_account_id(
     assert fetched.account_id == account_id, (
         "account_id must survive the DB round-trip via get_live_thread_session"
     )
+
+
+async def test_get_latest_thread_session_returns_newest_row_across_accounts(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    """Unlike get_live_thread_session, this ignores account_id entirely."""
+    account_a = uuid.uuid4()
+    account_b = uuid.uuid4()
+    await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="latest-test",
+        account_id=account_a,
+        ma_session_id="sess_old",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="latest-test",
+        account_id=account_b,
+        ma_session_id="sess_new",
+        created_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+
+    fetched = await get_latest_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="latest-test",
+    )
+
+    assert fetched is not None
+    assert fetched.ma_session_id == "sess_new", (
+        "get_latest_thread_session must return the newest row regardless of account"
+    )
+
+
+async def test_get_latest_thread_session_ignores_dead_rows(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    account_id = uuid.uuid4()
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="latest-dead-test",
+        account_id=account_id,
+        ma_session_id="sess_dead",
+    )
+    await mark_dead(db_session, id=row.id)
+
+    fetched = await get_latest_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="latest-dead-test",
+    )
+
+    assert fetched is None, "get_latest_thread_session must exclude dead rows"
+
+
+async def test_get_latest_thread_session_returns_none_for_unknown_thread(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    fetched = await get_latest_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="unknown-thread",
+    )
+
+    assert fetched is None
