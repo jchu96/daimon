@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from daimon.adapters.discord.wizard import (
     WizardCustomTextModal,
@@ -337,6 +338,27 @@ async def test_tap_on_a_row_deleted_between_read_and_write_edits_nothing(
 
     interaction.edit_original_response.assert_not_awaited()
     interaction.followup.send.assert_awaited_once()
+
+
+async def test_re_render_suppresses_every_mention(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Head text and the review summary interpolate agent-authored prompt and
+    question text verbatim, so every re-render has to suppress mentions."""
+    row = await _seed(db_session_factory, current_step=0)
+    bot = _fake_bot(db_session_factory)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot)
+
+    item = await WizardNavButton.from_custom_id(
+        interaction, MagicMock(), _nav_match(row.id, "next")
+    )
+    assert await item.interaction_check(interaction) is True
+    await item.callback(interaction)
+
+    allowed = interaction.edit_original_response.call_args.kwargs["allowed_mentions"]
+    assert allowed.to_dict() == discord.AllowedMentions.none().to_dict(), (
+        "a wizard re-render must ping nobody"
+    )
 
 
 async def test_second_tap_computed_from_the_same_base_row_is_refused_as_stale(

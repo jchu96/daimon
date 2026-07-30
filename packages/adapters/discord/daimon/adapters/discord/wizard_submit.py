@@ -177,7 +177,8 @@ class WizardSubmitButton(
                 # already refused it (returned `state` unchanged). Re-render
                 # whatever screen the row is actually on; no claim, no turn.
                 await interaction.edit_original_response(
-                    view=build_wizard_view(to_screen(spec, submitted))
+                    view=build_wizard_view(to_screen(spec, submitted)),
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
@@ -212,7 +213,8 @@ class WizardSubmitButton(
             # again" would invite a retry that can only ever be rejected.
             try:
                 await interaction.edit_original_response(
-                    view=build_wizard_view(to_screen(spec, submitted))
+                    view=build_wizard_view(to_screen(spec, submitted)),
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.HTTPException:
                 _log.exception("wizard_submit.collapse_edit_failed", short_id=row.id)

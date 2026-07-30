@@ -215,7 +215,13 @@ async def _post_wizard_impl(  # pyright: ignore[reportUnusedFunction]
         _check_send_permission(channel, member)
         if not isinstance(channel, discord.abc.Messageable):
             raise ToolError("channel does not support sending messages")
-        sent = await channel.send(view=view, files=files)
+        # The head text carries the agent-authored prompt and question
+        # verbatim (only user-typed answers go through the summary's escape
+        # pass), so an injected `@everyone` in a form would ping the channel.
+        # Nothing in a form legitimately needs to mention anyone.
+        sent = await channel.send(
+            view=view, files=files, allowed_mentions=discord.AllowedMentions.none()
+        )
 
     # Mapped by position, not by filename: a file's display name is slugged
     # from the agent-supplied image title, so two steps titled the same thing

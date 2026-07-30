@@ -173,7 +173,12 @@ async def _apply_and_render(
         # rather than re-rendering a screen that no longer matches the row.
         await interaction.followup.send(_STALE, ephemeral=True)
         return
-    await interaction.edit_original_response(view=build_wizard_view(to_screen(spec, new_state)))
+    # A re-render carries the agent-authored prompt and question verbatim in
+    # its head text; nothing in a form legitimately needs to mention anyone.
+    await interaction.edit_original_response(
+        view=build_wizard_view(to_screen(spec, new_state)),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 class WizardNavButton(

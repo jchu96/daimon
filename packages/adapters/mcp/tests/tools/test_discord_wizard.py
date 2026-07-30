@@ -301,6 +301,37 @@ async def test_post_wizard_sends_no_message_content(
     )
 
 
+async def test_post_wizard_suppresses_every_mention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The head text carries the agent-authored prompt and question verbatim,
+    so an injected mass mention would ping the whole channel."""
+    posted: dict[str, Any] = {}
+    patch_discord_http(monkeypatch, _happy_path_handler(posted))
+    spec = WizardSpec(
+        prompt="@everyone pick one",
+        steps=[
+            Step(
+                key="k",
+                question="<@&999> which?",
+                kind=StepKind.CHOICE,
+                options=[Option(label="a", value="a")],
+            )
+        ],
+    )
+    await _post_wizard_impl(
+        _runtime_with_discord_token(file_store=None),
+        _auth(),
+        channel_id="222",
+        spec=spec,
+        short_id="abcd1234",
+    )
+    payload = _payload_from_kwargs(posted)
+    assert payload["allowed_mentions"] == discord.AllowedMentions.none().to_dict(), (
+        "a wizard post must suppress every mention -- nothing in a form needs to ping"
+    )
+
+
 async def test_post_wizard_uploads_every_step_image_but_references_only_the_first(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
