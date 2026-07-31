@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 from notebook_host.jail import get_slug_paths
 
 
@@ -210,3 +211,114 @@ def test_save_uid_registry_writes_atomically_via_tmp_and_replace(tmp_path: Path)
     )
     on_disk = json.loads(path.read_text())
     assert on_disk == {"a": 100000, "b": 100001}, "the file's raw JSON should match the records"
+
+
+# ─── remove_slug_tree uid release ─────────────────────────────────────────────
+
+
+def test_remove_slug_tree_with_uids_file_releases_the_slug(tmp_path: Path) -> None:
+    """remove_slug_tree(..., uids_file=p) drops the slug from the uid registry too."""
+    from notebook_host.jail import (
+        ensure_slug_jail,
+        get_or_create_slug_uid,
+        load_uid_registry,
+        remove_slug_tree,
+    )
+
+    uids_file = tmp_path / "uids.json"
+    ensure_slug_jail(tmp_path, "abc")
+    get_or_create_slug_uid(uids_file, "abc", start=100000, end=100005)
+
+    remove_slug_tree(tmp_path, "abc", uids_file=uids_file)
+
+    assert "abc" not in load_uid_registry(uids_file), (
+        "remove_slug_tree with uids_file must release the slug's uid"
+    )
+
+
+def test_remove_slug_tree_without_uids_file_leaves_registry_untouched(tmp_path: Path) -> None:
+    """remove_slug_tree with no uids_file kwarg does not touch the uid registry."""
+    from notebook_host.jail import (
+        ensure_slug_jail,
+        get_or_create_slug_uid,
+        load_uid_registry,
+        remove_slug_tree,
+    )
+
+    uids_file = tmp_path / "uids.json"
+    ensure_slug_jail(tmp_path, "abc")
+    get_or_create_slug_uid(uids_file, "abc", start=100000, end=100005)
+
+    remove_slug_tree(tmp_path, "abc")
+
+    assert "abc" in load_uid_registry(uids_file), (
+        "remove_slug_tree without uids_file must leave the uid registry unchanged"
+    )
+
+
+# ─── privilege drop: can_apply_jail / resolve_jail_uid / build_jailed_preexec ─
+
+
+def test_resolve_jail_uid_raises_when_jail_unavailable_and_not_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """can_apply_jail() False + allow_unjailed=False raises JailUnavailableError."""
+    from notebook_host import jail
+
+    monkeypatch.setattr(jail, "can_apply_jail", lambda: False)
+    with pytest.raises(jail.JailUnavailableError) as exc_info:
+        jail.resolve_jail_uid(
+            tmp_path / "uids.json", "abc", start=100000, end=100005, allow_unjailed=False
+        )
+    assert "allow_unjailed_spawn" in str(exc_info.value), (
+        "the fail-closed error must name the deliberate opt-out setting"
+    )
+
+
+def test_resolve_jail_uid_returns_none_when_jail_unavailable_and_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """can_apply_jail() False + allow_unjailed=True returns None (spawn unjailed)."""
+    from notebook_host import jail
+
+    monkeypatch.setattr(jail, "can_apply_jail", lambda: False)
+    result = jail.resolve_jail_uid(
+        tmp_path / "uids.json", "abc", start=100000, end=100005, allow_unjailed=True
+    )
+    assert result is None, "an explicit opt-out on an unjailable host must return None, not raise"
+
+
+def test_resolve_jail_uid_returns_a_stable_int_when_jail_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """can_apply_jail() True resolves (and persists) a real uid from the pool."""
+    from notebook_host import jail
+
+    monkeypatch.setattr(jail, "can_apply_jail", lambda: True)
+    uids_file = tmp_path / "uids.json"
+    first = jail.resolve_jail_uid(uids_file, "abc", start=100000, end=100005, allow_unjailed=False)
+    second = jail.resolve_jail_uid(uids_file, "abc", start=100000, end=100005, allow_unjailed=False)
+    assert isinstance(first, int), "a jailable host must resolve to a real uid, not None"
+    assert first == second, "the same slug must resolve to the same uid across calls"
+
+
+def test_resolve_jail_uid_propagates_pool_exhaustion_even_when_unjailed_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A full uid pool raises UidPoolExhaustedError, never degrading to None."""
+    from notebook_host import jail
+
+    monkeypatch.setattr(jail, "can_apply_jail", lambda: True)
+    uids_file = tmp_path / "uids.json"
+    jail.get_or_create_slug_uid(uids_file, "a", start=100000, end=100000)
+
+    with pytest.raises(jail.UidPoolExhaustedError):
+        jail.resolve_jail_uid(uids_file, "b", start=100000, end=100000, allow_unjailed=True)
+
+
+def test_build_jailed_preexec_returns_a_callable_for_any_uid() -> None:
+    """build_jailed_preexec never returns None — build-time only, not invoked here."""
+    from notebook_host.jail import build_jailed_preexec
+
+    preexec = build_jailed_preexec(1000, rlimit_as_bytes=None, rlimit_cpu_seconds=None)
+    assert callable(preexec), "build_jailed_preexec must always return a callable"

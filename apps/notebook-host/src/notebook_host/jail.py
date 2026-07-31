@@ -1,18 +1,32 @@
 """Per-slug on-disk layout and directory-tree lifecycle.
 
-This module owns two things: the shape of a slug's directory tree
-(``SlugPaths``) and creating/removing that tree on disk. ``data_dir/<slug>/``
-is the isolation boundary a jailed marimo process is confined to; every
-host-owned registry file (``blogs.json``, ``pids.json``, ``uids.json``)
-deliberately sits outside it, as a sibling of every slug root rather than
-inside any of them.
+This module owns three things: the shape of a slug's directory tree
+(``SlugPaths``), creating/removing that tree on disk, and the privilege-drop
+mechanism a spawned/validated notebook runs under. ``data_dir/<slug>/`` is the
+isolation boundary a jailed marimo process is confined to; every host-owned
+registry file (``blogs.json``, ``pids.json``, ``uids.json``) deliberately sits
+outside it, as a sibling of every slug root rather than inside any of them.
 
 Nothing here imports ``Settings`` — callers read config and pass paths / ints
 in explicitly, so this module has no dependency on ``notebook_host.config``.
 
-Pure functions only for path computation; the tree create/remove pair is the
-only filesystem I/O (mkdir/chmod/chown/rmtree — no clock, no process control,
-no network).
+Pure functions only for path computation; the tree create/remove pair and the
+uid-resolution/privilege-drop functions are the only filesystem/process I/O
+(mkdir, chmod, chown, rmtree, and dropping into another uid — no clock, no
+network).
+
+Two documented limitations of the uid split, deliberately not worked around:
+
+1. Allocated uids have no ``/etc/passwd`` entry. ``uv``/``marimo`` do not need
+   one (verified — neither does an NSS lookup once ``HOME`` is set explicitly),
+   but notebook code that itself calls ``Path.home()``,
+   ``os.path.expanduser("~")`` or ``getpass.getuser()`` will raise
+   ``KeyError: getpwuid()``. This is a correctness footnote for tenant
+   notebook authors, not an isolation gap.
+2. Because ``HOME`` is per-slug, each slug's ``uv`` cache is private. Repeated
+   ``--sandbox`` publishes across *different* slugs each pay their own PEP 723
+   dependency download instead of sharing one warm cache — a direct,
+   unavoidable consequence of per-uid isolation, not a bug.
 """
 
 from __future__ import annotations
@@ -20,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,7 +101,7 @@ def ensure_slug_jail(data_dir: Path, slug: str, *, uid: int | None = None) -> Sl
     return paths
 
 
-def remove_slug_tree(data_dir: Path, slug: str) -> None:
+def remove_slug_tree(data_dir: Path, slug: str, *, uids_file: Path | None = None) -> None:
     """Remove a slug's whole directory tree in one call.
 
     Replaces the unlink-plus-two-rmtrees pattern the flat layout required
@@ -94,9 +109,17 @@ def remove_slug_tree(data_dir: Path, slug: str) -> None:
     background sweep delete only one of the three on-disk pieces. A no-op
     (does not raise) if the tree doesn't exist.
 
+    When ``uids_file`` is given, the slug's uid is also released from the
+    registry (via ``release_slug_uid``) after the tree is gone — keeping uid
+    release on the same single code path every delete site already calls,
+    rather than adding a fourth thing each caller must remember. Omitted by
+    default so this plan changes no caller's behaviour.
+
     ``slug`` must already have passed ``lifecycle.safe_slug``.
     """
     shutil.rmtree(get_slug_paths(data_dir, slug).root, ignore_errors=True)
+    if uids_file is not None:
+        release_slug_uid(uids_file, slug)
 
 
 # ─── uid pool ────────────────────────────────────────────────────────────────
@@ -201,3 +224,94 @@ def release_slug_uid(path: Path, slug: str) -> None:
     registry = load_uid_registry(path)
     if registry.pop(slug, None) is not None:
         save_uid_registry(path, registry)
+
+
+# ─── privilege drop ──────────────────────────────────────────────────────────
+#
+# The jail's failure policy is the opposite of the rlimit-only preexec in
+# lifecycle.py: rlimits warn and degrade (fine for a resource cap), the jail
+# fails closed (required for a security control, D-05). Keeping the drop here
+# rather than folding it into lifecycle._make_preexec is deliberate — merging
+# the two failure policies into one function is exactly how the isolation
+# would get silently lost.
+
+
+class JailUnavailableError(RuntimeError):
+    """Raised when the jail cannot be applied and no explicit opt-out is set."""
+
+
+def can_apply_jail() -> bool:
+    """Whether this process can actually drop privilege into another uid.
+
+    The ``os.geteuid() == 0`` check is the operative one, not merely whether
+    the platform exposes the privilege-changing syscalls used below: a
+    non-root process cannot change its uid to another value regardless of
+    platform, so this gate is POSIX-and-root, not Linux-only like the rlimit
+    gate in ``lifecycle._make_preexec`` (which only cares about ``RLIMIT_AS``
+    reliability, not privilege). The ``hasattr`` checks are evaluated first so
+    a non-POSIX platform short-circuits before reaching ``os.geteuid()``,
+    which doesn't exist there.
+    """
+    return hasattr(os, "setuid") and hasattr(os, "setgroups") and os.geteuid() == 0
+
+
+def resolve_jail_uid(
+    uids_file: Path, slug: str, *, start: int, end: int, allow_unjailed: bool
+) -> int | None:
+    """Resolve the uid a spawn/validate call for ``slug`` should drop into.
+
+    Fail-closed per D-05: when the jail cannot be applied (not root, or this
+    platform cannot change process identity), this raises
+    ``JailUnavailableError`` unless the caller has explicitly set
+    ``allow_unjailed=True`` (the deliberate dev-host opt-out, wired to the
+    ``allow_unjailed_spawn`` setting) — in which case it returns ``None`` and
+    the caller spawns unjailed rather than refusing.
+
+    ``UidPoolExhaustedError`` from the underlying allocation is allowed to
+    propagate unchanged, even when ``allow_unjailed=True``: a full pool must be
+    loud, never a silent fall-through to an unjailed spawn.
+    """
+    if can_apply_jail():
+        return get_or_create_slug_uid(uids_file, slug, start=start, end=end)
+    if allow_unjailed:
+        return None
+    raise JailUnavailableError(
+        "cannot apply the notebook jail on this host (not root, or this "
+        "platform cannot change process identity); refusing to spawn "
+        "unjailed. Set allow_unjailed_spawn=True to explicitly opt out on a "
+        "dev host."
+    )
+
+
+def build_jailed_preexec(
+    uid: int, *, rlimit_as_bytes: int | None, rlimit_cpu_seconds: int | None
+) -> Callable[[], None]:
+    """Build the preexec_fn that drops the forked child into ``uid``.
+
+    Always returns a callable — never ``None``. This is a deliberate
+    divergence from ``lifecycle._make_preexec``, which returns ``None`` on
+    non-Linux or when no rlimits are configured: a jail that silently does not
+    apply is exactly the failure mode this plan exists to remove, so there is
+    no code path here that can produce a no-op preexec.
+
+    The gid always equals the uid — each slug gets its own primary group of
+    the same number, so no separate gid allocation is needed.
+
+    Import ``resource`` here (POSIX-only stdlib), matching ``_make_preexec``'s
+    existing guarded-import style.
+    """
+    import resource  # POSIX-only stdlib; this whole mechanism requires POSIX.
+
+    def _apply() -> None:  # runs in the forked child, before launching marimo
+        os.setgroups([])  # MUST precede setgid/setuid — omitting this leaves
+        # the child in every supplementary group the host process (root)
+        # belongs to, even after setuid/setgid drop the primary identity.
+        os.setgid(uid)  # MUST precede setuid — a process cannot change gid
+        # once its uid is no longer 0.
+        os.setuid(uid)
+        if rlimit_as_bytes:
+            resource.setrlimit(resource.RLIMIT_AS, (rlimit_as_bytes, rlimit_as_bytes))
+        if rlimit_cpu_seconds:
+            resource.setrlimit(resource.RLIMIT_CPU, (rlimit_cpu_seconds, rlimit_cpu_seconds))
+
+    return _apply
