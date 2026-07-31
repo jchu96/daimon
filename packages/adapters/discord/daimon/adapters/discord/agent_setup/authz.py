@@ -1,13 +1,31 @@
-"""Click-time authorization gate for the panel's spec-mutating writes.
+"""Click-time authorization gates for the panel's mutating writes.
 
-`EditView`'s spec controls are disabled when the render-time snapshot says a
-control shouldn't be usable — that snapshot is a rendering hint, not a
-boundary. This module is the boundary: every callback that would write an
-agent's prompt, model, skills, or MCP servers calls
-`refuse_if_reachable_and_not_admin` first, which re-derives both admin status
-and reachability from live state rather than trusting anything the view was
-constructed with, so a stale open panel or a demoted admin cannot write a
-change the rendered panel had already forbidden.
+`EditView`'s controls are disabled when the render-time snapshot says a control
+shouldn't be usable — that snapshot is a rendering hint, not a boundary. This
+module is the boundary: the gates here re-derive admin status and reachability
+from live state rather than trusting anything the view was constructed with, so
+a stale open panel or a demoted admin cannot write a change the rendered panel
+had already forbidden.
+
+Two gates live here, and which one a write routes through follows from whether
+the field it writes is part of the agent spec:
+
+- Spec fields — prompt, model, skills, MCP servers — route through
+  `refuse_if_reachable_and_not_admin`. That gate refuses a defaults-managed
+  agent even for an admin, because a panel spec edit never stamps the
+  reconciler's spec hash: an admin bypass would leave permanent, silent drift
+  against the repo defaults that reconcile never notices.
+
+- Per-agent attachments — the repo binding and the env vars — route through
+  `refuse_if_shared_and_not_admin`. Attachments never enter the agent spec, so
+  the system-agent absolutism above does not apply to them, and an admin
+  binding a repo to the seeded agent is the first-run onboarding step. That
+  gate is still closed to non-admins on any shared agent, whether the agent is
+  shared because it ships with the deployment or because something currently
+  resolves to it.
+
+A new mutating control belongs to one of those two sets. Pick its gate from the
+set the field is in, not from the button it happens to sit next to.
 """
 
 from __future__ import annotations
@@ -30,6 +48,12 @@ _SYSTEM_AGENT_MESSAGE = (
 _REACHABLE_AGENT_MESSAGE = (
     "This agent is currently the default for this channel or the server, so "
     "changing its setup needs Manage Server. Fork it to make an editable copy."
+)
+_SHARED_AGENT_MESSAGE = (
+    "This agent is shared — it either ships with the deployment or is the "
+    "current default for this channel or the server — so changing its repo or "
+    "environment variables needs Manage Server. Fork it to make an editable "
+    "copy; the fork starts with no environment variables of its own."
 )
 
 
@@ -78,5 +102,52 @@ async def refuse_if_reachable_and_not_admin(
         )
     if reachable:
         await _send_ephemeral(interaction, _REACHABLE_AGENT_MESSAGE)
+        return True
+    return False
+
+
+async def refuse_if_shared_and_not_admin(
+    interaction: discord.Interaction,  # type: ignore[type-arg]  # discord.Interaction default generic arg; only response/followup/guild_id are used
+    *,
+    runtime: DiscordRuntime,
+    entry: RosterEntry | None,
+) -> bool:
+    """Click-time re-check shared by every callback writing a per-agent attachment.
+
+    Returns True when the caller must return immediately (the write is
+    refused); False when the write may proceed. Order, each short-circuiting:
+
+    1. No target selected -> refuse silently (belt and braces; every call
+       site already narrows `entry` past its own `selected is None` check).
+    2. A live guild admin -> allow, before any MA or database read. This is
+       the one step ordered differently from `refuse_if_reachable_and_not_admin`,
+       and it is what keeps an admin able to bind a repo to the seeded agent.
+    3. The target is a system agent -> refuse; it belongs to the deployment
+       and every member of the install shares it.
+    4. Otherwise, read reachability fresh from the database and refuse when
+       the target currently resolves for some channel or the workspace.
+
+    Both refusals carry the same message on purpose: telling the caller which
+    limb fired would say nothing they can act on, and either way the fix is the
+    same — ask an admin, or fork.
+    """
+    if entry is None:
+        log.debug("agent_setup.authz.no_target")
+        return True
+    if is_guild_admin(interaction):  # pyright: ignore[reportArgumentType]  # discord.Interaction vs Interaction[commands.Bot]; is_guild_admin only reads user/guild
+        return False
+    if entry.is_system:
+        await _send_ephemeral(interaction, _SHARED_AGENT_MESSAGE)
+        return True
+    tenant_id = await resolve_tenant_for_panel(runtime, interaction)
+    async with runtime.sessionmaker() as session:
+        reachable = await is_agent_reachable_in_tenant(
+            session,
+            tenant_id=tenant_id,
+            agent_name=entry.name,
+            default=runtime.deployment_default,
+        )
+    if reachable:
+        await _send_ephemeral(interaction, _SHARED_AGENT_MESSAGE)
         return True
     return False
