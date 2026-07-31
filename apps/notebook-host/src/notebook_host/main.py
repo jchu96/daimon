@@ -42,6 +42,7 @@ from notebook_host.lifecycle import (
     validate_notebook,
     wait_for_port,
 )
+from notebook_host.migration import migrate_flat_layout
 from notebook_host.pids_store import reap_orphans
 from notebook_host.proxy import create_proxy_router
 
@@ -106,6 +107,22 @@ def create_app(settings: Settings) -> FastAPI:
                 "on a dev host."
             )
         settings.data_dir.mkdir(parents=True, exist_ok=True)
+        # Move any pre-jail flat layout onto the nested one before anything
+        # else touches data_dir — reap_orphans and the blog respawn below
+        # both assume data_dir/<slug>/notebook.py already exists. Not
+        # wrapped in try/except: a migration failure must abort the boot
+        # rather than come up serving a half-isolated data_dir.
+        migrated = migrate_flat_layout(
+            settings.data_dir,
+            uids_file=settings.resolved_uids_file,
+            uid_start=settings.jail_uid_start,
+            uid_end=settings.jail_uid_end,
+            allow_unjailed=settings.allow_unjailed_spawn,
+        )
+        if migrated:
+            _log.info(
+                "migrated %d legacy blog(s) to the nested layout: %s", len(migrated), migrated
+            )
         # Reap any marimo subprocesses left behind by a previous host crash
         # before we accept any PUTs. The previous host's pids.json is the
         # only record of what's still running with start_new_session=True.

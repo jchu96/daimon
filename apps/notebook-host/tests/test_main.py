@@ -242,6 +242,109 @@ async def test_create_app_lifespan_boots_when_break_glass_set(
         assert resp.status_code == 200, "the break-glass opt-out should let an unjailable host boot"
 
 
+# ─── boot migration (D-03: an existing flat deployment stays servable) ─────
+
+
+async def test_create_app_lifespan_migrates_flat_layout_and_respawns_blog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host booted against a pre-upgrade flat data_dir respawns the blog from
+    its migrated nested source.
+
+    This is the test that proves D-03's actual promise: an existing blog
+    keeps serving at the same URL across the upgrade.
+    """
+    import notebook_host.main as main_mod
+    from notebook_host.blogs_store import BlogRecord, register_blog
+    from notebook_host.config import load_settings
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8610")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8613")
+    set_unjailed_test_env(monkeypatch)
+    settings = load_settings(_env_file=None)
+
+    (tmp_path / "pre-radar.py").write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
+    register_blog(tmp_path / "blogs.json", BlogRecord(slug="pre-radar", created_at=1.0))
+
+    calls: list[tuple[str, SlugPaths, str]] = []
+
+    def fake_spawn_marimo(
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        sandbox: bool = False,
+        rlimit_as_bytes: int | None = None,
+        rlimit_cpu_seconds: int | None = None,
+        jail_uid: int | None = None,
+    ) -> subprocess.Popen[bytes]:
+        calls.append((slug, paths, mode))
+        proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
+        proc.poll.return_value = None
+        proc.pid = 8888
+        return proc  # type: ignore[return-value]
+
+    async def fake_wait(port: int, slug: str, timeout_s: float) -> bool:
+        return True
+
+    monkeypatch.setattr(main_mod, "spawn_marimo", fake_spawn_marimo)
+    monkeypatch.setattr(main_mod, "wait_for_port", fake_wait)
+
+    with TestClient(main_mod.create_app(settings)):
+        pass
+
+    assert len(calls) == 1, "the migrated blog must be respawned exactly once at boot"
+    slug, paths, mode = calls[0]
+    assert slug == "pre-radar", "the respawned slug must be the one registered in blogs.json"
+    assert mode == "run", "boot respawn of a registered blog must use run mode"
+    assert paths.notebook == tmp_path / "pre-radar" / "notebook.py", (
+        "the spawner must receive paths pointing at the migrated nested source, not the "
+        "old flat file"
+    )
+    assert not (tmp_path / "pre-radar.py").exists(), (
+        "the flat legacy source must be gone once the boot migration has run"
+    )
+
+
+async def test_create_app_lifespan_aborts_when_migration_raises_uid_pool_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A migration that cannot allocate a uid for every legacy slug must abort the boot.
+
+    Not respawn what it can and leave the rest — that would silently produce
+    a half-isolated host.
+    """
+    import notebook_host.main as main_mod
+    from notebook_host.config import load_settings
+    from notebook_host.jail import UidPoolExhaustedError
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    set_unjailed_test_env(monkeypatch)
+    settings = load_settings(_env_file=None)
+
+    def raising_migrate(*args: object, **kwargs: object) -> list[str]:
+        raise UidPoolExhaustedError("pool exhausted")
+
+    spawn_calls: list[object] = []
+
+    def spy_spawn_marimo(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        spawn_calls.append((args, kwargs))
+        proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
+        return proc  # type: ignore[return-value]
+
+    monkeypatch.setattr(main_mod, "migrate_flat_layout", raising_migrate)
+    monkeypatch.setattr(main_mod, "spawn_marimo", spy_spawn_marimo)
+
+    with pytest.raises(UidPoolExhaustedError), TestClient(main_mod.create_app(settings)):
+        pass
+
+    assert spawn_calls == [], "no spawn may occur once the migration has raised"
+
+
 def _dead_proc() -> subprocess.Popen[bytes]:
     proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     proc.poll.return_value = 0  # dead
