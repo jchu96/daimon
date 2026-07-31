@@ -727,6 +727,66 @@ async def test_owner_update_and_delete_succeed_when_caller_is_creator(
     assert result.deleted is True, "the creator must be able to delete their own routine"
 
 
+async def test_update_routine_raises_when_neither_caller_nor_routine_has_a_user_id(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    """A missing user id on both sides is not a match — it is two absences."""
+    tenant = await make_tenant(db_session)
+    created = await create_routine(
+        db_session,
+        tenant_id=tenant.id,
+        created_by_user_id=None,
+        agent_id="agent_a",
+        agent_name="daimon",
+        cron_expr="* * * * *",
+        timezone_="UTC",
+        trigger_message="orig",
+    )
+    await db_session.commit()
+
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity(tenant_id=tenant.id, platform_user_id=None, is_admin=False)
+    with pytest.raises(ToolError, match="routine not found"):
+        await _update_routine_impl(runtime, auth, routine_id=created.id, trigger_message="hacked")
+
+    row = await get_routine(db_session, created.id, tenant_id=tenant.id)
+    assert row is not None, "row must still exist after a denied update"
+    assert row.trigger_message == "orig", (
+        "a caller with no platform user id must not be able to rewrite a routine "
+        "that has no recorded creator"
+    )
+
+
+async def test_delete_routine_raises_when_neither_caller_nor_routine_has_a_user_id(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    created = await create_routine(
+        db_session,
+        tenant_id=tenant.id,
+        created_by_user_id=None,
+        agent_id="agent_a",
+        agent_name="daimon",
+        cron_expr="* * * * *",
+        timezone_="UTC",
+        trigger_message="orig",
+    )
+    await db_session.commit()
+
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity(tenant_id=tenant.id, platform_user_id=None, is_admin=False)
+    with pytest.raises(ToolError, match="routine not found"):
+        await _delete_routine_impl(runtime, auth, routine_id=created.id)
+
+    row = await get_routine(db_session, created.id, tenant_id=tenant.id)
+    assert row is not None, (
+        "a caller with no platform user id must not be able to delete a routine "
+        "that has no recorded creator"
+    )
+
+
 async def test_admin_update_and_delete_succeed_when_caller_is_non_owner_admin(
     committing_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,

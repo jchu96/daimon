@@ -49,12 +49,19 @@ def _require_routine_owner(auth: AuthIdentity, row: RoutineRow) -> None:
 
     Raises the same ``"routine not found"`` text an unknown id produces, so a
     non-owner probe cannot distinguish "forbidden" from "does not exist".
-    CLI and internal tokens have no platform user id but always carry
-    ``is_admin``, so they pass on the admin branch below — no separate
-    null-check branch is needed here.
+
+    Both sides of the comparison are nullable and neither null identifies an
+    owner: a caller with no platform user id (a CLI-minted token, or an account
+    with no principal for its tenant's platform) is nobody's creator, and a
+    routine with no recorded creator has no owner to match. Comparing them
+    directly would let ``None == None`` through, so both fail closed — only an
+    admin may mutate an ownerless routine. Note that a non-admin caller without
+    a platform user id therefore cannot mutate any routine.
     """
     if auth.is_admin:
         return
+    if auth.platform_user_id is None or row.created_by_user_id is None:
+        raise ToolError("routine not found")
     if auth.platform_user_id != row.created_by_user_id:
         raise ToolError("routine not found")
 
