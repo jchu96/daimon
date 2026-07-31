@@ -1025,12 +1025,13 @@ async def test_edit_view_github_button_opens_modal_for_admin_on_system_agent(
 
 
 @pytest.mark.asyncio
-async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admin(
+async def test_env_vars_paste_modal_refuses_on_reachable_agent_for_non_admin(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Env vars are a per-agent attachment, never part of the agent spec — the
-    new click-time gate must not reach this path even for a reachable agent
-    edited by a non-admin."""
+    """`put_agent_file` is an upsert and the files are mounted read-write on
+    every session of the agent, so a non-admin pasting over the workspace's
+    current default agent would overwrite secrets everyone in the install
+    depends on. The Env vars button still opens for them; the write does not."""
     from daimon.adapters.discord.agent_setup.credentials import PasteSecretModal
     from daimon.core.ma_identity import derive_agent_uuid
     from daimon.core.ma_resolver import new_resolver_cache
@@ -1039,8 +1040,9 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
     from daimon.core.stores.agent_files import get_agent_file
     from daimon.testing.factories import make_tenant
 
+    guild_id = 910301
     async with db_session_factory() as session, session.begin():
-        tenant = await make_tenant(session, platform="discord", workspace_id="env-vars-still-open")
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
     agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="agent_env_test")
 
     settings = MagicMock()
@@ -1051,8 +1053,7 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         sessionmaker=db_session_factory,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
-        # A non-admin caller editing the workspace's current default agent —
-        # env vars stay writable regardless.
+        # The target agent is the workspace's current default, so it is shared.
         deployment_default=DeploymentDefault(agent_name="daimon"),
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
@@ -1062,13 +1063,15 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         return None
 
     modal = PasteSecretModal(
-        runtime=runtime, tenant_id=tenant.id, agent_id=agent_id, on_added=_noop
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=_entry("daimon"),
+        on_added=_noop,
     )
     modal.content_input._value = "XERO_API_KEY=abc123"  # pyright: ignore[reportPrivateUsage]
 
-    interaction = MagicMock()
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
+    interaction = _non_admin_interaction(guild_id=guild_id)
 
     await modal.on_submit(interaction)
 
@@ -1076,4 +1079,7 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         row = await get_agent_file(
             session, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY"
         )
-    assert row is not None, "env var write must succeed even on the workspace's default agent"
+    assert row is None, "a non-admin must not write env vars onto the workspace's default agent"
+    interaction.response.defer.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
