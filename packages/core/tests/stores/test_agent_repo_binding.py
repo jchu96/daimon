@@ -11,14 +11,17 @@ from daimon.core._models import AgentRepoBinding
 from daimon.core.errors import StoreError
 from daimon.core.stores.agent_repo_binding import (
     clear_binding,
+    copy_binding,
     get_binding,
     get_bindings_for_repo,
+    list_bindings_without_proof,
+    record_proof,
     set_binding,
     update_last_sync,
     update_repo_and_branch_keep_secret,
 )
-from daimon.core.stores.domain import AgentRepoBindingRow
-from daimon.testing.factories import make_tenant
+from daimon.core.stores.domain import AgentRepoBindingRow, RepoAccessProof
+from daimon.testing.factories import make_account, make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -496,3 +499,416 @@ async def test_update_repo_and_branch_keep_secret_raises_when_no_binding(
             repo_url="owner/repo",
             default_branch="main",
         )
+
+
+# ---------------------------------------------------------------------------
+# Proof-of-access: set_binding, copy_binding, keep-secret repo edit,
+# list_bindings_without_proof, record_proof
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_binding_with_proof_persists_all_three_proof_columns(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+
+    row = await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="secret-ref",
+        proof=proof,
+    )
+
+    assert row.proof_kind == "pat", "set_binding with a proof should persist proof_kind"
+    assert row.proof_at == proof.at, "set_binding with a proof should persist proof_at"
+    assert row.proof_account_id == account.id, (
+        "set_binding with a proof should persist proof_account_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_binding_without_proof_on_existing_proven_row_clears_proof(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    proof = RepoAccessProof(
+        kind="public", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="secret-ref",
+        proof=proof,
+    )
+
+    rebound = await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="secret-ref-2",
+    )
+
+    assert rebound.proof_kind is None, (
+        "a re-bind with no proof must clear a stale proof_kind, not inherit it"
+    )
+    assert rebound.proof_at is None, "a re-bind with no proof must clear a stale proof_at"
+    assert rebound.proof_account_id is None, (
+        "a re-bind with no proof must clear a stale proof_account_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_copy_binding_carries_proof_forward_verbatim(db_session: AsyncSession) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    source_agent_id = uuid.uuid4()
+    target_agent_id = uuid.uuid4()
+    proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=source_agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="source-secret",
+        proof=proof,
+    )
+
+    target = await copy_binding(
+        db_session,
+        tenant_id=tenant.id,
+        source_agent_id=source_agent_id,
+        target_agent_id=target_agent_id,
+        ma_secret_ref="target-secret",
+    )
+
+    assert target is not None, "copy_binding should return the newly-written target row"
+    assert target.repo_url == "owner/repo", "copy_binding must carry repo_url forward"
+    assert target.default_branch == "main", "copy_binding must carry default_branch forward"
+    assert target.ma_secret_ref == "target-secret", (
+        "copy_binding must use the caller-supplied ma_secret_ref, not the source's"
+    )
+    assert target.proof_kind == "pat", "copy_binding must carry proof_kind forward verbatim"
+    assert target.proof_at == proof.at, "copy_binding must carry proof_at forward verbatim"
+    assert target.proof_account_id == account.id, (
+        "copy_binding must carry proof_account_id forward verbatim"
+    )
+
+
+@pytest.mark.asyncio
+async def test_copy_binding_on_proofless_source_yields_proofless_target(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    source_agent_id = uuid.uuid4()
+    target_agent_id = uuid.uuid4()
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=source_agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="source-secret",
+    )
+
+    target = await copy_binding(
+        db_session,
+        tenant_id=tenant.id,
+        source_agent_id=source_agent_id,
+        target_agent_id=target_agent_id,
+        ma_secret_ref="target-secret",
+    )
+
+    assert target is not None
+    assert target.proof_kind is None, (
+        "copy_binding cannot invent proof: a proofless source yields a proofless target"
+    )
+    assert target.proof_at is None
+    assert target.proof_account_id is None
+
+
+@pytest.mark.asyncio
+async def test_copy_binding_returns_none_when_source_has_no_binding(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+
+    target = await copy_binding(
+        db_session,
+        tenant_id=tenant.id,
+        source_agent_id=uuid.uuid4(),
+        target_agent_id=uuid.uuid4(),
+        ma_secret_ref="target-secret",
+    )
+
+    assert target is None, "copy_binding should return None when there is nothing to copy"
+
+
+@pytest.mark.asyncio
+async def test_update_repo_and_branch_keep_secret_with_new_repo_nulls_proof(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/old-repo",
+        default_branch="main",
+        ma_secret_ref=f"inline-pat:{agent_id}",
+        proof=proof,
+    )
+
+    updated = await update_repo_and_branch_keep_secret(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/new-repo",
+        default_branch="main",
+    )
+
+    assert updated.repo_url == "owner/new-repo", "repo_url should be updated"
+    assert updated.proof_kind is None, "a repo-URL change must clear proof_kind"
+    assert updated.proof_at is None, "a repo-URL change must clear proof_at"
+    assert updated.proof_account_id is None, "a repo-URL change must clear proof_account_id"
+    assert updated.ma_secret_ref == f"inline-pat:{agent_id}", (
+        "ma_secret_ref must remain untouched by a repo-URL change"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_repo_and_branch_keep_secret_with_same_repo_leaves_proof_intact(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref=f"inline-pat:{agent_id}",
+        proof=proof,
+    )
+
+    updated = await update_repo_and_branch_keep_secret(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="develop",
+    )
+
+    assert updated.default_branch == "develop", "default_branch should be updated"
+    assert updated.proof_kind == "pat", "a branch-only edit must leave proof_kind intact"
+    assert updated.proof_at == proof.at, "a branch-only edit must leave proof_at intact"
+    assert updated.proof_account_id == account.id, (
+        "a branch-only edit must leave proof_account_id intact"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_repo_and_branch_keep_secret_url_differing_by_scheme_does_not_clear_proof(
+    db_session: AsyncSession,
+) -> None:
+    """Normalization is load-bearing: a URL that normalizes to the SAME 'owner/repo'
+    (differing only by scheme or a trailing '.git') counts as the same repo."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    proof = RepoAccessProof(
+        kind="public", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="anon:",
+        proof=proof,
+    )
+
+    updated = await update_repo_and_branch_keep_secret(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="https://github.com/owner/repo.git",
+        default_branch="main",
+    )
+
+    assert updated.repo_url == "owner/repo", "normalized form should be unchanged"
+    assert updated.proof_kind == "public", (
+        "a URL differing only by scheme/.git normalizes to the same repo and must not clear proof"
+    )
+    assert updated.proof_account_id == account.id
+
+
+@pytest.mark.asyncio
+async def test_list_bindings_without_proof_returns_only_proofless_rows_across_tenants(
+    db_session: AsyncSession,
+) -> None:
+    t1 = await make_tenant(db_session)
+    t2 = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=t1)
+    proven_agent_id = uuid.uuid4()
+    proofless_agent_id_1 = uuid.uuid4()
+    proofless_agent_id_2 = uuid.uuid4()
+
+    await set_binding(
+        db_session,
+        tenant_id=t1.id,
+        agent_id=proven_agent_id,
+        repo_url="owner/proven-repo",
+        default_branch="main",
+        ma_secret_ref="secret-proven",
+        proof=RepoAccessProof(
+            kind="pat", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+        ),
+    )
+    await set_binding(
+        db_session,
+        tenant_id=t1.id,
+        agent_id=proofless_agent_id_1,
+        repo_url="owner/proofless-a",
+        default_branch="main",
+        ma_secret_ref="secret-a",
+    )
+    await set_binding(
+        db_session,
+        tenant_id=t2.id,
+        agent_id=proofless_agent_id_2,
+        repo_url="owner/proofless-b",
+        default_branch="main",
+        ma_secret_ref="secret-b",
+    )
+
+    rows = await list_bindings_without_proof(db_session)
+
+    proofless_agent_ids = {r.agent_id for r in rows}
+    assert proven_agent_id not in proofless_agent_ids, (
+        "a proven binding must not appear in list_bindings_without_proof"
+    )
+    assert proofless_agent_id_1 in proofless_agent_ids, (
+        "a proofless binding in tenant 1 must appear"
+    )
+    assert proofless_agent_id_2 in proofless_agent_ids, (
+        "a proofless binding in tenant 2 must appear (install-agnostic across tenants)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_proof_overwrites_proof_without_altering_repo_or_secret(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref=f"inline-pat:{agent_id}",
+    )
+
+    fresh_proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 10, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    updated = await record_proof(
+        db_session, tenant_id=tenant.id, agent_id=agent_id, proof=fresh_proof
+    )
+
+    assert updated.proof_kind == "pat", "record_proof should stamp proof_kind"
+    assert updated.proof_at == fresh_proof.at, "record_proof should stamp proof_at"
+    assert updated.proof_account_id == account.id, "record_proof should stamp proof_account_id"
+    assert updated.repo_url == "owner/repo", "record_proof must not alter repo_url"
+    assert updated.default_branch == "main", "record_proof must not alter default_branch"
+    assert updated.ma_secret_ref == f"inline-pat:{agent_id}", (
+        "record_proof must not alter ma_secret_ref"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_proof_raises_storeerror_for_unknown_agent(db_session: AsyncSession) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+
+    with pytest.raises(StoreError, match="no binding for agent"):
+        await record_proof(
+            db_session,
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            proof=RepoAccessProof(
+                kind="public",
+                at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC),
+                account_id=account.id,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_repo_edit_then_record_proof_in_one_transaction_leaves_new_repo_and_new_proof(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    old_proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 9, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/old-repo",
+        default_branch="main",
+        ma_secret_ref=f"inline-pat:{agent_id}",
+        proof=old_proof,
+    )
+
+    await update_repo_and_branch_keep_secret(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/new-repo",
+        default_branch="main",
+    )
+    new_proof = RepoAccessProof(
+        kind="pat", at=datetime(2026, 7, 31, 11, 0, 0, tzinfo=UTC), account_id=account.id
+    )
+    final = await record_proof(db_session, tenant_id=tenant.id, agent_id=agent_id, proof=new_proof)
+
+    assert final.repo_url == "owner/new-repo", "the new repo must stick"
+    assert final.proof_kind == "pat", "the freshly recorded proof must stick"
+    assert final.proof_at == new_proof.at, "the freshly recorded proof's timestamp must stick"
+    assert final.proof_account_id == account.id

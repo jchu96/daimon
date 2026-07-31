@@ -57,6 +57,7 @@ from daimon.core.stores.domain import (
     Platform,
     PlatformPrincipalRow,
     PrincipalLinkRow,
+    RepoAccessProof,
     RoutineRow,
     SlackUserTokenRow,
     TenantLedgerRow,
@@ -403,6 +404,7 @@ async def make_agent_repo_binding(
     repo_url: str = "owner/repo",
     default_branch: str = "main",
     ma_secret_ref: str | None = None,
+    proof: RepoAccessProof | None = None,
 ) -> AgentRepoBindingRow:
     """Upsert an agent_repo_binding row via `agent_repo_binding.set_binding`."""
     tenant = tenant or await make_tenant(session)
@@ -415,6 +417,7 @@ async def make_agent_repo_binding(
         repo_url=repo_url,
         default_branch=default_branch,
         ma_secret_ref=ma_secret_ref,
+        proof=proof,
     )
 
 

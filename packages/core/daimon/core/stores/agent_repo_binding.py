@@ -8,8 +8,8 @@ from typing import Any, cast
 
 from daimon.core._models import AgentRepoBinding
 from daimon.core.errors import StoreError
-from daimon.core.stores.domain import AgentRepoBindingRow
-from sqlalchemy import CursorResult, delete, func, select, update
+from daimon.core.stores.domain import AgentRepoBindingRow, RepoAccessProof
+from sqlalchemy import CursorResult, case, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,13 +41,26 @@ async def set_binding(
     repo_url: str,
     default_branch: str,
     ma_secret_ref: str,
+    proof: RepoAccessProof | None = None,
 ) -> AgentRepoBindingRow:
     """Upsert the per-agent repo binding (1:1). Returns the post-write row.
 
     Normalizes repo_url via _normalize_owner_repo before storing so the webhook
     reverse lookup (get_bindings_for_repo) always matches canonical 'owner/repo'.
+
+    `proof` records what the caller established about repo access at bind
+    time; callers must supply the proof they established at bind time. Both
+    the insert values and the conflict-path set_ clause write all three proof
+    columns unconditionally — a re-bind that supplies no proof clears any
+    stale proof rather than silently inheriting the previous bind's. The
+    `= None` default is temporary: it exists only so pre-existing callers
+    that have not yet been threaded with a proof continue to compile; every
+    production caller is expected to pass one explicitly.
     """
     normalized_url = _normalize_owner_repo(repo_url)
+    proof_kind = proof.kind if proof is not None else None
+    proof_at = proof.at if proof is not None else None
+    proof_account_id = proof.account_id if proof is not None else None
     stmt = (
         pg_insert(AgentRepoBinding)
         .values(
@@ -56,6 +69,9 @@ async def set_binding(
             repo_url=normalized_url,
             default_branch=default_branch,
             ma_secret_ref=ma_secret_ref,
+            proof_kind=proof_kind,
+            proof_at=proof_at,
+            proof_account_id=proof_account_id,
         )
         .on_conflict_do_update(
             constraint="pk_agent_repo_binding",
@@ -63,6 +79,9 @@ async def set_binding(
                 "repo_url": normalized_url,
                 "default_branch": default_branch,
                 "ma_secret_ref": ma_secret_ref,
+                "proof_kind": proof_kind,
+                "proof_at": proof_at,
+                "proof_account_id": proof_account_id,
                 "updated_at": func.now(),
             },
         )
@@ -84,6 +103,61 @@ async def get_binding(
     orm = await session.get(AgentRepoBinding, (tenant_id, agent_id))
     if orm is None:
         return None
+    return AgentRepoBindingRow.model_validate(orm)
+
+
+async def copy_binding(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    source_agent_id: uuid.UUID,
+    target_agent_id: uuid.UUID,
+    ma_secret_ref: str,
+) -> AgentRepoBindingRow | None:
+    """Copy a source agent's binding onto a target agent (fork's deep copy).
+
+    Returns None when the source has no binding — the caller's "nothing to
+    copy" case, mirroring how fork already returns early today.
+
+    This is a copy, not a new proof: `repo_url`, `default_branch`, and the
+    three proof columns are carried forward from the source row verbatim,
+    including when they are NULL. `repo_url` is the source's already-
+    canonical value and is NOT re-normalized. There is deliberately no
+    `proof` parameter here — the target can only inherit exactly what the
+    source held, never invent proof of its own.
+    """
+    source = await get_binding(session, tenant_id=tenant_id, agent_id=source_agent_id)
+    if source is None:
+        return None
+    stmt = (
+        pg_insert(AgentRepoBinding)
+        .values(
+            tenant_id=tenant_id,
+            agent_id=target_agent_id,
+            repo_url=source.repo_url,
+            default_branch=source.default_branch,
+            ma_secret_ref=ma_secret_ref,
+            proof_kind=source.proof_kind,
+            proof_at=source.proof_at,
+            proof_account_id=source.proof_account_id,
+        )
+        .on_conflict_do_update(
+            constraint="pk_agent_repo_binding",
+            set_={
+                "repo_url": source.repo_url,
+                "default_branch": source.default_branch,
+                "ma_secret_ref": ma_secret_ref,
+                "proof_kind": source.proof_kind,
+                "proof_at": source.proof_at,
+                "proof_account_id": source.proof_account_id,
+                "updated_at": func.now(),
+            },
+        )
+        .returning(AgentRepoBinding)
+    )
+    result = await session.execute(stmt)
+    orm = result.scalar_one()
+    await session.flush()
     return AgentRepoBindingRow.model_validate(orm)
 
 
@@ -137,6 +211,73 @@ async def update_repo_and_branch_keep_secret(
     reference is never clobbered by a repo-URL-only edit. Normalizes repo_url
     the same way set_binding does. Raises StoreError when no binding exists
     (mirrors update_last_sync / clear_binding discipline).
+
+    Proof is per-repo, so re-pointing a binding at a different repo
+    invalidates it: the three proof columns are cleared when — and only
+    when — the normalized repo URL actually changes. A branch-only edit
+    leaves proof intact. This is computed atomically inside the same UPDATE
+    via a CASE comparing against the pre-update column value, with no
+    separate read.
+    """
+    normalized_url = _normalize_owner_repo(repo_url)
+    url_unchanged = AgentRepoBinding.repo_url == normalized_url
+    stmt = (
+        update(AgentRepoBinding)
+        .where(
+            AgentRepoBinding.tenant_id == tenant_id,
+            AgentRepoBinding.agent_id == agent_id,
+        )
+        .values(
+            repo_url=normalized_url,
+            default_branch=default_branch,
+            proof_kind=case((url_unchanged, AgentRepoBinding.proof_kind), else_=None),
+            proof_at=case((url_unchanged, AgentRepoBinding.proof_at), else_=None),
+            proof_account_id=case((url_unchanged, AgentRepoBinding.proof_account_id), else_=None),
+            updated_at=func.now(),
+        )
+        .returning(AgentRepoBinding)
+    )
+    result = await session.execute(stmt)
+    orm = result.scalar_one_or_none()
+    if orm is None:
+        raise StoreError(f"no binding for agent {agent_id}")
+    await session.flush()
+    return AgentRepoBindingRow.model_validate(orm)
+
+
+async def list_bindings_without_proof(session: AsyncSession) -> list[AgentRepoBindingRow]:
+    """Return every binding with no recorded proof, ordered by repo_url.
+
+    Install-agnostic: returns bindings from ALL tenants, matching
+    get_bindings_for_repo's existing framing. Intended for an operator
+    inventory of the population a fail-closed proof gate affects.
+    """
+    result = await session.execute(
+        select(AgentRepoBinding)
+        .where(AgentRepoBinding.proof_kind.is_(None))
+        .order_by(AgentRepoBinding.repo_url)
+    )
+    return [AgentRepoBindingRow.model_validate(o) for o in result.scalars()]
+
+
+async def record_proof(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    proof: RepoAccessProof,
+) -> AgentRepoBindingRow:
+    """Stamp a freshly-established proof onto an existing binding.
+
+    Narrowed by construction: this can only UPDATE the three proof columns
+    on a binding that already exists — it cannot create a binding, change
+    `repo_url`, or touch `ma_secret_ref`. Its two callers are the
+    keep-existing-token repo edit (which re-establishes proof against the
+    new repo and records it in the same transaction) and the one-shot
+    operator backfill (which records a `public` proof with a NULL account,
+    having no acting person). `proof` is required and non-nullable: clearing
+    proof is `update_repo_and_branch_keep_secret`'s job, not this one's.
+    Raises StoreError when no binding exists (mirrors update_last_sync).
     """
     stmt = (
         update(AgentRepoBinding)
@@ -145,8 +286,9 @@ async def update_repo_and_branch_keep_secret(
             AgentRepoBinding.agent_id == agent_id,
         )
         .values(
-            repo_url=_normalize_owner_repo(repo_url),
-            default_branch=default_branch,
+            proof_kind=proof.kind,
+            proof_at=proof.at,
+            proof_account_id=proof.account_id,
             updated_at=func.now(),
         )
         .returning(AgentRepoBinding)
