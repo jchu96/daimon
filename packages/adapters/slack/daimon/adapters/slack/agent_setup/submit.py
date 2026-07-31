@@ -785,9 +785,12 @@ async def run_edit_repo_submission(
 ) -> None:
     """Post-ack: update repo binding and/or inline PAT for the agent.
 
-    Repo binding and the inline PAT are per-agent attachments that never
-    enter the agent spec, so this form is open to every workspace member —
-    including against the workspace's current default agent. Blank PAT
+    Repo binding and the inline token are per-agent attachments that never
+    enter the agent spec, so they are exempt from the spec gate's built-in
+    agent absolutism — an admin binding a repo to the built-in agent is a
+    supported first-run step. They are refused for a non-admin whenever the
+    target is the built-in agent or a current default, though, because a repo
+    re-point changes what the whole workspace's shared agent clones. Blank PAT
     field = keep stored token (never overwrites).
 
     No binding write happens without a successful GitHub probe against the
@@ -798,6 +801,23 @@ async def run_edit_repo_submission(
     """
     try:
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+        # One gate at the top covers every write below it — the replace-token
+        # bind, the keep-token re-point and its proof re-establish, and the
+        # first-time-bind fallback — and it runs before the GitHub probe, so a
+        # refused submission never puts the member's token on the wire.
+        refused = await gate.refuse_if_shared_and_not_admin(
+            runtime,
+            web_client,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            channel_id=channel_id,
+            user_id=user_id,
+            dev_allow_all=_dev_allow_all_admin(runtime),
+        )
+        if refused:
+            return
+
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
         ma_agent = await find_agent_by_daimon_tag(
