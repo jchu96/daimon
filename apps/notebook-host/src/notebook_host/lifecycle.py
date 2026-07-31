@@ -21,7 +21,7 @@ from typing import Literal
 import httpx
 from fastapi import HTTPException, status
 
-from notebook_host.jail import SlugPaths
+from notebook_host.jail import SlugPaths, build_jailed_preexec
 
 _log = logging.getLogger(__name__)
 
@@ -196,6 +196,7 @@ def spawn_marimo(
     sandbox: bool = False,
     rlimit_as_bytes: int | None = None,
     rlimit_cpu_seconds: int | None = None,
+    jail_uid: int | None = None,
 ) -> subprocess.Popen[bytes]:
     """Spawn ``marimo <mode> <basename>`` on ``port`` from a per-slug workspace.
 
@@ -204,13 +205,21 @@ def spawn_marimo(
     passthrough. ``start_new_session`` isolates the child's process group;
     env is scrubbed so notebook code can't read the admin bearer; RLIMIT_AS/CPU
     (Linux) cap runaway notebooks (inherited by the sandbox's re-exec'd
-    descendants).
+    descendants). ``HOME`` always points into ``paths.home`` — inside the
+    slug's own tree — regardless of whether ``jail_uid`` is set, so the
+    dev/CI unjailed path exercises the same environment shape production runs
+    under.
 
     ``sandbox`` adds ``--sandbox``, which makes marimo install the notebook's
     PEP 723 ``dependencies`` into an isolated uv venv — the only way a notebook
     can use a library outside the host's baked set. Pass it only for notebooks
     that declare inline metadata (``has_inline_script_metadata``); a headerless
     notebook under ``--sandbox`` loses the baked pandas/numpy/pymc stack.
+
+    When ``jail_uid`` is set, the child runs as that per-notebook uid
+    (``build_jailed_preexec``) instead of the host's own uid; when it is
+    ``None`` (the default), behaviour is unchanged from before this uid split
+    existed — the existing rlimit-only preexec, with its non-Linux warning.
     """
     uv = shutil.which("uv")
     if uv is None:
@@ -231,14 +240,28 @@ def spawn_marimo(
         f"/n/{slug}",
     ]
     log_path = paths.log
+    # Opened here, in the host process, before the fork — so the file is
+    # created root-owned even though it lives inside the uid-owned 0700 slug
+    # root. That's correct and needs no chown: the child inherits this
+    # already-open file descriptor, and POSIX does not re-check permissions on
+    # an inherited fd. Do not chown this file, and do not move the open()
+    # after the privilege drop — the dropped-uid child would then be opening a
+    # path it has no rights to, breaking log writes outright.
     log_fh = open(log_path, "ab")  # noqa: SIM115 — owned by subprocess
-    preexec = _make_preexec(rlimit_as_bytes, rlimit_cpu_seconds)
-    if preexec is None and sys.platform != "linux" and (rlimit_as_bytes or rlimit_cpu_seconds):
-        _log.warning(
-            "rlimit configured but platform=%s is not Linux; "
-            "subprocess will run without resource caps",
-            sys.platform,
+    env = scrub_env(dict(os.environ))
+    env["HOME"] = str(paths.home)
+    if jail_uid is not None:
+        preexec = build_jailed_preexec(
+            jail_uid, rlimit_as_bytes=rlimit_as_bytes, rlimit_cpu_seconds=rlimit_cpu_seconds
         )
+    else:
+        preexec = _make_preexec(rlimit_as_bytes, rlimit_cpu_seconds)
+        if preexec is None and sys.platform != "linux" and (rlimit_as_bytes or rlimit_cpu_seconds):
+            _log.warning(
+                "rlimit configured but platform=%s is not Linux; "
+                "subprocess will run without resource caps",
+                sys.platform,
+            )
     try:
         return subprocess.Popen(
             cmd,
@@ -246,7 +269,7 @@ def spawn_marimo(
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env=scrub_env(dict(os.environ)),
+            env=env,
             preexec_fn=preexec,
         )
     finally:
@@ -308,6 +331,7 @@ def validate_notebook(
     sandbox: bool = False,
     rlimit_as_bytes: int | None = None,
     rlimit_cpu_seconds: int | None = None,
+    jail_uid: int | None = None,
 ) -> ValidationResult:
     """Run ``marimo export html`` to confirm the notebook's cells actually run.
 
@@ -324,6 +348,11 @@ def validate_notebook(
     cold sandbox install here also warms uv's shared cache, so the subsequent
     spawn starts fast.
 
+    The validator deliberately runs under the same jail as the spawned
+    process: it executes the same untrusted notebook code, so ``jail_uid``
+    (when set) drops privilege here too, and ``HOME`` points into the same
+    per-slug tree.
+
     Blocking (uses ``subprocess.run``) — call via ``asyncio.to_thread`` from the
     async request handler. On timeout, returns ``ok=True`` with
     ``timed_out=True``: a slow-but-possibly-valid notebook is published rather
@@ -334,8 +363,22 @@ def validate_notebook(
     if uv is None:
         raise RuntimeError("uv not on PATH")
     workspace = _prepare_workspace(paths)
-    preexec = _make_preexec(rlimit_as_bytes, rlimit_cpu_seconds)
+    if jail_uid is not None:
+        preexec = build_jailed_preexec(
+            jail_uid, rlimit_as_bytes=rlimit_as_bytes, rlimit_cpu_seconds=rlimit_cpu_seconds
+        )
+    else:
+        preexec = _make_preexec(rlimit_as_bytes, rlimit_cpu_seconds)
+    env = scrub_env(dict(os.environ))
+    env["HOME"] = str(paths.home)
     with tempfile.TemporaryDirectory() as tmp:
+        if jail_uid is not None:
+            # Unlike the log file above, this directory is opened *by the
+            # child* (marimo's own `-o` write), after the privilege drop, not
+            # inherited as an already-open fd — so it needs a real chown, or
+            # the export fails for every notebook the moment the jail is on,
+            # looking like a marimo export error rather than a permissions bug.
+            os.chown(tmp, jail_uid, jail_uid)
         cmd = [uv, "run", "--with", "marimo", "marimo", "export", "html"]
         if sandbox:
             cmd.append("--sandbox")
@@ -344,7 +387,7 @@ def validate_notebook(
             proc = subprocess.run(  # noqa: S603
                 cmd,
                 cwd=str(workspace),
-                env=scrub_env(dict(os.environ)),
+                env=env,
                 preexec_fn=preexec,
                 capture_output=True,
                 text=True,

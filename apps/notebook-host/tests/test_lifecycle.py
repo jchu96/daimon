@@ -749,6 +749,204 @@ def test_spawn_marimo_passes_preexec_fn(monkeypatch: pytest.MonkeyPatch, tmp_pat
     )
 
 
+# ─── HOME / jail_uid wiring ────────────────────────────────────────────────────
+
+
+def _capture_spawn_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **spawn_kwargs: object
+) -> dict[str, str]:
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    captured: dict[str, object] = {}
+    sentinel_proc = _make_fake_popen()
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel_proc
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, **spawn_kwargs)  # pyright: ignore[reportArgumentType]
+    env = captured.get("env")
+    assert isinstance(env, dict), "spawn_marimo must pass env= to Popen"
+    return env
+
+
+def test_spawn_marimo_sets_home_to_slug_home_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spawn_marimo always sets HOME to paths.home, jailed or not."""
+    from notebook_host.jail import get_slug_paths
+
+    env = _capture_spawn_env(monkeypatch, tmp_path)
+    paths = get_slug_paths(tmp_path, "myslug")
+    assert env["HOME"] == str(paths.home), (
+        "HOME must point into the slug's own tree, or uv's cache write fails"
+    )
+
+
+def test_spawn_marimo_preserves_virtual_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """VIRTUAL_ENV survives scrub_env unchanged — it's what keeps the baked stack."""
+    monkeypatch.setenv("VIRTUAL_ENV", "/app/.venv")
+    env = _capture_spawn_env(monkeypatch, tmp_path)
+    assert env["VIRTUAL_ENV"] == "/app/.venv", (
+        "VIRTUAL_ENV must flow through unchanged so headerless notebooks keep "
+        "the baked pandas/numpy/pymc stack"
+    )
+
+
+def test_spawn_marimo_env_still_has_no_daimon_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The DAIMON_* scrub guarantee is unbroken by the HOME/jail_uid additions."""
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "shhhh")
+    env = _capture_spawn_env(monkeypatch, tmp_path)
+    daimon_keys = [k for k in env if k.startswith("DAIMON_")]
+    assert daimon_keys == [], f"all DAIMON_-prefixed vars must still be stripped; got {daimon_keys}"
+
+
+def test_spawn_marimo_with_jail_uid_none_uses_rlimit_only_preexec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """jail_uid=None with no rlimits configured on Linux yields preexec_fn=None,
+    exactly matching _make_preexec's own pre-existing behaviour."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(lifecycle.sys, "platform", "linux")
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    captured: dict[str, object] = {}
+    sentinel_proc = _make_fake_popen()
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel_proc
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, jail_uid=None)
+
+    assert captured.get("preexec_fn") is None, (
+        "jail_uid=None with no rlimits must leave preexec_fn None, unchanged from before "
+        "the jail existed"
+    )
+
+
+def test_spawn_marimo_with_jail_uid_set_always_has_a_preexec_fn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """jail_uid=4242 yields a non-None preexec_fn even with both rlimits None —
+    a path where the old rlimit-only preexec would have returned None."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    captured: dict[str, object] = {}
+    sentinel_proc = _make_fake_popen()
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel_proc
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, jail_uid=4242)
+
+    assert captured.get("preexec_fn") is not None, (
+        "jail_uid set must always yield a preexec_fn, even with no rlimits configured"
+    )
+
+
+def test_validate_notebook_with_jail_uid_chowns_the_temp_export_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """validate_notebook(jail_uid=...) chowns its TemporaryDirectory to that uid."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    chown_calls: list[tuple[str, int, int]] = []
+
+    def fake_chown(path: object, uid: int, gid: int) -> None:
+        chown_calls.append((str(path), uid, gid))
+
+    monkeypatch.setattr(lifecycle.os, "chown", fake_chown)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.validate_notebook("myslug", paths, timeout_s=5.0, jail_uid=4242)
+
+    assert len(chown_calls) == 1, f"expected exactly one os.chown call, got {chown_calls}"
+    chowned_path, uid, gid = chown_calls[0]
+    assert chowned_path, "chown must target a real path (the export temp dir)"
+    assert uid == 4242, "chown must target the jail uid"
+    assert gid == 4242, "chown must target the matching primary group (gid == uid)"
+
+
+def test_validate_notebook_without_jail_uid_never_calls_chown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """validate_notebook(jail_uid=None) does not call os.chown at all."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    chown_calls: list[object] = []
+    monkeypatch.setattr(
+        lifecycle.os,
+        "chown",
+        lambda *a, **kw: chown_calls.append((a, kw)),  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.validate_notebook("myslug", paths, timeout_s=5.0, jail_uid=None)
+
+    assert chown_calls == [], "jail_uid=None must never call os.chown"
+
+
 # ─── sandbox / inline-script-metadata tests ──────────────────────────────────
 
 
