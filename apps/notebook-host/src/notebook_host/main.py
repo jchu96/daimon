@@ -22,7 +22,15 @@ from fastapi import FastAPI, HTTPException
 from notebook_host.admin import AdminState, create_admin_router
 from notebook_host.blogs_store import load_blogs
 from notebook_host.config import Settings
-from notebook_host.jail import SlugPaths, ensure_slug_jail, remove_slug_tree
+from notebook_host.jail import (
+    JailUnavailableError,
+    SlugPaths,
+    UidPoolExhaustedError,
+    can_apply_jail,
+    ensure_slug_jail,
+    remove_slug_tree,
+    resolve_jail_uid,
+)
 from notebook_host.lifecycle import (
     NotebookProcess,
     ValidationResult,
@@ -48,7 +56,12 @@ def create_app(settings: Settings) -> FastAPI:
     # the same mode as the spawn, so both read the on-disk source (already
     # written by the PUT handler) through the same detector.
     def _spawner(
-        slug: str, paths: SlugPaths, port: int, *, mode: Literal["edit", "run"] = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: Literal["edit", "run"] = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
         return spawn_marimo(
             slug,
@@ -58,9 +71,10 @@ def create_app(settings: Settings) -> FastAPI:
             sandbox=has_inline_script_metadata(paths.notebook.read_text(encoding="utf-8")),
             rlimit_as_bytes=settings.marimo_rlimit_as_bytes or None,
             rlimit_cpu_seconds=settings.marimo_rlimit_cpu_seconds or None,
+            jail_uid=jail_uid,
         )
 
-    def _validator(slug: str, paths: SlugPaths) -> ValidationResult:
+    def _validator(slug: str, paths: SlugPaths, *, jail_uid: int | None = None) -> ValidationResult:
         return validate_notebook(
             slug,
             paths,
@@ -68,6 +82,7 @@ def create_app(settings: Settings) -> FastAPI:
             sandbox=has_inline_script_metadata(paths.notebook.read_text(encoding="utf-8")),
             rlimit_as_bytes=settings.marimo_rlimit_as_bytes or None,
             rlimit_cpu_seconds=settings.marimo_rlimit_cpu_seconds or None,
+            jail_uid=jail_uid,
         )
 
     state = AdminState(
@@ -79,6 +94,17 @@ def create_app(settings: Settings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:  # pyright: ignore[reportUnusedFunction]
+        # Fail-closed boot gate (D-05): a host that cannot apply the jail must
+        # not come up at all. Refusing per-request instead would leave an
+        # apparently healthy host answering nothing but 503s — a configuration
+        # refusal that reads as an outage of unknown cause.
+        if not can_apply_jail() and not settings.allow_unjailed_spawn:
+            raise JailUnavailableError(
+                "cannot apply the notebook jail on this host (not root, or this "
+                "platform cannot change process identity); refusing to boot. Set "
+                "DAIMON_NOTEBOOK__ALLOW_UNJAILED_SPAWN=true to explicitly opt out "
+                "on a dev host."
+            )
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         # Reap any marimo subprocesses left behind by a previous host crash
         # before we accept any PUTs. The previous host's pids.json is the
@@ -117,12 +143,24 @@ async def _spawn_blog_process(state: AdminState, slug: str) -> bool:
 
     Source must already exist on the persistent volume at
     ``data_dir/<slug>/notebook.py``. Used by boot respawn and the sweep's
-    self-heal. A failure (missing source, pool exhausted, spawn timeout) logs
-    and returns False — callers must not let one bad blog abort their loop.
-    The caller is responsible for popping any stale entry for ``slug`` before
-    calling (so its port frees up for reuse).
+    self-heal. A failure (missing source, pool exhausted, spawn timeout, or the
+    jail being unavailable) logs and returns False — callers must not let one
+    bad blog abort their loop. A blog that cannot be jailed stays down; it must
+    not respawn unisolated. The caller is responsible for popping any stale
+    entry for ``slug`` before calling (so its port frees up for reuse).
     """
-    paths = ensure_slug_jail(state.settings.data_dir, slug)
+    try:
+        uid = resolve_jail_uid(
+            state.settings.resolved_uids_file,
+            slug,
+            start=state.settings.jail_uid_start,
+            end=state.settings.jail_uid_end,
+            allow_unjailed=state.settings.allow_unjailed_spawn,
+        )
+    except (JailUnavailableError, UidPoolExhaustedError) as err:
+        _log.error("blog %r respawn could not be jailed: %s", slug, err)
+        return False
+    paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
     if not paths.notebook.exists():
         _log.warning("blog %r has no source at %s; skipping respawn", slug, paths.notebook)
         return False
@@ -130,7 +168,7 @@ async def _spawn_blog_process(state: AdminState, slug: str) -> bool:
         port = allocate_port(
             state.processes, state.settings.marimo_port_start, state.settings.marimo_port_end
         )
-        proc = state.spawner(slug, paths, port, mode="run")
+        proc = state.spawner(slug, paths, port, mode="run", jail_uid=uid)
     except HTTPException as err:
         _log.warning("blog %r respawn could not start: %s", slug, err.detail)
         return False
@@ -183,7 +221,7 @@ async def _sweep_once(state: AdminState) -> bool:
             continue
         kill(np)
         state.processes.pop(slug, None)
-        remove_slug_tree(state.settings.data_dir, slug)
+        remove_slug_tree(state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file)
         mutated = True
     # Self-heal any registered blog that isn't currently running. This covers a
     # respawn that failed earlier (popped from state.processes but still in the

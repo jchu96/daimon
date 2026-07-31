@@ -23,7 +23,15 @@ from notebook_host.blogs_store import (
 )
 from notebook_host.capability import CapabilityClaims, verify_token
 from notebook_host.config import Settings
-from notebook_host.jail import SlugPaths, ensure_slug_jail, get_slug_paths, remove_slug_tree
+from notebook_host.jail import (
+    JailUnavailableError,
+    SlugPaths,
+    UidPoolExhaustedError,
+    ensure_slug_jail,
+    get_slug_paths,
+    remove_slug_tree,
+    resolve_jail_uid,
+)
 from notebook_host.lifecycle import (
     NotebookProcess,
     ValidationResult,
@@ -39,12 +47,20 @@ from notebook_host.pids_store import record_from_process, save_pids
 
 class Spawner(Protocol):
     def __call__(
-        self, slug: str, paths: SlugPaths, port: int, *, mode: Literal["edit", "run"] = "edit"
+        self,
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: Literal["edit", "run"] = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]: ...
 
 
 class Validator(Protocol):
-    def __call__(self, slug: str, paths: SlugPaths) -> ValidationResult: ...
+    def __call__(
+        self, slug: str, paths: SlugPaths, *, jail_uid: int | None = None
+    ) -> ValidationResult: ...
 
 
 @dataclass
@@ -141,18 +157,39 @@ async def _spawn_tracked(
 
     The caller must hold ``state.lock_for(slug)``. Returns the live
     ``NotebookProcess``. Raises ``HTTPException`` 422 (validation), 503 (port
-    pool exhausted), or 504 (spawn timeout). Shared by the notebook and blog
-    PUT handlers so the two never drift.
+    pool exhausted, or notebook isolation unavailable), or 504 (spawn
+    timeout). Shared by the notebook and blog PUT handlers so the two never
+    drift.
     """
-    paths = ensure_slug_jail(state.settings.data_dir, slug)
-    _atomic_write_bytes(paths.notebook, source_bytes)
+    # This is the request boundary — the one place admin.py is allowed to
+    # catch JailUnavailableError/UidPoolExhaustedError. Both mean the host is
+    # refusing to serve rather than failing transiently, mirroring
+    # allocate_port's existing 503 for pool exhaustion.
+    try:
+        uid = resolve_jail_uid(
+            state.settings.resolved_uids_file,
+            slug,
+            start=state.settings.jail_uid_start,
+            end=state.settings.jail_uid_end,
+            allow_unjailed=state.settings.allow_unjailed_spawn,
+        )
+    except JailUnavailableError as err:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"notebook isolation unavailable: {err}"
+        ) from err
+    except UidPoolExhaustedError as err:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"uid pool exhausted: {err}"
+        ) from err
+    paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
+    _atomic_write_bytes(paths.notebook, source_bytes, owner_uid=uid)
 
     # Confirm the cells actually execute before we tear down any
     # existing notebook for this slug. Runs off the event loop (the
     # marimo export is blocking). A failure here leaves a previously
     # published notebook for this slug untouched and serving.
     if state.validator is not None:
-        result = await asyncio.to_thread(state.validator, slug, paths)
+        result = await asyncio.to_thread(state.validator, slug, paths, jail_uid=uid)
         if not result.ok:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -169,7 +206,7 @@ async def _spawn_tracked(
     port = allocate_port(
         state.processes, state.settings.marimo_port_start, state.settings.marimo_port_end
     )
-    proc = state.spawner(slug, paths, port, mode=mode)
+    proc = state.spawner(slug, paths, port, mode=mode, jail_uid=uid)
     np = state.make_process(slug, port, proc, mode=mode)
     state.processes[slug] = np
 
@@ -257,9 +294,25 @@ def create_admin_router(state: AdminState) -> APIRouter:
         async with state.lock_for(slug):
             # ensure the tree exists even when an attachment arrives before
             # the first publish, with the same 0700 mode a publish would set.
-            paths = ensure_slug_jail(state.settings.data_dir, slug)
+            try:
+                uid = resolve_jail_uid(
+                    state.settings.resolved_uids_file,
+                    slug,
+                    start=state.settings.jail_uid_start,
+                    end=state.settings.jail_uid_end,
+                    allow_unjailed=state.settings.allow_unjailed_spawn,
+                )
+            except JailUnavailableError as err:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, f"notebook isolation unavailable: {err}"
+                ) from err
+            except UidPoolExhaustedError as err:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, f"uid pool exhausted: {err}"
+                ) from err
+            paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
             final_path = paths.data / name
-            _atomic_write_bytes(final_path, body)
+            _atomic_write_bytes(final_path, body, owner_uid=uid)
             return {
                 "slug": slug,
                 "name": name,
@@ -277,7 +330,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
         np = state.processes.pop(slug, None)
         if np is not None:
             kill(np)
-        remove_slug_tree(state.settings.data_dir, slug)
+        remove_slug_tree(state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file)
         state.snapshot_pids()
 
     @router.get("/admin/notebooks", dependencies=[Depends(require_admin)])
@@ -350,7 +403,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
         if np is not None:
             kill(np)
         unregister_blog(state.settings.resolved_blogs_file, slug)
-        remove_slug_tree(state.settings.data_dir, slug)
+        remove_slug_tree(state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file)
         state.snapshot_pids()
 
     @router.post("/admin/sweep", dependencies=[Depends(require_admin)])
@@ -366,7 +419,9 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 continue
             kill(np)
             state.processes.pop(slug, None)
-            remove_slug_tree(state.settings.data_dir, slug)
+            remove_slug_tree(
+                state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
+            )
             reaped.append({"slug": slug, "reason": reason, "age_s": round(np.age_s, 2)})
         if reaped:
             state.snapshot_pids()
@@ -407,9 +462,26 @@ def create_admin_router(state: AdminState) -> APIRouter:
             async with state.lock_for(slug):
                 # ensure the tree exists even when an attachment arrives before
                 # the first publish, with the same 0700 mode a publish would set.
-                paths = ensure_slug_jail(state.settings.data_dir, slug)
+                try:
+                    uid = resolve_jail_uid(
+                        state.settings.resolved_uids_file,
+                        slug,
+                        start=state.settings.jail_uid_start,
+                        end=state.settings.jail_uid_end,
+                        allow_unjailed=state.settings.allow_unjailed_spawn,
+                    )
+                except JailUnavailableError as err:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        f"notebook isolation unavailable: {err}",
+                    ) from err
+                except UidPoolExhaustedError as err:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, f"uid pool exhausted: {err}"
+                    ) from err
+                paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
                 final_path = paths.data / name
-                _atomic_write_bytes(final_path, body)
+                _atomic_write_bytes(final_path, body, owner_uid=uid)
                 return {
                     "slug": slug,
                     "name": name,
