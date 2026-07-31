@@ -11,8 +11,10 @@ import base64
 import hashlib
 import hmac
 import json
+import runpy
 import subprocess
 import unittest.mock
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,17 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from notebook_host.jail import SlugPaths, get_slug_paths
+
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
 
 _SECRET = "test-secret"
 
@@ -62,10 +75,16 @@ def _make_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClie
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
     settings = load_settings(_env_file=None)
 
     def spawner(
-        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
         m: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         m.poll.return_value = None

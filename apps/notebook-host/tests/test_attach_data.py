@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import runpy
 import subprocess
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from notebook_host.jail import SlugPaths, get_slug_paths
 
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
+
 AUTH = "Bearer test-secret"
 NO_AUTH = "Bearer wrong-secret"
 
@@ -28,7 +41,12 @@ def _make_stub_spawner() -> unittest.mock.MagicMock:
     """Return a stub spawner that records calls and returns a fake Popen."""
 
     def spawner(
-        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
         mock_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         mock_proc.poll.return_value = None
@@ -52,6 +70,7 @@ def _make_test_app(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner = _make_stub_spawner()
@@ -145,6 +164,33 @@ def test_atomic_write_cleans_tmp_on_partial_failure(
     monkeypatch.setattr(admin_module.os, "replace", real_replace)
     admin_module._atomic_write_bytes(target, b"recovered")  # pyright: ignore[reportPrivateUsage]
     assert target.read_bytes() == b"recovered"
+
+
+def test_put_data_before_publish_lands_under_data_dir_owned_by_resolved_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An attachment PUT before any publish creates data/<name>, chowned to the resolved uid.
+
+    Forces ``resolve_jail_uid`` to return this process's own uid rather than
+    going through the real jail-availability check — a self-chown succeeds
+    without root, so this exercises the real ``os.chown`` call end to end.
+    """
+    import notebook_host.admin as admin_mod
+
+    self_uid = os.getuid()
+    monkeypatch.setattr(admin_mod, "resolve_jail_uid", lambda *a, **kw: self_uid)  # noqa: ARG005
+
+    client, _, _, _ = _make_test_app(tmp_path, monkeypatch)
+    resp = client.put(
+        "/admin/notebooks/pre-publish/data/x.csv",
+        content=b"a,b\n1,2\n",
+        headers={"Authorization": AUTH},
+    )
+    assert resp.status_code == 200, f"attachment before publish should succeed; got {resp.text}"
+
+    final_path = get_slug_paths(tmp_path, "pre-publish").data / "x.csv"
+    assert final_path.exists(), "attachment should land under data_dir/<slug>/data/"
+    assert final_path.stat().st_uid == self_uid, "the file should be owned by the resolved uid"
 
 
 def test_put_data_does_not_spawn_marimo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

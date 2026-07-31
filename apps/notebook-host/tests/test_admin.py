@@ -7,9 +7,11 @@ are spawned. `wait_for_port` is monkeypatched at the module level to return True
 
 from __future__ import annotations
 
+import runpy
 import subprocess
 import time
 import unittest.mock
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,23 +21,40 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from notebook_host.jail import SlugPaths, get_slug_paths
 
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
+
 AUTH = "Bearer test-secret"
 NO_AUTH = "Bearer wrong-secret"
 
 
 def _make_stub_spawner(
     pid: int = 12345,
-) -> tuple[unittest.mock.MagicMock, list[tuple[str, SlugPaths, int]]]:
+) -> tuple[unittest.mock.MagicMock, list[tuple[str, SlugPaths, int, int | None]]]:
     """Return (stub_spawner, calls_log).
 
-    The stub records every (slug, paths, port) call and returns a Popen mock.
+    The stub records every (slug, paths, port, jail_uid) call and returns a
+    Popen mock.
     """
-    calls: list[tuple[str, SlugPaths, int]] = []
+    calls: list[tuple[str, SlugPaths, int, int | None]] = []
 
     def spawner(
-        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
-        calls.append((slug, paths, port))
+        calls.append((slug, paths, port, jail_uid))
         mock_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         mock_proc.poll.return_value = None  # alive
         mock_proc.pid = pid
@@ -67,6 +86,7 @@ def _make_test_app(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner, _ = _make_stub_spawner()
@@ -185,6 +205,7 @@ def test_put_existing_slug_kills_old_and_respawns(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner, calls = _make_stub_spawner()
@@ -284,6 +305,82 @@ def test_put_notebook_timeout_returns_504(tmp_path: Path, monkeypatch: pytest.Mo
     assert "slow-nb" not in state.processes, "registry should not contain the slug after timeout"
 
 
+# ─── fail-closed jail gate (D-05) ────────────────────────────────────────────
+# These deliberately do NOT call set_unjailed_test_env — they pin the
+# production default (fail-closed) rather than opting out of it.
+
+
+def test_put_notebook_returns_503_when_jail_unavailable_and_no_break_glass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that cannot jail refuses to publish (503) rather than serving unisolated."""
+    import notebook_host.admin as admin_mod
+    import notebook_host.jail as jail_mod
+    from notebook_host.admin import AdminState, create_admin_router
+    from notebook_host.config import load_settings
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    # allow_unjailed_spawn is deliberately left unset — production default (False).
+    settings = load_settings(_env_file=None)
+    monkeypatch.setattr(jail_mod, "can_apply_jail", lambda: False)
+
+    stub_spawner, _ = _make_stub_spawner()
+
+    async def _fake_wait(port: int, slug: str, timeout_s: float) -> bool:
+        return True
+
+    monkeypatch.setattr(admin_mod, "wait_for_port", _fake_wait)
+    state = AdminState(settings=settings, processes={}, spawner=stub_spawner)
+    app = FastAPI()
+    app.include_router(create_admin_router(state))
+    client = TestClient(app)
+
+    resp = client.put(
+        "/admin/notebooks/x", json={"source": "x = 1"}, headers={"Authorization": AUTH}
+    )
+    assert resp.status_code == 503, (
+        "an unjailable host must refuse to publish rather than serve unisolated"
+    )
+    assert "isolation" in resp.text.lower(), "the 503 detail should name the condition"
+
+
+def test_put_notebook_returns_200_when_break_glass_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same unjailable host publishes once the break-glass setting is on."""
+    import notebook_host.admin as admin_mod
+    import notebook_host.jail as jail_mod
+    from notebook_host.admin import AdminState, create_admin_router
+    from notebook_host.config import load_settings
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    set_unjailed_test_env(monkeypatch)
+    settings = load_settings(_env_file=None)
+    monkeypatch.setattr(jail_mod, "can_apply_jail", lambda: False)
+
+    stub_spawner, _ = _make_stub_spawner()
+
+    async def _fake_wait(port: int, slug: str, timeout_s: float) -> bool:
+        return True
+
+    monkeypatch.setattr(admin_mod, "wait_for_port", _fake_wait)
+    state = AdminState(settings=settings, processes={}, spawner=stub_spawner)
+    app = FastAPI()
+    app.include_router(create_admin_router(state))
+    client = TestClient(app)
+
+    resp = client.put(
+        "/admin/notebooks/x", json={"source": "x = 1"}, headers={"Authorization": AUTH}
+    )
+    assert resp.status_code == 200, "the break-glass opt-out should let an unjailable host publish"
+
+
 # ─── /admin/notebooks DELETE ─────────────────────────────────────────────────
 
 
@@ -301,6 +398,26 @@ def test_delete_notebook_returns_204(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert resp.status_code == 204, "DELETE should return 204"
     assert "del-me" not in state.processes, "registry should not contain del-me after DELETE"
     assert not (tmp_path / "del-me" / "notebook.py").exists(), "file should be removed after DELETE"
+
+
+def test_delete_notebook_releases_uid_from_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE releases the slug's uid back to the pool, not just kills the process."""
+    from notebook_host.jail import load_uid_registry, save_uid_registry
+
+    client, state, _ = _make_test_app(tmp_path, monkeypatch)
+    client.put("/admin/notebooks/del-uid", json={"source": "x=1"}, headers={"Authorization": AUTH})
+    # can_apply_jail() is False on this (unprivileged) test host, so the publish
+    # above ran unjailed and left no registry entry of its own — seed one
+    # directly to simulate a slug that a jailed host had previously allocated.
+    save_uid_registry(state.settings.resolved_uids_file, {"del-uid": 100042})
+
+    resp = client.delete("/admin/notebooks/del-uid", headers={"Authorization": AUTH})
+    assert resp.status_code == 204, "DELETE should return 204"
+
+    registry = load_uid_registry(state.settings.resolved_uids_file)
+    assert "del-uid" not in registry, "DELETE should release the slug's uid back to the pool"
 
 
 def test_delete_notebook_removes_source_attachment_and_workspace_in_one_call(
@@ -630,6 +747,7 @@ def test_admin_accepts_any_configured_bearer(
     monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRETS", "primary-token,backup-token")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner, _ = _make_stub_spawner()
@@ -678,6 +796,7 @@ def test_singular_admin_secret_still_works(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "legacy-token")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     assert len(settings.admin_secrets) == 1, (
@@ -738,7 +857,9 @@ def test_put_notebook_rejected_when_validation_fails(
     """A validator that reports failure → 422 with cell_errors, and no spawn."""
     from notebook_host.lifecycle import ValidationResult
 
-    def failing_validator(slug: str, paths: SlugPaths) -> ValidationResult:
+    def failing_validator(
+        slug: str, paths: SlugPaths, *, jail_uid: int | None = None
+    ) -> ValidationResult:
         return ValidationResult(
             ok=False,
             errors=["MultipleDefinitionError: The variable 'ax' was defined by another cell"],
@@ -767,7 +888,7 @@ def test_put_notebook_failed_validation_leaves_existing_notebook_running(
 
     results = [ValidationResult(ok=True), ValidationResult(ok=False, errors=["boom"])]
 
-    def validator(slug: str, paths: SlugPaths) -> ValidationResult:
+    def validator(slug: str, paths: SlugPaths, *, jail_uid: int | None = None) -> ValidationResult:
         return results.pop(0)
 
     client, state, stub_spawner = _make_test_app(tmp_path, monkeypatch, validator=validator)
@@ -797,7 +918,9 @@ def test_put_notebook_published_when_validation_passes(
 
     seen: list[tuple[str, str]] = []
 
-    def ok_validator(slug: str, paths: SlugPaths) -> ValidationResult:
+    def ok_validator(
+        slug: str, paths: SlugPaths, *, jail_uid: int | None = None
+    ) -> ValidationResult:
         seen.append((slug, paths.notebook.name))
         return ValidationResult(ok=True)
 

@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import runpy
 import subprocess
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 from notebook_host.jail import SlugPaths, get_slug_paths
+
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
 
 pytestmark = pytest.mark.asyncio
 
@@ -26,12 +40,18 @@ def _make_state(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8600")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8603")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
     settings = load_settings(_env_file=None)
 
     calls: list[tuple[str, SlugPaths, int, str]] = []
 
     def spawner(
-        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
         calls.append((slug, paths, port, mode))
         proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
@@ -179,6 +199,47 @@ async def test_sweep_once_reconciles_registered_blog_missing_from_processes(
     assert state.processes["pre-orphan"].is_alive(), "reconciled blog must be alive"
     assert calls[-1][3] == "run", "reconcile respawn must use run mode"
     assert mutated is True, "respawning an orphaned blog mutates state"
+
+
+# ─── fail-closed boot gate (D-05) ────────────────────────────────────────────
+# These deliberately do NOT call set_unjailed_test_env — they pin the
+# production default (fail-closed) rather than opting out of it.
+
+
+async def test_create_app_lifespan_raises_when_jail_unavailable_and_no_break_glass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that cannot jail refuses to boot at all, per D-05."""
+    import notebook_host.main as main_mod
+    from notebook_host.config import load_settings
+    from notebook_host.jail import JailUnavailableError
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    # allow_unjailed_spawn is deliberately left unset — production default (False).
+    settings = load_settings(_env_file=None)
+    monkeypatch.setattr(main_mod, "can_apply_jail", lambda: False)
+
+    with pytest.raises(JailUnavailableError), TestClient(main_mod.create_app(settings)):
+        pass
+
+
+async def test_create_app_lifespan_boots_when_break_glass_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same unjailable host boots once the break-glass setting is on."""
+    import notebook_host.main as main_mod
+    from notebook_host.config import load_settings
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    set_unjailed_test_env(monkeypatch)
+    settings = load_settings(_env_file=None)
+    monkeypatch.setattr(main_mod, "can_apply_jail", lambda: False)
+
+    with TestClient(main_mod.create_app(settings)) as client:
+        resp = client.get("/health")
+        assert resp.status_code == 200, "the break-glass opt-out should let an unjailable host boot"
 
 
 def _dead_proc() -> subprocess.Popen[bytes]:
