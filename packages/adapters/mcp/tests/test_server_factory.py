@@ -131,8 +131,7 @@ async def test_factory_omits_discord_tools_when_no_discord_settings(
     )
     mcp = app.state.mcp
     registered = {t.name for t in await mcp.local_provider.list_tools()}
-    # read_channel and search_messages are discord-only; send_message also
-    # exists in sessions tools so it is not a reliable discord discriminator.
+    # read_channel and search_messages are discord-only.
     discord_only_tools = {"read_channel", "search_messages"}
     assert not (registered & discord_only_tools), (
         "discord tools should not be registered without bot token"
