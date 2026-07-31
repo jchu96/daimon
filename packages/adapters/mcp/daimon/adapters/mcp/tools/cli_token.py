@@ -44,16 +44,15 @@ async def _get_cli_token_impl(
     """
     auth = await _auth(ctx)
     try:
-        # This token is handed to the agent's shell for transient gh/clone use
-        # and is never persisted, so opting into the operator service default
-        # is safe here.
+        # Resolves only a credential bound to this agent; the deployment-wide
+        # operator service default is never handed out here.
         token = await dispatch_mint_token(
             service=service,
             account_id=auth.account_id,
             agent_id=auth.agent_id,
             sessionmaker=runtime.session_factory,
             settings=runtime.settings,
-            allow_service_default=True,
+            allow_service_default=False,
         )
     except NoBindingError as e:
         logger.warning(
@@ -87,7 +86,9 @@ def register_cli_token_tool(mcp: FastMCP, runtime: McpRuntime) -> None:
     ) -> str:
         """Mint a short-lived CLI access token for the named service.
 
-        Returns the token as plaintext (e.g. for ``export GH_TOKEN=$(...)``).
-        See the ``cli-auth`` skill for env-var mappings.
+        Fails with a ``ToolError`` when the calling agent has no credential
+        bound for that service — see the ``cli-auth`` skill for the
+        per-agent binding flow. On success, returns the token as plaintext
+        (e.g. for ``export GH_TOKEN=$(...)``).
         """
         return await _get_cli_token_impl(runtime, ctx, service=service)
