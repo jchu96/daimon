@@ -1073,10 +1073,12 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Remove secret — always open: env-variable credentials are a
-        # per-agent attachment, not part of the agent spec. No refusal for any
-        # caller; is_admin/can_edit_spec are resolved only for the L1 stale
-        # fallback and the L2 re-render's build_l2_view kwargs.
+        # Remove secret — env-variable credentials are a per-agent attachment,
+        # so this routes through the shared-state gate rather than the spec
+        # gate: an admin may remove a secret from the built-in agent, but a
+        # non-admin may not remove one from any agent the workspace currently
+        # depends on. The is_admin resolved below is not that check — it feeds
+        # only the L1 stale fallback and the L2 re-render's build_l2_view kwargs.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__remove_secret":
             is_admin = await resolve_is_admin(
@@ -1089,6 +1091,17 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
 
             agent_name_for_remove = selected_agent_name or ""
             if not agent_name_for_remove:
+                return
+
+            if await gate.refuse_if_shared_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_remove,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             ma_agent = await find_agent_by_daimon_tag(
