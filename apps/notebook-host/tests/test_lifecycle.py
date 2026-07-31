@@ -53,6 +53,10 @@ def test_settings_defaults_match_documented_values() -> None:
     assert settings.data_dir == Path("/data/notebooks"), (
         "data_dir default should be Path('/data/notebooks')"
     )
+    assert settings.jail_uid_start == 100000, "jail_uid_start default should be 100000"
+    assert settings.jail_uid_end == 100999, "jail_uid_end default should be 100999"
+    assert settings.allow_unjailed_spawn is False, "allow_unjailed_spawn default should be False"
+    assert settings.uids_file is None, "uids_file default should be unset"
 
 
 def test_settings_env_override_applied(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,6 +88,38 @@ def test_resolved_blogs_file_honors_explicit_override(monkeypatch: pytest.Monkey
     settings = load_settings(_env_file=None)
     assert settings.resolved_blogs_file == Path("/tmp/custom-blogs.json"), (
         "explicit blogs_file path must be used verbatim"
+    )
+
+
+def test_resolved_uids_file_defaults_to_data_dir_uids_json() -> None:
+    """uids_file unset -> resolved_uids_file is data_dir / 'uids.json'."""
+    from notebook_host.config import load_settings
+
+    settings = load_settings(_env_file=None)
+    assert settings.resolved_uids_file == settings.data_dir / "uids.json", (
+        "default uid registry must live next to the source files on the volume"
+    )
+
+
+def test_resolved_uids_file_honors_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit DAIMON_NOTEBOOK__UIDS_FILE wins over the data_dir default."""
+    monkeypatch.setenv("DAIMON_NOTEBOOK__UIDS_FILE", "/tmp/custom-uids.json")
+    from notebook_host.config import load_settings
+
+    settings = load_settings(_env_file=None)
+    assert settings.resolved_uids_file == Path("/tmp/custom-uids.json"), (
+        "explicit uids_file path must be used verbatim"
+    )
+
+
+def test_allow_unjailed_spawn_env_override_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DAIMON_NOTEBOOK__ALLOW_UNJAILED_SPAWN=true reflects on resolved Settings."""
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ALLOW_UNJAILED_SPAWN", "true")
+    from notebook_host.config import load_settings
+
+    settings = load_settings(_env_file=None)
+    assert settings.allow_unjailed_spawn is True, (
+        "allow_unjailed_spawn should reflect the env override value"
     )
 
 

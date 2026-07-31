@@ -107,6 +107,29 @@ class Settings(BaseSettings):
     # 1 hour before SIGXCPU. Notebooks doing legitimate long-running compute
     # may need this raised. 0 disables the cap.
     marimo_rlimit_cpu_seconds: int = 3600
+    # Start of the per-slug uid pool range (inclusive). 1000 slots starting
+    # at 100000, verified free of any /etc/passwd entry in the
+    # python:3.12-slim base image. The concurrent ceiling is the 61-slot
+    # port pool; the range only has to cover concurrent notebooks plus
+    # permanent blogs, because a uid is released when its slug's tree is
+    # deleted.
+    jail_uid_start: int = 100000
+    # End of the per-slug uid pool range (inclusive).
+    jail_uid_end: int = 100999
+    # This is a break-glass setting for hosts that cannot apply the uid jail (non-root
+    # container, non-POSIX dev machine). Default False means such a host
+    # refuses to serve notebooks rather than serving them unisolated —
+    # deliberately NOT modelled on the RLIMIT gate above, which warns and
+    # degrades: that's acceptable for a resource cap and is not acceptable
+    # for an isolation boundary.
+    allow_unjailed_spawn: bool = False
+    # Path to the persisted uid registry. Host writes {slug: uid} whenever a
+    # new slug is jailed; ``None`` (default) means "use
+    # ``data_dir / 'uids.json'``" — keeps it on the same persistent volume
+    # as pids.json/blogs.json, same framing as pids_file/blogs_file below.
+    # It must live outside every slug root so no jailed process can read or
+    # rewrite it.
+    uids_file: Path | None = None
     # Path to the orphan-recovery pids file. Host writes {slug: PidRecord}
     # on every register/unregister; at startup, reads + reaps any live
     # PIDs that survived the previous host crash. ``None`` (default) means
@@ -127,6 +150,11 @@ class Settings(BaseSettings):
     def resolved_blogs_file(self) -> Path:
         """The actual blogs.json path: explicit setting, else data_dir / blogs.json."""
         return self.blogs_file if self.blogs_file is not None else self.data_dir / "blogs.json"
+
+    @property
+    def resolved_uids_file(self) -> Path:
+        """The actual uids.json path: explicit setting, else data_dir / uids.json."""
+        return self.uids_file if self.uids_file is not None else self.data_dir / "uids.json"
 
     # WebSocket Origin allowlist. Empty list = check disabled (suitable for
     # trusted-network deployments where the host isn't browser-reachable
