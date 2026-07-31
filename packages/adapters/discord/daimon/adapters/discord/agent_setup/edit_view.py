@@ -316,8 +316,14 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         # spec_editable gates the same controls on reachability instead: an
         # agent nobody has scoped is every member's scratchpad; once some
         # channel or the workspace points at it, only an admin may change its
-        # spec. Env vars and GitHub… are per-agent attachments, never part of
-        # the spec, so neither guard applies to them.
+        # spec. Env vars and GitHub… are per-agent attachments: they never
+        # enter the agent spec, so the is_system absolutism above does not
+        # apply to them — an admin binding a repo to the built-in agent is a
+        # supported first-run step. They are subject to their own shared-state
+        # guard instead, which refuses a non-admin whenever the target is a
+        # system agent or currently reachable. That is why their buttons render
+        # enabled while the spec controls render disabled: the refusal happens
+        # on click, not at render.
         is_system = bool(state.selected and state.selected.is_system)
         spec_editable = state.is_admin or not state.is_selected_reachable()
         spec_controls_disabled = is_system or not spec_editable
@@ -423,6 +429,14 @@ class EditView(ExpiringView, discord.ui.LayoutView):
 
     async def _on_github(self, interaction: discord.Interaction) -> None:
         log.info("agent_setup.edit.github.click", agent_name=self._selected_name())
+        # Refuse before the modal opens so a member who may not bind this
+        # agent's repo never types a GitHub token into a form that will be
+        # rejected. RepoAuthModal.on_submit re-checks; that call is the
+        # boundary, this one keeps the credential out of the payload.
+        if await authz.refuse_if_shared_and_not_admin(
+            interaction, runtime=self.runtime, entry=self.state.selected
+        ):
+            return
         await interaction.response.send_modal(
             RepoAuthModal(self.state, runtime=self.runtime, allowed_user_id=self.allowed_user_id)
         )
