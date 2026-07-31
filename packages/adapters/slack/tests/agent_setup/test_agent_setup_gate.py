@@ -7,6 +7,10 @@ Covers refuse_if_reachable_and_not_admin's four behaviors:
   - any caller, including an admin, against a defaults-managed agent ->
     refused, pointing at forking as the editable path
 
+and refuse_if_shared_and_not_admin's branch ordering, which differs in one
+place: the admin short-circuit runs first, so an admin can still attach a repo
+to the workspace's built-in agent.
+
 All cases use a real Postgres schema (db_session_factory) + the
 transport-level FakeSlackWebClient from conftest (no AsyncMock on
 client.* methods) for the Slack side, and real scoped_config_write rows
@@ -26,7 +30,10 @@ import pytest
 import yarl
 from aioresponses import aioresponses as AioResponsesMock
 from anthropic.types.beta import BetaManagedAgentsAgent
-from daimon.adapters.slack.agent_setup.gate import refuse_if_reachable_and_not_admin
+from daimon.adapters.slack.agent_setup.gate import (
+    refuse_if_reachable_and_not_admin,
+    refuse_if_shared_and_not_admin,
+)
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_MANAGED,
@@ -315,3 +322,276 @@ async def test_gate_refuses_a_workspace_admin_editing_the_defaults_managed_agent
         text = (kwargs.get("json") or {}).get("text", "")
         assert "built-in agent" in text, "ephemeral should say the agent is built in"
         assert "Fork" in text, "ephemeral should point at forking as the editable path"
+
+
+async def test_shared_gate_admin_passes_on_a_defaults_managed_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An admin may write attachments on the workspace's built-in agent.
+
+    Binding a repo to the built-in agent is the first-run onboarding step, so
+    the admin short-circuit has to run before the defaults-managed lookup. If
+    the two are ever reordered the lookup fires, the agent reads as managed,
+    and onboarding breaks -- which is what the MA call counter pins here.
+    """
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await session.commit()
+
+    ma_calls: list[str] = []
+    serve_seeded_agent = _seeded_agent_handler(tenant_id=tenant.id, agent_name=_AGENT_NAME)
+
+    def counting_handler(request: httpx.Request) -> httpx.Response:
+        ma_calls.append(request.url.path)
+        return serve_seeded_agent(request)
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _runtime_with_failing_sessionmaker()
+        object.__setattr__(runtime, "anthropic", build_fake_anthropic(counting_handler))
+
+        refused = await refuse_if_shared_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+        )
+
+        assert refused is False, (
+            "an admin must still be able to attach a repo to the built-in agent"
+        )
+        assert ma_calls == [], "the admin short-circuit must precede the defaults-managed lookup"
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        assert post_key not in mock.requests, "admin path must not post any ephemeral"
+
+
+async def test_shared_gate_admin_passes_on_a_reachable_agent_without_reading_the_database(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Admin caller on a workspace-default agent -> proceed, no DB read.
+
+    The agent is genuinely reachable in the database, but the runtime handed
+    to the gate raises if its sessionmaker is called, so a pass here proves the
+    admin short-circuit returns before the reachability read.
+    """
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await make_tenant_config(session, tenant=tenant, agent_name=_AGENT_NAME, mode="agent")
+        await session.commit()
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _runtime_with_failing_sessionmaker()
+
+        refused = await refuse_if_shared_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+        )
+
+        assert refused is False, "an admin caller must never be refused an attachment write"
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        assert post_key not in mock.requests, "admin path must not post any ephemeral"
+
+
+async def test_shared_gate_non_admin_refuses_on_a_defaults_managed_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Non-admin + the workspace's built-in agent -> refused, one ephemeral."""
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await session.commit()
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_non_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _build_runtime(db_session_factory)
+        object.__setattr__(
+            runtime,
+            "anthropic",
+            build_fake_anthropic(
+                _seeded_agent_handler(tenant_id=tenant.id, agent_name=_AGENT_NAME)
+            ),
+        )
+
+        refused = await refuse_if_shared_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+        )
+
+        assert refused is True, "a member must not rewrite the built-in agent's attachments"
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        matches = mock.requests.get(post_key, [])
+        assert len(matches) == 1, f"expected exactly one ephemeral, got {len(matches)}"
+
+        text = (matches[0][1].get("json") or {}).get("text", "")
+        assert "workspace-admin permission" in text, (
+            "ephemeral should name the permission the caller lacks"
+        )
+
+
+async def test_shared_gate_non_admin_refuses_on_a_reachable_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Non-admin + a workspace-default agent -> refused, one ephemeral."""
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await make_tenant_config(session, tenant=tenant, agent_name=_AGENT_NAME, mode="agent")
+        await session.commit()
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_non_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _build_runtime(db_session_factory)
+
+        refused = await refuse_if_shared_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+        )
+
+        assert refused is True, (
+            "a member must not repoint or overwrite a shared agent's attachments"
+        )
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        matches = mock.requests.get(post_key, [])
+        assert len(matches) == 1, f"expected exactly one ephemeral, got {len(matches)}"
+
+        text = (matches[0][1].get("json") or {}).get("text", "")
+        assert "workspace-admin permission" in text, (
+            "ephemeral should name the permission the caller lacks"
+        )
+
+
+async def test_shared_gate_non_admin_passes_on_an_unreachable_unmanaged_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Non-admin + an agent nothing resolves to -> proceed, no ephemeral.
+
+    An unreachable, unmanaged agent is not shared state, so its owner may
+    bind a repo or paste secrets without an admin.
+    """
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await session.commit()
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_non_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _build_runtime(db_session_factory)
+
+        refused = await refuse_if_shared_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+        )
+
+        assert refused is False, "an unshared agent's attachments stay member-writable"
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        assert post_key not in mock.requests, "pass-through case must not post any ephemeral"
+
+
+async def test_shared_gate_dev_allow_all_lets_a_non_admin_through(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """dev_allow_all=True treats a non-admin as admin, matching the spec gate."""
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        await make_tenant_config(session, tenant=tenant, agent_name=_AGENT_NAME, mode="agent")
+        await session.commit()
+
+    with AioResponsesMock() as mock:
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _USERS_INFO_PATTERN,
+            payload=_non_admin_users_info_payload(),
+            repeat=True,
+        )
+        mock.post(  # pyright: ignore[reportUnknownMemberType]
+            f"{_SLACK_API_BASE}/chat.postEphemeral",
+            payload={"ok": True},
+            repeat=True,
+        )
+        client = AsyncWebClient(token="xoxb-test")
+        runtime = _build_runtime(db_session_factory)
+
+        refused = await refuse_if_shared_and_not_admin(
+            runtime,
+            client,
+            tenant_id=tenant.id,
+            agent_name=_AGENT_NAME,
+            channel_id=_CHANNEL_ID,
+            user_id=_USER_ID,
+            dev_allow_all=True,
+        )
+
+        assert refused is False, "the dev admin-gate override must open the attachment gate too"
+
+        post_key = ("POST", yarl.URL(f"{_SLACK_API_BASE}/chat.postEphemeral"))
+        assert post_key not in mock.requests, "the override path must not post any ephemeral"
