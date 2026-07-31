@@ -38,6 +38,7 @@ async def test_set_binding_inserts_new_row(db_session: AsyncSession) -> None:
         repo_url="https://github.com/example/repo.git",
         default_branch="main",
         ma_secret_ref="secret-ref-1",
+        proof=None,
     )
 
     assert isinstance(row, AgentRepoBindingRow), "set_binding must return Pydantic, not ORM"
@@ -62,6 +63,7 @@ async def test_set_binding_overwrites_existing(db_session: AsyncSession) -> None
         repo_url="https://github.com/example/old.git",
         default_branch="main",
         ma_secret_ref="secret-old",
+        proof=None,
     )
 
     second = await set_binding(
@@ -71,6 +73,7 @@ async def test_set_binding_overwrites_existing(db_session: AsyncSession) -> None
         repo_url="https://github.com/example/new.git",
         default_branch="develop",
         ma_secret_ref="secret-new",
+        proof=None,
     )
 
     assert second.repo_url == "example/new", "upsert must overwrite repo_url (normalized form)"
@@ -125,6 +128,7 @@ async def test_get_binding_returns_row_when_bound(db_session: AsyncSession) -> N
         repo_url="https://github.com/example/repo.git",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     row = await get_binding(db_session, tenant_id=tenant.id, agent_id=agent_id)
@@ -158,6 +162,7 @@ async def test_clear_binding_removes_row(db_session: AsyncSession) -> None:
         repo_url="https://github.com/example/repo.git",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     await clear_binding(db_session, tenant_id=tenant.id, agent_id=agent_id)
@@ -189,6 +194,7 @@ async def test_tenant_cascade_deletes_binding(db_session: AsyncSession) -> None:
         repo_url="https://github.com/example/repo.git",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     await db_session.execute(sa.text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant.id})
@@ -212,6 +218,7 @@ async def test_cross_tenant_isolation(db_session: AsyncSession) -> None:
         repo_url="https://github.com/example/t1.git",
         default_branch="main",
         ma_secret_ref="secret-t1",
+        proof=None,
     )
 
     # Same agent_id under tenant 2 must not see tenant 1's binding.
@@ -244,6 +251,7 @@ async def test_set_binding_normalizes_repo_url(db_session: AsyncSession) -> None
         repo_url="https://github.com/owner/repo.git",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     assert row.repo_url == "owner/repo", (
@@ -268,6 +276,7 @@ async def test_get_bindings_for_repo_normalizes(db_session: AsyncSession) -> Non
         repo_url="https://github.com/owner/repo.git",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     rows = await get_bindings_for_repo(db_session, repo_url="owner/repo")
@@ -295,6 +304,7 @@ async def test_get_bindings_for_repo_returns_all_tenants(db_session: AsyncSessio
         repo_url="org/shared-starter",
         default_branch="main",
         ma_secret_ref="secret-t1",
+        proof=None,
     )
     await set_binding(
         db_session,
@@ -303,6 +313,7 @@ async def test_get_bindings_for_repo_returns_all_tenants(db_session: AsyncSessio
         repo_url="org/shared-starter",
         default_branch="main",
         ma_secret_ref="secret-t2",
+        proof=None,
     )
 
     rows = await get_bindings_for_repo(db_session, repo_url="org/shared-starter")
@@ -334,6 +345,7 @@ async def test_update_last_sync_persists(db_session: AsyncSession) -> None:
         repo_url="org/my-repo",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     sync_time = datetime(2026, 5, 30, 12, 0, 0, tzinfo=UTC)
@@ -372,6 +384,7 @@ async def test_update_last_sync_clears_error(db_session: AsyncSession) -> None:
         repo_url="org/my-repo",
         default_branch="main",
         ma_secret_ref="secret-ref",
+        proof=None,
     )
 
     # Set an error first.
@@ -431,6 +444,7 @@ async def test_update_repo_and_branch_keep_secret_preserves_ma_secret_ref(
         repo_url="https://github.com/example/old.git",
         default_branch="main",
         ma_secret_ref=f"inline-pat:{agent_id}",
+        proof=None,
     )
 
     updated = await update_repo_and_branch_keep_secret(
@@ -469,6 +483,7 @@ async def test_update_repo_and_branch_keep_secret_normalizes_repo_url(
         repo_url="owner/old-repo",
         default_branch="main",
         ma_secret_ref="anon:",
+        proof=None,
     )
 
     updated = await update_repo_and_branch_keep_secret(
@@ -562,6 +577,7 @@ async def test_set_binding_without_proof_on_existing_proven_row_clears_proof(
         repo_url="owner/repo",
         default_branch="main",
         ma_secret_ref="secret-ref-2",
+        proof=None,
     )
 
     assert rebound.proof_kind is None, (
@@ -627,6 +643,7 @@ async def test_copy_binding_on_proofless_source_yields_proofless_target(
         repo_url="owner/repo",
         default_branch="main",
         ma_secret_ref="source-secret",
+        proof=None,
     )
 
     target = await copy_binding(
@@ -801,6 +818,7 @@ async def test_list_bindings_without_proof_returns_only_proofless_rows_across_te
         repo_url="owner/proofless-a",
         default_branch="main",
         ma_secret_ref="secret-a",
+        proof=None,
     )
     await set_binding(
         db_session,
@@ -809,6 +827,7 @@ async def test_list_bindings_without_proof_returns_only_proofless_rows_across_te
         repo_url="owner/proofless-b",
         default_branch="main",
         ma_secret_ref="secret-b",
+        proof=None,
     )
 
     rows = await list_bindings_without_proof(db_session)
@@ -839,6 +858,7 @@ async def test_record_proof_overwrites_proof_without_altering_repo_or_secret(
         repo_url="owner/repo",
         default_branch="main",
         ma_secret_ref=f"inline-pat:{agent_id}",
+        proof=None,
     )
 
     fresh_proof = RepoAccessProof(
@@ -912,3 +932,51 @@ async def test_repo_edit_then_record_proof_in_one_transaction_leaves_new_repo_an
     assert final.proof_kind == "pat", "the freshly recorded proof must stick"
     assert final.proof_at == new_proof.at, "the freshly recorded proof's timestamp must stick"
     assert final.proof_account_id == account.id
+
+
+# ---------------------------------------------------------------------------
+# proof keyword is required — no default
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_binding_raises_typeerror_when_proof_omitted(
+    db_session: AsyncSession,
+) -> None:
+    """The runtime face of the compile-time contract: proof has no default,
+    so calling set_binding without it is a TypeError, not a silent NULL."""
+    tenant = await make_tenant(db_session)
+
+    with pytest.raises(TypeError):
+        await set_binding(  # type: ignore[call-arg]
+            db_session,
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            repo_url="owner/repo",
+            default_branch="main",
+            ma_secret_ref="secret-ref",
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_binding_explicit_proof_none_writes_all_three_columns_null(
+    db_session: AsyncSession,
+) -> None:
+    """Passing proof=None explicitly must stay writable: it is the state
+    pre-migration rows carry and clearing proof on a repo change relies on."""
+    tenant = await make_tenant(db_session)
+    agent_id = uuid.uuid4()
+
+    row = await set_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        repo_url="owner/repo",
+        default_branch="main",
+        ma_secret_ref="secret-ref",
+        proof=None,
+    )
+
+    assert row.proof_kind is None, "explicit proof=None must leave proof_kind NULL"
+    assert row.proof_at is None, "explicit proof=None must leave proof_at NULL"
+    assert row.proof_account_id is None, "explicit proof=None must leave proof_account_id NULL"

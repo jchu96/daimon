@@ -775,6 +775,7 @@ async def _seed_repo_binding_with_pat(
         repo_url=repo_url,
         default_branch=default_branch,
         ma_secret_ref="anon:",
+        proof=RepoAccessProof(kind="pat", at=datetime(2026, 5, 1, tzinfo=UTC), account_id=None),
     )
     # Per-agent credential overlay: agent_uuid → principal_id.
     await github_binding_store.set_agent_github_binding(

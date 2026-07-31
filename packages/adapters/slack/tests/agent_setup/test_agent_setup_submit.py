@@ -1717,6 +1717,7 @@ async def test_run_edit_repo_submission_blank_pat_stored_token_cannot_access_new
             repo_url="https://github.com/example/old-repo.git",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{agent_uuid}",
+            proof=None,
         )
         await session.commit()
 
@@ -1798,6 +1799,7 @@ async def test_run_edit_repo_submission_blank_pat_repoints_vault_credential_ref_
             repo_url="https://github.com/example/vault-old.git",
             default_branch="main",
             ma_secret_ref=vault_ref,
+            proof=None,
         )
         await session.commit()
     assert seeded.proof_kind is None, "the seeded binding must start with no proof recorded"

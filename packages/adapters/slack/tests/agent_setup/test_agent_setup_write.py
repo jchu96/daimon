@@ -458,6 +458,7 @@ async def test_fork_agent_rekeys_source_credential_onto_fork(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []
@@ -528,6 +529,7 @@ async def test_fork_agent_raises_when_source_credential_unresolvable(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []
@@ -578,6 +580,7 @@ async def test_fork_agent_copies_anon_binding_without_error_or_credential_write(
             repo_url="github.com/acme/public-repo",
             default_branch="main",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []

@@ -41,7 +41,7 @@ async def set_binding(
     repo_url: str,
     default_branch: str,
     ma_secret_ref: str,
-    proof: RepoAccessProof | None = None,
+    proof: RepoAccessProof | None,
 ) -> AgentRepoBindingRow:
     """Upsert the per-agent repo binding (1:1). Returns the post-write row.
 
@@ -49,13 +49,15 @@ async def set_binding(
     reverse lookup (get_bindings_for_repo) always matches canonical 'owner/repo'.
 
     `proof` records what the caller established about repo access at bind
-    time; callers must supply the proof they established at bind time. Both
-    the insert values and the conflict-path set_ clause write all three proof
-    columns unconditionally — a re-bind that supplies no proof clears any
-    stale proof rather than silently inheriting the previous bind's. The
-    `= None` default is temporary: it exists only so pre-existing callers
-    that have not yet been threaded with a proof continue to compile; every
-    production caller is expected to pass one explicitly.
+    time. It has no default: every caller must state what it established,
+    because a write that silently elides proof is a write that should not
+    happen. Passing `None` explicitly is the one legitimate way to record
+    that no proof was established — pre-migration rows carry it, and clearing
+    proof on a repo change is correct behavior — but it must be said, not
+    defaulted into. Both the insert values and the conflict-path set_ clause
+    write all three proof columns unconditionally, so a re-bind that states
+    an explicitly-absent proof clears any stale proof rather than silently
+    inheriting the previous bind's.
     """
     normalized_url = _normalize_owner_repo(repo_url)
     proof_kind = proof.kind if proof is not None else None

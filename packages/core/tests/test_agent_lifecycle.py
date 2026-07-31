@@ -88,6 +88,7 @@ async def test_copy_rekeys_inline_pat_source_onto_fork(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     await copy_credential_and_repo_binding(
@@ -142,6 +143,7 @@ async def test_copy_raises_when_source_credential_unresolvable(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     with pytest.raises(DaimonError, match="github git-proxy"):
@@ -201,6 +203,7 @@ async def test_copy_raises_even_with_operator_fallback_configured(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     with pytest.raises(DaimonError, match="github git-proxy"):
@@ -240,6 +243,7 @@ async def test_copy_anon_binding_without_error_or_credential_write(
             repo_url="github.com/acme/public-repo",
             default_branch="main",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     fernet_key = Fernet.generate_key().decode()
@@ -300,6 +304,7 @@ async def test_copy_rewrites_secret_ref_for_inline_pat(
             repo_url="https://github.com/acme/private-repo",
             default_branch="develop",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     await copy_credential_and_repo_binding(
@@ -469,6 +474,7 @@ async def test_copy_leaves_fork_proof_null_when_source_proof_is_null(
             repo_url="github.com/acme/unproven-repo",
             default_branch="main",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     fernet_key = Fernet.generate_key().decode()

@@ -464,6 +464,7 @@ async def test_get_repo_binding_returns_public_projection(
             repo_url="https://github.com/o/r",
             default_branch="trunk",
             ma_secret_ref="cred_seeded",
+            proof=None,
         )
 
     runtime = _runtime(committing_sessionmaker)
@@ -505,6 +506,7 @@ async def test_clear_repo_binding_removes_row_and_calls_vault_delete(
             repo_url="https://github.com/o/r",
             default_branch="main",
             ma_secret_ref="cred_to_delete",
+            proof=None,
         )
 
     record: list[tuple[str, str, dict[str, Any]]] = []
@@ -557,6 +559,7 @@ async def test_clear_repo_binding_swallows_vault_delete_failure(
             repo_url="https://github.com/o/r",
             default_branch="main",
             ma_secret_ref="cred_will_500",
+            proof=None,
         )
 
     client = _make_stub_anthropic_for_vaults(account_id=account_id, delete_status=500)
@@ -795,6 +798,7 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
             repo_url="https://github.com/o/r-old",
             default_branch="main",
             ma_secret_ref="old-cred-id",
+            proof=None,
         )
 
     async def _fake_mint(**_kwargs: object) -> str:

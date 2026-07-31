@@ -81,6 +81,7 @@ async def _seed_bound_pat(
             repo_url=repo_url,
             default_branch="main",
             ma_secret_ref=f"inline-pat:{agent_id}",
+            proof=None,
         )
 
 
@@ -174,6 +175,7 @@ async def test_resolve_sync_token_returns_fallback_for_tenant_binding_with_no_ov
             repo_url=url,
             default_branch="main",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     settings = _minimal_settings(fallback_pat=SecretStr("ghp_operator_fallback"))

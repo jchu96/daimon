@@ -74,6 +74,7 @@ from daimon.core.headless_runner import LAST_RESULT_TAIL_MAX, run_turn
 from daimon.core.stores import agent_github_binding as github_binding_store
 from daimon.core.stores import agent_repo_binding as repo_binding_store
 from daimon.core.stores.agent_files import put_agent_file
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
@@ -812,6 +813,9 @@ async def test_run_turn_mounts_repo_resource_when_bound_and_pat_present(
         repo_url="https://github.com/example-org/example-repo",
         default_branch="main",
         ma_secret_ref="anon:",
+        proof=RepoAccessProof(
+            kind="pat", at=dt.datetime(2026, 5, 1, tzinfo=dt.UTC), account_id=None
+        ),
     )
     await github_binding_store.set_agent_github_binding(
         db_session, agent_id=agent_uuid, principal_id=agent_uuid
@@ -871,6 +875,9 @@ async def test_run_turn_provisions_copilot_credential_from_pat(
         repo_url="https://github.com/example-org/example-repo",
         default_branch="main",
         ma_secret_ref="anon:",
+        proof=RepoAccessProof(
+            kind="pat", at=dt.datetime(2026, 5, 1, tzinfo=dt.UTC), account_id=None
+        ),
     )
     await github_binding_store.set_agent_github_binding(
         db_session, agent_id=agent_uuid, principal_id=agent_uuid
