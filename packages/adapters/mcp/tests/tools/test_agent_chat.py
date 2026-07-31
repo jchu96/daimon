@@ -307,7 +307,7 @@ async def test_narrowing_agent_id_claim_returns_only_agent_chat_tools() -> None:
     mcp.add_transform(Visibility(False, tags={"agent-chat"}))
 
     runtime = _runtime(client, session_factory=mock_sessionmaker)
-    register_agent_chat_tools(mcp, runtime)
+    register_agent_chat_tools(mcp, runtime, billing_config=None)
 
     # Add a representative admin tool to verify it remains hidden
     @mcp.tool(tags={"admin"})  # pyright: ignore[reportArgumentType]
@@ -372,7 +372,7 @@ def _full_stack_mcp(token: str, claims: dict[str, str]) -> FastMCP:
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda _r, _m: list_response([]))
     runtime = _runtime(build_fake_anthropic(router.dispatch), session_factory=mock_sessionmaker)
-    register_agent_chat_tools(mcp, runtime)
+    register_agent_chat_tools(mcp, runtime, billing_config=None)
 
     @mcp.tool(tags={"admin"})  # pyright: ignore[reportArgumentType]
     async def list_agents_admin() -> str:  # pyright: ignore[reportUnusedFunction]
@@ -814,7 +814,7 @@ async def test_agent_chat_tools_have_no_agent_id_parameter() -> None:
 
     mcp = FastMCP(name="test")
     runtime = _runtime(client)
-    register_agent_chat_tools(mcp, runtime)
+    register_agent_chat_tools(mcp, runtime, billing_config=None)
 
     agent_chat_names = {
         "describe_agent",
@@ -1066,7 +1066,7 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
     )
     mcp.add_transform(Visibility(False, tags={"agent-chat"}))
     runtime = _runtime(build_fake_anthropic(router.dispatch), session_factory=mock_sessionmaker)
-    register_agent_chat_tools(mcp, runtime)
+    register_agent_chat_tools(mcp, runtime, billing_config=None)
 
     result = await _call_tool_via_http(
         mcp.http_app(), token, "list_events", {"handle": "ses_test001"}
