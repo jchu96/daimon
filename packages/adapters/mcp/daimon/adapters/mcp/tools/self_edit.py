@@ -77,6 +77,18 @@ class AgentRepoBindingPublic(BaseModel):
         )
 
 
+# Secret refs the setup panels write are not MA vault entries: ``anon:`` marks a
+# public repo with no stored secret, and ``inline-pat:`` points at an encrypted
+# row in our own database. Anything else is the id of a vault credential this
+# module created, and revoking the binding means deleting it.
+_NON_VAULT_SECRET_REF_PREFIXES = ("anon:", "inline-pat:")
+
+
+def _is_vault_credential_ref(ma_secret_ref: str) -> bool:
+    """True when the binding's secret ref names an MA vault credential."""
+    return not ma_secret_ref.startswith(_NON_VAULT_SECRET_REF_PREFIXES)
+
+
 def _require_agent_id(auth: AuthIdentity) -> uuid.UUID:
     """Return ``auth.agent_id`` or raise ``ToolError`` if absent."""
     if auth.agent_id is None:
@@ -197,8 +209,10 @@ async def _set_repo_binding_impl(
     """Bind the calling agent to a git repo.
 
     Order of operations: mint PAT → vault credential create → DB row
-    write → best-effort old vault credential delete. Vault upload happens
-    BEFORE the DB write so a vault failure leaves no binding row.
+    write → old vault credential delete. Vault upload happens BEFORE the DB
+    write so a vault failure leaves no binding row. The rebind is committed
+    before the old credential is revoked, so a revocation failure raises
+    against an already-updated binding rather than rolling it back.
     """
     agent_id = _require_agent_id(auth)
 
@@ -299,19 +313,27 @@ async def _set_repo_binding_impl(
             )
         raise
 
-    # 6. Best-effort delete old vault cred AFTER DB commit.
-    if old_ref is not None and old_ref != new_cred.id:
+    # 6. Delete the credential the previous binding pointed at, AFTER DB commit.
+    #    A failure here means that token is still live with nothing pointing at
+    #    it any more — most likely because the previous binding was made from a
+    #    different account, whose vault this caller cannot reach. The rebind
+    #    itself stands; say so rather than reporting a clean success.
+    if old_ref is not None and _is_vault_credential_ref(old_ref) and old_ref != new_cred.id:
         try:
             await runtime.client.beta.vaults.credentials.delete(
                 old_ref,
                 vault_id=vault_id,
             )
-        except anthropic.APIError:
+        except anthropic.APIError as e:
             logger.warning(
-                "set_repo_binding outcome=orphan_old_vault_cred agent=%s",
+                "set_repo_binding outcome=orphan_old_vault_cred agent=%s cred=%s",
                 agent_id,
+                old_ref,
             )
-            # Orphan acceptable; new credential is already live.
+            raise ToolError(
+                "the repo is now bound, but the credential from the previous binding "
+                "could not be revoked and is still live"
+            ) from e
 
     logger.info(
         "set_repo_binding outcome=success service=%s account=%s agent=%s",
@@ -347,10 +369,17 @@ async def _clear_repo_binding_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
 ) -> dict[str, bool]:
-    """Remove the binding. Idempotent and tolerant of vault delete failure."""
+    """Remove the binding, revoking the credential it points at.
+
+    Idempotent when no binding exists. Refuses when the stored credential
+    cannot be revoked: the binding row is per (tenant, agent) while the vault
+    is per (account, agent), so a caller from a different account than the one
+    that bound the repo resolves a different vault — or none — and deleting the
+    row there would drop the only pointer to a token that is still live.
+    """
     agent_id = _require_agent_id(auth)
 
-    # Read the binding to capture the vault ref for best-effort cleanup.
+    # Read the binding to capture the ref of the credential to revoke.
     async with runtime.session_factory() as session:
         existing = await get_binding(
             session,
@@ -369,30 +398,39 @@ async def _clear_repo_binding_impl(
         )
         return {"cleared": True}
 
-    # Best-effort vault delete. Narrow the ToolError catch to the
-    # lookup only — if credentials.delete itself ever raised ToolError it would
-    # be the wrong outcome label.
-    try:
-        vault_id = await _vault_id_for_agent(
-            runtime.client, account_id=auth.account_id, agent_id=agent_id
-        )
-    except ToolError:
-        # No vault for this account — nothing to delete remotely.
-        logger.warning(
-            "clear_repo_binding outcome=no_vault_to_clean agent=%s",
-            agent_id,
-        )
-    else:
+    # Revocation must actually revoke. Both failure modes below mean the token
+    # this binding points at survives, so neither may reach the row delete.
+    # Narrow the ToolError catch to the lookup only — if credentials.delete
+    # itself ever raised ToolError it would be the wrong outcome label.
+    if _is_vault_credential_ref(existing.ma_secret_ref):
+        try:
+            vault_id = await _vault_id_for_agent(
+                runtime.client, account_id=auth.account_id, agent_id=agent_id
+            )
+        except ToolError as e:
+            logger.warning(
+                "clear_repo_binding outcome=no_vault_to_revoke_from agent=%s",
+                agent_id,
+            )
+            raise ToolError(
+                "the stored credential cannot be revoked from this account, so the "
+                "binding was left in place — clear it from the account that bound it"
+            ) from e
         try:
             await runtime.client.beta.vaults.credentials.delete(
                 existing.ma_secret_ref,
                 vault_id=vault_id,
             )
-        except anthropic.APIError:
+        except anthropic.APIError as e:
             logger.warning(
-                "clear_repo_binding outcome=vault_delete_failed agent=%s",
+                "clear_repo_binding outcome=vault_delete_failed agent=%s cred=%s",
                 agent_id,
+                existing.ma_secret_ref,
             )
+            raise ToolError(
+                "the stored credential could not be revoked and is still live, so the "
+                "binding was left in place"
+            ) from e
 
     # Delete DB row. We already know `existing` is not None, so clear_binding
     # has a row to clear — let any StoreError propagate.
