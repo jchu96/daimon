@@ -25,6 +25,10 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+_REGISTRY_MODE = 0o600
+"""Explicit mode for pids.json — host-owned process state, not meant to be
+readable by any jailed slug now that ``data_dir`` is traversable (0711)."""
+
 
 class PidRecord(BaseModel):
     slug: str
@@ -64,12 +68,15 @@ def save_pids(path: Path, records: dict[str, PidRecord]) -> None:
     """Atomically rewrite the pids file (tmp + rename).
 
     The rename is atomic on the same filesystem, so a host crash mid-write
-    leaves either the old file or the new — never a truncated file.
+    leaves either the old file or the new — never a truncated file. The tmp
+    file is locked to ``_REGISTRY_MODE`` (0600) before that rename, not
+    after — no window where a freshly written pids file is world-readable.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     payload = {slug: rec.model_dump() for slug, rec in records.items()}
     tmp.write_text(json.dumps(payload, indent=2))
+    os.chmod(tmp, _REGISTRY_MODE)
     os.replace(tmp, path)
 
 

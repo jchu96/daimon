@@ -31,12 +31,11 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from notebook_host.jail import resolve_jail_uid
+from notebook_host.jail import SLUG_TREE_MODE, lock_data_dir_root, resolve_jail_uid
 from notebook_host.lifecycle import safe_slug
 
 _log = logging.getLogger(__name__)
 
-_TREE_MODE = 0o700
 _STAGING_PREFIX = ".migrating-"
 
 
@@ -54,17 +53,18 @@ def migrate_flat_layout(
     fully migrated). Must be called before anything else touches ``data_dir``
     — nothing here is safe to run concurrently with a spawn or a request.
 
-    ``data_dir`` itself is locked to ``0700`` as the very first step, before
-    any per-slug directory is created or chowned, so there is never a window
-    where a freshly jailed slug sits inside a still-traversable parent
-    alongside not-yet-migrated flat siblings.
+    ``data_dir`` itself is locked to ``jail.DATA_DIR_MODE`` (0711 — traversable,
+    not listable) as the very first step, before any per-slug directory is
+    created or chowned, so there is never a window where a freshly jailed
+    slug sits inside a still-unlocked parent alongside not-yet-migrated flat
+    siblings.
 
     ``UidPoolExhaustedError`` and ``JailUnavailableError`` (from
     ``resolve_jail_uid``) are allowed to propagate uncaught: a migration that
     cannot isolate every legacy slug must abort the boot rather than leave
     some of them unjailed.
     """
-    os.chmod(data_dir, _TREE_MODE)
+    lock_data_dir_root(data_dir)
 
     migrated: list[str] = []
 
@@ -112,12 +112,12 @@ def migrate_flat_layout(
 
         staging = data_dir / f"{_STAGING_PREFIX}{slug}"
         staging.mkdir(exist_ok=True)
-        os.chmod(staging, _TREE_MODE)
+        os.chmod(staging, SLUG_TREE_MODE)
 
         for name in ("workspace", "home"):
             d = staging / name
             d.mkdir(exist_ok=True)
-            os.chmod(d, _TREE_MODE)
+            os.chmod(d, SLUG_TREE_MODE)
 
         data = staging / "data"
         legacy_data = data_dir / f"{slug}.data"
@@ -125,7 +125,7 @@ def migrate_flat_layout(
             os.rename(legacy_data, data)
         elif not data.exists():
             data.mkdir()
-        os.chmod(data, _TREE_MODE)
+        os.chmod(data, SLUG_TREE_MODE)
 
         # Last: the source move is what marks staging as "complete" for pass
         # 1's resume predicate above, so it must happen only after every

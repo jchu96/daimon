@@ -15,6 +15,15 @@ uid-resolution/privilege-drop functions are the only filesystem/process I/O
 (mkdir, chmod, chown, rmtree, and dropping into another uid — no clock, no
 network).
 
+``data_dir`` itself must be traversable (mode 0711, ``DATA_DIR_MODE`` below) so
+a dropped uid can resolve an absolute path down into its own subtree — Linux
+requires the ``x`` bit on every path component, including ones the caller
+doesn't otherwise need to read. It must not be listable, so a jailed process
+can reach a path it already knows but cannot enumerate sibling slugs. This is
+strictly weaker than the per-slug boundary (``SLUG_TREE_MODE``, still 0700)
+and does not change it: the parent grants traversal only, ownership of every
+subtree stays exclusive to that slug's uid.
+
 Two documented limitations of the uid split, deliberately not worked around:
 
 1. Allocated uids have no ``/etc/passwd`` entry. ``uv``/``marimo`` do not need
@@ -38,7 +47,44 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-_TREE_MODE = 0o700
+SLUG_TREE_MODE = 0o700
+"""Mode for each slug's four owned directories (root, data, workspace, home).
+
+This is the real isolation boundary: only the slug's own uid (chowned by
+``ensure_slug_jail``) can read, write, or traverse it.
+"""
+
+DATA_DIR_MODE = 0o711
+"""Mode for ``data_dir`` itself — traversable by any uid, listable by none.
+
+Corrected 2026-07-31: a live container rehearsal (plan 05) proved ``0700``
+denies a dropped uid traversal into its OWN subtree, since resolving an
+absolute path requires the ``x`` bit on every path component. ``0711`` fixes
+that while keeping ``data_dir`` unlistable (no ``r`` bit), so a jailed
+process can reach a path it already knows but cannot enumerate other slugs.
+``migration.py`` must use this exact value — call ``lock_data_dir_root``
+rather than chmod'ing ``data_dir`` with a locally-defined mode, so the two
+can never drift apart.
+"""
+
+_REGISTRY_MODE = 0o600
+"""Mode for host-owned registry files (uids.json here; blogs.json/pids.json
+in their own modules). Explicit because under ``DATA_DIR_MODE`` the parent no
+longer hides them via its own unlistability, and the file's default-umask
+mode (0644) would otherwise leave it world-readable. ``blogs.json`` in
+particular lists every slug, and per D-04 the slug is the only access control
+on the unauthenticated ``/n/{slug}/*`` proxy — reading it hands out every
+other notebook's URL."""
+
+
+def lock_data_dir_root(data_dir: Path) -> None:
+    """Chmod ``data_dir`` itself to ``DATA_DIR_MODE``. Idempotent; call on every boot.
+
+    The single place this mode is ever applied — callers (``migration.py``)
+    must go through this function instead of chmod'ing ``data_dir`` directly,
+    so the parent's mode can't silently drift from the slug tree's.
+    """
+    os.chmod(data_dir, DATA_DIR_MODE)
 
 
 @dataclass(frozen=True)
@@ -95,7 +141,7 @@ def ensure_slug_jail(data_dir: Path, slug: str, *, uid: int | None = None) -> Sl
     dirs = (paths.root, paths.data, paths.workspace, paths.home)
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
-        os.chmod(d, _TREE_MODE)
+        os.chmod(d, SLUG_TREE_MODE)
         if uid is not None:
             os.chown(d, uid, uid)
     return paths
@@ -166,10 +212,16 @@ def load_uid_registry(path: Path) -> dict[str, int]:
 
 
 def save_uid_registry(path: Path, records: dict[str, int]) -> None:
-    """Atomically rewrite the uid registry (tmp + rename), same idiom as save_pids."""
+    """Atomically rewrite the uid registry (tmp + rename), same idiom as save_pids.
+
+    The tmp file is locked to ``_REGISTRY_MODE`` (0600) before the rename, not
+    after — so there is never a window where a freshly written or rewritten
+    registry is briefly world-readable under the default umask.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(records, indent=2))
+    os.chmod(tmp, _REGISTRY_MODE)
     os.replace(tmp, path)
 
 
