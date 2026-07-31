@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 import anthropic
@@ -47,17 +48,29 @@ from daimon.adapters.slack.agent_setup.write import (
     create_blank_agent,
     fork_agent,
     kick_off_skill_sync,
+    load_agent_inline_pat,
+    mask_tail,
+    owner_repo_from_url,
     store_inline_pat,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
-from daimon.core.errors import DaimonError
+from daimon.core.errors import DaimonError, StoreError
+from daimon.core.github_visibility import is_public_repo, pat_can_access_repo
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_files import put_agent_file
+from daimon.core.stores.agent_repo_binding import (
+    record_proof,
+    update_repo_and_branch_keep_secret,
+)
+from daimon.core.stores.agent_repo_binding import (
+    set_binding as set_agent_repo_binding,
+)
+from daimon.core.stores.domain import RepoAccessProof
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.exc import SQLAlchemyError
@@ -776,6 +789,12 @@ async def run_edit_repo_submission(
     enter the agent spec, so this form is open to every workspace member —
     including against the workspace's current default agent. Blank PAT
     field = keep stored token (never overwrites).
+
+    No binding write happens without a successful GitHub probe against the
+    exact repo being bound: a pasted token must prove it can read the repo
+    before it is stored or bound; a blank-token bind is allowed only against
+    a repo the agent's existing stored token can read, or that anyone can
+    read.
     """
     try:
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
@@ -796,32 +815,131 @@ async def run_edit_repo_submission(
 
         pat: str | None = extra.get("pat")  # type: ignore[assignment]
         pat_replace: bool = bool(extra.get("pat_replace"))
+        repo_url: str | None = extra.get("repo_url")  # type: ignore[assignment]
+        now = datetime.now(UTC)
 
-        if pat_replace and pat:
-            # Only replace when the user explicitly typed a new value.
+        if pat_replace and pat and repo_url:
+            # A new token AND a repo were submitted together — the check runs
+            # BEFORE the token is stored or any binding is written.
+            owner_repo = owner_repo_from_url(repo_url)
+            has_access = await pat_can_access_repo(
+                runtime.http_client, owner_repo=owner_repo, pat=pat
+            )
+            if not has_access:
+                await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+                    channel=channel_id,
+                    user=user_id,
+                    text=(
+                        ":x: That token has no access to this repo (or the repo "
+                        "doesn't exist). Paste a token that can read it."
+                    ),
+                )
+                return
             await store_inline_pat(
                 runtime,
                 account_id=account_id,
                 agent_id=agent_uuid,
                 plaintext_pat=pat,
             )
-            from daimon.adapters.slack.agent_setup.write import mask_tail
-
             log.info(
                 "slack.agent_setup.edit_repo.pat_replaced",
                 team_id=team_id,
                 agent_name=agent_name,
                 masked=mask_tail(pat),
             )
-
-        repo_url: str | None = extra.get("repo_url")  # type: ignore[assignment]
-        if repo_url:
-            if pat_replace:
-                # A new PAT was typed — replace-the-secret path.
-                from daimon.core.stores.agent_repo_binding import (
-                    set_binding as set_agent_repo_binding,
+            async with runtime.sessionmaker.begin() as session:
+                await set_agent_repo_binding(
+                    session,
+                    tenant_id=tenant_id,
+                    agent_id=agent_uuid,
+                    repo_url=repo_url,
+                    default_branch="main",
+                    ma_secret_ref=f"inline-pat:{agent_uuid}",
+                    proof=RepoAccessProof(kind="pat", at=now, account_id=account_id),
                 )
+            log.info(
+                "slack.agent_setup.edit_repo.bound",
+                team_id=team_id,
+                agent_name=agent_name,
+                repo_url=repo_url,
+            )
+        elif pat_replace and pat:
+            # A new token with no repo — store it, write no binding, record
+            # no proof (unchanged behavior).
+            await store_inline_pat(
+                runtime,
+                account_id=account_id,
+                agent_id=agent_uuid,
+                plaintext_pat=pat,
+            )
+            log.info(
+                "slack.agent_setup.edit_repo.pat_replaced",
+                team_id=team_id,
+                agent_name=agent_name,
+                masked=mask_tail(pat),
+            )
+        elif repo_url:
+            # Blank token field. A bind is allowed only against a repo the
+            # agent's existing stored token can read, or that anyone can
+            # read — the only credential that will ever clone a binding with
+            # no fresh token is either that stored token or the operator's
+            # public-read-only fallback.
+            owner_repo = owner_repo_from_url(repo_url)
+            stored = await load_agent_inline_pat(runtime, agent_id=agent_uuid)
+            proof: RepoAccessProof
+            fresh_ref: str
+            if stored is not None:
+                covers_new_repo = await pat_can_access_repo(
+                    runtime.http_client, owner_repo=owner_repo, pat=stored
+                )
+                if not covers_new_repo:
+                    await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+                        channel=channel_id,
+                        user=user_id,
+                        text=(
+                            ":x: This agent already has a stored GitHub token that "
+                            "can't access this repo. Paste a token that can, then "
+                            "bind again."
+                        ),
+                    )
+                    return
+                proof = RepoAccessProof(kind="pat", at=now, account_id=account_id)
+                fresh_ref = f"inline-pat:{agent_uuid}"
+            else:
+                public = await is_public_repo(runtime.http_client, owner_repo=owner_repo)
+                if not public:
+                    await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+                        channel=channel_id,
+                        user=user_id,
+                        text=(
+                            ":x: This repo isn't publicly readable (it's private, or "
+                            "it doesn't exist) — a token is required to bind it."
+                        ),
+                    )
+                    return
+                proof = RepoAccessProof(kind="public", at=now, account_id=account_id)
+                fresh_ref = "anon:"
 
+            try:
+                # Keep-existing-token path (T-83-16 / PAT-CLOBBER): preserve
+                # ma_secret_ref instead of clobbering it, then re-establish
+                # proof against the NEW repo in the same transaction.
+                async with runtime.sessionmaker.begin() as session:
+                    await update_repo_and_branch_keep_secret(
+                        session,
+                        tenant_id=tenant_id,
+                        agent_id=agent_uuid,
+                        repo_url=repo_url,
+                        default_branch="main",
+                    )
+                    await record_proof(
+                        session,
+                        tenant_id=tenant_id,
+                        agent_id=agent_uuid,
+                        proof=proof,
+                    )
+            except StoreError:
+                # First-time bind with no prior secret to preserve.
                 async with runtime.sessionmaker.begin() as session:
                     await set_agent_repo_binding(
                         session,
@@ -829,48 +947,9 @@ async def run_edit_repo_submission(
                         agent_id=agent_uuid,
                         repo_url=repo_url,
                         default_branch="main",
-                        ma_secret_ref=f"inline-pat:{agent_uuid}",
+                        ma_secret_ref=fresh_ref,
+                        proof=proof,
                     )
-            else:
-                # Blank PAT — keep the existing token (T-83-16). Preserve
-                # ma_secret_ref instead of clobbering it (PAT-CLOBBER).
-                from daimon.core.errors import StoreError
-                from daimon.core.stores.agent_repo_binding import (
-                    set_binding as set_agent_repo_binding,
-                )
-                from daimon.core.stores.agent_repo_binding import (
-                    update_repo_and_branch_keep_secret,
-                )
-
-                try:
-                    async with runtime.sessionmaker.begin() as session:
-                        await update_repo_and_branch_keep_secret(
-                            session,
-                            tenant_id=tenant_id,
-                            agent_id=agent_uuid,
-                            repo_url=repo_url,
-                            default_branch="main",
-                        )
-                except StoreError:
-                    # First-time bind with no prior secret to preserve —
-                    # genuinely anon: (no PAT was ever provided). Write the
-                    # anon: binding.
-                    #
-                    # No App-coverage probe here (unlike the discord panel): the
-                    # Slack app.py create_session call does not thread
-                    # session_factory, so the repo-clone path never runs on
-                    # Slack today — advertising "App-covered" would be
-                    # misleading. Wiring Slack repo clone (session_factory +
-                    # fernet + env-mount) is a tracked follow-up.
-                    async with runtime.sessionmaker.begin() as session:
-                        await set_agent_repo_binding(
-                            session,
-                            tenant_id=tenant_id,
-                            agent_id=agent_uuid,
-                            repo_url=repo_url,
-                            default_branch="main",
-                            ma_secret_ref="anon:",
-                        )
             log.info(
                 "slack.agent_setup.edit_repo.bound",
                 team_id=team_id,
