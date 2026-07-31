@@ -56,7 +56,7 @@ from daimon.core.specs import (
 )
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.scoped_config_read import get_scope
-from daimon.core.stores.scoped_config_write import set_fields, unset_fields
+from daimon.core.stores.scoped_config_write import clear_agent_references, set_fields, unset_fields
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -295,7 +295,12 @@ async def fork_agent(
 
 
 async def delete_agent(runtime: SlackRuntime, *, tenant_id: uuid.UUID, name: str) -> None:
-    """Archive the MA agent matching ``name`` under the given tenant."""
+    """Archive the MA agent matching ``name`` under the given tenant.
+
+    Channel and workspace scope rows naming the agent are cleared as part of the
+    delete, so turn resolution falls through the cascade instead of resolving to
+    a deleted agent.
+    """
     agent = await find_agent_by_daimon_tag(runtime.anthropic, tenant_id=tenant_id, name=name)
     if agent is None:
         raise DaimonError(f"No agent named *{name}* found.")
@@ -307,6 +312,12 @@ async def delete_agent(runtime: SlackRuntime, *, tenant_id: uuid.UUID, name: str
         agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
         log_context={"tenant_id": str(tenant_id), "agent_name": name, "ma_agent_id": agent.id},
     )
+    # After the MA archive, never before: a failure here leaves an archived
+    # agent with stale scope rows rather than a live agent with cleared ones.
+    # Deliberately unguarded — a failure must reach the action's error boundary
+    # rather than degrade silently.
+    async with runtime.sessionmaker.begin() as session:
+        await clear_agent_references(session, tenant_id=tenant_id, agent_name=name)
 
 
 async def replace_agent_resources_for_panel(
