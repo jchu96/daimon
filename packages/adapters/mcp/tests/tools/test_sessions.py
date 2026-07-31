@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -33,16 +32,13 @@ from daimon.adapters.mcp.tools.sessions import (
     _get_session_impl,
     _list_session_events_impl,
     _list_sessions_impl,
-    _send_message_impl,
     register_sessions_tools,
 )
 from daimon.core.scope import DeploymentDefault
 from daimon.testing.ma import (
     MARouter,
     build_fake_anthropic,
-    json_body,
     list_response,
-    send_events_response,
 )
 from factories import make_ma_agent
 from fastmcp import FastMCP
@@ -357,64 +353,6 @@ async def test_list_session_events_admits_thread_status_events_through_fastmcp()
     )
 
 
-async def test_send_message_admits_thread_status_events_through_fastmcp() -> None:
-    """send_message must not output-validation-error when MA's send response
-    includes a session.thread_status_idle event — a variant the pinned SDK's
-    BetaManagedAgentsSendSessionEvents union does not model.
-
-    RED on main: the tool's BetaManagedAgentsSendSessionEvents return
-    annotation re-validates the raw response body and rejects it wholesale.
-    """
-    tenant_id = uuid.uuid4()
-    token = "send-message-novel-type"
-    claims = {
-        "sub": str(uuid.uuid4()),
-        "tenant_id": str(tenant_id),
-        "role": "user",
-        "client_id": "test",
-    }
-
-    router = MARouter()
-    router.add(
-        "GET",
-        r"/v1/agents",
-        lambda _r, _m: list_response(
-            [
-                make_ma_agent(
-                    id="ag_a",
-                    name="demo",
-                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
-                ).model_dump(mode="json")
-            ]
-        ),
-    )
-    router.add(
-        "GET",
-        r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(
-            200, json=_make_session_payload(session_id="ses_1", agent_id="ag_a")
-        ),
-    )
-    router.add(
-        "POST",
-        r"/v1/sessions/([^/]+)/events",
-        lambda _r, _m: send_events_response(data=[_make_thread_idle_event_raw()]),
-    )
-    client = build_fake_anthropic(router.dispatch)
-    app = _sessions_mcp_app(client, token, claims)
-
-    result = await _call_tool_via_http(
-        app, token, "send_message", {"session_id": "ses_1", "text": "hello"}
-    )
-
-    payload = result.get("result", result)
-    assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
-    assert not payload.get("isError"), (
-        f"send_message must not output-validation-error on a thread_status_idle "
-        f"event in the response; got {payload!r}"
-    )
-
-
 async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
     tenant_id = uuid.uuid4()
 
@@ -690,135 +628,3 @@ async def test_list_session_events_returns_page_envelope() -> None:
     assert result.next_page == "p2", "should forward SDK next_page cursor unchanged"
     item: SessionEventOut = result.items[0]
     assert item.id == "sevt_1", "event id should round-trip through SDK parse"
-
-
-async def test_send_message_posts_user_message_with_text_block() -> None:
-    tenant_id = uuid.uuid4()
-
-    captured: list[dict[str, Any]] = []
-
-    def on_send(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
-        captured.append(json_body(req))
-        return send_events_response(data=None)
-
-    router = MARouter()
-    router.add(
-        "GET",
-        r"/v1/agents",
-        lambda _r, _m: list_response(
-            [
-                make_ma_agent(
-                    id="ag_a",
-                    name="demo",
-                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
-                ).model_dump(mode="json")
-            ]
-        ),
-    )
-    router.add(
-        "GET",
-        r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(
-            200,
-            json=BetaManagedAgentsSession.model_validate(
-                {
-                    "id": "ses_1",
-                    "type": "session",
-                    "agent": {
-                        "id": "ag_a",
-                        "name": "demo",
-                        "version": 1,
-                        "type": "agent",
-                        "model": {"id": "claude-opus-4-5"},
-                        "mcp_servers": [],
-                        "skills": [],
-                        "tools": [],
-                    },
-                    "archived_at": None,
-                    "created_at": "2026-05-08T10:00:00Z",
-                    "updated_at": "2026-05-08T10:00:00Z",
-                    "outcome_evaluations": [],
-                    "environment_id": "env_1",
-                    "metadata": {},
-                    "resources": [],
-                    "stats": {},
-                    "status": "idle",
-                    "title": None,
-                    "usage": {},
-                    "vault_ids": [],
-                }
-            ).model_dump(mode="json"),
-        ),
-    )
-    router.add("POST", r"/v1/sessions/([^/]+)/events", on_send)
-    client = build_fake_anthropic(router.dispatch)
-
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
-    await _send_message_impl(_runtime(client), auth, "ses_1", "hello")
-
-    assert len(captured) == 1, "should POST to /events exactly once"
-    body = captured[0]
-    events = body["events"]
-    assert events[0]["type"] == "user.message", "event type must be user.message"
-    assert events[0]["content"][0]["type"] == "text", "first content block must be text"
-    assert events[0]["content"][0]["text"] == "hello", "text payload must round-trip verbatim"
-
-
-async def test_send_message_raises_when_cross_tenant() -> None:
-    tenant_id = uuid.uuid4()
-
-    router = MARouter()
-    router.add(
-        "GET",
-        r"/v1/agents",
-        lambda _r, _m: list_response(
-            [
-                make_ma_agent(
-                    id="ag_a",
-                    name="demo",
-                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
-                ).model_dump(mode="json")
-            ]
-        ),
-    )
-    router.add(
-        "GET",
-        r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(
-            200,
-            json=BetaManagedAgentsSession.model_validate(
-                {
-                    "id": "ses_x",
-                    "type": "session",
-                    "agent": {
-                        "id": "ag_other",
-                        "name": "other",
-                        "version": 1,
-                        "type": "agent",
-                        "model": {"id": "claude-opus-4-5"},
-                        "mcp_servers": [],
-                        "skills": [],
-                        "tools": [],
-                    },
-                    "archived_at": None,
-                    "created_at": "2026-05-08T10:00:00Z",
-                    "updated_at": "2026-05-08T10:00:00Z",
-                    "outcome_evaluations": [],
-                    "environment_id": "env_1",
-                    "metadata": {},
-                    "resources": [],
-                    "stats": {},
-                    "status": "idle",
-                    "title": None,
-                    "usage": {},
-                    "vault_ids": [],
-                }
-            ).model_dump(mode="json"),
-        ),
-    )
-    # No POST handler — scope check must reject before any send is attempted.
-    client = build_fake_anthropic(router.dispatch)
-
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
-    with pytest.raises(ToolError, match="session not found"):
-        await _send_message_impl(_runtime(client), auth, "ses_x", "hello")

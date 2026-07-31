@@ -217,7 +217,6 @@ def create_mcp_app(
     mcp.add_transform(
         AgentChatAwareBM25SearchTransform(
             max_results=5,
-            always_visible=["list_credentials"],
             search_result_serializer=serialize_tools_for_output_markdown,
         )
     )
@@ -265,7 +264,7 @@ def create_mcp_app(
     register_wizard_tools(mcp, runtime)
     skills.register_skill_tools(mcp, runtime)
     sessions.register_sessions_tools(mcp, runtime)
-    agent_chat.register_agent_chat_tools(mcp, runtime)
+    agent_chat.register_agent_chat_tools(mcp, runtime, billing_config=effective_billing_config)
     time.register_time_tools(mcp, runtime)
     routines.register_routines_tools(mcp, runtime)
     register_cli_token_tool(mcp, runtime)

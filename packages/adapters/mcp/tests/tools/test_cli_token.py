@@ -173,13 +173,11 @@ async def test_get_cli_token_no_binding_maps_to_tool_error(
             await client.call_tool("get_cli_token", {"service": "github"})
 
 
-async def test_get_cli_token_github_resolves_operator_fallback_when_unbound(
+async def test_get_cli_token_github_refuses_when_unbound_even_with_operator_fallback_configured(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """No credential bound + a configured operator fallback -> get_cli_token
-    resolves the shared service PAT instead of raising NoBindingError. This
-    token is handed to the agent's shell for transient gh/clone use, never
-    persisted, so it is a legitimate opt-in site."""
+    """An agent with no bound credential is refused; the operator's shared
+    token is never substituted, even when a fallback is configured."""
     fernet_key = SecretStr(Fernet.generate_key().decode("ascii"))
     settings = _build_settings(
         fernet_key=fernet_key, github_fallback_pat=SecretStr("ghp_operator_fallback")
@@ -221,11 +219,11 @@ async def test_get_cli_token_github_resolves_operator_fallback_when_unbound(
     register_cli_token_tool(mcp, runtime)
 
     async with Client(mcp) as client:
-        result = await client.call_tool("get_cli_token", {"service": "github"})
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool("get_cli_token", {"service": "github"})
 
-    text = result.content[0].text  # type: ignore[union-attr]
-    assert text == "ghp_operator_fallback", (
-        "get_cli_token('github') must resolve the operator fallback when no credential is bound"
+    assert "ghp_operator_fallback" not in str(exc_info.value), (
+        "the operator's shared token must never reach the caller, by any route"
     )
 
 

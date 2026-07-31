@@ -1,4 +1,10 @@
-"""Vault tool: list_credentials — safe projection of caller's MCP vault credentials."""
+"""Vault tool: list_credentials — safe projection of caller's MCP vault credentials.
+
+Tagged ``agent-chat``, so it is visible only to a session whose token
+carries an agent identity — the same identity its ``agent_id`` guard needs
+to resolve the caller's per-agent vault. An ordinary chat session never
+discovers this tool.
+"""
 
 from __future__ import annotations
 
@@ -36,11 +42,13 @@ async def _list_credentials_impl(
     client: AsyncAnthropic,
     auth: AuthIdentity,
 ) -> list[VaultCredentialSummary]:
-    display_name = f"daimon-mcp:{auth.account_id}"
+    if auth.agent_id is None:
+        raise ToolError("agent_id missing — token was not minted for an agent session")
+    display_name = f"daimon-mcp:{auth.account_id}:{auth.agent_id}"
     matching = [v async for v in client.beta.vaults.list() if v.display_name == display_name]
     if not matching:
         raise ToolError(
-            "no MCP vault found for this account — run a session first to bootstrap the vault"
+            "no MCP vault found for this agent — run a session first to bootstrap the vault"
         )
     vault_id = min(matching, key=lambda v: v.created_at).id
     creds = [c async for c in client.beta.vaults.credentials.list(vault_id=vault_id)]
@@ -48,7 +56,7 @@ async def _list_credentials_impl(
 
 
 def register_vault_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def list_credentials(ctx: Context) -> list[VaultCredentialSummary]:  # pyright: ignore[reportUnusedFunction]
         """List credentials in the caller's MCP vault (safe projection — no secrets)."""
         return await _list_credentials_impl(runtime.client, await _auth(ctx))

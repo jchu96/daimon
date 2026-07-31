@@ -160,15 +160,15 @@ async def _seed_admin_and_user(
 async def test_non_admin_list_tools(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Non-admin tools/list returns only search_tools, call_tool, list_credentials.
+    """Non-admin tools/list returns only search_tools and call_tool.
 
     tools/list is NOT the discovery surface for individual tools — the BM25
-    search transform collapses the full catalog into these three meta-tools for
-    every session, admin included. Asserting that a specific mutating tool name
-    is absent from THIS response would be vacuously true for every tool in the
-    catalog, admin-gated or not, so that per-tool check lives against
-    search_tools instead (see test_non_admin_search_includes_relaxed_tool and
-    the other search_tools-based tests below)."""
+    search transform collapses the full catalog into these two meta-tools for
+    every session, admin included. list_credentials is agent-chat-tagged, so
+    it never appears here for a session with no agent identity — same as any
+    other mutating tool name, that per-tool check lives against search_tools
+    instead (see test_non_admin_search_includes_relaxed_tool and the other
+    search_tools-based tests below)."""
     admin_token, user_token = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
 
@@ -177,10 +177,14 @@ async def test_non_admin_list_tools(
     tool_names: list[str] = [t["name"] for t in tools_payload.get("tools", [])]  # type: ignore[union-attr]
 
     # Only meta-tools visible to non-admins
-    for expected in ("search_tools", "call_tool", "list_credentials"):
+    for expected in ("search_tools", "call_tool"):
         assert expected in tool_names, (
             f"Expected {expected!r} in non-admin tool list, got: {tool_names}"
         )
+    assert "list_credentials" not in tool_names, (
+        f"list_credentials is agent-chat-tagged and must not appear for a "
+        f"session with no agent identity; got: {tool_names}"
+    )
 
 
 async def test_non_admin_search_excludes_admin_tools(
@@ -245,13 +249,20 @@ RELAXED_TOOL_NAMES = (
     "update_agent",
     "attach_mcp_server",
     "fork_agent",
+)
+"""The four agents.py tools whose blast radius is one agent, not the whole
+tenant — relaxed onto the open (non-admin-visible, non-admin-callable)
+surface. Untagged, so a non-admin chat session's search surfaces them."""
+
+AGENT_IDENTITY_SCOPED_TOOL_NAMES = (
     "set_repo_binding",
     "clear_repo_binding",
     "self_write_file",
     "self_delete_file",
 )
-"""The eight tools whose blast radius is one agent, not the whole tenant —
-relaxed onto the open (non-admin-visible, non-admin-callable) surface."""
+"""Four of the self_edit.py tools, tagged agent-chat: visible only to a
+session whose token carries an agent identity, never to an ordinary
+non-admin chat session's search."""
 
 CHAT_REMOVAL_TOOL_NAMES = (
     "detach_mcp_server",
@@ -331,18 +342,39 @@ async def test_non_admin_search_includes_relaxed_tool(
     )
 
 
-async def test_non_admin_call_relaxed_tool_reaches_impl(
+@pytest.mark.parametrize("tool_name", AGENT_IDENTITY_SCOPED_TOOL_NAMES)
+async def test_non_admin_search_excludes_agent_identity_scoped_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tool_name: str,
+) -> None:
+    """Each agent-identity-scoped self_edit tool stays undiscoverable to a
+    non-admin chat session's search_tools — the agent-chat tag hides it from
+    any session whose token carries no agent identity."""
+    _, user_token = await _seed_admin_and_user(sessionmaker)
+    app = _make_app(sessionmaker)
+
+    result = await _mcp_session(
+        app,
+        token=user_token,
+        method="tools/call",
+        params={"name": "search_tools", "arguments": {"query": tool_name.replace("_", " ")}},
+    )
+    call_result = result.get("result", result)
+    content = call_result.get("content", [])  # type: ignore[union-attr]
+    output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
+    assert tool_name not in output_text, (
+        f"{tool_name} must NOT be discoverable by a non-admin chat session; got: {output_text!r}"
+    )
+
+
+async def test_non_admin_call_self_write_file_refused(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A relaxed tool's call_tool invocation reaches its implementation for a
-    non-admin caller.
-
-    Only the absence of the two rejection outcomes is asserted: "not found"
-    (visibility would still be blocking it) and the Manage Server refusal (the
-    impl gate would still be firing). A tool-level validation error is an
-    acceptable — expected — outcome here, because what's being proven is that
-    the call reached the implementation at all, not that it fully succeeds
-    without any arguments."""
+    """A non-admin chat session's call_tool invocation of self_write_file is
+    refused — the agent-chat tag hides it from tools/list and get_tool, so
+    the call never reaches the implementation. This is the inverted record
+    of the tool leaving the chat surface: it used to reach the impl and fail
+    inside with "agent_id missing"; now it is refused before that."""
     _, user_token = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
 
@@ -359,15 +391,14 @@ async def test_non_admin_call_relaxed_tool_reaches_impl(
         },
     )
     call_result = result.get("result", result)
+    is_error = call_result.get("isError", False)  # type: ignore[union-attr]
     content = call_result.get("content", [])  # type: ignore[union-attr]
     output_text = " ".join(
         item.get("text", "") for item in content if isinstance(item, dict)
     ).lower()
-    assert "not found" not in output_text, (
-        f"self_write_file must be visible to a non-admin call_tool invocation; got: {output_text!r}"
-    )
-    assert "manage server" not in output_text, (
-        f"self_write_file must not be impl-gated for a non-admin caller; got: {output_text!r}"
+    assert is_error or "not found" in output_text, (
+        f"self_write_file must be refused for a non-admin chat caller; "
+        f"isError={is_error!r}, output={output_text!r}"
     )
 
 
@@ -508,13 +539,15 @@ async def test_admin_search_includes_fork_agent(
 async def test_admin_list_tools_returns_meta_tools(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Admin tools/list returns the BM25 meta-tools (search_tools, call_tool, list_credentials).
+    """Admin tools/list returns the BM25 meta-tools (search_tools, call_tool).
 
     The BM25SearchTransform collapses the full tool catalog into meta-tools for
     all users. Admin tools are accessible via search_tools/call_tool (already
     tested in test_admin_search_includes_admin_tools). The tools/list response
     is identical for admin and non-admin in terms of visible tool names — the
     difference is that admin call_tool calls against admin tools are allowed.
+    list_credentials is agent-chat-tagged, not admin-tagged, so an
+    admin-but-not-agent-identity session does not see it here either.
     """
     admin_token, user_token = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
@@ -523,7 +556,11 @@ async def test_admin_list_tools_returns_meta_tools(
     tools_payload = result.get("result", result)
     tool_names: list[str] = [t["name"] for t in tools_payload.get("tools", [])]  # type: ignore[union-attr]
 
-    for expected in ("search_tools", "call_tool", "list_credentials"):
+    for expected in ("search_tools", "call_tool"):
         assert expected in tool_names, (
             f"Expected meta-tool {expected!r} missing from admin tool list: {tool_names}"
         )
+    assert "list_credentials" not in tool_names, (
+        f"list_credentials is agent-chat-tagged and must not appear for an "
+        f"admin session with no agent identity; got: {tool_names}"
+    )
