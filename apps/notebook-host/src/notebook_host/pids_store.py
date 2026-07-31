@@ -17,13 +17,17 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import signal
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel
+
+_log = logging.getLogger(__name__)
 
 _REGISTRY_MODE = 0o600
 """Explicit mode for pids.json — host-owned process state, not meant to be
@@ -94,13 +98,47 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def reap_orphans(path: Path, *, term_wait_seconds: float = 5.0) -> list[PidRecord]:
-    """Read pids file, SIGTERM each live entry (escalating to SIGKILL), clear file.
+def _pid_matches_record(rec: PidRecord) -> bool:
+    """True when ``/proc/<pid>/cmdline`` still identifies the process as ``rec``'s marimo.
 
-    Returns the list of records that were live at sweep time (caller may
-    log them). Records whose PID is already dead are skipped silently.
-    Called exactly once at host startup before any new spawn — leaves the
-    pids file empty on exit so the next register starts from a clean slate.
+    Liveness alone is not identity — PIDs are recycled by the OS, so a
+    persisted record can point at a number the kernel has since handed to an
+    unrelated process. This reads the live process's argv and requires both
+    the ``marimo`` token and the exact ``/n/<slug>`` value passed to
+    ``--base-url`` (``spawn_marimo``), so the check is specific to *that*
+    slug's subprocess, not merely "some marimo". A PID we cannot identify —
+    ``/proc`` entry gone, or unreadable — must not be signalled.
+
+    Linux only (``/proc``). On any other platform this always returns False;
+    ``reap_orphans`` logs once that orphan reaping is unavailable there,
+    preferring a leaked orphan on a dev host over a wrong-process kill.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        raw = Path(f"/proc/{rec.pid}/cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+    argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\x00") if part]
+    return "marimo" in argv and f"/n/{rec.slug}" in argv
+
+
+def reap_orphans(path: Path, *, term_wait_seconds: float = 5.0) -> list[PidRecord]:
+    """Read pids file, SIGTERM each live *matching* entry (escalating to SIGKILL), clear file.
+
+    A record is only signalled when its PID is both alive and still
+    identifiable, via ``/proc/<pid>/cmdline``, as that slug's marimo process
+    (see ``_pid_matches_record``) — liveness alone used to be treated as proof
+    of identity, which meant a PID recycled onto an unrelated process would be
+    SIGTERM'd then SIGKILL'd with only a log line claiming N orphans reaped.
+
+    Returns the list of records that were both live and identity-matched at
+    sweep time (caller may log them). Records whose PID is already dead, or
+    whose cmdline no longer matches, are skipped silently (well, at debug
+    level) — not signalled, not returned. Called exactly once at host startup
+    before any new spawn — leaves the pids file empty on exit so the next
+    register starts from a clean slate, regardless of what was or wasn't
+    signalled.
     """
     records = load_pids(path)
     if not records:
@@ -108,9 +146,25 @@ def reap_orphans(path: Path, *, term_wait_seconds: float = 5.0) -> list[PidRecor
         # with no prior state. No-op if missing.
         return []
 
+    if sys.platform != "linux":
+        _log.warning(
+            "orphan reaping requires /proc to verify process identity before "
+            "signalling; platform=%s cannot provide that, so %d persisted "
+            "record(s) will not be signalled",
+            sys.platform,
+            len(records),
+        )
+
     reaped: list[PidRecord] = []
     for rec in records.values():
         if not _pid_alive(rec.pid):
+            continue
+        if not _pid_matches_record(rec):
+            _log.debug(
+                "pid %d for slug %r no longer identifies as that slug's marimo; not signalling",
+                rec.pid,
+                rec.slug,
+            )
             continue
         reaped.append(rec)
         try:
