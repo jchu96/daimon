@@ -44,6 +44,46 @@ def _make_runtime_with_settings(*, fallback_pat: object = None) -> DiscordRuntim
     return runtime
 
 
+def _admin_interaction(user_id: int = 42) -> MagicMock:
+    """Interaction whose caller is a live guild admin (administrator permission).
+
+    ``is_guild_admin`` short-circuits on the permission, so no guild owner_id or
+    DB read is involved.
+    """
+    interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member)
+    interaction.user.id = user_id
+    interaction.user.guild_permissions.administrator = True
+    interaction.guild.owner_id = user_id + 1
+    interaction.guild_id = 2001
+    interaction.response.is_done = MagicMock(return_value=False)
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    return interaction
+
+
+def _non_admin_interaction(user_id: int = 42) -> MagicMock:
+    """Interaction whose caller is a live non-admin: no administrator, no
+    manage_guild, and not the guild owner — the demoted-admin shape."""
+    interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member)
+    interaction.user.id = user_id
+    interaction.user.guild_permissions.administrator = False
+    interaction.user.guild_permissions.manage_guild = False
+    interaction.guild.owner_id = user_id + 1
+    interaction.guild_id = 2001
+    interaction.response.is_done = MagicMock(return_value=False)
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    return interaction
+
+
 def _container_text(container: discord.ui.Container[discord.ui.LayoutView]) -> str:
     """Collect all TextDisplay content from a V2 Container (depth-first)."""
     parts: list[str] = []
@@ -1135,9 +1175,9 @@ async def test_delete_btn_routes_failure_through_render_error(
 
     monkeypatch.setattr(panel_mod, "_resolve_tenant", _boom)
 
-    interaction = MagicMock()
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
+    # Live admin: the callback's click-time admin re-check runs before anything
+    # else, and this test's subject is the failure path behind it.
+    interaction = _admin_interaction()
 
     await view.delete_btn.callback(interaction)
 
@@ -1407,11 +1447,9 @@ async def test_delete_failure_captures_to_sentry_with_tenant_context_and_swallow
 
     monkeypatch.setattr(panel_mod, "capture_exception_with_scope", fake_capture)
 
-    interaction = MagicMock()
-    interaction.user.id = 42
-    interaction.guild_id = 2001
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
+    # Live admin: the callback's click-time admin re-check runs before the
+    # delete, and this test's subject is the capture behind it.
+    interaction = _admin_interaction()
 
     # Must not raise — swallow preserved.
     await view.delete_btn.callback(interaction)
@@ -1500,3 +1538,193 @@ async def test_superseded_panel_view_does_not_rewrite_the_message(
 
     await view_b.on_timeout()
     mock_interaction.edit_original_response.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Admin row: click-time admin re-check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_btn_refuses_a_demoted_admin_without_deleting(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller who was an admin at render time but is not one now deletes nothing."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+
+    async def _unexpected_delete(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("delete_agent must not be reached for a non-admin caller")
+
+    monkeypatch.setattr(panel_mod, "delete_agent", _unexpected_delete)
+
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=True)
+    view = AgentSetupView(state, runtime=_make_runtime_with_settings(), allowed_user_id=42)
+    interaction = _non_admin_interaction()
+
+    await view.delete_btn.callback(interaction)
+
+    interaction.response.send_message.assert_called_once()
+    message = interaction.response.send_message.call_args.args[0]
+    assert "Manage Server" in message, "the refusal must name the permission the caller lacks"
+    # The refusal must own the interaction's first response — no defer precedes it.
+    interaction.response.defer.assert_not_called()
+    interaction.followup.send.assert_not_called()
+    interaction.edit_original_response.assert_not_called()
+    assert state.roster == [selected], "a refused delete must leave the roster untouched"
+
+
+@pytest.mark.asyncio
+async def test_delete_btn_refusal_precedes_the_nothing_to_delete_branch(
+    account_id: uuid.UUID,
+) -> None:
+    """With nothing selected AND a non-admin caller, the admin refusal is what is sent.
+
+    Pins the ordering: a non-admin must not learn whether an agent is selected.
+    """
+    state = PanelState(
+        roster=[_entry("alice")], selected=None, account_id=account_id, is_admin=True
+    )
+    view = AgentSetupView(state, runtime=_make_runtime_with_settings(), allowed_user_id=42)
+    interaction = _non_admin_interaction()
+
+    await view.delete_btn.callback(interaction)
+
+    interaction.response.send_message.assert_called_once()
+    message = interaction.response.send_message.call_args.args[0]
+    assert "Manage Server" in message, "the admin gate must fire before the selection check"
+    assert "Nothing to delete." not in message, (
+        "a non-admin must not learn whether an agent is selected"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_btn_still_deletes_for_a_live_admin(
+    account_id: uuid.UUID, tenant_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is not a blanket ban: a live admin's delete still runs end to end."""
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+    from daimon.core.stores.domain import AgentRepoBindingRow
+
+    deleted_names: list[str] = []
+
+    async def _spy_delete(*_args: Any, **kwargs: Any) -> None:
+        deleted_names.append(str(kwargs["name"]))
+
+    async def _fake_secret_count(*_args: Any, **_kwargs: Any) -> int:
+        return 0
+
+    async def _fake_github_login(*_args: Any, **_kwargs: Any) -> str | None:
+        return None
+
+    async def _fake_repo_binding(*_args: Any, **_kwargs: Any) -> AgentRepoBindingRow | None:
+        return None
+
+    monkeypatch.setattr(panel_mod, "delete_agent", _spy_delete)
+    monkeypatch.setattr(panel_mod, "load_secret_count", _fake_secret_count)
+    monkeypatch.setattr(panel_mod, "load_selected_github_login", _fake_github_login)
+    monkeypatch.setattr(panel_mod, "load_repo_binding", _fake_repo_binding)
+
+    selected = _entry("alice")
+    state = PanelState(
+        roster=[selected, _entry("bob")],
+        selected=selected,
+        account_id=account_id,
+        is_admin=True,
+    )
+    view = AgentSetupView(state, runtime=_make_runtime_with_settings(), allowed_user_id=42)
+    interaction = _admin_interaction()
+
+    await view.delete_btn.callback(interaction)
+
+    assert deleted_names == ["alice"], "a live admin's delete must still reach delete_agent"
+    interaction.response.defer.assert_called_once()
+    interaction.followup.send.assert_not_called()
+    interaction.edit_original_response.assert_called_once()
+    assert "alice" not in {e.name for e in state.roster}, (
+        "the deleted agent must be dropped from the roster"
+    )
+    assert tenant_id is not None, "the autouse tenant stub supplies the id threaded into the delete"
+
+
+@pytest.mark.asyncio
+async def test_connect_via_mcp_refuses_a_demoted_admin_without_minting_a_bearer(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A demoted admin clicking Connect via MCP is issued no bearer token."""
+    import daimon.adapters.discord.agent_setup.mcp_access as mcp_access_mod
+
+    async def _unexpected_connect(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("send_connect_via_mcp must not be reached for a non-admin caller")
+
+    monkeypatch.setattr(mcp_access_mod, "send_connect_via_mcp", _unexpected_connect)
+
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=True)
+    view = AgentSetupView(state, runtime=_make_runtime_with_settings(), allowed_user_id=42)
+    interaction = _non_admin_interaction()
+
+    await view.connect_mcp_btn.callback(interaction)
+
+    interaction.response.send_message.assert_called_once()
+    message = interaction.response.send_message.call_args.args[0]
+    assert "Manage Server" in message, "the refusal must name the permission the caller lacks"
+    assert "Bearer" not in message, "a refused caller must receive no token material"
+    interaction.response.defer.assert_not_called()
+    interaction.followup.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_connect_via_mcp_still_works_for_a_live_admin(
+    account_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live admin still reaches the bearer-minting handler unchanged."""
+    import daimon.adapters.discord.agent_setup.mcp_access as mcp_access_mod
+
+    connect_calls: list[dict[str, Any]] = []
+
+    async def _spy_connect(*_args: Any, **kwargs: Any) -> None:
+        connect_calls.append(kwargs)
+
+    monkeypatch.setattr(mcp_access_mod, "send_connect_via_mcp", _spy_connect)
+
+    selected = _entry("alice")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=True)
+    view = AgentSetupView(state, runtime=_make_runtime_with_settings(), allowed_user_id=42)
+    interaction = _admin_interaction()
+
+    await view.connect_mcp_btn.callback(interaction)
+
+    assert len(connect_calls) == 1, "a live admin must still reach send_connect_via_mcp"
+    assert connect_calls[0]["state"] is state, "the handler must receive the panel's own state"
+    interaction.response.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_panel_member_row_is_still_usable_by_a_non_admin(account_id: uuid.UUID) -> None:
+    """The admin re-check stays in the two admin-row callbacks, never in interaction_check.
+
+    A view-level admin gate would lock ordinary members out of New / Fork / Edit,
+    which the panel deliberately offers to everyone. This test fails if the check
+    is ever moved up into the view.
+    """
+    import daimon.adapters.discord.agent_setup.panel as panel_mod
+
+    state = PanelState(roster=[_entry("alice")], selected=None, account_id=account_id)
+    view = AgentSetupView(state, runtime=_make_runtime_with_settings(), allowed_user_id=42)
+    interaction = _non_admin_interaction(user_id=42)
+
+    passed = await view.interaction_check(interaction)
+    assert passed is True, (
+        "the view-level check is invoker-only; an admin gate there would lock members out"
+    )
+
+    new_btn = _find_button(view, "New")
+    await new_btn.callback(interaction)
+
+    interaction.response.send_modal.assert_called_once()
+    modal = interaction.response.send_modal.call_args.args[0]
+    assert isinstance(modal, panel_mod.NewAgentModal), (
+        "a non-admin must still reach the New agent modal"
+    )
+    interaction.response.send_message.assert_not_called()

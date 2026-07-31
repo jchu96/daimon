@@ -81,6 +81,65 @@ def _find_select(
     return None
 
 
+def _joined_view_text(view: discord.ui.LayoutView) -> str:
+    """Collect all TextDisplay content anywhere in a LayoutView, joined with newlines."""
+    return "\n".join(
+        child.content for child in view.walk_children() if isinstance(child, discord.ui.TextDisplay)
+    )
+
+
+def _admin_interaction(*, guild_id: int, user_id: int = 42) -> MagicMock:
+    """A click from a live guild admin.
+
+    The caller has to be a spec'd `discord.Member` with a real permission flag:
+    the click-time gate reads the live interaction, so a bare MagicMock user is
+    not a Member and would be refused. `is_done()` is pinned False so any
+    refusal lands on `response.send_message`, not `followup.send`.
+    """
+    guild = MagicMock(spec=discord.Guild)
+    guild.owner_id = user_id + 1
+
+    user = MagicMock(spec=discord.Member)
+    user.id = user_id
+    user.guild_permissions.administrator = True
+    user.guild_permissions.manage_guild = True
+
+    interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.guild = guild
+    interaction.user = user
+    interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
+def _non_admin_interaction(*, guild_id: int, user_id: int = 42) -> MagicMock:
+    """A click from a member who is not (or is no longer) a guild admin.
+
+    All three inputs the admin check reads are set: `administrator`,
+    `manage_guild`, and a guild owner that is somebody else. Leaving any of them
+    a bare mock attribute would make the caller a truthy admin and the refusal
+    test inert.
+    """
+    guild = MagicMock(spec=discord.Guild)
+    guild.owner_id = user_id + 1
+
+    user = MagicMock(spec=discord.Member)
+    user.id = user_id
+    user.guild_permissions.administrator = False
+    user.guild_permissions.manage_guild = False
+
+    interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.guild = guild
+    interaction.user = user
+    interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
 SINCE = datetime(2026, 5, 1, tzinfo=UTC)
 NOW = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
 
@@ -264,9 +323,7 @@ async def test_topup_select_callback_posts_to_mcp_checkout_and_sends_ephemeral_u
             break
     assert topup_select is not None, "admin view must contain a _TopUpSelect"
 
-    interaction = MagicMock()
-    interaction.guild_id = int(guild_id)
-    interaction.response.send_message = AsyncMock()
+    interaction = _admin_interaction(guild_id=int(guild_id))
     # Simulate selecting "$10"
     topup_select._values = ["10"]  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -350,9 +407,7 @@ async def test_topup_checkout_token_carries_no_admin_or_internal_claim(
         since=SINCE,
     )
     topup_select = next(item for item in view.walk_children() if isinstance(item, _TopUpSelect))
-    interaction = MagicMock()
-    interaction.guild_id = 888000000000000001
-    interaction.response.send_message = AsyncMock()
+    interaction = _admin_interaction(guild_id=888000000000000001)
     topup_select._values = ["10"]  # pyright: ignore[reportAttributeAccessIssue]
 
     with _mock.patch(
@@ -373,6 +428,215 @@ async def test_topup_checkout_token_carries_no_admin_or_internal_claim(
     assert "internal" not in claims, (
         "billing checkout bearer must not carry the internal admin discriminator (CR-01)"
     )
+
+
+@pytest.mark.asyncio
+async def test_topup_select_renders_an_error_when_the_checkout_call_returns_a_non_2xx_status(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A failing checkout POST must reach the panel's error renderer.
+
+    `_create_checkout` calls `raise_for_status()`. Before the except tuple was
+    widened, the resulting `httpx.HTTPStatusError` escaped the callback into
+    discord.py's dispatcher, which shows the admin "This interaction failed" and
+    no request id — the failure operators most need to be able to trace.
+    """
+    import httpx
+    from daimon.adapters.discord.billing_panel.panel import _TopUpSelect
+    from daimon.core.config import McpSettings
+    from pydantic import HttpUrl, SecretStr
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "unknown account"}, request=request)
+
+    mock_transport = httpx.MockTransport(_handle)
+    import unittest.mock as _mock
+
+    mock_settings = MagicMock()
+    mock_settings.mcp = McpSettings(
+        public_url=HttpUrl("http://mcp-internal:8000/mcp"),
+        jwt_secret=SecretStr("test-secret-for-button-callback-32b"),
+    )
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.settings = mock_settings
+    runtime.sessionmaker = db_session_factory
+
+    view = BillingPanelView(
+        _make_state(is_admin=True),
+        runtime=runtime,
+        allowed_user_id=42,
+        is_admin=True,
+        account_id=_TEST_ACCOUNT_ID,
+        now=NOW,
+        since=SINCE,
+    )
+    topup_select = next(item for item in view.walk_children() if isinstance(item, _TopUpSelect))
+    interaction = _admin_interaction(guild_id=888000000000000001)
+    topup_select._values = ["10"]  # pyright: ignore[reportAttributeAccessIssue]
+
+    with _mock.patch(
+        "daimon.adapters.discord.billing_panel.panel.httpx.AsyncClient",
+        return_value=httpx.AsyncClient(transport=mock_transport),
+    ):
+        await topup_select.callback(interaction)
+
+    interaction.response.send_message.assert_awaited_once()
+    call_args = interaction.response.send_message.call_args
+    assert call_args.kwargs.get("ephemeral") is True, "the failure notice must be ephemeral"
+    sent_text = call_args.args[0] if call_args.args else ""
+    assert "rid: " in sent_text, (
+        "a failed checkout must render with a request id the operator can trace in logs"
+    )
+    assert "checkout.stripe.com" not in sent_text, "no checkout URL may be sent on a failure"
+    assert db_session is not None
+
+
+@pytest.mark.asyncio
+async def test_topup_select_refuses_a_demoted_admin_without_creating_a_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member who was an admin when the panel rendered must mint no checkout link.
+
+    The panel is self-renewing (every interaction rebuilds it with a fresh
+    timeout), so the render-time `is_admin` snapshot is indefinitely stale.
+    `_create_checkout` is replaced with a raiser: a gate that sends an ephemeral
+    and then falls through would still fail this test.
+    """
+    from daimon.adapters.discord.billing_panel import panel as panel_module
+    from daimon.adapters.discord.billing_panel.panel import _TopUpSelect
+
+    async def _explode(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("a non-admin click must never reach _create_checkout")
+
+    monkeypatch.setattr(panel_module, "_create_checkout", _explode)
+
+    view = BillingPanelView(
+        _make_state(is_admin=True),
+        runtime=_make_runtime(),
+        allowed_user_id=42,
+        is_admin=True,
+        account_id=_TEST_ACCOUNT_ID,
+        now=NOW,
+        since=SINCE,
+    )
+    topup_select = next(item for item in view.walk_children() if isinstance(item, _TopUpSelect))
+    interaction = _non_admin_interaction(guild_id=888000000000000001)
+    topup_select._values = ["10"]  # pyright: ignore[reportAttributeAccessIssue]
+
+    await topup_select.callback(interaction)
+
+    interaction.response.send_message.assert_awaited_once()
+    sent_text = interaction.response.send_message.call_args.args[0]
+    assert "Manage Server" in sent_text, (
+        f"the refusal must tell the member what permission is missing; got: {sent_text!r}"
+    )
+    assert "checkout.stripe.com" not in sent_text, "no checkout URL may be handed to a non-admin"
+    interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_member_lookup_select_refuses_a_demoted_admin_without_reading_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-member spend is exactly what load_billing_snapshot's member branch withholds.
+
+    Both usage reads are replaced with raisers, and the runtime's sessionmaker
+    raises too, so the gate must refuse before the panel opens a session at all.
+    """
+    from daimon.adapters.discord.billing_panel import panel as panel_module
+    from daimon.adapters.discord.billing_panel.panel import _MemberLookupSelect
+
+    async def _explode_cost(*_args: object, **_kwargs: object) -> float:
+        raise AssertionError("a non-admin click must never read another member's spend")
+
+    async def _explode_turns(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("a non-admin click must never read another member's turn count")
+
+    monkeypatch.setattr(panel_module, "cost_for_user_in_tenant_since", _explode_cost)
+    monkeypatch.setattr(panel_module, "turn_count_for_user_in_tenant_since", _explode_turns)
+
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.sessionmaker = MagicMock(
+        side_effect=AssertionError("a refused lookup must not open a session")
+    )
+
+    view = BillingPanelView(
+        _make_state(is_admin=True),
+        runtime=runtime,
+        allowed_user_id=42,
+        is_admin=True,
+        account_id=_TEST_ACCOUNT_ID,
+        now=NOW,
+        since=SINCE,
+    )
+    lookup_select = next(
+        item for item in view.walk_children() if isinstance(item, _MemberLookupSelect)
+    )
+    target = MagicMock(spec=discord.Member)
+    target.id = 100000000000000007
+    target.display_name = "bob"
+    lookup_select._values = [target]  # pyright: ignore[reportAttributeAccessIssue]
+
+    interaction = _non_admin_interaction(guild_id=888000000000000001)
+
+    await lookup_select.callback(interaction)
+
+    interaction.response.send_message.assert_awaited_once()
+    call_args = interaction.response.send_message.call_args
+    sent_text = call_args.args[0]
+    assert "Manage Server" in sent_text, (
+        f"the refusal must tell the member what permission is missing; got: {sent_text!r}"
+    )
+    assert "view" not in call_args.kwargs, "no spend card may be rendered for a non-admin"
+    interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_member_lookup_select_still_renders_spend_for_a_live_admin(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The gate must not cost a live admin the lookup the panel exists to offer."""
+    from daimon.adapters.discord.billing_panel.panel import _MemberLookupSelect
+
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.sessionmaker = db_session_factory
+
+    view = BillingPanelView(
+        _make_state(is_admin=True),
+        runtime=runtime,
+        allowed_user_id=42,
+        is_admin=True,
+        account_id=_TEST_ACCOUNT_ID,
+        now=NOW,
+        since=SINCE,
+    )
+    lookup_select = next(
+        item for item in view.walk_children() if isinstance(item, _MemberLookupSelect)
+    )
+    target = MagicMock(spec=discord.Member)
+    target.id = 100000000000000007
+    target.display_name = "bob"
+    lookup_select._values = [target]  # pyright: ignore[reportAttributeAccessIssue]
+
+    interaction = _admin_interaction(guild_id=888000000000000001)
+
+    await lookup_select.callback(interaction)
+
+    interaction.response.send_message.assert_awaited_once()
+    call_args = interaction.response.send_message.call_args
+    assert call_args.kwargs.get("ephemeral") is True, "the spend card must stay ephemeral"
+    rendered = call_args.kwargs.get("view")
+    assert isinstance(rendered, discord.ui.LayoutView), (
+        "a live admin's lookup must still render the member-spend card"
+    )
+    text = _joined_view_text(rendered)
+    assert "bob" in text, "the card must name the looked-up member"
+    assert "no usage this period" in text, (
+        "a member with no seeded usage must render the zero-spend copy, not a refusal"
+    )
+    assert db_session is not None
 
 
 # ---- V2 container builder tests (B8 design) ----

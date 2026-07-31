@@ -555,7 +555,11 @@ def test_edit_view_non_admin_reachable_non_system_disables_spec_controls(
     account_id: uuid.UUID,
 ) -> None:
     """A non-admin editing a reachable, non-system agent gets the five
-    spec-touching controls disabled; GitHub… and Env vars stay enabled."""
+    spec-touching controls disabled; GitHub… and Env vars stay enabled.
+
+    Enabled is not unguarded: the attachment gate refuses those two on click,
+    so the caller reads why they cannot bind a repo instead of staring at a
+    greyed-out button."""
     from daimon.core.specs import SkillRef
 
     selected = _entry_with_mcps(
@@ -945,12 +949,89 @@ async def test_mcp_remove_select_refuses_write_on_system_agent_even_for_admin(
 
 
 @pytest.mark.asyncio
-async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admin(
+async def test_edit_view_github_button_refuses_for_non_admin_on_reachable_agent(
+    account_id: uuid.UUID,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Env vars are a per-agent attachment, never part of the agent spec — the
-    new click-time gate must not reach this path even for a reachable agent
-    edited by a non-admin."""
+    """The GitHub… button stays clickable for everyone, but a non-admin
+    clicking it on a currently-reachable agent gets the refusal instead of the
+    modal — so no GitHub token is ever typed into a form that would be
+    rejected on submit."""
+    from daimon.core.scope import DeploymentDefault
+    from daimon.testing.factories import make_tenant
+
+    guild_id = 910103
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry("bot")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.sessionmaker = db_session_factory
+    runtime.deployment_default = DeploymentDefault(agent_name="bot")
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    github_btn = _find_button(view, "GitHub…")
+    assert github_btn.disabled is False, "GitHub… must stay clickable for a non-admin"
+    assert github_btn.callback is not None
+
+    interaction = _non_admin_interaction(guild_id=guild_id)
+    interaction.response.send_modal = AsyncMock()
+    await github_btn.callback(interaction)
+
+    interaction.response.send_modal.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_edit_view_github_button_opens_modal_for_admin_on_system_agent(
+    account_id: uuid.UUID,
+) -> None:
+    """An admin may bind a repo to the deployment's built-in agent — that is
+    the first-run step — so the button opens the modal even though the target
+    is both a system agent and the workspace's default."""
+    from daimon.adapters.discord.agent_setup.modals import RepoAuthModal
+    from daimon.core.scope import DeploymentDefault
+
+    selected = RosterEntry(
+        name="daimon",
+        model="claude-sonnet-4-6",
+        spec=AgentSpec(name="daimon", model="claude-sonnet-4-6"),
+        is_system=True,
+    )
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    github_btn = _find_button(view, "GitHub…")
+    assert github_btn.callback is not None
+
+    interaction = _admin_interaction()
+    interaction.response.send_modal = AsyncMock()
+    await github_btn.callback(interaction)
+
+    interaction.response.send_modal.assert_called_once()
+    modal = interaction.response.send_modal.call_args.args[0]
+    assert isinstance(modal, RepoAuthModal), "an admin must still reach the repo-bind modal"
+    interaction.response.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_env_vars_paste_modal_refuses_on_reachable_agent_for_non_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`put_agent_file` is an upsert and the files are mounted read-write on
+    every session of the agent, so a non-admin pasting over the workspace's
+    current default agent would overwrite secrets everyone in the install
+    depends on. The Env vars button still opens for them; the write does not."""
     from daimon.adapters.discord.agent_setup.credentials import PasteSecretModal
     from daimon.core.ma_identity import derive_agent_uuid
     from daimon.core.ma_resolver import new_resolver_cache
@@ -959,8 +1040,9 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
     from daimon.core.stores.agent_files import get_agent_file
     from daimon.testing.factories import make_tenant
 
+    guild_id = 910301
     async with db_session_factory() as session, session.begin():
-        tenant = await make_tenant(session, platform="discord", workspace_id="env-vars-still-open")
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
     agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="agent_env_test")
 
     settings = MagicMock()
@@ -971,8 +1053,7 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         sessionmaker=db_session_factory,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
-        # A non-admin caller editing the workspace's current default agent —
-        # env vars stay writable regardless.
+        # The target agent is the workspace's current default, so it is shared.
         deployment_default=DeploymentDefault(agent_name="daimon"),
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
@@ -982,13 +1063,15 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         return None
 
     modal = PasteSecretModal(
-        runtime=runtime, tenant_id=tenant.id, agent_id=agent_id, on_added=_noop
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=_entry("daimon"),
+        on_added=_noop,
     )
     modal.content_input._value = "XERO_API_KEY=abc123"  # pyright: ignore[reportPrivateUsage]
 
-    interaction = MagicMock()
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
+    interaction = _non_admin_interaction(guild_id=guild_id)
 
     await modal.on_submit(interaction)
 
@@ -996,4 +1079,7 @@ async def test_env_vars_paste_modal_still_writes_on_reachable_agent_for_non_admi
         row = await get_agent_file(
             session, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY"
         )
-    assert row is not None, "env var write must succeed even on the workspace's default agent"
+    assert row is None, "a non-admin must not write env vars onto the workspace's default agent"
+    interaction.response.defer.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True

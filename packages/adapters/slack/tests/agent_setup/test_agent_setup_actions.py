@@ -12,7 +12,9 @@ Covers the five required behaviors from 83-05 plan:
              NOT call views.update or views.push
 
 Also covers the field-follows-the-gate authorization matrix (10-06): the
-always-open branches (new/fork/edit/edit_repo_form/paste_secrets/remove_secret),
+branches open to every caller (new/fork/edit/paste_secrets), the branches
+gated on shared state by ``refuse_if_shared_and_not_admin``
+(edit_repo_form/remove_secret),
 the admin-only-unconditional branches (delete/scope:*/connect_mcp), and the
 field-conditional branches gated by ``refuse_if_reachable_and_not_admin``
 (remove_skill/remove_mcp/edit_agent_form/add_skill/add_mcp) — each proved for
@@ -43,7 +45,9 @@ from daimon.adapters.slack.agent_setup.actions import (
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.github_credentials import build_multifernet, encrypt_token
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import ChannelConfigRow, ChannelScopeRef, TenantScopeRef
+from daimon.core.stores.agent_files import get_agent_file, put_agent_file
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
@@ -990,9 +994,15 @@ def _assert_reachability_refusal(client_fake: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Always-open branches: new, fork, edit, edit_repo_form,
-# paste_secrets, remove_secret -- no refusal for any caller, admin or not.
-# `new` is covered above; the remaining five follow.
+# Branches open to every caller: new, fork, edit, and the paste_secrets form
+# push -- the last of those is refused at submission rather than at the push,
+# so its open-time test below asserts the push on purpose. `new` is covered
+# above; fork, edit, and paste_secrets follow.
+#
+# Branches gated on shared state via refuse_if_shared_and_not_admin:
+# edit_repo_form and remove_secret. Each has a non-admin refusal test against a
+# workspace-default agent and an admin-positive sibling proving the same action
+# still succeeds for an admin.
 # ---------------------------------------------------------------------------
 
 
@@ -1037,15 +1047,22 @@ async def test_handle_agent_setup_action_edit_non_admin_pushes_l2_no_ephemeral(
 
 
 @pytest.mark.asyncio
-async def test_handle_agent_setup_action_edit_repo_form_non_admin_pushes_form_no_ephemeral(
+async def test_handle_agent_setup_action_edit_repo_form_non_admin_on_default_agent_refuses_with_ephemeral(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: object,
 ) -> None:
+    """A non-admin never sees the edit-repo form for the workspace's default agent.
+
+    The form prompts for a GitHub personal access token, so the refusal has to
+    land at the push -- once the form is on screen the member has already been
+    asked for a credential the submission would refuse to use.
+    """
     tenant_id, fernet_key, _ = await _seed_team(db_session)
     agent_payload = _agent_payload(tenant_id=tenant_id)
     handler = _make_ma_handler_with_agents([agent_payload])
     runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
 
     payload = _action_payload(
         "agent_setup__edit_repo_form", selected_agent_name=_AGENT_NAME, active_section="repo_auth"
@@ -1053,10 +1070,48 @@ async def test_handle_agent_setup_action_edit_repo_form_non_admin_pushes_form_no
     await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
 
     client_fake: Any = fake_slack_web_client
-    assert _get_push_callback_id(client_fake) == "agent_setup__edit_repo", (
-        "non-admin agent_setup__edit_repo_form must push the edit-repo form"
+    assert not _has_push(client_fake), (
+        "non-admin agent_setup__edit_repo_form on the workspace default must NOT push the "
+        "token-collecting form"
     )
-    _assert_no_refusal(client_fake)
+    texts = _ephemeral_texts(client_fake)
+    assert len(texts) == 1, f"exactly one refusal ephemeral must be posted, got {texts!r}"
+    assert "workspace-admin" in texts[0], (
+        f"the refusal must name the permission the caller lacks, got {texts[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_edit_repo_form_admin_on_default_agent_pushes_form(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    """An admin still gets the edit-repo form for the workspace's default agent.
+
+    Binding a repo to the agent the whole workspace uses is the ordinary
+    first-run step; the gate refuses non-admins, not admins.
+    """
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    payload = _action_payload(
+        "agent_setup__edit_repo_form", selected_agent_name=_AGENT_NAME, active_section="repo_auth"
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    assert _get_push_callback_id(client_fake) == "agent_setup__edit_repo", (
+        "admin agent_setup__edit_repo_form on the workspace default must still push the form"
+    )
+    assert not _ephemeral_texts(client_fake), (
+        "an admin must not be refused on the workspace default agent"
+    )
 
 
 @pytest.mark.asyncio
@@ -1065,10 +1120,19 @@ async def test_handle_agent_setup_action_paste_secrets_non_admin_pushes_form_no_
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: object,
 ) -> None:
+    """The paste-secrets form is pushed for every member, unlike the edit-repo form.
+
+    It prompts for nothing at push time, so nothing is at risk in showing it;
+    the write it submits is refused at submission when the target is shared. If
+    this test starts failing, a gate was added where none belongs -- fix the
+    handler, not the test.
+    """
     tenant_id, fernet_key, _ = await _seed_team(db_session)
     agent_payload = _agent_payload(tenant_id=tenant_id)
     handler = _make_ma_handler_with_agents([agent_payload])
     runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+    # Shared target on purpose: this is the case a push-time gate would refuse.
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
 
     payload = _action_payload(
         "agent_setup__paste_secrets", selected_agent_name=_AGENT_NAME, active_section="secrets"
@@ -1083,18 +1147,32 @@ async def test_handle_agent_setup_action_paste_secrets_non_admin_pushes_form_no_
 
 
 @pytest.mark.asyncio
-async def test_handle_agent_setup_action_remove_secret_non_admin_writes_and_updates_no_ephemeral(
+async def test_handle_agent_setup_action_remove_secret_non_admin_on_default_agent_refuses_and_writes_nothing(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     fake_slack_web_client: object,
 ) -> None:
-    """remove_secret is always open: env variables are a per-agent
-    attachment, never part of the agent spec -- even on a reachable agent."""
+    """A non-admin cannot delete an env variable from the workspace's default agent.
+
+    Removing a variable the shared agent's integrations depend on is
+    destructive and silent -- the next turn simply loses it -- so the gate has
+    to fire before the delete, not after.
+    """
     tenant_id, fernet_key, _ = await _seed_team(db_session)
     agent_payload = _agent_payload(tenant_id=tenant_id)
     handler = _make_ma_handler_with_agents([agent_payload])
     runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
     await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=_MA_AGENT_ID)
+    async with db_session_factory() as session, session.begin():
+        await put_agent_file(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="SOME_KEY",
+            content="some-value",
+        )
 
     payload = _action_payload(
         "agent_setup__remove_secret",
@@ -1104,11 +1182,67 @@ async def test_handle_agent_setup_action_remove_secret_non_admin_writes_and_upda
     )
     await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
 
-    client_fake: Any = fake_slack_web_client
-    assert _has_update(client_fake), (
-        "non-admin remove_secret on a reachable agent must still re-render L2"
+    async with db_session_factory() as session:
+        surviving = await get_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="SOME_KEY"
+        )
+    assert surviving is not None, (
+        "non-admin remove_secret on the workspace default must delete no agent file"
     )
-    _assert_no_refusal(client_fake)
+
+    client_fake: Any = fake_slack_web_client
+    texts = _ephemeral_texts(client_fake)
+    assert len(texts) == 1, f"exactly one refusal ephemeral must be posted, got {texts!r}"
+    assert "workspace-admin" in texts[0], (
+        f"the refusal must name the permission the caller lacks, got {texts[0]!r}"
+    )
+    assert "SOME_KEY" not in texts[0], (
+        f"the refusal must not echo the secret key back to the channel, got {texts[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_agent_setup_action_remove_secret_admin_on_default_agent_deletes_the_file(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: object,
+) -> None:
+    """An admin still removes env variables from the workspace's default agent."""
+    tenant_id, fernet_key, _ = await _seed_team(db_session)
+    agent_payload = _agent_payload(tenant_id=tenant_id)
+    handler = _make_ma_handler_with_agents([agent_payload])
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=handler)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=_MA_AGENT_ID)
+    async with db_session_factory() as session, session.begin():
+        await put_agent_file(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="SOME_KEY",
+            content="some-value",
+        )
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    payload = _action_payload(
+        "agent_setup__remove_secret",
+        selected_agent_name=_AGENT_NAME,
+        active_section="secrets",
+        action_extra={"selected_option": {"value": "SOME_KEY"}},
+    )
+    await handle_agent_setup_action(runtime, payload)  # type: ignore[arg-type]
+
+    async with db_session_factory() as session:
+        removed = await get_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="SOME_KEY"
+        )
+    assert removed is None, (
+        "admin remove_secret on the workspace default must delete the agent file"
+    )
+    assert _has_update(client_fake), "admin remove_secret must re-render L2 after the delete"
 
 
 # ---------------------------------------------------------------------------

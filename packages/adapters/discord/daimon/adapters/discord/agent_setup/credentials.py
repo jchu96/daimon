@@ -23,8 +23,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import structlog
+from daimon.adapters.discord.agent_setup import authz
 from daimon.adapters.discord.agent_setup.expiry import ExpiringView
-from daimon.adapters.discord.agent_setup.state import PanelState
+from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
@@ -59,8 +60,10 @@ def build_credentials_container(
 
     Env variables are per-agent daimon state (agent_files, keyed by
     tenant/agent/key) and are never part of the agent spec, so provenance
-    (system-agent or not) does not gate them — every member, on every agent,
-    including the seeded default, can view and manage this sub-view.
+    (system-agent or not) does not gate *rendering* them: every member, on
+    every agent including the seeded default, can open this sub-view and read
+    the key names. The two writes are a different question and are refused at
+    click time on a shared agent — see `_on_remove` and `PasteSecretModal`.
     """
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container()
     container.add_item(
@@ -94,13 +97,18 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
         runtime: DiscordRuntime,
         tenant_id: uuid.UUID,
         agent_id: uuid.UUID,
+        entry: RosterEntry | None,
         on_added: OnAdded,
     ) -> None:
         super().__init__()
-        # Modal has no `.view` reference — store deps explicitly.
+        # Modal has no `.view` reference — store deps explicitly. `entry` has no
+        # default on purpose: it is the submit gate's target, and a construction
+        # site that forgot it would silently build an ungated modal, so pyright
+        # must reject it rather than let it through.
         self._runtime = runtime
         self._tenant_id = tenant_id
         self._agent_id = agent_id
+        self._entry = entry
         self._on_added = on_added
         self.content_input: discord.ui.TextInput[PasteSecretModal] = discord.ui.TextInput(
             label="KEY=VALUE lines",
@@ -112,6 +120,16 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
         self.add_item(self.content_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Submit time is the boundary: a modal opened before the caller lost
+        # Manage Server must not write, and `put_agent_file` is an upsert whose
+        # files are mounted read-write on every session of a shared agent.
+        # Before defer() so the refusal owns the first response, and before the
+        # pasted content is read at all, so nothing derived from it — not a key
+        # name, not a value — exists on the refusal path.
+        if await authz.refuse_if_shared_and_not_admin(
+            interaction, runtime=self._runtime, entry=self._entry
+        ):
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         raw = str(self.content_input.value or "")
 
@@ -266,6 +284,19 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         return _cb
 
     async def _on_remove(self, interaction: discord.Interaction, key_name: str) -> None:
+        # Read and write split apart here on purpose: this gate belongs on the
+        # two writes, NOT in `interaction_check`, which guards opening the list
+        # too. The container carries key NAMES only, so a member seeing that the
+        # shared agent has a variable set can ask an admin for the right thing —
+        # and can tell whether a missing variable is why their turn failed.
+        # Removing one is the destructive half and stops here.
+        # Runs before the click log so a refused removal does not record the key
+        # name, and before defer() so the refusal owns the first response rather
+        # than showing a thinking indicator it will not fulfil.
+        if await authz.refuse_if_shared_and_not_admin(
+            interaction, runtime=self._runtime, entry=self._state.selected
+        ):
+            return
         # key_name is the secret KEY NAME the option carried — never a value.
         _log.info("credentials.remove.click", key=key_name)
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -292,6 +323,10 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
                 runtime=self._runtime,
                 tenant_id=self._tenant_id,
                 agent_id=self._agent_id,
+                # `EditView._on_env_vars` derives this sub-view's agent_id from
+                # the same `state.selected`, so the gate's target and the write's
+                # target are always the same agent.
+                entry=self._state.selected,
                 on_added=self._reload_and_rerender,
             )
         )
@@ -333,8 +368,9 @@ def _build_remove_select(secret_names: list[str]) -> discord.ui.Select[Credentia
 
     Each option's ``label``/``value`` carries ONLY the secret KEY NAME — never a
     value, never a per-key custom_id. Disabled (empty placeholder) only when
-    there are no secrets — env vars are per-agent daimon state, never part of
-    the agent spec, so provenance does not gate removal here.
+    there are no secrets; a shared agent's select still renders enabled and
+    refuses on click, because a greyed control teaches nothing while the
+    refusal carries the reason and the fork advice.
     """
     if len(secret_names) == 0:
         return discord.ui.Select(

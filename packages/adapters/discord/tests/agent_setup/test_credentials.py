@@ -51,6 +51,46 @@ def _state(entry: RosterEntry, account_id: uuid.UUID) -> PanelState:
     return PanelState(roster=[entry], selected=entry, account_id=account_id)
 
 
+def _interaction(user_id: int = 42, *, is_admin: bool = True, guild_id: int = 12345) -> MagicMock:
+    """A discord.Interaction stand-in, a live guild admin by default so the
+    env-var write gate short-circuits without a DB read. Tests proving the
+    shared-agent refusal pass ``is_admin=False`` and register a tenant for the
+    guild, because that path reads reachability from Postgres."""
+    interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.user = MagicMock(spec=discord.Member)
+    interaction.user.id = user_id
+    interaction.user.guild_permissions.administrator = is_admin
+    interaction.user.guild_permissions.manage_guild = False
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
+    interaction.response.edit_message = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)
+    interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    return interaction
+
+
+def _runtime(
+    sessionmaker: Any,
+    *,
+    deployment_default: DeploymentDefault | None = None,
+) -> DiscordRuntime:
+    settings = MagicMock()
+    settings.mcp.public_url = None
+    return DiscordRuntime(
+        settings=settings,
+        anthropic=build_stub_anthropic(),
+        sessionmaker=sessionmaker,
+        notebook_rate_limiter=RateLimiter(max_requests=999),
+        billing_config=None,
+        deployment_default=deployment_default or DeploymentDefault(),
+        resolver_cache=new_resolver_cache(),
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
+    )
+
+
 def _walk_buttons(view: discord.ui.LayoutView) -> list[discord.ui.Button[Any]]:
     """Walk the full LayoutView tree and collect all Button items."""
     return [item for item in view.walk_children() if isinstance(item, discord.ui.Button)]
@@ -250,7 +290,9 @@ def test_subview_remove_select_option_carries_key_name_never_value(account_id: u
 def test_subview_system_agent_enables_mutations(account_id: uuid.UUID) -> None:
     """Env vars are per-agent daimon state, never part of the agent spec, so a
     system agent's remove select and add button are enabled exactly like a
-    user agent's — provenance does not gate this sub-view."""
+    user agent's — provenance does not gate this sub-view's rendering. The
+    enabled state is deliberate: the refusal happens at click time and carries
+    the reason, which a greyed control cannot."""
     entry = _entry("sys", is_system=True)
     view = CredentialsSubView(
         runtime=MagicMock(spec=DiscordRuntime),
@@ -297,28 +339,20 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
     _tid = tenant.id
     agent_id = uuid.uuid4()
 
-    runtime = DiscordRuntime(
-        settings=MagicMock(),
-        anthropic=build_stub_anthropic(),
-        sessionmaker=db_session_factory,
-        notebook_rate_limiter=RateLimiter(max_requests=999),
-        billing_config=None,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
-    )
+    runtime = _runtime(db_session_factory)
     on_added = AsyncMock()
     modal = PasteSecretModal(
-        runtime=runtime, tenant_id=tenant.id, agent_id=agent_id, on_added=on_added
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=_entry("bot"),
+        on_added=on_added,
     )
     modal.content_input._value = (  # pyright: ignore[reportPrivateUsage]
         f"# a comment\nXERO_API_KEY={_SECRET_VALUE}\n\nTOGGL_TOKEN=second-value\n"
     )
 
-    interaction = MagicMock()
-    interaction.user.id = 42
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
+    interaction = _interaction()
 
     cap = structlog.testing.LogCapture()
     structlog.configure(processors=[cap])
@@ -358,25 +392,17 @@ async def test_paste_modal_rejects_invalid_key_and_writes_nothing(
     _tid = tenant.id
     agent_id = uuid.uuid4()
 
-    runtime = DiscordRuntime(
-        settings=MagicMock(),
-        anthropic=build_stub_anthropic(),
-        sessionmaker=db_session_factory,
-        notebook_rate_limiter=RateLimiter(max_requests=999),
-        billing_config=None,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
-    )
+    runtime = _runtime(db_session_factory)
     modal = PasteSecretModal(
-        runtime=runtime, tenant_id=tenant.id, agent_id=agent_id, on_added=AsyncMock()
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=_entry("bot"),
+        on_added=AsyncMock(),
     )
     modal.content_input._value = "123BAD=value\nGOOD_KEY=val"  # pyright: ignore[reportPrivateUsage]
 
-    interaction = MagicMock()
-    interaction.user.id = 42
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
+    interaction = _interaction()
 
     await modal.on_submit(interaction)
 
@@ -384,6 +410,150 @@ async def test_paste_modal_rejects_invalid_key_and_writes_nothing(
     assert rows == [], "fail-fast on an invalid key writes nothing"
     msg = interaction.followup.send.call_args.args[0]
     assert "Secret name must match" in msg, "invalid-key toast shown"
+
+
+# --- PasteSecretModal: click-time gate on a shared agent -------------------
+
+
+@pytest.mark.asyncio
+async def test_paste_modal_refuses_write_on_reachable_agent_for_non_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """put_agent_file is an upsert and its files are mounted read-write on every
+    session of the agent, so a non-admin pasting over an agent the workspace
+    currently resolves to would silently replace secrets everyone depends on."""
+    guild_id = 920401
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    agent_id = uuid.uuid4()
+
+    entry = _entry("bot")
+    runtime = _runtime(db_session_factory, deployment_default=DeploymentDefault(agent_name="bot"))
+    modal = PasteSecretModal(
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=entry,
+        on_added=AsyncMock(),
+    )
+    modal.content_input._value = f"XERO_API_KEY={_SECRET_VALUE}"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    async with db_session_factory() as session:
+        rows = await list_agent_files(session, tenant_id=tenant.id, agent_id=agent_id)
+    assert rows == [], "a non-admin must write no env var onto a currently-reachable agent"
+    interaction.response.defer.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_paste_modal_refuses_write_on_system_agent_for_non_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The deployment's built-in agent is shared by everyone in the install
+    whether or not anything currently scopes to it, so its env vars are closed
+    to non-admins on provenance alone."""
+    guild_id = 920402
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    agent_id = uuid.uuid4()
+
+    runtime = _runtime(db_session_factory)
+    modal = PasteSecretModal(
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=_entry("daimon", is_system=True),
+        on_added=AsyncMock(),
+    )
+    modal.content_input._value = f"XERO_API_KEY={_SECRET_VALUE}"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    async with db_session_factory() as session:
+        rows = await list_agent_files(session, tenant_id=tenant.id, agent_id=agent_id)
+    assert rows == [], "a non-admin must write no env var onto the built-in agent"
+    interaction.response.defer.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_paste_modal_still_writes_on_reachable_system_agent_for_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Setting the built-in default agent's variables is how an admin finishes
+    onboarding, and that agent is both a system agent and the workspace's
+    default. The gate must not close that path."""
+    guild_id = 920403
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    agent_id = uuid.uuid4()
+
+    runtime = _runtime(
+        db_session_factory, deployment_default=DeploymentDefault(agent_name="daimon")
+    )
+    modal = PasteSecretModal(
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        entry=_entry("daimon", is_system=True),
+        on_added=AsyncMock(),
+    )
+    modal.content_input._value = f"XERO_API_KEY={_SECRET_VALUE}"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=True, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    async with db_session_factory() as session:
+        stored = await get_agent_file(
+            session, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY"
+        )
+    assert stored is not None and stored.content == _SECRET_VALUE, (
+        "an admin must still set the built-in default agent's env vars"
+    )
+
+
+@pytest.mark.asyncio
+async def test_paste_modal_refusal_logs_no_key_names_or_values(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The module's hygiene invariant holds on the refusal path too: the gate
+    runs before the pasted content is read, so neither the key names nor the
+    values reach the log stream."""
+    guild_id = 920404
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    runtime = _runtime(db_session_factory)
+    modal = PasteSecretModal(
+        runtime=runtime,
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        entry=_entry("daimon", is_system=True),
+        on_added=AsyncMock(),
+    )
+    modal.content_input._value = (  # pyright: ignore[reportPrivateUsage]
+        f"XERO_API_KEY={_SECRET_VALUE}\nTOGGL_TOKEN=second-value"
+    )
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    cap = structlog.testing.LogCapture()
+    structlog.configure(processors=[cap])
+    try:
+        await modal.on_submit(interaction)
+    finally:
+        structlog.reset_defaults()
+
+    for captured in cap.entries:
+        rendered = repr(captured)
+        assert _SECRET_VALUE not in rendered, "a refused paste must not log a secret value"
+        assert "XERO_API_KEY" not in rendered, "a refused paste must not log a key name either"
+        assert "TOGGL_TOKEN" not in rendered, "a refused paste must not log a key name either"
 
 
 # --- ✕ remove (real DB) -----------------------------------------------------
@@ -407,16 +577,7 @@ async def test_remove_deletes_the_key_and_rerenders(
         )
 
     entry = _entry("bot")
-    runtime = DiscordRuntime(
-        settings=MagicMock(),
-        anthropic=build_stub_anthropic(),
-        sessionmaker=db_session_factory,
-        notebook_rate_limiter=RateLimiter(max_requests=999),
-        billing_config=None,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
-    )
+    runtime = _runtime(db_session_factory)
     view = CredentialsSubView(
         runtime=runtime,
         state=_state(entry, account_id),
@@ -426,11 +587,7 @@ async def test_remove_deletes_the_key_and_rerenders(
         secret_names=["XERO_API_KEY", "KEEP_ME"],
     )
 
-    interaction = MagicMock()
-    interaction.user.id = 42
-    interaction.response.defer = AsyncMock()
-    interaction.followup.send = AsyncMock()
-    interaction.edit_original_response = AsyncMock()
+    interaction = _interaction()
 
     # Drive the remove through the select callback (the new entry point).
     select = _remove_select(view)
@@ -445,6 +602,100 @@ async def test_remove_deletes_the_key_and_rerenders(
     # The re-render view must not leak the surviving value.
     rerender_kwargs = interaction.edit_original_response.call_args.kwargs
     assert _SECRET_VALUE not in str(rerender_kwargs), "no value in re-render call kwargs"
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_delete_on_reachable_agent_for_non_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """One click on the remove select destroys a credential every session of a
+    shared agent depends on, so a non-admin is refused on an agent the
+    workspace currently resolves to."""
+    guild_id = 920405
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    agent_id = uuid.uuid4()
+    async with db_session_factory() as s, s.begin():
+        await put_agent_file(
+            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+        )
+        await put_agent_file(
+            s, tenant_id=tenant.id, agent_id=agent_id, key="KEEP_ME", content="keep"
+        )
+
+    entry = _entry("bot")
+    runtime = _runtime(db_session_factory, deployment_default=DeploymentDefault(agent_name="bot"))
+    view = CredentialsSubView(
+        runtime=runtime,
+        state=_state(entry, account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        secret_names=["XERO_API_KEY", "KEEP_ME"],
+    )
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    select = _remove_select(view)
+    select._values = ["XERO_API_KEY"]  # pyright: ignore[reportPrivateUsage]  # simulate a user pick
+    assert select.callback is not None
+    await select.callback(interaction)
+
+    async with db_session_factory() as session:
+        rows = await list_agent_files(session, tenant_id=tenant.id, agent_id=agent_id)
+    assert sorted(r.key for r in rows) == ["KEEP_ME", "XERO_API_KEY"], (
+        "a refused removal must delete nothing"
+    )
+    interaction.response.defer.assert_not_called()
+    interaction.edit_original_response.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_remove_still_deletes_on_reachable_system_agent_for_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """The onboarding sibling of the paste-side positive: an admin must still
+    be able to clear a stale variable off the built-in default agent."""
+    guild_id = 920406
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    agent_id = uuid.uuid4()
+    async with db_session_factory() as s, s.begin():
+        await put_agent_file(
+            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+        )
+        await put_agent_file(
+            s, tenant_id=tenant.id, agent_id=agent_id, key="KEEP_ME", content="keep"
+        )
+
+    entry = _entry("daimon", is_system=True)
+    runtime = _runtime(
+        db_session_factory, deployment_default=DeploymentDefault(agent_name="daimon")
+    )
+    view = CredentialsSubView(
+        runtime=runtime,
+        state=_state(entry, account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        secret_names=["XERO_API_KEY", "KEEP_ME"],
+    )
+
+    interaction = _interaction(is_admin=True, guild_id=guild_id)
+    select = _remove_select(view)
+    select._values = ["XERO_API_KEY"]  # pyright: ignore[reportPrivateUsage]  # simulate a user pick
+    assert select.callback is not None
+    await select.callback(interaction)
+
+    async with db_session_factory() as session:
+        rows = await list_agent_files(session, tenant_id=tenant.id, agent_id=agent_id)
+    assert [r.key for r in rows] == ["KEEP_ME"], (
+        "an admin must still remove a variable from the built-in default agent"
+    )
+    interaction.edit_original_response.assert_awaited()  # sub-view re-rendered in place
 
 
 # --- back navigation --------------------------------------------------------
@@ -560,9 +811,73 @@ async def test_editview_env_vars_button_opens_subview(
     assert _SECRET_VALUE not in all_text, "the opened view lists the key masked, never its value"
 
 
+@pytest.mark.asyncio
+async def test_subview_opens_and_lists_key_names_for_a_non_admin_on_a_shared_agent(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the two writes are gated. A member opening the env-vars list on the
+    shared built-in agent still sees the key names — that is what lets them ask
+    an admin for the right variable, and tell whether a missing one is why their
+    turn failed. The container carries names only, so nothing secret crosses."""
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="920407")
+
+    ma_agent_id = "agent_017shared"
+    agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)
+    async with db_session_factory() as s, s.begin():
+        await put_agent_file(
+            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+        )
+
+    now = dt.datetime.now(dt.UTC)
+    real_agent = BetaManagedAgentsAgent(
+        id=ma_agent_id,
+        type="agent",
+        name="daimon",
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
+        metadata={},
+        description=None,
+        created_at=now,
+        updated_at=now,
+        version=1,
+        mcp_servers=[],
+        skills=[],
+        tools=[],
+        system=None,
+    )
+
+    async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
+        return real_agent
+
+    monkeypatch.setattr(edit_view_mod, "find_agent_by_daimon_tag", fake_find)
+    monkeypatch.setattr(edit_view_mod, "_resolve_tenant", AsyncMock(return_value=tenant.id))
+
+    runtime = _runtime(
+        db_session_factory, deployment_default=DeploymentDefault(agent_name="daimon")
+    )
+    entry = _entry("daimon", is_system=True)
+    edit_view = EditView(_state(entry, account_id), runtime=runtime, allowed_user_id=42)
+
+    interaction = _interaction(is_admin=False, guild_id=920407)
+
+    await edit_view._on_env_vars(interaction)  # pyright: ignore[reportPrivateUsage]
+
+    interaction.response.edit_message.assert_awaited_once()
+    sub_view = interaction.response.edit_message.call_args.kwargs["view"]
+    assert isinstance(sub_view, CredentialsSubView), "a non-admin still reaches the sub-view"
+    all_text = _container_all_text(sub_view)
+    assert "XERO_API_KEY" in all_text, "a member must see which variables the shared agent has"
+    assert _SECRET_VALUE not in all_text, "no value may cross into the rendered container"
+    interaction.response.send_message.assert_not_called()
+
+
 def test_editview_env_vars_button_enabled_for_system_agent(account_id: uuid.UUID) -> None:
     """Env vars are per-agent daimon state, never part of the agent spec, so
-    the button is enabled for the seeded/system agent exactly like any other."""
+    the button is enabled for the seeded/system agent exactly like any other.
+    The enabled state is deliberate — opening the list stays open to every
+    member, and the two writes inside refuse at click time."""
     settings = MagicMock()
     settings.mcp.public_url = None
     runtime = DiscordRuntime(

@@ -29,6 +29,7 @@ from daimon.adapters.discord.agent_setup.write import (
     load_tenant_roster,
     validate_model_id,
 )
+from daimon.adapters.discord.checks import refuse_if_not_admin
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
@@ -651,6 +652,14 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
         from daimon.adapters.discord.agent_setup.mcp_access import send_connect_via_mcp
 
         log.info("agent_setup.connect_mcp_btn.click", agent_name=self._selected_name())
+        # state.is_admin is a snapshot from panel-open, and every interaction
+        # rebuilds this view with a fresh timeout — so re-derive admin from the
+        # live interaction before minting a 90-day bearer for the tenant's MCP
+        # surface. The check sits here rather than in interaction_check because
+        # that method guards the whole view, including the member row (New /
+        # Fork / Edit) that is deliberately open to everyone.
+        if await refuse_if_not_admin(interaction):  # pyright: ignore[reportArgumentType]  # discord.Interaction vs Interaction[commands.Bot]; refuse_if_not_admin only reads user/guild/response
+            return
         await send_connect_via_mcp(
             interaction,
             runtime=self.runtime,
@@ -683,6 +692,14 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
     async def _on_delete(self, interaction: discord.Interaction) -> None:
         target_name = self.state.selected.name if self.state.selected else None
         log.info("agent_setup.delete_btn.click", agent_name=target_name)
+        # The same live re-check as Connect via MCP, and it runs first: before
+        # the selection check, so a refused caller learns nothing about what is
+        # selected, and before defer(), so the refusal owns the interaction's
+        # first response. Not in interaction_check, which guards the member row
+        # (New / Fork / Edit) too — an admin gate there would lock members out
+        # of the panel entirely.
+        if await refuse_if_not_admin(interaction):  # pyright: ignore[reportArgumentType]  # discord.Interaction vs Interaction[commands.Bot]; refuse_if_not_admin only reads user/guild/response
+            return
         if self.state.selected is None or target_name is None:
             await interaction.response.send_message("Nothing to delete.", ephemeral=True)
             return

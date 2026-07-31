@@ -461,8 +461,12 @@ async def test_delete_archives_ma_agent_and_jumps_selection(
     view = AgentSetupView(state, runtime=runtime, allowed_user_id=42)
 
     delete_btn = _find_button(view, "Delete")
+    # Live guild admin: the callback re-checks admin status at click time before
+    # deleting anything, and this test's subject is the delete behind that gate.
     interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = 42
+    interaction.user.guild_permissions.administrator = True
     interaction.response.defer = AsyncMock()
     interaction.response.edit_message = AsyncMock()
     interaction.edit_original_response = AsyncMock()
@@ -526,8 +530,12 @@ async def test_delete_last_agent_disables_section_buttons(
     view = AgentSetupView(state, runtime=runtime, allowed_user_id=42)
 
     delete_btn = _find_button(view, "Delete")
+    # Live guild admin: the callback re-checks admin status at click time before
+    # deleting anything, and this test's subject is the delete behind that gate.
     interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = 42
+    interaction.user.guild_permissions.administrator = True
     interaction.response.defer = AsyncMock()
     interaction.response.edit_message = AsyncMock()
     interaction.edit_original_response = AsyncMock()

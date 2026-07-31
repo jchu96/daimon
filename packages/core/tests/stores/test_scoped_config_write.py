@@ -13,6 +13,7 @@ from daimon.core.scope import (
 )
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import (
+    clear_agent_references,
     delete_propagation_row,
     propagate,
     set_fields,
@@ -667,3 +668,141 @@ async def test_delete_propagation_row_does_not_touch_other_tenants(
     await delete_propagation_row(db_session, scope=scope_t1)
     surviving = await get_scope(db_session, scope=scope_t2)
     assert surviving is not None, "deleting t1's row must not touch t2's row"
+
+
+# ---------------------------------------------------------------------------
+# clear_agent_references
+# ---------------------------------------------------------------------------
+
+
+async def test_clear_agent_references_deletes_channel_row_when_agent_was_its_only_field(
+    db_session: AsyncSession,
+) -> None:
+    t = await make_tenant(db_session)
+    scope = ChannelScopeRef(tenant_id=t.id, channel_id="c1")
+    await set_fields(db_session, scope=scope, tenant_id=t.id, agent_name="doomed")
+
+    cleared = await clear_agent_references(db_session, tenant_id=t.id, agent_name="doomed")
+
+    assert cleared == 1, "one channel row named the deleted agent"
+    row = await get_scope(db_session, scope=scope)
+    assert row is None, (
+        "a channel row whose only set field was the deleted agent must be removed "
+        "so resolution falls through to the next tier"
+    )
+
+
+async def test_clear_agent_references_preserves_channel_row_that_also_sets_environment_name(
+    db_session: AsyncSession,
+) -> None:
+    t = await make_tenant(db_session)
+    scope = ChannelScopeRef(tenant_id=t.id, channel_id="c1")
+    await set_fields(
+        db_session,
+        scope=scope,
+        tenant_id=t.id,
+        agent_name="doomed",
+        environment_name="prod",
+    )
+
+    cleared = await clear_agent_references(db_session, tenant_id=t.id, agent_name="doomed")
+
+    assert cleared == 1, "the channel row named the deleted agent"
+    row = await get_scope(db_session, scope=scope)
+    assert row is not None, "row still carries environment_name, so it must survive"
+    assert row.agent_name is None, "agent_name must be cleared"
+    assert row.environment_name == "prod", "environment_name must be left untouched"
+
+
+async def test_clear_agent_references_preserves_user_active_channel_row(
+    db_session: AsyncSession,
+) -> None:
+    t = await make_tenant(db_session)
+    scope = ChannelScopeRef(tenant_id=t.id, channel_id="c1")
+    await set_fields(
+        db_session,
+        scope=scope,
+        tenant_id=t.id,
+        mode="user_active",
+        agent_name="doomed",
+    )
+
+    cleared = await clear_agent_references(db_session, tenant_id=t.id, agent_name="doomed")
+
+    assert cleared == 1, "the user_active row named the deleted agent"
+    row = await get_scope(db_session, scope=scope)
+    assert row is not None, "a user_active row must survive the clear — its mode IS the propagation"
+    assert row.mode == "user_active", "mode must be left untouched"
+    assert row.agent_name is None, "agent_name must still be cleared on a user_active row"
+
+
+async def test_clear_agent_references_clears_tenant_default_row(
+    db_session: AsyncSession,
+) -> None:
+    t = await make_tenant(db_session)
+    scope = TenantScopeRef(tenant_id=t.id)
+    await set_fields(db_session, scope=scope, tenant_id=t.id, agent_name="doomed")
+
+    cleared = await clear_agent_references(db_session, tenant_id=t.id, agent_name="doomed")
+
+    assert cleared == 1, "the tenant-scope row must count toward the return value"
+    row = await get_scope(db_session, scope=scope)
+    assert row is None, "the workspace default row must be removed, not left naming a dead agent"
+
+
+async def test_clear_agent_references_leaves_rows_naming_a_different_agent_untouched(
+    db_session: AsyncSession,
+) -> None:
+    t = await make_tenant(db_session)
+    channel_scope = ChannelScopeRef(tenant_id=t.id, channel_id="c1")
+    tenant_scope = TenantScopeRef(tenant_id=t.id)
+    await set_fields(db_session, scope=channel_scope, tenant_id=t.id, agent_name="other")
+    await set_fields(db_session, scope=tenant_scope, tenant_id=t.id, agent_name="other")
+
+    cleared = await clear_agent_references(db_session, tenant_id=t.id, agent_name="doomed")
+
+    assert cleared == 0, "no row named the deleted agent"
+    channel_row = await get_scope(db_session, scope=channel_scope)
+    assert channel_row is not None and channel_row.agent_name == "other", (
+        "a channel row naming a different agent must be untouched"
+    )
+    tenant_row = await get_scope(db_session, scope=tenant_scope)
+    assert tenant_row is not None and tenant_row.agent_name == "other", (
+        "a tenant row naming a different agent must be untouched"
+    )
+
+
+async def test_clear_agent_references_is_scoped_to_the_given_tenant(
+    db_session: AsyncSession,
+) -> None:
+    t1 = await make_tenant(db_session)
+    t2 = await make_tenant(db_session)
+    scope_t1 = ChannelScopeRef(tenant_id=t1.id, channel_id="c1")
+    scope_t2 = ChannelScopeRef(tenant_id=t2.id, channel_id="c1")
+    tenant_scope_t2 = TenantScopeRef(tenant_id=t2.id)
+    await set_fields(db_session, scope=scope_t1, tenant_id=t1.id, agent_name="doomed")
+    await set_fields(db_session, scope=scope_t2, tenant_id=t2.id, agent_name="doomed")
+    await set_fields(db_session, scope=tenant_scope_t2, tenant_id=t2.id, agent_name="doomed")
+
+    cleared = await clear_agent_references(db_session, tenant_id=t1.id, agent_name="doomed")
+
+    assert cleared == 1, "only t1's single row may be counted"
+    assert await get_scope(db_session, scope=scope_t1) is None, "t1's row should be gone"
+    surviving_channel = await get_scope(db_session, scope=scope_t2)
+    assert surviving_channel is not None and surviving_channel.agent_name == "doomed", (
+        "another tenant's channel row naming the same agent must be untouched"
+    )
+    surviving_tenant = await get_scope(db_session, scope=tenant_scope_t2)
+    assert surviving_tenant is not None and surviving_tenant.agent_name == "doomed", (
+        "another tenant's tenant row naming the same agent must be untouched"
+    )
+
+
+async def test_clear_agent_references_returns_zero_when_nothing_matches(
+    db_session: AsyncSession,
+) -> None:
+    t = await make_tenant(db_session)
+
+    cleared = await clear_agent_references(db_session, tenant_id=t.id, agent_name="doomed")
+
+    assert cleared == 0, "a tenant with no scope rows at all must report zero clears"

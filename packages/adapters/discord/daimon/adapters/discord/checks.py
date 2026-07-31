@@ -26,6 +26,8 @@ from discord.ext import commands
 
 P = ParamSpec("P")
 
+_ADMIN_ONLY_MESSAGE = "That action needs Manage Server — ask a server admin to do it."
+
 
 def is_member_guild_admin(member: discord.Member, *, guild_owner_id: int | None) -> bool:
     """Return True if the member is a guild admin by Discord-native permissions.
@@ -49,6 +51,29 @@ def is_guild_admin(interaction: Interaction[commands.Bot]) -> bool:
     guild = interaction.guild
     owner_id = guild.owner_id if guild is not None else None
     return is_member_guild_admin(user, guild_owner_id=owner_id)
+
+
+async def refuse_if_not_admin(interaction: Interaction[commands.Bot]) -> bool:
+    """Click-time admin re-check for a callback whose blast radius exceeds the clicker's own agent.
+
+    Returns True when the caller must return immediately (the action is
+    refused); False when it may proceed.
+
+    Whatever admin state a view was rendered with is a hint — every interaction
+    rebuilds the view with a fresh timeout, so a member who was an admin when
+    the panel opened may not be one now. This is the boundary, and it reads the
+    live interaction rather than anything the view carried.
+
+    Call it before any ``defer()`` or response in the callback, so the refusal
+    owns the interaction's first response.
+    """
+    if is_guild_admin(interaction):
+        return False
+    if interaction.response.is_done():
+        await interaction.followup.send(_ADMIN_ONLY_MESSAGE, ephemeral=True)
+    else:
+        await interaction.response.send_message(_ADMIN_ONLY_MESSAGE, ephemeral=True)
+    return True
 
 
 async def resolve_tenant_for_interaction(

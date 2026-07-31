@@ -12,10 +12,13 @@ import pytest
 from daimon.adapters.discord.agent_setup.write import delete_agent
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.scope import ChannelScopeRef
 from daimon.core.stores.agent_memory_stores import (
     get_memory_store_id,
     insert_memory_store,
 )
+from daimon.core.stores.scoped_config_read import get_scope
+from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     FakeMemoryStoreState,
@@ -156,3 +159,83 @@ async def test_delete_agent_succeeds_when_store_archive_fails(
     assert mem_state.stores[store.id]["archived_at"] is None
     async with db_session_factory() as s:
         assert await get_memory_store_id(s, tenant_id=tenant.id, agent_id=agent_uuid) == store.id
+
+
+async def test_delete_agent_clears_channel_default_naming_the_agent(
+    db_session, db_session_factory
+) -> None:
+    """Deleting the channel's current default must not leave a row naming a dead agent.
+
+    A channel_config row pointing at an archived agent makes every turn in that
+    channel fail to resolve until an admin re-scopes by hand.
+    """
+    tenant = await make_tenant(db_session)
+    scope = ChannelScopeRef(tenant_id=tenant.id, channel_id="C_DELETED_DEFAULT")
+    await set_fields(db_session, scope=scope, tenant_id=tenant.id, agent_name="doomed")
+    await db_session.commit()
+
+    client = build_fake_anthropic(
+        combine_handlers(
+            _make_archive_agent_handler(),
+            make_fake_memory_store_handler(FakeMemoryStoreState()),
+            make_fake_ma_handler(),
+        )
+    )
+    await client.beta.agents.create(
+        name="doomed",
+        model="claude-sonnet-4-6",
+        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "doomed"},
+    )
+
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.anthropic = client
+    runtime.sessionmaker = db_session_factory
+
+    await delete_agent(runtime, tenant_id=tenant.id, name="doomed")
+
+    async with db_session_factory() as s:
+        assert await get_scope(s, scope=scope) is None, (
+            "the channel row naming the deleted agent must be gone so resolution "
+            "falls through the cascade instead of naming a dead agent"
+        )
+
+
+async def test_delete_agent_leaves_scope_rows_naming_another_agent_untouched(
+    db_session, db_session_factory
+) -> None:
+    """Only rows naming the deleted agent move; a sibling channel keeps its default."""
+    tenant = await make_tenant(db_session)
+    doomed_scope = ChannelScopeRef(tenant_id=tenant.id, channel_id="C_DOOMED")
+    survivor_scope = ChannelScopeRef(tenant_id=tenant.id, channel_id="C_SURVIVOR")
+    await set_fields(db_session, scope=doomed_scope, tenant_id=tenant.id, agent_name="doomed")
+    await set_fields(db_session, scope=survivor_scope, tenant_id=tenant.id, agent_name="keeper")
+    await db_session.commit()
+
+    client = build_fake_anthropic(
+        combine_handlers(
+            _make_archive_agent_handler(),
+            make_fake_memory_store_handler(FakeMemoryStoreState()),
+            make_fake_ma_handler(),
+        )
+    )
+    await client.beta.agents.create(
+        name="doomed",
+        model="claude-sonnet-4-6",
+        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "doomed"},
+    )
+
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.anthropic = client
+    runtime.sessionmaker = db_session_factory
+
+    await delete_agent(runtime, tenant_id=tenant.id, name="doomed")
+
+    async with db_session_factory() as s:
+        assert await get_scope(s, scope=doomed_scope) is None, (
+            "the channel row naming the deleted agent must be gone"
+        )
+        survivor = await get_scope(s, scope=survivor_scope)
+        assert survivor is not None, "a channel row naming a different agent must survive"
+        assert survivor.agent_name == "keeper", (
+            "a channel row naming a different agent must keep its agent_name"
+        )

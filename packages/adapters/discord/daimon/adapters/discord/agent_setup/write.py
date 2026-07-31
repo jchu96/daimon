@@ -51,6 +51,7 @@ from daimon.core.specs import (
     merge_default_agent_toolset,
 )
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
+from daimon.core.stores.scoped_config_write import clear_agent_references
 from pydantic import ValidationError
 
 from .state import PanelState, RosterEntry
@@ -473,7 +474,12 @@ async def fork_agent(
 
 
 async def delete_agent(runtime: DiscordRuntime, *, tenant_id: uuid.UUID, name: str) -> None:
-    """Archive the MA agent matching `name` under the given tenant."""
+    """Archive the MA agent matching `name` under the given tenant.
+
+    Channel and server scope rows naming the agent are cleared as part of the
+    delete, so turn resolution falls through the cascade instead of resolving to
+    a deleted agent.
+    """
     agent = await find_agent_by_daimon_tag(runtime.anthropic, tenant_id=tenant_id, name=name)
     if agent is None:
         raise DaimonError(f"No agent named **{name}** found.")
@@ -485,6 +491,12 @@ async def delete_agent(runtime: DiscordRuntime, *, tenant_id: uuid.UUID, name: s
         agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
         log_context={"tenant_id": str(tenant_id), "agent_name": name, "ma_agent_id": agent.id},
     )
+    # After the MA archive, never before: a failure here leaves an archived
+    # agent with stale scope rows rather than a live agent with cleared ones.
+    # Deliberately unguarded — a failure must reach the callback's error
+    # boundary rather than degrade silently.
+    async with runtime.sessionmaker.begin() as session:
+        await clear_agent_references(session, tenant_id=tenant_id, agent_name=name)
 
 
 def _build_runtime_fernet(runtime: DiscordRuntime) -> MultiFernet:

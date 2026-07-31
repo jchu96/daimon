@@ -19,10 +19,22 @@ Handler contract:
 Security — the gate follows the blast radius of what each branch touches,
 never a blanket admin check ("hiding ≠ gating" principle: every refusal is
 decided post-ack, server-side, never trusted from the rendered view):
-  - Always open, no refusal for any caller: new, fork, edit (L1→L2 push),
-    edit_repo_form, paste_secrets, remove_secret. Repo bindings and env
-    variables are per-agent attachments that never enter the agent spec;
-    building/configuring an unscoped agent has no tenant-wide blast radius.
+  - Open to every caller: new, fork, edit (L1→L2 push), and the paste_secrets
+    form push. Building an unscoped agent has no tenant-wide blast radius, and
+    the paste-secrets form prompts for nothing at push time — the write it
+    submits is refused at submission instead.
+  - Shared-state gated via ``refuse_if_shared_and_not_admin`` in
+    ``agent_setup.gate``: edit_repo_form and remove_secret. Repo bindings and
+    env variables are per-agent attachments that never enter the agent spec, so
+    they are exempt from the spec gate's absolutism about defaults-managed
+    agents — an admin configuring the workspace's built-in agent is a supported
+    first-run step. A non-admin is refused whenever the target is the built-in
+    agent or one the workspace currently depends on, because a repo re-point or
+    a secret deletion changes state every member's turns rely on.
+    edit_repo_form is gated at the push because that form prompts for a GitHub
+    personal access token and no credential should transit for a write that is
+    going to be refused; the corresponding submissions are gated again in the
+    submit module, which is the actual write boundary.
   - Field-conditional via the shared reachability gate in ``agent_setup.gate``:
     remove_skill, remove_mcp, edit_agent_form, add_skill, add_mcp. These touch
     the agent spec (system/model/skills/mcp_servers), so a non-admin is
@@ -1073,10 +1085,12 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Remove secret — always open: env-variable credentials are a
-        # per-agent attachment, not part of the agent spec. No refusal for any
-        # caller; is_admin/can_edit_spec are resolved only for the L1 stale
-        # fallback and the L2 re-render's build_l2_view kwargs.
+        # Remove secret — env-variable credentials are a per-agent attachment,
+        # so this routes through the shared-state gate rather than the spec
+        # gate: an admin may remove a secret from the built-in agent, but a
+        # non-admin may not remove one from any agent the workspace currently
+        # depends on. The is_admin resolved below is not that check — it feeds
+        # only the L1 stale fallback and the L2 re-render's build_l2_view kwargs.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__remove_secret":
             is_admin = await resolve_is_admin(
@@ -1089,6 +1103,17 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
 
             agent_name_for_remove = selected_agent_name or ""
             if not agent_name_for_remove:
+                return
+
+            if await gate.refuse_if_shared_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_remove,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             ma_agent = await find_agent_by_daimon_tag(
@@ -1363,12 +1388,26 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Edit Repo Form — push L3 edit-repo form. Always open: the
-        # repo binding is a per-agent attachment, not part of the agent spec.
+        # Edit Repo Form — push L3 edit-repo form, gated on shared state at the
+        # push. Pushing a form is not itself a write; the reason the gate sits
+        # here is that this form prompts for a GitHub personal access token, and
+        # no credential should transit for a write that is going to be refused.
+        # The submission is gated again, which is the actual write boundary.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__edit_repo_form":
             agent_name_for_repo = selected_agent_name or ""
             if not agent_name_for_repo:
+                return
+
+            if await gate.refuse_if_shared_and_not_admin(
+                runtime,
+                client,
+                tenant_id=tenant_id,
+                agent_name=agent_name_for_repo,
+                channel_id=channel_id,
+                user_id=user_id,
+                dev_allow_all=_dev_allow_all_admin(runtime),
+            ):
                 return
 
             is_admin = await resolve_is_admin(
@@ -1507,9 +1546,11 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             )
 
         # -----------------------------------------------------------------------
-        # Paste Secrets — push L3 paste-secrets form. Always open:
-        # env-variable credentials are a per-agent attachment, not part of
-        # the agent spec.
+        # Paste Secrets — push L3 paste-secrets form, deliberately ungated at
+        # the push, unlike the adjacent edit-repo form: this form prompts for
+        # nothing at push time, so no credential can transit for a write that
+        # will be refused. Every member gets the form; the write it submits is
+        # refused at submission instead, which is the actual write boundary.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__paste_secrets":
             agent_name_for_secrets = selected_agent_name or ""

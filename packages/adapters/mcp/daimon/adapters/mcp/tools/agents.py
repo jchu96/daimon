@@ -61,6 +61,7 @@ from daimon.core.specs import (
     SkillRepo,
     merge_default_agent_toolset,
 )
+from daimon.core.stores.scoped_config_write import clear_agent_references
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ValidationError
@@ -680,6 +681,12 @@ async def _archive_agent_impl(
             agent_name=name,
             ma_agent_id=agent.id,
         )
+    # Outside the best-effort degrade on purpose: a transient memory-store
+    # failure must not skip the scope clear, or every turn in the affected
+    # channel — or the whole install, for the workspace row — keeps resolving
+    # to an archived agent. A failure here surfaces to the tool caller.
+    async with runtime.session_factory() as session, session.begin():
+        await clear_agent_references(session, tenant_id=auth.tenant_id, agent_name=name)
 
 
 def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
@@ -810,5 +817,9 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
 
     @mcp.tool(tags={"admin"})
     async def archive_agent(ctx: Context, name: str) -> None:  # pyright: ignore[reportUnusedFunction]
-        """Archive the MA agent and delete from the tenant pool."""
+        """Archive the MA agent and delete from the tenant pool.
+
+        Also clears any channel or workspace default naming the agent, so turns
+        in those scopes fall back to the next tier instead of failing to resolve.
+        """
         await _archive_agent_impl(runtime, await _auth(ctx), name)

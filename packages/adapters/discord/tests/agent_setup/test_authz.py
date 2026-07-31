@@ -1,4 +1,4 @@
-"""Tests for refuse_if_reachable_and_not_admin — the click-time write-path gate."""
+"""Tests for the click-time write-path gates: the spec gate and the attachment gate."""
 
 from __future__ import annotations
 
@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
-from daimon.adapters.discord.agent_setup.authz import refuse_if_reachable_and_not_admin
+from daimon.adapters.discord.agent_setup.authz import (
+    refuse_if_reachable_and_not_admin,
+    refuse_if_shared_and_not_admin,
+)
 from daimon.adapters.discord.agent_setup.state import RosterEntry
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.ma_resolver import new_resolver_cache
@@ -183,6 +186,131 @@ async def test_system_agent_refusal_uses_followup_when_already_acked() -> None:
     refused = await refuse_if_reachable_and_not_admin(interaction, runtime=runtime, entry=entry)
 
     assert refused is True
+    session_factory.assert_not_called()
+    interaction.response.send_message.assert_not_called()
+    interaction.followup.send.assert_called_once()
+    assert interaction.followup.send.call_args.kwargs.get("ephemeral") is True
+
+
+# ---------------------------------------------------------------------------
+# refuse_if_shared_and_not_admin — the attachment gate (repo binding, env vars)
+# ---------------------------------------------------------------------------
+
+
+async def test_shared_gate_no_target_refuses_silently_without_db_read() -> None:
+    session_factory = MagicMock()
+    runtime = _runtime(sessionmaker=session_factory)
+    interaction = _member_interaction()
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=None)
+
+    assert refused is True, "no selected agent must refuse"
+    session_factory.assert_not_called()
+    interaction.response.send_message.assert_not_called()
+    interaction.followup.send.assert_not_called()
+
+
+async def test_shared_gate_admin_passes_on_a_system_agent() -> None:
+    session_factory = MagicMock()
+    runtime = _runtime(sessionmaker=session_factory)
+    interaction = _admin_interaction()
+    entry = _entry("daimon", is_system=True)
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=entry)
+
+    assert refused is False, (
+        "an admin must be able to attach a repo to the seeded agent — that is the "
+        "first-run onboarding step, and the spec gate's system-agent absolutism "
+        "must not leak into the attachment gate"
+    )
+    interaction.response.send_message.assert_not_called()
+    interaction.followup.send.assert_not_called()
+
+
+async def test_shared_gate_admin_passes_on_a_reachable_agent_without_touching_the_database() -> (
+    None
+):
+    session_factory = MagicMock()
+    entry = _entry("bot")
+    runtime = _runtime(
+        sessionmaker=session_factory,
+        deployment_default=DeploymentDefault(agent_name=entry.name),
+    )
+    interaction = _admin_interaction()
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=entry)
+
+    assert refused is False, "a live admin must pass even when the target is the current default"
+    session_factory.assert_not_called()
+    interaction.response.send_message.assert_not_called()
+    interaction.followup.send.assert_not_called()
+
+
+async def test_shared_gate_non_admin_refuses_on_a_system_agent() -> None:
+    session_factory = MagicMock()
+    runtime = _runtime(sessionmaker=session_factory)
+    interaction = _member_interaction()
+    entry = _entry("daimon", is_system=True)
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=entry)
+
+    assert refused is True, "a member must not write attachments on the deployment's own agent"
+    session_factory.assert_not_called()
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+    interaction.followup.send.assert_not_called()
+
+
+async def test_shared_gate_non_admin_refuses_on_a_reachable_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    guild_id = 222004
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    entry = _entry("bot")
+    runtime = _runtime(
+        sessionmaker=db_session_factory,
+        deployment_default=DeploymentDefault(agent_name=entry.name),
+    )
+    interaction = _member_interaction(guild_id=guild_id)
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=entry)
+
+    assert refused is True, "the workspace's current default agent must refuse a non-admin"
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+    interaction.followup.send.assert_not_called()
+
+
+async def test_shared_gate_non_admin_passes_on_an_unreachable_non_system_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    guild_id = 222005
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+    runtime = _runtime(sessionmaker=db_session_factory)
+    interaction = _member_interaction(guild_id=guild_id)
+    entry = _entry("bot")
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=entry)
+
+    assert refused is False, (
+        "an agent that is neither seeded nor currently resolved by anything is "
+        "the member's own to attach a repo to"
+    )
+    interaction.response.send_message.assert_not_called()
+    interaction.followup.send.assert_not_called()
+
+
+async def test_shared_gate_refusal_uses_followup_when_already_acked() -> None:
+    session_factory = MagicMock()
+    runtime = _runtime(sessionmaker=session_factory)
+    interaction = _member_interaction(acked=True)
+    entry = _entry("daimon", is_system=True)
+
+    refused = await refuse_if_shared_and_not_admin(interaction, runtime=runtime, entry=entry)
+
+    assert refused is True, "an acked interaction must still refuse"
     session_factory.assert_not_called()
     interaction.response.send_message.assert_not_called()
     interaction.followup.send.assert_called_once()

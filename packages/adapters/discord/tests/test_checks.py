@@ -1,12 +1,14 @@
-"""Tests for gating decorators: require_registered_guild."""
+"""Tests for the gating decorators and the click-time admin gate."""
 
 from __future__ import annotations
 
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from daimon.adapters.discord.checks import (
+    refuse_if_not_admin,
     require_registered_guild,
     resolve_tenant_for_interaction,
 )
@@ -160,3 +162,71 @@ class TestResolveTenantForInteraction:
         interaction = _make_interaction(guild_id=None, sessionmaker=db_session_factory)
         resolved = await resolve_tenant_for_interaction(interaction.client, interaction)
         assert resolved is None, "guild_id None should resolve to None"
+
+
+# ---------------------------------------------------------------------------
+# refuse_if_not_admin
+# ---------------------------------------------------------------------------
+
+
+def _admin_gate_interaction(
+    *, is_admin: bool, is_member: bool = True, acked: bool = False
+) -> MagicMock:
+    """Build a mock Interaction with the minimum attributes refuse_if_not_admin touches."""
+    interaction = MagicMock()
+    interaction.user = MagicMock(spec=discord.Member) if is_member else MagicMock()
+    interaction.user.id = 1 if is_admin else 2
+    interaction.user.guild_permissions.administrator = is_admin
+    interaction.user.guild_permissions.manage_guild = False
+    interaction.guild.owner_id = 999
+    interaction.response.is_done.return_value = acked
+    interaction.response.send_message = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
+async def test_refuse_if_not_admin_passes_a_live_guild_admin_silently() -> None:
+    interaction = _admin_gate_interaction(is_admin=True)
+
+    refused = await refuse_if_not_admin(interaction)
+
+    assert refused is False, "a live guild admin must pass the gate"
+    interaction.response.send_message.assert_not_awaited()
+    interaction.followup.send.assert_not_awaited()
+
+
+async def test_refuse_if_not_admin_refuses_a_member_with_one_ephemeral() -> None:
+    interaction = _admin_gate_interaction(is_admin=False)
+
+    refused = await refuse_if_not_admin(interaction)
+
+    assert refused is True, "an ordinary member must be refused"
+    interaction.response.send_message.assert_awaited_once()
+    assert "Manage Server" in interaction.response.send_message.call_args.args[0], (
+        "the refusal should name the permission the member is missing"
+    )
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True, (
+        "the refusal must be ephemeral"
+    )
+    interaction.followup.send.assert_not_awaited()
+
+
+async def test_refuse_if_not_admin_refuses_a_non_member_user() -> None:
+    interaction = _admin_gate_interaction(is_admin=True, is_member=False)
+
+    refused = await refuse_if_not_admin(interaction)
+
+    assert refused is True, "a DM-context User is not a guild admin and must be refused"
+    interaction.response.send_message.assert_awaited_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+async def test_refuse_if_not_admin_uses_followup_when_already_acked() -> None:
+    interaction = _admin_gate_interaction(is_admin=False, acked=True)
+
+    refused = await refuse_if_not_admin(interaction)
+
+    assert refused is True, "an acked interaction must still refuse"
+    interaction.response.send_message.assert_not_awaited()
+    interaction.followup.send.assert_awaited_once()
+    assert interaction.followup.send.call_args.kwargs.get("ephemeral") is True
