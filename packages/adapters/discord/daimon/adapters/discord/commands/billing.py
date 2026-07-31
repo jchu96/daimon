@@ -77,6 +77,7 @@ class BillingCog(commands.Cog):
                     external_id=str(interaction.user.id),
                 )
                 account_id = principal.account_id
+                await session.commit()
             view = BillingPanelView(
                 state,
                 runtime=runtime,

@@ -248,7 +248,7 @@ class _TopUpSelect(discord.ui.Select["BillingPanelView"]):
                 f"Top up ${amount}: complete payment here (link is private):\n{url}",
                 ephemeral=True,
             )
-        except (DaimonError, discord.HTTPException) as exc:
+        except (DaimonError, discord.HTTPException, httpx.HTTPStatusError) as exc:
             rid = generate_request_id()
             await interaction.response.send_message(
                 render_error(exc, request_id=rid), ephemeral=True
