@@ -17,6 +17,7 @@ no network).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -96,3 +97,107 @@ def remove_slug_tree(data_dir: Path, slug: str) -> None:
     ``slug`` must already have passed ``lifecycle.safe_slug``.
     """
     shutil.rmtree(get_slug_paths(data_dir, slug).root, ignore_errors=True)
+
+
+# ─── uid pool ────────────────────────────────────────────────────────────────
+#
+# A persisted slug -> uid registry, not a deterministic hash of the slug.
+# Blogs are permanent and accumulate for the life of the deployment, so a
+# hash into any convenient-sized range carries real birthday-collision risk
+# — and a collision silently defeats isolation for both colliding slugs. The
+# registry lives at ``data_dir / "uids.json"``, alongside ``blogs.json`` and
+# ``pids.json``, outside every slug root. A plain ``dict[str, int]`` is
+# enough here — unlike ``PidRecord``/``BlogRecord``, a uid row carries no
+# other fields, so a Pydantic model would buy nothing.
+
+
+class UidPoolExhaustedError(RuntimeError):
+    """Raised when every uid in the configured range is already allocated."""
+
+
+def load_uid_registry(path: Path) -> dict[str, int]:
+    """Read the uid registry. Returns an empty dict if missing or malformed.
+
+    Same posture as ``pids_store.load_pids``: a malformed file means a
+    previous instance died mid-write, so we forget it rather than trust
+    partial state. Entries whose key is not a ``str`` or whose value is not
+    a genuine ``int`` (``bool`` is an ``int`` subclass and is rejected too)
+    are skipped rather than raising.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():  # pyright: ignore[reportUnknownVariableType]
+        if not isinstance(key, str):
+            continue
+        if not isinstance(value, int) or isinstance(value, bool):
+            continue
+        out[key] = value
+    return out
+
+
+def save_uid_registry(path: Path, records: dict[str, int]) -> None:
+    """Atomically rewrite the uid registry (tmp + rename), same idiom as save_pids."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(records, indent=2))
+    os.replace(tmp, path)
+
+
+def allocate_uid(registry: dict[str, int], slug: str, *, start: int, end: int) -> int:
+    """Return the uid for ``slug``, allocating a new one if needed. Pure.
+
+    If ``slug`` is already in ``registry``, its existing uid is returned
+    unchanged — idempotency the boot migration depends on. Otherwise the
+    lowest value in ``range(start, end + 1)`` not present in
+    ``registry.values()`` is returned. Does not touch disk and does not
+    mutate ``registry``. Raises ``UidPoolExhaustedError`` if every value in
+    the range is already taken.
+    """
+    if slug in registry:
+        return registry[slug]
+    used = set(registry.values())
+    for uid in range(start, end + 1):
+        if uid not in used:
+            return uid
+    raise UidPoolExhaustedError(f"uid pool exhausted ({start}-{end}, {len(registry)} allocated)")
+
+
+def get_or_create_slug_uid(path: Path, slug: str, *, start: int, end: int) -> int:
+    """Load the registry, allocate (or reuse) a uid for ``slug``, save if changed.
+
+    No write on the hit path — an already-registered slug returns without
+    rewriting the file.
+    """
+    registry = load_uid_registry(path)
+    if slug in registry:
+        return registry[slug]
+    uid = allocate_uid(registry, slug, start=start, end=end)
+    registry[slug] = uid
+    save_uid_registry(path, registry)
+    return uid
+
+
+def release_slug_uid(path: Path, slug: str) -> None:
+    """Drop a slug's uid from the registry, making it immediately reusable.
+
+    A no-op for a slug that isn't registered — does not raise and does not
+    create the file if it didn't already exist.
+
+    The caller MUST have already killed the slug's process before calling
+    this: the uid becomes reusable the instant this returns, and a
+    surviving process still holding the old uid would otherwise be able to
+    reach whichever slug gets allocated it next. Releasing is required
+    rather than optional — edit-mode notebooks are TTL-reaped every
+    ``subprocess_ttl_seconds`` (default 24h), so a never-releasing pool
+    would burn through its whole range on ordinary churn.
+    """
+    registry = load_uid_registry(path)
+    if registry.pop(slug, None) is not None:
+        save_uid_registry(path, registry)
