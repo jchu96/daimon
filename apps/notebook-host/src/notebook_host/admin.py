@@ -23,6 +23,7 @@ from notebook_host.blogs_store import (
 )
 from notebook_host.capability import CapabilityClaims, verify_token
 from notebook_host.config import Settings
+from notebook_host.consumed_store import burn_jti
 from notebook_host.jail import (
     JailUnavailableError,
     SlugPaths,
@@ -75,9 +76,6 @@ class AdminState:
     # Serialises concurrent PUTs to the same slug. Without it, two PUTs can
     # interleave kill/allocate/spawn and orphan the loser's subprocess.
     slug_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
-    # Single-use capability-token jtis already burned. Process-local; bounded by
-    # the token TTL (~300s) across restarts. Replay of a consumed token → 409.
-    consumed: set[str] = field(default_factory=set[str])
 
     def make_process(
         self,
@@ -445,7 +443,19 @@ def create_admin_router(state: AdminState) -> APIRouter:
         # Public route — authed by the capability token, NOT the admin bearer.
         secrets_list = [s.get_secret_value() for s in state.settings.admin_secrets]
         claims: CapabilityClaims = verify_token(secrets_list, token, now=datetime.now(UTC))
-        if claims.jti in state.consumed:
+        # Burn before reading the body: burn_jti's check-and-write is one call
+        # with no await in between, so two concurrent replays of one token
+        # cannot both observe it as unused. Burning here (rather than after a
+        # successful write) means a token whose upload later fails a size
+        # check is not reusable — that is what single-use means; the
+        # alternative reopens the replay window this closes.
+        burned = burn_jti(
+            state.settings.resolved_consumed_file,
+            claims.jti,
+            exp=claims.exp,
+            now=int(datetime.now(UTC).timestamp()),
+        )
+        if not burned:
             raise HTTPException(status.HTTP_409_CONFLICT, "capability token already used")
         body = await request.body()
         ceiling = (
@@ -459,11 +469,6 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 f"upload body exceeds cap (size={len(body)}, token_max={claims.max_bytes}, "
                 f"host_ceiling={ceiling})",
             )
-        # Single-use is best-effort: the in-set check and this add straddle the
-        # body read, so two concurrent replays of one token could both pass. Low
-        # risk — both carry identical authorized bytes and the slug lock serialises
-        # the writes. Process-local, TTL-bounded; a persistent store is day-2.
-        state.consumed.add(claims.jti)
         slug = safe_slug(claims.slug)
 
         if claims.op == "data":

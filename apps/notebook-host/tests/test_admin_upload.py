@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from notebook_host.admin import AdminState, create_admin_router
 from notebook_host.jail import SlugPaths, get_slug_paths
 
 # `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
@@ -166,6 +167,38 @@ def test_upload_oversize_body_rejected(tmp_path: Path, monkeypatch: pytest.Monke
     r = client.put(f"/upload/{tok}", content=b"z" * 5000)
     assert r.status_code == 413, "body over the token's max_bytes → 413"
     assert not get_slug_paths(tmp_path, "big").notebook.exists(), "no file written when oversize"
+
+    retry = client.put(f"/upload/{tok}", content=b"z" * 500)
+    assert retry.status_code == 409, (
+        "the token was burned before the size check ran, so a retry after a rejected "
+        "oversize upload is not reusable — that is the documented consequence of closing "
+        "the concurrent-replay window before the body read"
+    )
+
+
+def test_upload_replay_rejected_across_a_fresh_admin_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capability token burned before a host restart must still be refused after one.
+
+    Regression test for the defect: the old `AdminState.consumed` in-memory
+    set only ever passed the single-use check because the process stayed
+    alive across the two requests in a test. Building a *fresh* AdminState
+    and app over the same data_dir — the shape of a real host restart —
+    proves the burn now survives on disk rather than in that set.
+    """
+    client, state = _make_app(tmp_path, monkeypatch)
+    tok = _mint("blog", "restart-test", jti="reused-across-restart")
+    r1 = client.put(f"/upload/{tok}", content=b"# first\n")
+    assert r1.status_code == 200, r1.text
+
+    fresh_state = AdminState(settings=state.settings, processes={}, spawner=state.spawner)
+    fresh_app = FastAPI()
+    fresh_app.include_router(create_admin_router(fresh_state))
+    fresh_client = TestClient(fresh_app, raise_server_exceptions=True)
+
+    r2 = fresh_client.put(f"/upload/{tok}", content=b"# replay\n")
+    assert r2.status_code == 409, "a token burned before a restart must still be refused after one"
 
 
 def test_upload_data_with_no_name_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

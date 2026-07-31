@@ -140,6 +140,13 @@ class Settings(BaseSettings):
     # mode. ``None`` (default) means "use ``data_dir / 'blogs.json'``" — kept on
     # the same persistent volume as the source files.
     blogs_file: Path | None = None
+    # Path to the burned single-use capability-token jti registry. The
+    # /upload/{token} handler writes {jti: exp} here on every successful burn;
+    # this set survives a host restart, unlike the process-local set it
+    # replaced — a token burned before a restart is still refused after one.
+    # ``None`` (default) means "use ``data_dir / 'consumed.json'``" — kept on
+    # the same persistent volume as the other registries.
+    consumed_file: Path | None = None
 
     @property
     def resolved_pids_file(self) -> Path:
@@ -150,6 +157,15 @@ class Settings(BaseSettings):
     def resolved_blogs_file(self) -> Path:
         """The actual blogs.json path: explicit setting, else data_dir / blogs.json."""
         return self.blogs_file if self.blogs_file is not None else self.data_dir / "blogs.json"
+
+    @property
+    def resolved_consumed_file(self) -> Path:
+        """The actual consumed.json path: explicit setting, else data_dir / consumed.json."""
+        return (
+            self.consumed_file
+            if self.consumed_file is not None
+            else self.data_dir / "consumed.json"
+        )
 
     @property
     def resolved_uids_file(self) -> Path:
