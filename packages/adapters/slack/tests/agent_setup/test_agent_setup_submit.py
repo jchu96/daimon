@@ -7,9 +7,12 @@ Covers:
 - run_* handlers via FakeSlackWebClient:
   - run_new_agent_submission (admin, write succeeds) posts :white_check_mark: ephemeral; no views_update
   - run_paste_secrets_submission (admin, 2 pairs) posts count ephemeral without secret values; no views_update
-  - the four always-open paths (new/fork/edit_repo/paste_secrets): a non-admin
-    submission succeeds with no permission-refusal ephemeral, including against
-    the workspace's currently-default agent for the two per-agent attachments
+  - creation (new/fork): a non-admin submission succeeds with no
+    permission-refusal ephemeral
+  - the two per-agent attachment submissions (edit_repo/paste_secrets): a
+    non-admin proceeds only when the target agent is neither defaults-managed
+    nor currently reachable, is refused before any MA request otherwise, and
+    an admin succeeds against the workspace's currently-default agent
   - the three field-conditional paths (edit_agent/add_skill/add_mcp): a
     non-admin submission proceeds on an unreachable agent and is refused
     before any MA request on a reachable one, via the shared
@@ -26,6 +29,8 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+import structlog
+import structlog.testing
 import yarl
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.agent_setup import submit as submit_mod
@@ -586,7 +591,9 @@ def _ephemeral_texts(client_fake: Any) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Task 1 — the four always-open paths: non-admin succeeds, no refusal ephemeral
+# Creation paths, open to every member; and the two per-agent attachment
+# paths, refused for a non-admin on a shared agent — each with an
+# admin-positive sibling proving the shared-agent write still works
 # ---------------------------------------------------------------------------
 
 
@@ -692,12 +699,17 @@ async def test_run_fork_agent_submission_when_non_admin_forks_agent_with_no_refu
 
 
 @pytest.mark.asyncio
-async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_default_binds_repo(
+async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_default_refuses_bind(
     fake_slack_web_client: Any,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Repo binding is a per-agent attachment, so it stays open for a
-    non-admin even against the workspace's currently-default agent."""
+    """A repo re-point changes what the whole workspace's shared agent clones,
+    so a non-admin is refused against the currently-default agent — and refused
+    early enough that no GitHub probe is ever made.
+
+    The runtime's GitHub transport is the never-called handler: an outbound
+    probe would raise rather than quietly succeed, which is what pins the gate
+    ahead of the probe rather than merely ahead of the write."""
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding
 
@@ -713,6 +725,72 @@ async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_de
 
     client_fake: Any = fake_slack_web_client
     # conftest default users.info is non-admin; no override.
+
+    runtime = SlackRuntime(
+        settings=_build_edit_repo_settings(app_id=None),
+        anthropic=build_fake_anthropic(
+            _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+        ),
+        sessionmaker=db_session_factory,
+        billing_config=None,
+        http_client=_build_http_client(),
+        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+    )
+
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/default-agent.git",
+            "pat": "",
+            "pat_replace": False,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+
+    assert row is None, "no binding may be written for a non-admin on a workspace-default agent"
+
+    texts = _ephemeral_texts(client_fake)
+    assert any("workspace-admin" in t for t in texts), (
+        "the refusal ephemeral must say the change needs workspace-admin permission"
+    )
+    assert not any(":white_check_mark:" in t for t in texts), (
+        "a refused bind must not post a success confirmation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_when_admin_and_agent_is_workspace_default_binds_repo(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An admin binding a repo to the workspace's default agent is the
+    first-run onboarding step and must keep working — the attachment gate
+    short-circuits on live admin status before it looks at shared-ness."""
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'f' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+    await _seed_guild_account(db_session_factory, tenant_id=tenant_id)
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
 
     runtime = SlackRuntime(
         settings=_build_edit_repo_settings(app_id=None),
@@ -745,35 +823,22 @@ async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_de
     async with db_session_factory() as session:
         row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
 
-    assert row is not None, "binding should be written even against a workspace-default agent"
-    assert row.repo_url == "example/default-agent"
+    assert row is not None, "an admin's bind against the workspace-default agent must be written"
+    assert row.repo_url == "example/default-agent", (
+        "the binding must carry the submitted repo, not a stale one"
+    )
 
     texts = _ephemeral_texts(client_fake)
     assert any(":white_check_mark:" in t for t in texts), (
-        "repo binding must succeed for a non-admin on a workspace-default agent"
+        "an admin's bind must post the success confirmation"
     )
     assert not any("workspace-admin" in t for t in texts), (
-        "no reachability refusal ephemeral should be posted for a per-agent attachment"
+        "an admin must not see the shared-agent refusal"
     )
 
 
-@pytest.mark.asyncio
-async def test_run_paste_secrets_submission_when_non_admin_and_agent_is_workspace_default_writes_secrets(
-    fake_slack_web_client: Any,
-    db_session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """Env variables are a per-agent attachment, so they stay open for a
-    non-admin even against the workspace's currently-default agent."""
-    async with db_session_factory() as session:
-        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
-        tenant_id = tenant.id
-        await session.commit()
-    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
-
-    client_fake: Any = fake_slack_web_client
-    # conftest default users.info is non-admin; no override.
-
-    ma_agent_id = f"agent_{'g' * 24}"
+def _paste_secrets_ma_handler(*, tenant_id: Any, ma_agent_id: str) -> Any:
+    """Serve a single tenant-tagged agent for run_paste_secrets_submission."""
     agent_data = _agent_payload_for_gate_tests(tenant_id=tenant_id, agent_id=ma_agent_id)
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -785,7 +850,35 @@ async def test_run_paste_secrets_submission_when_non_admin_and_agent_is_workspac
             return httpx.Response(200, json={"data": [], "has_more": False})
         return httpx.Response(404, json={"error": f"unhandled {method} {path}"})
 
-    runtime = _build_runtime_with_db(db_session_factory, anthropic_handler=_handler)
+    return _handler
+
+
+@pytest.mark.asyncio
+async def test_run_paste_secrets_submission_when_non_admin_and_agent_is_workspace_default_refuses_write(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """put_agent_file is an upsert and the file it writes is mounted
+    read-write on every session of the shared agent, so a non-admin is refused
+    against the currently-default agent and no file exists afterwards."""
+    from daimon.core.ma_identity import derive_agent_uuid
+    from daimon.core.stores.agent_files import list_agent_files
+
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        tenant_id = tenant.id
+        await session.commit()
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    client_fake: Any = fake_slack_web_client
+    # conftest default users.info is non-admin; no override.
+
+    ma_agent_id = f"agent_{'g' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    runtime = _build_runtime_with_db(
+        db_session_factory,
+        anthropic_handler=_paste_secrets_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id),
+    )
 
     await run_paste_secrets_submission(
         runtime,
@@ -799,12 +892,123 @@ async def test_run_paste_secrets_submission_when_non_admin_and_agent_is_workspac
         extra={"pairs": [("OPEN_KEY", "open_val")]},
     )
 
+    async with db_session_factory() as session:
+        files = await list_agent_files(session, tenant_id=tenant_id, agent_id=agent_uuid)
+
+    assert files == [], "a refused paste must write no agent file at all"
+
     texts = _ephemeral_texts(client_fake)
-    assert any(":white_check_mark:" in t for t in texts), (
-        "paste-secrets must succeed for a non-admin on a workspace-default agent"
+    assert any("workspace-admin" in t for t in texts), (
+        "the refusal ephemeral must say the change needs workspace-admin permission"
     )
-    assert not any("workspace-admin" in t for t in texts), (
-        "no reachability refusal ephemeral should be posted for a per-agent attachment"
+    assert not any(":white_check_mark:" in t for t in texts), (
+        "a refused paste must not post a success confirmation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_paste_secrets_submission_when_admin_and_agent_is_workspace_default_writes_secrets(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An admin populating the workspace-default agent's environment still
+    works, and the confirmation still carries the key name only."""
+    from daimon.core.ma_identity import derive_agent_uuid
+    from daimon.core.stores.agent_files import get_agent_file
+
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        tenant_id = tenant.id
+        await session.commit()
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    ma_agent_id = f"agent_{'g' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    runtime = _build_runtime_with_db(
+        db_session_factory,
+        anthropic_handler=_paste_secrets_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id),
+    )
+
+    secret_value = "admin_written_value"
+    await run_paste_secrets_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="secrets",
+        extra={"pairs": [("SHARED_KEY", secret_value)]},
+    )
+
+    async with db_session_factory() as session:
+        row = await get_agent_file(
+            session, tenant_id=tenant_id, agent_id=agent_uuid, key="SHARED_KEY"
+        )
+
+    assert row is not None, "an admin's paste against the workspace-default agent must be written"
+    assert row.content == secret_value, "the stored file must carry the submitted value"
+
+    texts = _ephemeral_texts(client_fake)
+    assert any("SHARED_KEY" in t for t in texts), (
+        "the confirmation must name the key that was written"
+    )
+    assert not any(secret_value in t for t in texts), (
+        "the confirmation must never carry the secret value"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_paste_secrets_submission_refusal_logs_no_key_names(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The gate precedes every log line derived from the submitted pairs, so a
+    refused paste leaks neither key names nor values to the operator log."""
+    async with db_session_factory() as session:
+        tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
+        tenant_id = tenant.id
+        await session.commit()
+    await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
+
+    client_fake: Any = fake_slack_web_client
+    # conftest default users.info is non-admin; no override.
+
+    ma_agent_id = f"agent_{'g' * 24}"
+    runtime = _build_runtime_with_db(
+        db_session_factory,
+        anthropic_handler=_paste_secrets_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id),
+    )
+
+    cap = structlog.testing.LogCapture()
+    structlog.configure(processors=[cap])
+    try:
+        await run_paste_secrets_submission(
+            runtime,
+            client_fake.client,
+            team_id=_TEAM_ID,
+            user_id=_USER_ID,
+            channel_id=_CHANNEL_ID,
+            view_id="V_SUBMIT_TEST",
+            agent_name=_AGENT_NAME,
+            parent_section="secrets",
+            extra={"pairs": [("REFUSED_KEY", "refused_value")]},
+        )
+    finally:
+        structlog.reset_defaults()
+
+    assert all("keys" not in entry for entry in cap.entries), (
+        "a refused paste must emit no log entry carrying a keys field"
+    )
+    assert all("REFUSED_KEY" not in str(entry) for entry in cap.entries), (
+        "the submitted key name must never reach the log stream on the refusal path"
+    )
+    assert all("refused_value" not in str(entry) for entry in cap.entries), (
+        "the submitted secret value must never reach the log stream"
     )
 
 
@@ -1359,6 +1563,10 @@ def _build_edit_repo_settings(*, app_id: str | None, fernet_key: str | None = No
     settings.github = MagicMock()
     settings.github.app_id = app_id
     settings.github.oauth_scopes = ("repo",)
+    # Explicitly off: a MagicMock attribute is truthy, so leaving this unset
+    # makes _dev_allow_all_admin treat every caller as an admin and every
+    # admin gate inert while the suite stays green.
+    settings.slack.dev_allow_all_admin = False
     return settings
 
 
