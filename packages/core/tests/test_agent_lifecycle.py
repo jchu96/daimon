@@ -9,6 +9,7 @@ regression proof the whole phase's extraction leans on.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -24,11 +25,12 @@ from daimon.core.github_credentials import build_multifernet, get_pat, upsert_cr
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_memory_stores import get_memory_store_id, insert_memory_store
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.core.stores.github_credentials import (
     delete_credential_for_principal,
     get_credential_by_principal,
 )
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
     FakeMemoryStoreState,
     NotHandled,
@@ -343,6 +345,149 @@ async def test_copy_unbound_source_is_a_noop(
 
     fork_binding = await get_binding(db_session, tenant_id=tenant.id, agent_id=fork_agent_uuid)
     assert fork_binding is None
+
+
+async def test_copy_carries_pat_proof_forward_to_rekeyed_inline_pat_fork(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """A pat-proven source binding's proof (kind/timestamp/account) carries
+    forward onto the fork verbatim, alongside the fork's own re-keyed
+    inline-pat ma_secret_ref."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    source_agent_uuid = uuid.uuid4()
+    fork_agent_uuid = uuid.uuid4()
+
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+    plaintext = "ghp_proof_source_token_9999"
+    await upsert_credential_encrypted(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        principal_id=source_agent_uuid,
+        github_login="(inline-pat)",
+        plaintext_token=plaintext,
+        scopes=_OAUTH_SCOPES,
+    )
+    proof_at = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
+    async with db_session_factory() as s, s.begin():
+        await set_agent_github_binding(
+            s, agent_id=source_agent_uuid, principal_id=source_agent_uuid
+        )
+        await set_binding(
+            s,
+            tenant_id=tenant.id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/proven-repo",
+            default_branch="main",
+            ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=RepoAccessProof(kind="pat", at=proof_at, account_id=account.id),
+        )
+
+    await copy_credential_and_repo_binding(
+        anthropic=_refusing_anthropic(),  # type: ignore[arg-type]
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        oauth_scopes=_OAUTH_SCOPES,
+        tenant_id=tenant.id,
+        source_agent_uuid=source_agent_uuid,
+        fork_agent_uuid=fork_agent_uuid,
+    )
+
+    fork_binding = await get_binding(db_session, tenant_id=tenant.id, agent_id=fork_agent_uuid)
+    assert fork_binding is not None, "fork binding must exist"
+    assert fork_binding.proof_kind == "pat", "proof kind must carry forward verbatim"
+    assert fork_binding.proof_at == proof_at, "proof timestamp must carry forward verbatim"
+    assert fork_binding.proof_account_id == account.id, (
+        "proof account must carry forward verbatim, not re-attributed to the forking principal"
+    )
+    assert fork_binding.ma_secret_ref == f"inline-pat:{fork_agent_uuid}", (
+        "ma_secret_ref must still be re-keyed to the fork's own inline-pat ref"
+    )
+
+
+async def test_copy_carries_public_proof_forward_verbatim_for_anon_source(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """A public-proven anon: source binding copies both its ref and its
+    proof verbatim onto the fork."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    source_agent_uuid = uuid.uuid4()
+    fork_agent_uuid = uuid.uuid4()
+
+    proof_at = datetime(2026, 7, 30, 9, 30, 0, tzinfo=UTC)
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=tenant.id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/public-proven-repo",
+            default_branch="main",
+            ma_secret_ref="anon:",
+            proof=RepoAccessProof(kind="public", at=proof_at, account_id=None),
+        )
+
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+    await copy_credential_and_repo_binding(
+        anthropic=_refusing_anthropic(),  # type: ignore[arg-type]
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        oauth_scopes=_OAUTH_SCOPES,
+        tenant_id=tenant.id,
+        source_agent_uuid=source_agent_uuid,
+        fork_agent_uuid=fork_agent_uuid,
+    )
+
+    fork_binding = await get_binding(db_session, tenant_id=tenant.id, agent_id=fork_agent_uuid)
+    assert fork_binding is not None
+    assert fork_binding.ma_secret_ref == "anon:", "anon: ref must copy verbatim"
+    assert fork_binding.proof_kind == "public", "public proof kind must copy verbatim"
+    assert fork_binding.proof_at == proof_at, "proof timestamp must copy verbatim"
+    assert fork_binding.proof_account_id is None, (
+        "a system-proven public proof has no account to carry forward"
+    )
+
+
+async def test_copy_leaves_fork_proof_null_when_source_proof_is_null(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """A source binding with no recorded proof yields a fork binding with no
+    recorded proof — copy_binding invents nothing."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    source_agent_uuid = uuid.uuid4()
+    fork_agent_uuid = uuid.uuid4()
+
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=tenant.id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/unproven-repo",
+            default_branch="main",
+            ma_secret_ref="anon:",
+        )
+
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+    await copy_credential_and_repo_binding(
+        anthropic=_refusing_anthropic(),  # type: ignore[arg-type]
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        oauth_scopes=_OAUTH_SCOPES,
+        tenant_id=tenant.id,
+        source_agent_uuid=source_agent_uuid,
+        fork_agent_uuid=fork_agent_uuid,
+    )
+
+    fork_binding = await get_binding(db_session, tenant_id=tenant.id, agent_id=fork_agent_uuid)
+    assert fork_binding is not None
+    assert fork_binding.proof_kind is None, "no proof kind must be invented"
+    assert fork_binding.proof_at is None, "no proof timestamp must be invented"
+    assert fork_binding.proof_account_id is None, "no proof account must be invented"
 
 
 async def test_archive_best_effort_happy_path(
