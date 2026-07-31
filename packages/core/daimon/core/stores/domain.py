@@ -355,6 +355,27 @@ class PendingFileDeleteRow(BaseModel):
     created_at: datetime
 
 
+RepoProofKind = Literal["public", "pat"]
+
+
+class RepoAccessProof(BaseModel):
+    """Bind-time evidence that the binder could read a specific repo.
+
+    `at` is caller-supplied, not read from a clock inside this model or any
+    store/pure function that constructs one — the shell that just performed
+    the probe (a public-repo check or a PAT read) is the only place a
+    timestamp should come from. `account_id` is nullable because a
+    system-initiated proof (e.g. a one-shot operator backfill confirming a
+    repo is public) has no acting person to attribute it to.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: RepoProofKind
+    at: datetime
+    account_id: uuid.UUID | None
+
+
 class AgentRepoBindingRow(BaseModel):
     """Pydantic row for AgentRepoBinding."""
 
@@ -367,6 +388,9 @@ class AgentRepoBindingRow(BaseModel):
     ma_secret_ref: str
     last_sync_at: datetime | None = None
     last_sync_error: str | None = None
+    proof_kind: RepoProofKind | None = None
+    proof_at: datetime | None = None
+    proof_account_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
 
