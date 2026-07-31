@@ -13,8 +13,6 @@ Shell functions (injected httpx):
     installation-token mint (only for a binding with recorded proof) ->
     operator fallback PAT (only for a binding with a recorded
     verified-public proof) -> raise. Never returns an empty string.
-  is_app_installed_for_repo — bind-time App-coverage probe for setup panels;
-    returns False (never raises) when App creds are unset.
 """
 
 from __future__ import annotations
@@ -34,7 +32,7 @@ from pydantic import SecretStr
 
 log = structlog.get_logger()
 
-__all__ = ["select_clone_auth", "resolve_clone_token", "is_app_installed_for_repo"]
+__all__ = ["select_clone_auth", "resolve_clone_token"]
 
 
 def select_clone_auth(
@@ -174,38 +172,3 @@ async def resolve_clone_token(
         f"No credential is authorized to clone {binding.repo_url}. Re-bind this repo "
         "with a GitHub token that can read it, from the agent setup panel's GitHub option."
     )
-
-
-async def is_app_installed_for_repo(
-    http_client: httpx.AsyncClient,
-    *,
-    app_id: str | None,
-    app_private_key: SecretStr | None,
-    owner: str,
-    repo: str,
-    now: int,
-) -> bool:
-    """Bind-time App-coverage probe for setup panels.
-
-    Returns False (never raises) when App creds are unset, so panels on
-    non-App deployments just show the PAT path.
-
-    Args:
-        http_client: Injected async HTTP client. Caller owns lifecycle.
-        app_id: GitHub App id, or None if the App is not configured.
-        app_private_key: GitHub App private key, or None if not configured.
-        owner: Repository owner (org or user login).
-        repo: Repository name (no owner prefix).
-        now: Current Unix timestamp (int).
-
-    Returns:
-        True if the App is installed on the repo, False otherwise (including
-        when App creds are unset).
-    """
-    if app_id is None or app_private_key is None:
-        return False
-    jwt = build_app_jwt(app_private_key.get_secret_value(), app_id, now=now)
-    installation_id = await get_installation_id_for_repo(
-        http_client, jwt=jwt, owner=owner, repo=repo
-    )
-    return installation_id is not None

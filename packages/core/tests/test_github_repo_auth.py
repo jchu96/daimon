@@ -1,6 +1,5 @@
-"""Tests for github_repo_auth: the pure select_clone_auth decision table, the
-shell resolve_clone_token orchestrator, and the is_app_installed_for_repo
-panel-coverage probe.
+"""Tests for github_repo_auth: the pure select_clone_auth decision table and
+the shell resolve_clone_token orchestrator.
 
 The pure decision table is tested without I/O. The shell functions use
 httpx.MockTransport (transport-level fake — guideline:testing); each test
@@ -18,7 +17,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.errors import DaimonError
 from daimon.core.github_repo_auth import (
-    is_app_installed_for_repo,
     resolve_clone_token,
     select_clone_auth,
 )
@@ -406,68 +404,4 @@ async def test_resolve_clone_token_pat_kind_proof_never_unlocks_the_fallback_tie
 
 
 # ---------------------------------------------------------------------------
-# Task 2: is_app_installed_for_repo (shell, MockTransport)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_is_app_installed_for_repo_false_when_app_creds_unset() -> None:
-    """No app_id/app_private_key -> returns False with zero HTTP calls (non-App deployments)."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        pytest.fail(f"must not call GitHub when App creds are unset; got {request.url}")
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    installed = await is_app_installed_for_repo(
-        client,
-        app_id=None,
-        app_private_key=None,
-        owner="acme",
-        repo="widgets",
-        now=1_000_000,
-    )
-
-    assert installed is False, "must return False (not raise) when App creds are unset"
-
-
-@pytest.mark.asyncio
-async def test_is_app_installed_for_repo_true_when_installed() -> None:
-    """App creds set and the App is installed on the repo -> True."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code=200, json={"id": 42})
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    installed = await is_app_installed_for_repo(
-        client,
-        app_id="12345",
-        app_private_key=SecretStr(_generate_rsa_keypair()),
-        owner="acme",
-        repo="widgets",
-        now=1_000_000,
-    )
-
-    assert installed is True
-
-
-@pytest.mark.asyncio
-async def test_is_app_installed_for_repo_false_when_not_installed() -> None:
-    """App creds set but the App is not installed on the repo (404) -> False."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code=404)
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    installed = await is_app_installed_for_repo(
-        client,
-        app_id="12345",
-        app_private_key=SecretStr(_generate_rsa_keypair()),
-        owner="acme",
-        repo="widgets",
-        now=1_000_000,
-    )
-
-    assert installed is False
