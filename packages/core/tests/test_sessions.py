@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -23,6 +24,7 @@ from daimon.core.sessions import create_session
 from daimon.core.stores import agent_github_binding as github_binding_store
 from daimon.core.stores import agent_repo_binding as repo_binding_store
 from daimon.core.stores.agent_files import put_agent_file
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
@@ -849,11 +851,17 @@ async def test_create_session_uses_app_installation_token_when_app_installed_and
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """No per-agent PAT, App installed on the (private) repo owner -> the
-    minted installation token lands in authorization_token (step 2)."""
+    """No per-agent PAT, App installed on the (private) repo owner, and the
+    binding recorded a pat-kind proof at bind time -> the minted installation
+    token lands in authorization_token (step 2)."""
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
-    await _seed_inline_pat_binding(db_session, tenant_id=tenant.id, agent_uuid=agent_uuid)
+    await _seed_inline_pat_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        proof=RepoAccessProof(kind="pat", at=datetime.now(UTC), account_id=None),
+    )
 
     agent = _make_agent(anthropic_id="ag_app")
     env = _make_env(anthropic_id="env_app")
@@ -1282,7 +1290,12 @@ async def test_create_session_never_mirrors_fallback_pat_into_copilot_vault(
     agent_uuid = uuid.uuid4()
     account_id = uuid.UUID("00000000-0000-0000-0000-0000000000c2")
     public_url = "https://mcp.example.com/mcp"
-    await _seed_anon_binding(db_session, tenant_id=tenant.id, agent_uuid=agent_uuid)
+    await _seed_anon_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        proof=RepoAccessProof(kind="public", at=datetime.now(UTC), account_id=None),
+    )
     fernet = build_multifernet((Fernet.generate_key().decode(),))
 
     agent = _make_agent(anthropic_id="ag_fallback_novault")
@@ -1339,10 +1352,17 @@ async def test_create_session_app_installation_token_wins_over_fallback_for_anon
     guard for the resolve_clone_token ordering (per_agent_pat -> App ->
     fallback) now that get_pat can itself resolve a fallback: sessions.py
     must keep passing per_agent_pat=None to resolve_clone_token so the App
-    branch is reached first, exactly as before this phase's changes."""
+    branch is reached first, exactly as before this phase's changes. The
+    binding recorded a verified-public proof, which is what the fallback
+    tier requires (and the App tier accepts any recorded proof kind)."""
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
-    await _seed_anon_binding(db_session, tenant_id=tenant.id, agent_uuid=agent_uuid)
+    await _seed_anon_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        proof=RepoAccessProof(kind="public", at=datetime.now(UTC), account_id=None),
+    )
 
     agent = _make_agent(anthropic_id="ag_app_over_fallback")
     env = _make_env(anthropic_id="env_app_over_fallback")
@@ -1529,8 +1549,14 @@ async def _seed_anon_binding(
     agent_uuid: uuid.UUID,
     repo_url: str = "https://github.com/example-org/example-repo",
     default_branch: str = "main",
+    proof: RepoAccessProof | None = None,
 ) -> None:
-    """Seed an ``anon:`` (public, no-PAT) repo binding with NO per-agent PAT."""
+    """Seed an ``anon:`` (public, no-PAT) repo binding with NO per-agent PAT.
+
+    ``proof`` defaults to None (a proof-NULL row) — callers whose scenario
+    relies on the App or fallback tier firing must pass the proof that tier
+    now requires.
+    """
     await repo_binding_store.set_binding(
         db_session,
         tenant_id=tenant_id,
@@ -1538,6 +1564,7 @@ async def _seed_anon_binding(
         repo_url=repo_url,
         default_branch=default_branch,
         ma_secret_ref="anon:",
+        proof=proof,
     )
     await db_session.commit()
 
@@ -1549,11 +1576,14 @@ async def _seed_inline_pat_binding(
     agent_uuid: uuid.UUID,
     repo_url: str = "https://github.com/example-org/private-repo",
     default_branch: str = "main",
+    proof: RepoAccessProof | None = None,
 ) -> None:
     """Seed an ``inline-pat:`` (private) binding with NO resolvable per-agent PAT.
 
     Models the guardrail case: a private binding whose per-agent credential is
-    absent. The fallback PAT must NEVER apply here.
+    absent. The fallback PAT must NEVER apply here. ``proof`` defaults to
+    None — callers whose scenario relies on the App tier firing must pass a
+    proof.
     """
     await repo_binding_store.set_binding(
         db_session,
@@ -1562,6 +1592,7 @@ async def _seed_inline_pat_binding(
         repo_url=repo_url,
         default_branch=default_branch,
         ma_secret_ref=f"inline-pat:{agent_uuid}",
+        proof=proof,
     )
     await db_session.commit()
 
@@ -1573,7 +1604,12 @@ async def test_create_session_uses_fallback_pat_for_anon_binding_without_per_age
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     fernet = build_multifernet((Fernet.generate_key().decode(),))
-    await _seed_anon_binding(db_session, tenant_id=tenant.id, agent_uuid=agent_uuid)
+    await _seed_anon_binding(
+        db_session,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        proof=RepoAccessProof(kind="public", at=datetime.now(UTC), account_id=None),
+    )
 
     agent = _make_agent(anthropic_id="ag_fallback")
     env = _make_env(anthropic_id="env_fallback")

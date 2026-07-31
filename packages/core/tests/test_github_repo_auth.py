@@ -22,7 +22,7 @@ from daimon.core.github_repo_auth import (
     resolve_clone_token,
     select_clone_auth,
 )
-from daimon.core.stores.domain import AgentRepoBindingRow
+from daimon.core.stores.domain import AgentRepoBindingRow, RepoProofKind
 from pydantic import SecretStr
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,9 @@ def _generate_rsa_keypair() -> str:
     ).decode()
 
 
-def _make_binding(*, repo_url: str, ma_secret_ref: str) -> AgentRepoBindingRow:
+def _make_binding(
+    *, repo_url: str, ma_secret_ref: str, proof_kind: RepoProofKind | None = None
+) -> AgentRepoBindingRow:
     now = dt.datetime.now(dt.UTC)
     return AgentRepoBindingRow(
         tenant_id=uuid.uuid4(),
@@ -50,6 +52,9 @@ def _make_binding(*, repo_url: str, ma_secret_ref: str) -> AgentRepoBindingRow:
         ma_secret_ref=ma_secret_ref,
         last_sync_at=None,
         last_sync_error=None,
+        proof_kind=proof_kind,
+        proof_at=now if proof_kind is not None else None,
+        proof_account_id=None,
         created_at=now,
         updated_at=now,
     )
@@ -61,28 +66,37 @@ def _make_binding(*, repo_url: str, ma_secret_ref: str) -> AgentRepoBindingRow:
 
 
 @pytest.mark.parametrize(
-    ("has_per_agent_pat", "app_installed", "binding_is_public", "has_fallback_pat", "expected"),
+    ("has_per_agent_pat", "app_installed", "proof_kind", "has_fallback_pat", "expected"),
     [
-        # PAT always wins, regardless of the other inputs.
-        (True, False, False, False, "pat"),
-        (True, True, True, True, "pat"),
-        (True, False, True, True, "pat"),
-        # No PAT, App installed -> app mode, regardless of public/fallback.
-        (False, True, False, False, "app"),
-        (False, True, True, True, "app"),
-        # No PAT, no App, public binding + fallback PAT -> public mode.
-        (False, False, True, True, "public"),
-        # No PAT, no App, public binding but NO fallback PAT -> none (fail loud).
-        (False, False, True, False, "none"),
-        # No PAT, no App, private binding -> none regardless of fallback.
-        (False, False, False, True, "none"),
-        (False, False, False, False, "none"),
+        # PAT always wins, regardless of the other inputs -- proof is irrelevant.
+        (True, False, None, False, "pat"),
+        (True, True, "public", True, "pat"),
+        (True, False, "pat", True, "pat"),
+        # No PAT, App installed, a recorded proof (either kind) -> app mode.
+        (False, True, "pat", False, "app"),
+        (False, True, "public", True, "app"),
+        # No PAT, App installed, NO recorded proof -> none, even with a
+        # fallback PAT configured. This is the single most important case in
+        # the phase: a no-token binding on a private App-covered repo must
+        # refuse, not silently fall through to the public-read-only operator
+        # token.
+        (False, True, None, False, "none"),
+        (False, True, None, True, "none"),
+        # No PAT, App absent, a verified-public proof + fallback PAT -> public mode.
+        (False, False, "public", True, "public"),
+        # No PAT, App absent, a verified-public proof but NO fallback PAT -> none.
+        (False, False, "public", False, "none"),
+        # A pat-kind proof does not authorize the public-only operator token.
+        (False, False, "pat", True, "none"),
+        # No PAT, App absent, no recorded proof -> none regardless of fallback.
+        (False, False, None, True, "none"),
+        (False, False, None, False, "none"),
     ],
 )
 def test_select_clone_auth_table(
     has_per_agent_pat: bool,
     app_installed: bool,
-    binding_is_public: bool,
+    proof_kind: RepoProofKind | None,
     has_fallback_pat: bool,
     expected: str,
 ) -> None:
@@ -90,13 +104,13 @@ def test_select_clone_auth_table(
     mode = select_clone_auth(
         has_per_agent_pat=has_per_agent_pat,
         app_installed=app_installed,
-        binding_is_public=binding_is_public,
+        proof_kind=proof_kind,
         has_fallback_pat=has_fallback_pat,
     )
 
     assert mode == expected, (
         f"select_clone_auth(has_per_agent_pat={has_per_agent_pat}, "
-        f"app_installed={app_installed}, binding_is_public={binding_is_public}, "
+        f"app_installed={app_installed}, proof_kind={proof_kind!r}, "
         f"has_fallback_pat={has_fallback_pat}) should be {expected!r}, got {mode!r}"
     )
 
@@ -146,7 +160,9 @@ async def test_resolve_clone_token_app_installed_mints_installation_token() -> N
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    binding = _make_binding(repo_url="acme/widgets", ma_secret_ref="inline-pat:agent-1")
+    binding = _make_binding(
+        repo_url="acme/widgets", ma_secret_ref="inline-pat:agent-1", proof_kind="pat"
+    )
 
     token = await resolve_clone_token(
         client,
@@ -164,7 +180,8 @@ async def test_resolve_clone_token_app_installed_mints_installation_token() -> N
 
 @pytest.mark.asyncio
 async def test_resolve_clone_token_app_not_installed_falls_back_to_public() -> None:
-    """No PAT, App not installed (404), public (anon:) binding + fallback PAT -> public mode."""
+    """No PAT, App not installed (404), a verified-public proof + fallback PAT
+    -> public mode."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/repos/acme/oss-repo/installation":
@@ -173,7 +190,7 @@ async def test_resolve_clone_token_app_not_installed_falls_back_to_public() -> N
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:")
+    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:", proof_kind="public")
 
     token = await resolve_clone_token(
         client,
@@ -193,8 +210,9 @@ async def test_resolve_clone_token_app_not_installed_falls_back_to_public() -> N
 @pytest.mark.asyncio
 async def test_resolve_clone_token_app_lookup_error_falls_through_to_public_fallback() -> None:
     """A transient App-installation-lookup failure (e.g. 403 secondary rate-limit)
-    must NOT crash the clone — it degrades to 'App unavailable' so a public (anon:)
-    binding with an operator fallback PAT still resolves."""
+    must NOT crash the clone — it degrades to 'App unavailable' so a binding
+    with a recorded verified-public proof and an operator fallback PAT still
+    resolves."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/repos/acme/oss-repo/installation":
@@ -202,7 +220,7 @@ async def test_resolve_clone_token_app_lookup_error_falls_through_to_public_fall
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:")
+    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:", proof_kind="public")
 
     token = await resolve_clone_token(
         client,
@@ -231,7 +249,7 @@ async def test_resolve_clone_token_empty_string_pat_is_treated_as_no_token() -> 
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:")
+    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:", proof_kind="public")
 
     token = await resolve_clone_token(
         client,
@@ -269,8 +287,9 @@ async def test_resolve_clone_token_raises_when_no_credential_resolves() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_clone_token_raises_for_private_binding_even_with_fallback_pat() -> None:
-    """A fallback PAT never applies to a private (inline-pat:) binding, even if the
-    App is not installed — only anon: (public) bindings may use the fallback."""
+    """A fallback PAT never applies to a binding with no recorded proof, even
+    if the App is not installed — only a binding with a recorded
+    verified-public proof may use the fallback."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/repos/acme/private-repo/installation":
@@ -289,6 +308,99 @@ async def test_resolve_clone_token_raises_for_private_binding_even_with_fallback
             fallback_pat="ghp_operator_fallback",
             app_id="12345",
             app_private_key=SecretStr(_generate_rsa_keypair()),
+            now=1_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_clone_token_no_proof_raises_naming_rebind_fix() -> None:
+    """This is the single most important case in the phase: a no-token
+    binding on a private App-covered repo, with an operator fallback PAT
+    configured, must refuse rather than silently fall through to the
+    public-read-only fallback token. The App is genuinely installed (the
+    lookup succeeds), a fallback PAT is configured, but the binding recorded
+    no proof — resolve_clone_token must raise, and the message must name the
+    actual fix (re-bind with a token), not misdiagnose App coverage."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/secret-repo/installation":
+            return httpx.Response(status_code=200, json={"id": 555})
+        if request.url.path == "/app/installations/555/access_tokens":
+            # The best-effort App path mints eagerly, before the proof gate
+            # decides whether to use the result — this token is minted but
+            # then correctly discarded because the binding recorded no proof.
+            return httpx.Response(status_code=201, json={"token": "ghs_unused_installation_token"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    binding = _make_binding(repo_url="acme/secret-repo", ma_secret_ref="anon:")
+    assert binding.proof_kind is None, "this test's premise is a proof-NULL binding"
+
+    with pytest.raises(DaimonError, match="[Rr]e-bind") as exc_info:
+        await resolve_clone_token(
+            client,
+            binding=binding,
+            per_agent_pat=None,
+            fallback_pat="ghp_operator_fallback",
+            app_id="12345",
+            app_private_key=SecretStr(_generate_rsa_keypair()),
+            now=1_000_000,
+        )
+
+    assert "token" in str(exc_info.value).lower(), (
+        "the refusal must name the fix (re-bind with a token), not just say no credential exists"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_clone_token_per_agent_pat_short_circuits_before_any_proof_check() -> None:
+    """A per-agent PAT wins unconditionally and needs no recorded proof at
+    all — it IS the caller-supplied credential. Zero GitHub HTTP requests are
+    issued, pinning that the short-circuit precedes the App lookup that a
+    proof check would otherwise gate."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"GitHub transport must not be called on the PAT path; got {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    binding = _make_binding(repo_url="acme/private-repo", ma_secret_ref="inline-pat:agent-1")
+    assert binding.proof_kind is None, "PAT must win even with no recorded proof"
+
+    token = await resolve_clone_token(
+        client,
+        binding=binding,
+        per_agent_pat="ghp_per_agent_token",
+        fallback_pat="ghp_fallback_token",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        now=1_000_000,
+    )
+
+    assert token == "ghp_per_agent_token", "per-agent PAT must win with zero proof/GitHub calls"
+
+
+@pytest.mark.asyncio
+async def test_resolve_clone_token_pat_kind_proof_never_unlocks_the_fallback_tier() -> None:
+    """A pat-kind proof demonstrates the binder could read the repo with a
+    token — it does not demonstrate the repo is public. It must never unlock
+    the operator's public-read-only fallback PAT."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"App is not configured; no request expected: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    binding = _make_binding(
+        repo_url="acme/private-repo", ma_secret_ref="inline-pat:agent-1", proof_kind="pat"
+    )
+
+    with pytest.raises(DaimonError):
+        await resolve_clone_token(
+            client,
+            binding=binding,
+            per_agent_pat=None,
+            fallback_pat="ghp_operator_fallback",
+            app_id=None,
+            app_private_key=None,
             now=1_000_000,
         )
 
