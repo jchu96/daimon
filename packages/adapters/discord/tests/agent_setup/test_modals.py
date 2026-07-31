@@ -1987,14 +1987,17 @@ def test_repo_auth_modal_field_labels_fit_discord_limits(
     )
 
 
-# ----- 13. Click-time authz gate on the spec-mutating write callbacks -------
+# ----- 13. Click-time authz gate on the mutating write callbacks ------------
 #
 # AgentSectionModal and AddSkillModal each carry a write to the agent spec
 # (system/model, skills). A non-admin caller must be refused at submit time
 # when the target is currently reachable or is a system agent — the guard is
 # re-derived from live state, never from any render-time snapshot.
-# RepoAuthModal is deliberately NOT gated (a per-agent attachment, not part
-# of the spec).
+# RepoAuthModal is guarded too, but through the shared-state guard rather than
+# the spec guard: it never writes the agent spec, so an admin may still bind a
+# repo to the built-in agent — the first-run onboarding step — while a
+# non-admin is refused whenever the target is a system agent or is currently
+# reachable.
 
 
 @pytest.mark.asyncio
@@ -2130,12 +2133,12 @@ async def test_add_skill_modal_refuses_write_on_system_agent_even_for_admin(
 
 
 @pytest.mark.asyncio
-async def test_repo_auth_modal_still_writes_binding_on_reachable_system_agent_for_non_admin(
+async def test_repo_auth_modal_refuses_binding_on_reachable_system_agent_for_non_admin(
     monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
 ) -> None:
-    """The repo binding is a per-agent attachment, never part of the agent
-    spec — the new click-time gate must not reach this path even
-    for a reachable system agent edited by a non-admin."""
+    """A repo binding is shared state: everyone in the install talks to the
+    deployment's built-in agent, so a non-admin re-pointing it at a repo of
+    their choosing is refused at submit time."""
     set_binding_called = False
 
     async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
@@ -2177,6 +2180,219 @@ async def test_repo_auth_modal_still_writes_binding_on_reachable_system_agent_fo
     interaction = _interaction(is_admin=False)
     await modal.on_submit(interaction)
 
-    assert set_binding_called, (
-        "repo binding must still write on a reachable system agent for a non-admin caller"
+    assert set_binding_called is False, (
+        "a non-admin must not bind a repo to the deployment's built-in agent"
+    )
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_modal_still_writes_binding_on_reachable_system_agent_for_admin(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """Pointing the built-in default agent at a repo is the first thing an
+    admin does on a fresh install, and the built-in agent is both a system
+    agent and the workspace's default. That bind must keep working."""
+    set_binding_called = False
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        return True
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("daimon", is_system=True)
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    sm = MagicMock()
+    sm.begin.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+    sm.begin.return_value.__aexit__ = AsyncMock(return_value=False)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=tenant_id,
+        sessionmaker=sm,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/public-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=True)
+    await modal.on_submit(interaction)
+
+    assert set_binding_called is True, (
+        "an admin binding a repo to the built-in default agent must still write the binding"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_modal_refuses_binding_on_reachable_non_system_agent_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A user-created agent that something currently resolves to is shared the
+    moment it is scoped, so its repo binding closes to non-admins even though
+    the agent carries no system provenance."""
+    set_binding_called = False
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        return True
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(uuid.uuid4())
+
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    guild_id = 910201
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry("bot")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=uuid.uuid4(),
+        sessionmaker=db_session_factory,
+        deployment_default=DeploymentDefault(agent_name="bot"),
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/public-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    assert set_binding_called is False, (
+        "a non-admin must not re-point a currently-reachable agent's repo"
+    )
+    interaction.response.send_message.assert_called_once()
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_modal_writes_binding_on_unreachable_agent_for_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An agent nobody has scoped is the member's own scratchpad — the gate
+    closes shared agents, not every agent a member owns."""
+    set_binding_called = False
+
+    async def fake_is_public(http_client: Any, *, owner_repo: str) -> bool:
+        return True
+
+    async def fake_set_binding(*args: Any, **kwargs: Any) -> Any:
+        nonlocal set_binding_called
+        set_binding_called = True
+        return MagicMock()
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(uuid.uuid4())
+
+    monkeypatch.setattr(modals_mod, "is_public_repo", fake_is_public)
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", fake_set_binding)
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    guild_id = 910202
+    async with db_session_factory() as session, session.begin():
+        await make_tenant(session, platform="discord", workspace_id=str(guild_id))
+
+    selected = _entry("scratchpad")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=uuid.uuid4(),
+        sessionmaker=db_session_factory,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/public-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False, guild_id=guild_id)
+    await modal.on_submit(interaction)
+
+    assert set_binding_called is True, (
+        "a non-admin must still bind a repo to an agent nothing currently resolves to"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repo_auth_modal_refusal_logs_no_masked_token(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """A refused submit must not leave the submitted token in the log stream,
+    even masked — the gate runs before the submit log line."""
+
+    async def unexpected_set_binding(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no binding may be written on a refused submit")
+
+    async def fake_find(*args: Any, **kwargs: Any) -> Any:
+        return _fake_ma_agent_for_bind(tenant_id)
+
+    monkeypatch.setattr(modals_mod, "set_agent_repo_binding", unexpected_set_binding)
+    monkeypatch.setattr(modals_mod, "find_agent_by_daimon_tag", fake_find)
+
+    selected = _entry("daimon", is_system=True)
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(
+        anthropic=build_stub_anthropic(),
+        tenant_id=tenant_id,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+
+    modal = RepoAuthModal(state, runtime=runtime, allowed_user_id=42)
+    modal.url_in._value = "https://github.com/me/private-repo"  # pyright: ignore[reportPrivateUsage]
+    modal.branch_in._value = "main"  # pyright: ignore[reportPrivateUsage]
+    modal.pat_in._value = "ghp_refusedtoken1234"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction(is_admin=False)
+    cap = structlog.testing.LogCapture()
+    structlog.configure(processors=[cap])
+    try:
+        await modal.on_submit(interaction)
+    finally:
+        structlog.reset_defaults()
+
+    assert all("pat_masked" not in entry for entry in cap.entries), (
+        "a refused submit must emit no log entry carrying the token, masked or not"
+    )
+    assert all("ghp_refusedtoken1234" not in str(entry) for entry in cap.entries), (
+        "the plaintext token must never reach the log stream"
     )

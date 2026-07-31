@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
+import discord
 import httpx
 import pytest
 import structlog
@@ -1342,7 +1343,12 @@ async def test_apply_repo_modal_persists_binding(
     modal.pat_in._value = ""  # pyright: ignore[reportPrivateUsage]  # no inline PAT — OAuth path
 
     interaction = MagicMock()
+    # A live guild admin, so the bind path's attachment gate short-circuits
+    # without a DB read — this test is about where the binding persists, not
+    # about who may write it.
+    interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = 42
+    interaction.user.guild_permissions.administrator = True
     interaction.response.defer = AsyncMock()
     interaction.edit_original_response = AsyncMock()
     interaction.followup.send = AsyncMock()
