@@ -28,7 +28,7 @@ from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.domain import Role
-from daimon.core.stores.routines import create_routine
+from daimon.core.stores.routines import create_routine, get_routine
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp.exceptions import ToolError
@@ -101,6 +101,7 @@ def _auth_identity(
     external_id: str | None = "g_test",
     platform_user_id: str | None = "u_test",
     tenant_id: uuid.UUID | None = None,
+    is_admin: bool = False,
 ) -> AuthIdentity:
     return AuthIdentity(
         account_id=uuid.uuid4(),
@@ -109,6 +110,7 @@ def _auth_identity(
         platform=platform,
         external_id=external_id,
         platform_user_id=platform_user_id,
+        is_admin=is_admin,
     )
 
 
@@ -632,3 +634,124 @@ async def test_update_routine_unknown_agent_raises_toolerror(
     auth = _auth_identity(tenant_id=tenant.id)
     with pytest.raises(ToolError, match="no agent named"):
         await _update_routine_impl(runtime, auth, routine_id=created.id, agent_name="ghost")
+
+
+# ---------------------------------------------------------------------------
+# Owner-or-admin gate on mutation: only the creator or an admin may mutate a
+# routine. Reads stay tenant-wide and are unaffected.
+# ---------------------------------------------------------------------------
+
+
+async def test_update_routine_raises_when_caller_is_not_owner(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    created = await create_routine(
+        db_session,
+        tenant_id=tenant.id,
+        created_by_user_id="U_owner",
+        agent_id="agent_a",
+        agent_name="daimon",
+        cron_expr="* * * * *",
+        timezone_="UTC",
+        trigger_message="orig",
+    )
+    await db_session.commit()
+
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity(tenant_id=tenant.id, platform_user_id="U_other", is_admin=False)
+    with pytest.raises(ToolError, match="routine not found"):
+        await _update_routine_impl(runtime, auth, routine_id=created.id, trigger_message="hacked")
+
+    row = await get_routine(db_session, created.id, tenant_id=tenant.id)
+    assert row is not None, "row must still exist after a denied update"
+    assert row.trigger_message == "orig", (
+        "a non-owner's denied update must not change trigger_message"
+    )
+
+
+async def test_delete_routine_raises_when_caller_is_not_owner(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    created = await create_routine(
+        db_session,
+        tenant_id=tenant.id,
+        created_by_user_id="U_owner",
+        agent_id="agent_a",
+        agent_name="daimon",
+        cron_expr="* * * * *",
+        timezone_="UTC",
+        trigger_message="orig",
+    )
+    await db_session.commit()
+
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity(tenant_id=tenant.id, platform_user_id="U_other", is_admin=False)
+    with pytest.raises(ToolError, match="routine not found"):
+        await _delete_routine_impl(runtime, auth, routine_id=created.id)
+
+    row = await get_routine(db_session, created.id, tenant_id=tenant.id)
+    assert row is not None, "a non-owner's denied delete must leave the row in place"
+
+
+async def test_owner_update_and_delete_succeed_when_caller_is_creator(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    created = await create_routine(
+        db_session,
+        tenant_id=tenant.id,
+        created_by_user_id="U_owner",
+        agent_id="agent_a",
+        agent_name="daimon",
+        cron_expr="* * * * *",
+        timezone_="UTC",
+        trigger_message="orig",
+    )
+    await db_session.commit()
+
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity(tenant_id=tenant.id, platform_user_id="U_owner", is_admin=False)
+    updated = await _update_routine_impl(
+        runtime, auth, routine_id=created.id, trigger_message="updated by owner"
+    )
+    assert updated.trigger_message == "updated by owner", (
+        "the creator must be able to update their own routine"
+    )
+
+    result = await _delete_routine_impl(runtime, auth, routine_id=created.id)
+    assert result.deleted is True, "the creator must be able to delete their own routine"
+
+
+async def test_admin_update_and_delete_succeed_when_caller_is_non_owner_admin(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    created = await create_routine(
+        db_session,
+        tenant_id=tenant.id,
+        created_by_user_id="U_owner",
+        agent_id="agent_a",
+        agent_name="daimon",
+        cron_expr="* * * * *",
+        timezone_="UTC",
+        trigger_message="orig",
+    )
+    await db_session.commit()
+
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity(tenant_id=tenant.id, platform_user_id="U_other", is_admin=True)
+    updated = await _update_routine_impl(
+        runtime, auth, routine_id=created.id, trigger_message="updated by admin"
+    )
+    assert updated.trigger_message == "updated by admin", (
+        "an admin must be able to update a routine they did not create"
+    )
+
+    result = await _delete_routine_impl(runtime, auth, routine_id=created.id)
+    assert result.deleted is True, "an admin must be able to delete a routine they did not create"
