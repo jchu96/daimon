@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
-import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -24,6 +23,16 @@ from notebook_host.blogs_store import (
 )
 from notebook_host.capability import CapabilityClaims, verify_token
 from notebook_host.config import Settings
+from notebook_host.consumed_store import burn_jti
+from notebook_host.jail import (
+    JailUnavailableError,
+    SlugPaths,
+    UidPoolExhaustedError,
+    ensure_slug_jail,
+    get_slug_paths,
+    remove_slug_tree,
+    resolve_jail_uid,
+)
 from notebook_host.lifecycle import (
     NotebookProcess,
     ValidationResult,
@@ -39,12 +48,20 @@ from notebook_host.pids_store import record_from_process, save_pids
 
 class Spawner(Protocol):
     def __call__(
-        self, slug: str, file_path: Path, port: int, *, mode: Literal["edit", "run"] = "edit"
+        self,
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: Literal["edit", "run"] = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]: ...
 
 
 class Validator(Protocol):
-    def __call__(self, slug: str, file_path: Path) -> ValidationResult: ...
+    def __call__(
+        self, slug: str, paths: SlugPaths, *, jail_uid: int | None = None
+    ) -> ValidationResult: ...
 
 
 @dataclass
@@ -59,9 +76,6 @@ class AdminState:
     # Serialises concurrent PUTs to the same slug. Without it, two PUTs can
     # interleave kill/allocate/spawn and orphan the loser's subprocess.
     slug_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
-    # Single-use capability-token jtis already burned. Process-local; bounded by
-    # the token TTL (~300s) across restarts. Replay of a consumed token → 409.
-    consumed: set[str] = field(default_factory=set[str])
 
     def make_process(
         self,
@@ -115,12 +129,19 @@ def _bearer_dep(settings: Settings) -> Callable[[str | None], None]:
     return require
 
 
-def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    """Write via tmp + ``os.replace`` so a concurrent reader never sees a torn file."""
+def _atomic_write_bytes(path: Path, content: bytes, *, owner_uid: int | None = None) -> None:
+    """Write via tmp + ``os.replace`` so a concurrent reader never sees a torn file.
+
+    When ``owner_uid`` is given, the tmp file is chowned to ``(owner_uid,
+    owner_uid)`` before the replace, so the file is never visible at its final
+    path with the wrong owner.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     try:
         tmp.write_bytes(content)
+        if owner_uid is not None:
+            os.chown(tmp, owner_uid, owner_uid)
         os.replace(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
@@ -134,19 +155,39 @@ async def _spawn_tracked(
 
     The caller must hold ``state.lock_for(slug)``. Returns the live
     ``NotebookProcess``. Raises ``HTTPException`` 422 (validation), 503 (port
-    pool exhausted), or 504 (spawn timeout). Shared by the notebook and blog
-    PUT handlers so the two never drift.
+    pool exhausted, or notebook isolation unavailable), or 504 (spawn
+    timeout). Shared by the notebook and blog PUT handlers so the two never
+    drift.
     """
-    state.settings.data_dir.mkdir(parents=True, exist_ok=True)
-    path = state.settings.data_dir / f"{slug}.py"
-    path.write_bytes(source_bytes)
+    # This is the request boundary — the one place admin.py is allowed to
+    # catch JailUnavailableError/UidPoolExhaustedError. Both mean the host is
+    # refusing to serve rather than failing transiently, mirroring
+    # allocate_port's existing 503 for pool exhaustion.
+    try:
+        uid = resolve_jail_uid(
+            state.settings.resolved_uids_file,
+            slug,
+            start=state.settings.jail_uid_start,
+            end=state.settings.jail_uid_end,
+            allow_unjailed=state.settings.allow_unjailed_spawn,
+        )
+    except JailUnavailableError as err:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"notebook isolation unavailable: {err}"
+        ) from err
+    except UidPoolExhaustedError as err:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"uid pool exhausted: {err}"
+        ) from err
+    paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
+    _atomic_write_bytes(paths.notebook, source_bytes, owner_uid=uid)
 
     # Confirm the cells actually execute before we tear down any
     # existing notebook for this slug. Runs off the event loop (the
     # marimo export is blocking). A failure here leaves a previously
     # published notebook for this slug untouched and serving.
     if state.validator is not None:
-        result = await asyncio.to_thread(state.validator, slug, path)
+        result = await asyncio.to_thread(state.validator, slug, paths, jail_uid=uid)
         if not result.ok:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -163,7 +204,7 @@ async def _spawn_tracked(
     port = allocate_port(
         state.processes, state.settings.marimo_port_start, state.settings.marimo_port_end
     )
-    proc = state.spawner(slug, path, port, mode=mode)
+    proc = state.spawner(slug, paths, port, mode=mode, jail_uid=uid)
     np = state.make_process(slug, port, proc, mode=mode)
     state.processes[slug] = np
 
@@ -227,7 +268,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 "url": np.url,
                 "port": np.port,
                 "pid": np.process.pid,
-                "size_bytes": (state.settings.data_dir / f"{slug}.py").stat().st_size,
+                "size_bytes": get_slug_paths(state.settings.data_dir, slug).notebook.stat().st_size,
                 "subprocess_ttl_seconds": ttl,
                 "expires_at": expires_at.isoformat() if expires_at is not None else None,
             }
@@ -249,9 +290,27 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 f"({len(body)} > {state.settings.max_attachment_bytes_ceiling})",
             )
         async with state.lock_for(slug):
-            data_dir = state.settings.data_dir / f"{slug}.data"
-            final_path = data_dir / name
-            _atomic_write_bytes(final_path, body)
+            # ensure the tree exists even when an attachment arrives before
+            # the first publish, with the same 0700 mode a publish would set.
+            try:
+                uid = resolve_jail_uid(
+                    state.settings.resolved_uids_file,
+                    slug,
+                    start=state.settings.jail_uid_start,
+                    end=state.settings.jail_uid_end,
+                    allow_unjailed=state.settings.allow_unjailed_spawn,
+                )
+            except JailUnavailableError as err:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, f"notebook isolation unavailable: {err}"
+                ) from err
+            except UidPoolExhaustedError as err:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, f"uid pool exhausted: {err}"
+                ) from err
+            paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
+            final_path = paths.data / name
+            _atomic_write_bytes(final_path, body, owner_uid=uid)
             return {
                 "slug": slug,
                 "name": name,
@@ -264,17 +323,18 @@ def create_admin_router(state: AdminState) -> APIRouter:
         dependencies=[Depends(require_admin)],
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def delete_notebook(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
+    async def delete_notebook(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
         slug = safe_slug(slug)
-        np = state.processes.pop(slug, None)
-        if np is not None:
-            kill(np)
-        (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
-        # A crash between the .py unlink and these rmtrees leaks the dirs;
-        # the slug is gone from state.processes so sweep won't re-discover them.
-        shutil.rmtree(state.settings.data_dir / f"{slug}.data", ignore_errors=True)
-        shutil.rmtree(state.settings.data_dir / f"{slug}_workspace", ignore_errors=True)
-        state.snapshot_pids()
+        async with state.lock_for(slug):
+            np = state.processes.pop(slug, None)
+            if np is not None:
+                # kill blocks up to 5s (SIGTERM wait); must not block the
+                # event loop now that the handler is async.
+                await asyncio.to_thread(kill, np)
+            remove_slug_tree(
+                state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
+            )
+            state.snapshot_pids()
 
     @router.get("/admin/notebooks", dependencies=[Depends(require_admin)])
     def list_notebooks() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -313,7 +373,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 "url": np.url,
                 "port": np.port,
                 "pid": np.process.pid,
-                "size_bytes": (state.settings.data_dir / f"{slug}.py").stat().st_size,
+                "size_bytes": get_slug_paths(state.settings.data_dir, slug).notebook.stat().st_size,
             }
 
     @router.get("/admin/blogs", dependencies=[Depends(require_admin)])
@@ -340,16 +400,22 @@ def create_admin_router(state: AdminState) -> APIRouter:
         dependencies=[Depends(require_admin)],
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def delete_blog(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
+    async def delete_blog(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
         slug = safe_slug(slug)
-        np = state.processes.pop(slug, None)
-        if np is not None:
-            kill(np)
-        unregister_blog(state.settings.resolved_blogs_file, slug)
-        (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
-        shutil.rmtree(state.settings.data_dir / f"{slug}.data", ignore_errors=True)
-        shutil.rmtree(state.settings.data_dir / f"{slug}_workspace", ignore_errors=True)
-        state.snapshot_pids()
+        async with state.lock_for(slug):
+            # Unregister first, while the lock is held, so the registry stops
+            # naming this slug before anything blocking (kill) starts. This is
+            # what lets the sweep's self-heal, re-reading the registry under
+            # the same lock, see the slug is already gone rather than racing
+            # to respawn it.
+            unregister_blog(state.settings.resolved_blogs_file, slug)
+            np = state.processes.pop(slug, None)
+            if np is not None:
+                await asyncio.to_thread(kill, np)
+            remove_slug_tree(
+                state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
+            )
+            state.snapshot_pids()
 
     @router.post("/admin/sweep", dependencies=[Depends(require_admin)])
     def sweep() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -364,9 +430,9 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 continue
             kill(np)
             state.processes.pop(slug, None)
-            (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
-            shutil.rmtree(state.settings.data_dir / f"{slug}.data", ignore_errors=True)
-            shutil.rmtree(state.settings.data_dir / f"{slug}_workspace", ignore_errors=True)
+            remove_slug_tree(
+                state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
+            )
             reaped.append({"slug": slug, "reason": reason, "age_s": round(np.age_s, 2)})
         if reaped:
             state.snapshot_pids()
@@ -377,7 +443,19 @@ def create_admin_router(state: AdminState) -> APIRouter:
         # Public route — authed by the capability token, NOT the admin bearer.
         secrets_list = [s.get_secret_value() for s in state.settings.admin_secrets]
         claims: CapabilityClaims = verify_token(secrets_list, token, now=datetime.now(UTC))
-        if claims.jti in state.consumed:
+        # Burn before reading the body: burn_jti's check-and-write is one call
+        # with no await in between, so two concurrent replays of one token
+        # cannot both observe it as unused. Burning here (rather than after a
+        # successful write) means a token whose upload later fails a size
+        # check is not reusable — that is what single-use means; the
+        # alternative reopens the replay window this closes.
+        burned = burn_jti(
+            state.settings.resolved_consumed_file,
+            claims.jti,
+            exp=claims.exp,
+            now=int(datetime.now(UTC).timestamp()),
+        )
+        if not burned:
             raise HTTPException(status.HTTP_409_CONFLICT, "capability token already used")
         body = await request.body()
         ceiling = (
@@ -391,11 +469,6 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 f"upload body exceeds cap (size={len(body)}, token_max={claims.max_bytes}, "
                 f"host_ceiling={ceiling})",
             )
-        # Single-use is best-effort: the in-set check and this add straddle the
-        # body read, so two concurrent replays of one token could both pass. Low
-        # risk — both carry identical authorized bytes and the slug lock serialises
-        # the writes. Process-local, TTL-bounded; a persistent store is day-2.
-        state.consumed.add(claims.jti)
         slug = safe_slug(claims.slug)
 
         if claims.op == "data":
@@ -405,8 +478,28 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 )
             name = safe_attachment_name(claims.name)
             async with state.lock_for(slug):
-                final_path = state.settings.data_dir / f"{slug}.data" / name
-                _atomic_write_bytes(final_path, body)
+                # ensure the tree exists even when an attachment arrives before
+                # the first publish, with the same 0700 mode a publish would set.
+                try:
+                    uid = resolve_jail_uid(
+                        state.settings.resolved_uids_file,
+                        slug,
+                        start=state.settings.jail_uid_start,
+                        end=state.settings.jail_uid_end,
+                        allow_unjailed=state.settings.allow_unjailed_spawn,
+                    )
+                except JailUnavailableError as err:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        f"notebook isolation unavailable: {err}",
+                    ) from err
+                except UidPoolExhaustedError as err:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, f"uid pool exhausted: {err}"
+                    ) from err
+                paths = ensure_slug_jail(state.settings.data_dir, slug, uid=uid)
+                final_path = paths.data / name
+                _atomic_write_bytes(final_path, body, owner_uid=uid)
                 return {
                     "slug": slug,
                     "name": name,
@@ -417,7 +510,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
         mode: Literal["edit", "run"] = "run" if claims.op == "blog" else "edit"
         async with state.lock_for(slug):
             np = await _spawn_tracked(state, slug, body, mode=mode)
-            size_bytes = (state.settings.data_dir / f"{slug}.py").stat().st_size
+            size_bytes = get_slug_paths(state.settings.data_dir, slug).notebook.stat().st_size
             if claims.op == "blog":
                 register_blog(
                     state.settings.resolved_blogs_file,

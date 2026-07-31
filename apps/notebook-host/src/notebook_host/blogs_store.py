@@ -18,6 +18,12 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+_REGISTRY_MODE = 0o600
+"""Explicit mode for blogs.json. It lists every slug, and per D-04 the slug
+is the only access control on the unauthenticated ``/n/{slug}/*`` proxy — a
+default-umask 0644 would let any jailed process read it and obtain every
+other notebook's URL, now that ``data_dir`` is traversable (0711)."""
+
 
 class BlogRecord(BaseModel):
     slug: str
@@ -52,11 +58,16 @@ def load_blogs(path: Path) -> dict[str, BlogRecord]:
 
 
 def save_blogs(path: Path, records: dict[str, BlogRecord]) -> None:
-    """Atomically rewrite the registry (tmp + rename on the same filesystem)."""
+    """Atomically rewrite the registry (tmp + rename on the same filesystem).
+
+    The tmp file is locked to ``_REGISTRY_MODE`` (0600) before the rename,
+    not after — no window where a freshly written registry is world-readable.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     payload = {slug: rec.model_dump() for slug, rec in records.items()}
     tmp.write_text(json.dumps(payload, indent=2))
+    os.chmod(tmp, _REGISTRY_MODE)
     os.replace(tmp, path)
 
 

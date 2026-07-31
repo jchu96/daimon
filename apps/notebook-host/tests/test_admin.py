@@ -7,9 +7,11 @@ are spawned. `wait_for_port` is monkeypatched at the module level to return True
 
 from __future__ import annotations
 
+import runpy
 import subprocess
 import time
 import unittest.mock
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,18 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from notebook_host.jail import SlugPaths, get_slug_paths
+
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
 
 AUTH = "Bearer test-secret"
 NO_AUTH = "Bearer wrong-secret"
@@ -24,17 +38,23 @@ NO_AUTH = "Bearer wrong-secret"
 
 def _make_stub_spawner(
     pid: int = 12345,
-) -> tuple[unittest.mock.MagicMock, list[tuple[str, Path, int]]]:
+) -> tuple[unittest.mock.MagicMock, list[tuple[str, SlugPaths, int, int | None]]]:
     """Return (stub_spawner, calls_log).
 
-    The stub records every (slug, file_path, port) call and returns a Popen mock.
+    The stub records every (slug, paths, port, jail_uid) call and returns a
+    Popen mock.
     """
-    calls: list[tuple[str, Path, int]] = []
+    calls: list[tuple[str, SlugPaths, int, int | None]] = []
 
     def spawner(
-        slug: str, file_path: Path, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
-        calls.append((slug, file_path, port))
+        calls.append((slug, paths, port, jail_uid))
         mock_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         mock_proc.poll.return_value = None  # alive
         mock_proc.pid = pid
@@ -52,7 +72,7 @@ def _make_test_app(
 ) -> tuple[TestClient, Any, unittest.mock.MagicMock]:
     """Build a FastAPI app with stub spawner and monkeypatched wait_for_port.
 
-    Pass ``validator`` (a callable ``(slug, file_path) -> ValidationResult``) to
+    Pass ``validator`` (a callable ``(slug, paths) -> ValidationResult``) to
     exercise the pre-publish validation path; the default of None disables it.
 
     Returns (client, admin_state, stub_spawner).
@@ -66,6 +86,7 @@ def _make_test_app(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner, _ = _make_stub_spawner()
@@ -159,7 +180,7 @@ def test_put_notebook_with_valid_bearer_returns_200(
 def test_put_notebook_writes_file_to_data_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PUT /admin/notebooks/{slug} writes <data_dir>/<slug>.py with posted source."""
+    """PUT /admin/notebooks/{slug} writes data_dir/<slug>/notebook.py with posted source."""
     client, _, _ = _make_test_app(tmp_path, monkeypatch)
     source = "import marimo\napp = marimo.App()\n"
     client.put(
@@ -167,7 +188,7 @@ def test_put_notebook_writes_file_to_data_dir(
         json={"source": source},
         headers={"Authorization": AUTH},
     )
-    written = (tmp_path / "nb1.py").read_text()
+    written = (tmp_path / "nb1" / "notebook.py").read_text()
     assert written == source, "file should contain the posted source verbatim"
 
 
@@ -184,6 +205,7 @@ def test_put_existing_slug_kills_old_and_respawns(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner, calls = _make_stub_spawner()
@@ -250,7 +272,9 @@ def test_put_notebook_oversize_source_returns_413(
     )
     assert resp.status_code == 413, f"oversize source should return 413, got {resp.status_code}"
     assert "max_source_bytes" in resp.text, "detail should reference the cap"
-    assert not (tmp_path / "big-nb.py").exists(), "no file should be written on size-cap reject"
+    assert not (tmp_path / "big-nb" / "notebook.py").exists(), (
+        "no file should be written on size-cap reject"
+    )
 
 
 def test_put_notebook_under_size_cap_succeeds(
@@ -281,6 +305,82 @@ def test_put_notebook_timeout_returns_504(tmp_path: Path, monkeypatch: pytest.Mo
     assert "slow-nb" not in state.processes, "registry should not contain the slug after timeout"
 
 
+# ─── fail-closed jail gate (D-05) ────────────────────────────────────────────
+# These deliberately do NOT call set_unjailed_test_env — they pin the
+# production default (fail-closed) rather than opting out of it.
+
+
+def test_put_notebook_returns_503_when_jail_unavailable_and_no_break_glass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that cannot jail refuses to publish (503) rather than serving unisolated."""
+    import notebook_host.admin as admin_mod
+    import notebook_host.jail as jail_mod
+    from notebook_host.admin import AdminState, create_admin_router
+    from notebook_host.config import load_settings
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    # allow_unjailed_spawn is deliberately left unset — production default (False).
+    settings = load_settings(_env_file=None)
+    monkeypatch.setattr(jail_mod, "can_apply_jail", lambda: False)
+
+    stub_spawner, _ = _make_stub_spawner()
+
+    async def _fake_wait(port: int, slug: str, timeout_s: float) -> bool:
+        return True
+
+    monkeypatch.setattr(admin_mod, "wait_for_port", _fake_wait)
+    state = AdminState(settings=settings, processes={}, spawner=stub_spawner)
+    app = FastAPI()
+    app.include_router(create_admin_router(state))
+    client = TestClient(app)
+
+    resp = client.put(
+        "/admin/notebooks/x", json={"source": "x = 1"}, headers={"Authorization": AUTH}
+    )
+    assert resp.status_code == 503, (
+        "an unjailable host must refuse to publish rather than serve unisolated"
+    )
+    assert "isolation" in resp.text.lower(), "the 503 detail should name the condition"
+
+
+def test_put_notebook_returns_200_when_break_glass_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same unjailable host publishes once the break-glass setting is on."""
+    import notebook_host.admin as admin_mod
+    import notebook_host.jail as jail_mod
+    from notebook_host.admin import AdminState, create_admin_router
+    from notebook_host.config import load_settings
+
+    monkeypatch.setenv("DAIMON_NOTEBOOK__DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
+    monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    set_unjailed_test_env(monkeypatch)
+    settings = load_settings(_env_file=None)
+    monkeypatch.setattr(jail_mod, "can_apply_jail", lambda: False)
+
+    stub_spawner, _ = _make_stub_spawner()
+
+    async def _fake_wait(port: int, slug: str, timeout_s: float) -> bool:
+        return True
+
+    monkeypatch.setattr(admin_mod, "wait_for_port", _fake_wait)
+    state = AdminState(settings=settings, processes={}, spawner=stub_spawner)
+    app = FastAPI()
+    app.include_router(create_admin_router(state))
+    client = TestClient(app)
+
+    resp = client.put(
+        "/admin/notebooks/x", json={"source": "x = 1"}, headers={"Authorization": AUTH}
+    )
+    assert resp.status_code == 200, "the break-glass opt-out should let an unjailable host publish"
+
+
 # ─── /admin/notebooks DELETE ─────────────────────────────────────────────────
 
 
@@ -291,36 +391,59 @@ def test_delete_notebook_returns_204(tmp_path: Path, monkeypatch: pytest.MonkeyP
     # First PUT to create
     client.put("/admin/notebooks/del-me", json={"source": "y = 2"}, headers={"Authorization": AUTH})
     assert "del-me" in state.processes, "state should contain del-me after PUT"
-    assert (tmp_path / "del-me.py").exists(), "file should exist after PUT"
+    assert (tmp_path / "del-me" / "notebook.py").exists(), "file should exist after PUT"
 
     # Now DELETE
     resp = client.delete("/admin/notebooks/del-me", headers={"Authorization": AUTH})
     assert resp.status_code == 204, "DELETE should return 204"
     assert "del-me" not in state.processes, "registry should not contain del-me after DELETE"
-    assert not (tmp_path / "del-me.py").exists(), "file should be removed after DELETE"
+    assert not (tmp_path / "del-me" / "notebook.py").exists(), "file should be removed after DELETE"
 
 
-def test_delete_notebook_rmtrees_data_and_workspace_dirs(
+def test_delete_notebook_releases_uid_from_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DELETE also removes <slug>.data/ and <slug>_workspace/ (with their contents)."""
+    """DELETE releases the slug's uid back to the pool, not just kills the process."""
+    from notebook_host.jail import load_uid_registry, save_uid_registry
+
+    client, state, _ = _make_test_app(tmp_path, monkeypatch)
+    client.put("/admin/notebooks/del-uid", json={"source": "x=1"}, headers={"Authorization": AUTH})
+    # can_apply_jail() is False on this (unprivileged) test host, so the publish
+    # above ran unjailed and left no registry entry of its own — seed one
+    # directly to simulate a slug that a jailed host had previously allocated.
+    save_uid_registry(state.settings.resolved_uids_file, {"del-uid": 100042})
+
+    resp = client.delete("/admin/notebooks/del-uid", headers={"Authorization": AUTH})
+    assert resp.status_code == 204, "DELETE should return 204"
+
+    registry = load_uid_registry(state.settings.resolved_uids_file)
+    assert "del-uid" not in registry, "DELETE should release the slug's uid back to the pool"
+
+
+def test_delete_notebook_removes_source_attachment_and_workspace_in_one_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE removes the whole slug tree — source, attachment, and workspace — in one call.
+
+    Proves the delete unification behaviourally: publish, attach, delete, and
+    assert the entire slug root is gone rather than inspecting three separate
+    cleanup calls.
+    """
     client, state, _ = _make_test_app(tmp_path, monkeypatch)
 
     client.put("/admin/notebooks/del-me", json={"source": "y=2"}, headers={"Authorization": AUTH})
-    # The stub spawner doesn't run _prepare_workspace, so simulate the dirs.
-    data_dir = tmp_path / "del-me.data"
-    data_dir.mkdir(exist_ok=True)
-    (data_dir / "sales.csv").write_bytes(b"a,b\n1,2\n")
-    workspace = tmp_path / "del-me_workspace"
-    workspace.mkdir(exist_ok=True)
-    (workspace / "data").symlink_to(Path("..") / "del-me.data")
-    (workspace / "del-me.py").symlink_to(Path("..") / "del-me.py")
+    client.put(
+        "/admin/notebooks/del-me/data/sales.csv",
+        content=b"a,b\n1,2\n",
+        headers={"Authorization": AUTH},
+    )
+    assert (tmp_path / "del-me").exists(), "slug root should exist after publish + attach"
 
     resp = client.delete("/admin/notebooks/del-me", headers={"Authorization": AUTH})
     assert resp.status_code == 204, "DELETE should return 204"
-    assert not (tmp_path / "del-me.py").exists(), "source file should be removed"
-    assert not data_dir.exists(), "<slug>.data/ should be rmtreed (with attachments)"
-    assert not workspace.exists(), "<slug>_workspace/ should be rmtreed (with symlinks)"
+    assert (tmp_path / "del-me").exists() is False, (
+        "source, attachment, workspace and log must all be gone after one DELETE"
+    )
     assert "del-me" not in state.processes
 
 
@@ -402,7 +525,9 @@ def test_sweep_reaps_dead_and_ttl_past_entries(
     dead_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     dead_proc.poll.return_value = 1  # dead
     dead_proc.pid = 11111
-    (tmp_path / "dead-nb.py").write_text("x", encoding="utf-8")
+    dead_paths = get_slug_paths(tmp_path, "dead-nb")
+    dead_paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    dead_paths.notebook.write_text("x", encoding="utf-8")
     processes["dead-nb"] = NotebookProcess(
         slug="dead-nb",
         port=8500,
@@ -415,7 +540,9 @@ def test_sweep_reaps_dead_and_ttl_past_entries(
     alive_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     alive_proc.poll.return_value = None  # alive
     alive_proc.pid = 22222
-    (tmp_path / "old-nb.py").write_text("y", encoding="utf-8")
+    old_paths = get_slug_paths(tmp_path, "old-nb")
+    old_paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    old_paths.notebook.write_text("y", encoding="utf-8")
     processes["old-nb"] = NotebookProcess(
         slug="old-nb",
         port=8501,
@@ -429,7 +556,9 @@ def test_sweep_reaps_dead_and_ttl_past_entries(
     good_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     good_proc.poll.return_value = None
     good_proc.pid = 33333
-    (tmp_path / "good-nb.py").write_text("z", encoding="utf-8")
+    good_paths = get_slug_paths(tmp_path, "good-nb")
+    good_paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    good_paths.notebook.write_text("z", encoding="utf-8")
     processes["good-nb"] = NotebookProcess(
         slug="good-nb",
         port=8502,
@@ -450,10 +579,10 @@ def test_sweep_reaps_dead_and_ttl_past_entries(
     assert "good-nb" in state.processes, "good-nb should remain in registry"
 
 
-def test_sweep_rmtrees_data_and_workspace_dirs(
+def test_sweep_removes_whole_slug_tree_for_reaped_slugs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """POST /admin/sweep also rmtrees <slug>.data/ and <slug>_workspace/ for reaped slugs."""
+    """POST /admin/sweep removes the whole slug tree (source, data, workspace) for reaped slugs."""
     import notebook_host.admin as admin_mod
     from notebook_host.admin import AdminState, create_admin_router
     from notebook_host.config import load_settings
@@ -476,14 +605,14 @@ def test_sweep_rmtrees_data_and_workspace_dirs(
     dead_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     dead_proc.poll.return_value = 1
     dead_proc.pid = 11111
-    (tmp_path / "dead-nb.py").write_text("x", encoding="utf-8")
-    data_dir = tmp_path / "dead-nb.data"
-    data_dir.mkdir()
-    (data_dir / "x.csv").write_bytes(b"a")
-    workspace = tmp_path / "dead-nb_workspace"
-    workspace.mkdir()
-    (workspace / "data").symlink_to(Path("..") / "dead-nb.data")
-    (workspace / "dead-nb.py").symlink_to(Path("..") / "dead-nb.py")
+    dead_paths = get_slug_paths(tmp_path, "dead-nb")
+    dead_paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    dead_paths.notebook.write_text("x", encoding="utf-8")
+    dead_paths.data.mkdir()
+    (dead_paths.data / "x.csv").write_bytes(b"a")
+    dead_paths.workspace.mkdir()
+    (dead_paths.workspace / "data").symlink_to(Path("..") / "data")
+    (dead_paths.workspace / "notebook.py").symlink_to(Path("..") / "notebook.py")
 
     processes["dead-nb"] = NotebookProcess(
         slug="dead-nb",
@@ -496,9 +625,9 @@ def test_sweep_rmtrees_data_and_workspace_dirs(
     resp = client.post("/admin/sweep", headers={"Authorization": AUTH})
     assert resp.status_code == 200, "sweep should return 200"
     assert "dead-nb" not in state.processes, "registry should not contain reaped slug"
-    assert not (tmp_path / "dead-nb.py").exists(), "source file should be removed"
-    assert not data_dir.exists(), "<slug>.data/ should be rmtreed by sweep"
-    assert not workspace.exists(), "<slug>_workspace/ should be rmtreed by sweep"
+    assert dead_paths.root.exists() is False, (
+        "the whole slug tree (source, data, workspace) should be removed by sweep"
+    )
 
 
 def test_put_notebook_returns_null_expires_at_when_ttl_indefinite(
@@ -547,7 +676,9 @@ def test_sweep_keeps_old_alive_process_when_ttl_indefinite(
     dead_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     dead_proc.poll.return_value = 1
     dead_proc.pid = 11111
-    (tmp_path / "dead-nb.py").write_text("x", encoding="utf-8")
+    dead_paths = get_slug_paths(tmp_path, "dead-nb")
+    dead_paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    dead_paths.notebook.write_text("x", encoding="utf-8")
     processes["dead-nb"] = NotebookProcess(
         slug="dead-nb",
         port=8500,
@@ -561,7 +692,9 @@ def test_sweep_keeps_old_alive_process_when_ttl_indefinite(
     old_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
     old_proc.poll.return_value = None
     old_proc.pid = 22222
-    (tmp_path / "old-nb.py").write_text("y", encoding="utf-8")
+    old_paths = get_slug_paths(tmp_path, "old-nb")
+    old_paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    old_paths.notebook.write_text("y", encoding="utf-8")
     processes["old-nb"] = NotebookProcess(
         slug="old-nb",
         port=8501,
@@ -614,6 +747,7 @@ def test_admin_accepts_any_configured_bearer(
     monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRETS", "primary-token,backup-token")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner, _ = _make_stub_spawner()
@@ -662,6 +796,7 @@ def test_singular_admin_secret_still_works(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "legacy-token")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     assert len(settings.admin_secrets) == 1, (
@@ -722,7 +857,9 @@ def test_put_notebook_rejected_when_validation_fails(
     """A validator that reports failure → 422 with cell_errors, and no spawn."""
     from notebook_host.lifecycle import ValidationResult
 
-    def failing_validator(slug: str, file_path: Path) -> ValidationResult:
+    def failing_validator(
+        slug: str, paths: SlugPaths, *, jail_uid: int | None = None
+    ) -> ValidationResult:
         return ValidationResult(
             ok=False,
             errors=["MultipleDefinitionError: The variable 'ax' was defined by another cell"],
@@ -751,7 +888,7 @@ def test_put_notebook_failed_validation_leaves_existing_notebook_running(
 
     results = [ValidationResult(ok=True), ValidationResult(ok=False, errors=["boom"])]
 
-    def validator(slug: str, file_path: Path) -> ValidationResult:
+    def validator(slug: str, paths: SlugPaths, *, jail_uid: int | None = None) -> ValidationResult:
         return results.pop(0)
 
     client, state, stub_spawner = _make_test_app(tmp_path, monkeypatch, validator=validator)
@@ -776,13 +913,15 @@ def test_put_notebook_failed_validation_leaves_existing_notebook_running(
 def test_put_notebook_published_when_validation_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A passing validator → normal 200 publish, validator called with (slug, path)."""
+    """A passing validator → normal 200 publish, validator called with (slug, paths)."""
     from notebook_host.lifecycle import ValidationResult
 
     seen: list[tuple[str, str]] = []
 
-    def ok_validator(slug: str, file_path: Path) -> ValidationResult:
-        seen.append((slug, file_path.name))
+    def ok_validator(
+        slug: str, paths: SlugPaths, *, jail_uid: int | None = None
+    ) -> ValidationResult:
+        seen.append((slug, paths.notebook.name))
         return ValidationResult(ok=True)
 
     client, state, stub_spawner = _make_test_app(tmp_path, monkeypatch, validator=ok_validator)
@@ -792,5 +931,5 @@ def test_put_notebook_published_when_validation_passes(
         headers={"Authorization": AUTH},
     )
     assert resp.status_code == 200, "a notebook that passes validation should publish normally"
-    assert seen == [("good", "good.py")], "validator should be called with (slug, source path)"
+    assert seen == [("good", "notebook.py")], "validator should be called with (slug, SlugPaths)"
     assert stub_spawner.call_count == 1, "a validated notebook should be spawned exactly once"

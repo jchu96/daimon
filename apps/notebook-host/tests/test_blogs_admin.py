@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
+import runpy
 import subprocess
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from notebook_host.jail import SlugPaths, get_slug_paths
+
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
 
 AUTH = "Bearer test-secret"
 
 
 def _make_blog_app(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[TestClient, Any, list[tuple[str, Path, int, str]]]:
+) -> tuple[TestClient, Any, list[tuple[str, SlugPaths, int, str]]]:
     """App with a stub spawner that records mode. Returns (client, state, calls)."""
     import notebook_host.admin as admin_mod
     from notebook_host.admin import AdminState, create_admin_router
@@ -27,14 +41,20 @@ def _make_blog_app(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8503")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
     settings = load_settings(_env_file=None)
 
-    calls: list[tuple[str, Path, int, str]] = []
+    calls: list[tuple[str, SlugPaths, int, str]] = []
 
     def spawner(
-        slug: str, file_path: Path, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
-        calls.append((slug, file_path, port, mode))
+        calls.append((slug, paths, port, mode))
         proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         proc.poll.return_value = None  # alive
         proc.pid = 4321
@@ -109,4 +129,6 @@ def test_delete_blog_unregisters_and_kills(tmp_path: Path, monkeypatch: pytest.M
         "delete must drop the registry entry"
     )
     assert "pre-radar" not in state.processes, "delete must drop the tracked process"
-    assert not (tmp_path / "pre-radar.py").exists(), "delete must remove the source file"
+    assert not get_slug_paths(tmp_path, "pre-radar").notebook.exists(), (
+        "delete must remove the source file"
+    )

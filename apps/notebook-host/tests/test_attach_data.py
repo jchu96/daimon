@@ -1,6 +1,6 @@
 """Tests for the host-side PUT /admin/notebooks/{slug}/data/{name} endpoint.
 
-The data-PUT endpoint writes a raw blob to ``<data_dir>/<slug>.data/<name>``
+The data-PUT endpoint writes a raw blob to ``data_dir/<slug>/data/<name>``
 atomically (tmp + os.replace) and does NOT spawn marimo. It is the host
 half of the agent-side ``attach_notebook_data`` MCP tool.
 """
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import runpy
 import subprocess
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,18 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from notebook_host.jail import SlugPaths, get_slug_paths
+
+# `--import-mode=importlib` (root pyproject.toml) doesn't add this directory
+# to sys.path, and there's no `__init__.py` here (one would collide with the
+# top-level `tests` package name already claimed by `packages/core/tests`).
+# `runpy` loads `conftest.py` by file path without touching sys.path or
+# sys.modules, so a full monorepo `pytest` collection can't collide with
+# similar sys.path tricks in other adapters' tests (see
+# `packages/adapters/mcp/tests/tools/conftest.py`).
+set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
+    str(Path(__file__).parent / "conftest.py")
+)["set_unjailed_test_env"]
 
 AUTH = "Bearer test-secret"
 NO_AUTH = "Bearer wrong-secret"
@@ -27,7 +41,12 @@ def _make_stub_spawner() -> unittest.mock.MagicMock:
     """Return a stub spawner that records calls and returns a fake Popen."""
 
     def spawner(
-        slug: str, file_path: Path, port: int, *, mode: str = "edit"
+        slug: str,
+        paths: SlugPaths,
+        port: int,
+        *,
+        mode: str = "edit",
+        jail_uid: int | None = None,
     ) -> subprocess.Popen[bytes]:
         mock_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         mock_proc.poll.return_value = None
@@ -51,6 +70,7 @@ def _make_test_app(
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_START", "8500")
     monkeypatch.setenv("DAIMON_NOTEBOOK__MARIMO_PORT_END", "8501")
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
+    set_unjailed_test_env(monkeypatch)
 
     settings = load_settings(_env_file=None)
     stub_spawner = _make_stub_spawner()
@@ -82,7 +102,7 @@ def test_put_data_without_bearer_returns_401(
 
 
 def test_put_data_writes_blob_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """PUT data writes raw body to <data_dir>/<slug>.data/<name> byte-for-byte."""
+    """PUT data writes raw body to data_dir/<slug>/data/<name> byte-for-byte."""
     client, _, _, _ = _make_test_app(tmp_path, monkeypatch)
     payload = b"\x00\x01\x02binary\xff\xfeblob"
     resp = client.put(
@@ -98,12 +118,13 @@ def test_put_data_writes_blob_atomically(tmp_path: Path, monkeypatch: pytest.Mon
     assert body["path"] == "data/blob.bin", (
         "response path should be the notebook-visible 'data/<name>' form"
     )
-    final_path = tmp_path / "myslug.data" / "blob.bin"
+    data_dir = get_slug_paths(tmp_path, "myslug").data
+    final_path = data_dir / "blob.bin"
     assert final_path.read_bytes() == payload, (
         "on-disk bytes should match the request body verbatim (binary-safe)"
     )
     # No tmp file should remain on disk.
-    tmp_artifacts = list((tmp_path / "myslug.data").glob(".*.tmp"))
+    tmp_artifacts = list(data_dir.glob(".*.tmp"))
     assert tmp_artifacts == [], f"no .tmp artifacts should remain; found {tmp_artifacts}"
 
 
@@ -118,8 +139,8 @@ def test_atomic_write_cleans_tmp_on_partial_failure(
     """
     from notebook_host import admin as admin_module
 
-    target_dir = tmp_path / "myslug.data"
-    target_dir.mkdir()
+    target_dir = get_slug_paths(tmp_path, "myslug").data
+    target_dir.mkdir(parents=True)
     target = target_dir / "blob.bin"
 
     real_replace = os.replace
@@ -143,6 +164,33 @@ def test_atomic_write_cleans_tmp_on_partial_failure(
     monkeypatch.setattr(admin_module.os, "replace", real_replace)
     admin_module._atomic_write_bytes(target, b"recovered")  # pyright: ignore[reportPrivateUsage]
     assert target.read_bytes() == b"recovered"
+
+
+def test_put_data_before_publish_lands_under_data_dir_owned_by_resolved_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An attachment PUT before any publish creates data/<name>, chowned to the resolved uid.
+
+    Forces ``resolve_jail_uid`` to return this process's own uid rather than
+    going through the real jail-availability check — a self-chown succeeds
+    without root, so this exercises the real ``os.chown`` call end to end.
+    """
+    import notebook_host.admin as admin_mod
+
+    self_uid = os.getuid()
+    monkeypatch.setattr(admin_mod, "resolve_jail_uid", lambda *a, **kw: self_uid)  # noqa: ARG005
+
+    client, _, _, _ = _make_test_app(tmp_path, monkeypatch)
+    resp = client.put(
+        "/admin/notebooks/pre-publish/data/x.csv",
+        content=b"a,b\n1,2\n",
+        headers={"Authorization": AUTH},
+    )
+    assert resp.status_code == 200, f"attachment before publish should succeed; got {resp.text}"
+
+    final_path = get_slug_paths(tmp_path, "pre-publish").data / "x.csv"
+    assert final_path.exists(), "attachment should land under data_dir/<slug>/data/"
+    assert final_path.stat().st_uid == self_uid, "the file should be owned by the resolved uid"
 
 
 def test_put_data_does_not_spawn_marimo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,7 +228,7 @@ def test_put_data_overwrites_existing(tmp_path: Path, monkeypatch: pytest.Monkey
         headers={"Authorization": AUTH},
     )
     assert r2.status_code == 200, "second PUT should succeed"
-    final = (tmp_path / "over.data" / "file.bin").read_bytes()
+    final = (get_slug_paths(tmp_path, "over").data / "file.bin").read_bytes()
     assert final == second, (
         "second body should win on overwrite; tmp+rename leaves no partial state"
     )
@@ -227,7 +275,7 @@ def test_put_data_oversize_returns_413(tmp_path: Path, monkeypatch: pytest.Monke
     )
     assert resp.status_code == 413, f"oversize body should return 413; got {resp.status_code}"
     assert "max_attachment_bytes_ceiling" in resp.text, "detail should reference the cap"
-    assert not (tmp_path / "myslug.data" / "big.bin").exists(), (
+    assert not (get_slug_paths(tmp_path, "myslug").data / "big.bin").exists(), (
         "no file should be written when the size cap is exceeded"
     )
 
@@ -270,7 +318,8 @@ async def test_concurrent_put_data_and_source_serialize(
         f"source PUT should succeed under contention; got {r_source.status_code}: {r_source.text}"
     )
     # On-disk artifacts from both ops exist.
-    assert (tmp_path / "race.data" / "d.csv").read_bytes() == b"x,y\n", (
+    race_paths = get_slug_paths(tmp_path, "race")
+    assert (race_paths.data / "d.csv").read_bytes() == b"x,y\n", (
         "data file should be readable after concurrent PUTs"
     )
-    assert (tmp_path / "race.py").exists(), "source file should exist after concurrent PUTs"
+    assert race_paths.notebook.exists(), "source file should exist after concurrent PUTs"

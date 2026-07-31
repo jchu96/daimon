@@ -19,3 +19,21 @@ def monkeypatch_admin_secret(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(key, raising=False)
     # Set the required secret
     monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "test-secret")
+
+
+def set_unjailed_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt a test into the unjailed-spawn break-glass.
+
+    CI runs as an unprivileged user, so ``can_apply_jail()`` is False there
+    and the production default (fail-closed, D-05) refuses to spawn — every
+    publish would 503 until a test opts out. Call this from any test that is
+    exercising something other than the jail itself.
+
+    Deliberately NOT folded into the autouse fixture above: the production
+    default must stay observable so `test_settings_defaults_match_documented_values`
+    keeps asserting ``allow_unjailed_spawn is False`` against a clean
+    environment, and a future test that ought to exercise fail-closed must
+    not silently inherit the break-glass. One named call site per test is
+    greppable; an invisible global is not.
+    """
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ALLOW_UNJAILED_SPAWN", "true")
