@@ -35,6 +35,7 @@ from daimon.core.broker.errors import NoBindingError, ProviderConfigError
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.domain import Role
+from daimon.testing.factories import make_account, make_tenant
 from factories import seed_tenant
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -61,6 +62,23 @@ async def _seed_tenant(
     """Insert a Tenant row via the given factory and return its id."""
     async with sessionmaker.begin() as session:
         return await seed_tenant(session)
+
+
+async def _seed_tenant_and_fixed_account(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    account_id: uuid.UUID,
+) -> uuid.UUID:
+    """Seed a tenant plus an accounts row at a caller-chosen id.
+
+    Needed by any test whose bind reaches a successful ``set_binding`` call:
+    the write now threads a ``RepoAccessProof`` carrying ``account_id``, and
+    the row's ``proof_account_id`` FK requires that account to already exist.
+    """
+    async with sessionmaker.begin() as session:
+        tenant = await make_tenant(session)
+        await make_account(session, tenant=tenant, id=account_id)
+        return tenant.id
 
 
 _UNSET: uuid.UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -331,14 +349,37 @@ def _make_stub_anthropic_for_vaults(
 # ---------------------------------------------------------------------------
 
 
+def _github_probe_client(
+    *,
+    status_code: int = 200,
+    record: list[str] | None = None,
+) -> httpx.AsyncClient:
+    """Stub the GitHub repo-access probe (`pat_can_access_repo`) endpoint.
+
+    ``status_code=200`` simulates a credential that can read the repo;
+    ``status_code=404`` simulates one that cannot (or a repo that doesn't
+    exist). Records each requested path when ``record`` is given, so a test
+    can assert exactly which ``owner/repo`` string was probed.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if record is not None:
+            record.append(request.url.path)
+        if status_code == 404:
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(status_code, json={"private": True})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
 async def test_set_repo_binding_happy_path(
     committing_sessionmaker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Full orchestration: mint → vault.create → DB row → no old ref to delete."""
-    tenant_id = await _seed_tenant(committing_sessionmaker)
     account_id = uuid.uuid4()
     agent_id = uuid.uuid4()
+    tenant_id = await _seed_tenant_and_fixed_account(committing_sessionmaker, account_id=account_id)
 
     async def _fake_mint(**_kwargs: object) -> str:
         return "ghp_TEST_PAT_HAPPY"
@@ -357,6 +398,7 @@ async def test_set_repo_binding_happy_path(
         repo_url="https://github.com/o/r",
         default_branch="main",
         service="github",
+        http_client=_github_probe_client(),
     )
 
     assert isinstance(result, AgentRepoBindingPublic), "must return projection model, not raw row"
@@ -380,9 +422,9 @@ async def test_set_repo_binding_writes_row_with_new_cred_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The DB row's ma_secret_ref must equal the credential id returned by vault.create."""
-    tenant_id = await _seed_tenant(committing_sessionmaker)
     account_id = uuid.uuid4()
     agent_id = uuid.uuid4()
+    tenant_id = await _seed_tenant_and_fixed_account(committing_sessionmaker, account_id=account_id)
     new_id = "cred_xyz_42"
 
     async def _fake_mint(**_kwargs: object) -> str:
@@ -394,7 +436,11 @@ async def test_set_repo_binding_writes_row_with_new_cred_id(
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
     await _set_repo_binding_impl(
-        runtime, auth, repo_url="https://github.com/o/r", default_branch="main"
+        runtime,
+        auth,
+        repo_url="https://github.com/o/r",
+        default_branch="main",
+        http_client=_github_probe_client(),
     )
 
     row = await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id)
@@ -553,6 +599,7 @@ async def test_set_repo_binding_vault_failure_leaves_no_row(
             repo_url="https://github.com/o/r",
             default_branch="main",
             service="github",
+            http_client=_github_probe_client(),
         )
 
     assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
@@ -602,6 +649,7 @@ async def test_set_repo_binding_db_failure_deletes_new_vault_cred(
             repo_url="https://github.com/o/r",
             default_branch="main",
             service="github",
+            http_client=_github_probe_client(),
         )
 
     # Assert 1: a DELETE was issued for the just-created credential.
@@ -651,7 +699,11 @@ async def test_set_repo_binding_db_failure_cleanup_swallows_anthropic_error(
 
     with pytest.raises(StoreError, match="db gone"):
         await _set_repo_binding_impl(
-            runtime, auth, repo_url="https://github.com/o/r", default_branch="main"
+            runtime,
+            auth,
+            repo_url="https://github.com/o/r",
+            default_branch="main",
+            http_client=_github_probe_client(),
         )
 
 
@@ -698,9 +750,9 @@ async def test_pat_plaintext_never_in_logs(
 ) -> None:
     """T-19-04-02: the PAT plaintext must never appear in any log line."""
     SENTINEL = "ghp_SENTINEL_TEST_PAT_DO_NOT_LOG_42"
-    tenant_id = await _seed_tenant(committing_sessionmaker)
     account_id = uuid.uuid4()
     agent_id = uuid.uuid4()
+    tenant_id = await _seed_tenant_and_fixed_account(committing_sessionmaker, account_id=account_id)
 
     async def _fake_mint(**_kwargs: object) -> str:
         return SENTINEL
@@ -716,6 +768,7 @@ async def test_pat_plaintext_never_in_logs(
         repo_url="https://github.com/o/r",
         default_branch="main",
         service="github",
+        http_client=_github_probe_client(),
     )
 
     captured = capsys.readouterr()
@@ -729,9 +782,9 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rebind path: old credential is deleted AFTER the new credential POST + DB write."""
-    tenant_id = await _seed_tenant(committing_sessionmaker)
     account_id = uuid.uuid4()
     agent_id = uuid.uuid4()
+    tenant_id = await _seed_tenant_and_fixed_account(committing_sessionmaker, account_id=account_id)
 
     # Pre-seed an existing binding with a known old ref.
     async with committing_sessionmaker.begin() as session:
@@ -757,7 +810,11 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
     await _set_repo_binding_impl(
-        runtime, auth, repo_url="https://github.com/o/r-new", default_branch="main"
+        runtime,
+        auth,
+        repo_url="https://github.com/o/r-new",
+        default_branch="main",
+        http_client=_github_probe_client(),
     )
 
     # Sequence assertion: POST new cred BEFORE DELETE old cred.
@@ -787,6 +844,120 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     assert row.repo_url == "o/r-new", (
         "repo_url must reflect the rebind (normalized to canonical owner/repo), "
         "not the seeded original"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan 06: repo-access verification before any vault or DB write
+# ---------------------------------------------------------------------------
+
+
+async def test_set_repo_binding_refuses_when_credential_lacks_repo_access(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A minted credential that cannot read the target repo refuses the bind
+    before any vault upload — no orphan credential, no binding row.
+    """
+    tenant_id = await _seed_tenant(committing_sessionmaker)
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+
+    async def _fake_mint(**_kwargs: object) -> str:
+        return "ghp_TEST_PAT_NO_ACCESS"
+
+    monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
+    record: list[tuple[str, str, dict[str, Any]]] = []
+    client = _make_stub_anthropic_for_vaults(account_id=account_id, record=record)
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
+
+    with pytest.raises(ToolError, match="cannot read"):
+        await _set_repo_binding_impl(
+            runtime,
+            auth,
+            repo_url="https://github.com/o/private-repo",
+            default_branch="main",
+            http_client=_github_probe_client(status_code=404),
+        )
+
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
+        "a refused bind must leave no binding row"
+    )
+    methods = [(m, p) for m, p, _ in record]
+    assert not any(p.startswith(f"/v1/vaults/{_VAULT_ID}/credentials") for _, p in methods), (
+        f"a refused bind must upload nothing to the vault — actual transport requests: {methods!r}"
+    )
+
+
+async def test_set_repo_binding_records_pat_proof_when_credential_can_read_repo(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful bind records a pat-kind proof attributed to the caller."""
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    tenant_id = await _seed_tenant_and_fixed_account(committing_sessionmaker, account_id=account_id)
+
+    async def _fake_mint(**_kwargs: object) -> str:
+        return "ghp_TEST_PAT_HAS_ACCESS"
+
+    monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
+    client = _make_stub_anthropic_for_vaults(account_id=account_id)
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
+
+    await _set_repo_binding_impl(
+        runtime,
+        auth,
+        repo_url="https://github.com/o/r",
+        default_branch="main",
+        http_client=_github_probe_client(status_code=200),
+    )
+
+    row = await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id)
+    assert row is not None, "binding row must exist after a successful bind"
+    assert row.proof_kind == "pat", "a credentialed access check must record kind='pat'"
+    assert row.proof_at is not None, "proof must carry a timestamp"
+    assert row.proof_account_id == account_id, (
+        "proof must attribute the calling account, not any other identity"
+    )
+
+
+async def test_set_repo_binding_probes_canonical_owner_repo_for_full_url(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full-URL repo_url is probed against the canonical owner/repo path —
+    the same string set_binding will normalize and store — so a normalization
+    drift between the probe and the stored row cannot pass silently.
+    """
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    tenant_id = await _seed_tenant_and_fixed_account(committing_sessionmaker, account_id=account_id)
+
+    async def _fake_mint(**_kwargs: object) -> str:
+        return "ghp_TEST_PAT_URL_FORM"
+
+    monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
+    client = _make_stub_anthropic_for_vaults(account_id=account_id)
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
+
+    probed_paths: list[str] = []
+    await _set_repo_binding_impl(
+        runtime,
+        auth,
+        repo_url="https://github.com/o/r.git",
+        default_branch="main",
+        http_client=_github_probe_client(record=probed_paths),
+    )
+
+    assert probed_paths == ["/repos/o/r"], (
+        "the probe must hit the canonical owner/repo path, not the raw full-URL input — "
+        f"actual probed paths: {probed_paths!r}"
     )
 
 
