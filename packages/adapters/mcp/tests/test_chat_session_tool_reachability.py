@@ -18,14 +18,15 @@ exist) and the ``set_repo_binding``-from-chat gap were both this same class
 of mistake: prompt prose describing mechanism the live tool surface
 contradicts.
 
-Two outcomes are recorded rather than treated as bugs:
+One outcome is recorded rather than treated as a bug:
 
-- ``set_repo_binding`` / ``get_repo_binding`` are visible (untagged, per this
-  plan's relaxation) but refuse a chat-turn caller: ``_require_agent_id``
-  raises because a chat-turn token carries no ``agent_id`` claim. Fixing
-  this would mean minting an agent claim into the account-scoped vault
-  credential, which is out of scope here (that credential is deliberately
-  account-scoped, not agent-scoped).
+- ``set_repo_binding`` / ``get_repo_binding`` are tagged ``agent-chat`` and
+  therefore invisible to a chat-turn session entirely — a chat-turn vault
+  credential carries no ``agent_id`` claim, so it can never satisfy the
+  precondition these tools' own ``_require_agent_id`` gate enforces.
+  Minting an agent claim into the account-scoped vault credential would
+  make them reachable, but that credential is deliberately account-scoped,
+  not agent-scoped, so it is out of scope here.
 - ``request_mcp_credential`` / ``request_env_credential`` reject Slack
   callers and require a platform-bound identity (``auth.platform_user_id``).
   The session built here carries a Discord-shaped platform claim, so both
@@ -85,10 +86,10 @@ class ExpectedOutcome(NamedTuple):
 
 
 CHAT_TURN_TOOL_REACHABILITY: dict[str, ExpectedOutcome] = {
-    # self_edit.py — relaxed (untagged) but require auth.agent_id, which a
-    # chat-turn token does not carry.
-    "set_repo_binding": ExpectedOutcome(discoverable=True, blocked_by_agent_id=True),
-    "get_repo_binding": ExpectedOutcome(discoverable=True, blocked_by_agent_id=True),
+    # self_edit.py — tagged agent-chat, so a chat-turn session (no agent_id
+    # claim) never discovers them at all.
+    "set_repo_binding": ExpectedOutcome(discoverable=False),
+    "get_repo_binding": ExpectedOutcome(discoverable=False),
     # skills.py — reads stay ungated; sync_skills stays admin-only.
     "list_skills": ExpectedOutcome(discoverable=True),
     "sync_skills": ExpectedOutcome(discoverable=False),
@@ -114,8 +115,6 @@ The four chat-removal tools land in a later plan and are covered by the
 prompt-claim drift gate instead, not by this record."""
 
 _CALL_ARGS: dict[str, dict[str, object]] = {
-    "set_repo_binding": {"repo_url": "https://github.com/x/y", "default_branch": "main"},
-    "get_repo_binding": {},
     "list_skills": {},
     "update_agent": {"name": "demo-agent", "description": "hi"},
     "attach_mcp_server": {
@@ -335,12 +334,12 @@ async def test_chat_turn_session_matches_recorded_reachability(
     )
 
 
-async def test_agent_id_claim_session_discovers_none_of_the_relaxed_tools(
+async def test_agent_id_claim_session_discovers_agent_chat_and_self_edit_tools_only(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A session narrowed to agent-chat tools (an agent_id claim) discovers a
-    strictly different set and none of the eight relaxed tools — removing the
-    admin tag must not have accidentally granted agent-chat visibility."""
+    """A session narrowed to agent-chat-tagged tools (an agent_id claim)
+    discovers the six agent-chat tools plus the eight self-edit/vault tools
+    tagged in this plan, and none of the tenant-wide roster tools."""
     async with sessionmaker() as s, s.begin():
         tenant = await make_tenant(s, platform="discord", workspace_id="agent-chat-reachability")
         account = await make_account(s, tenant=tenant)
@@ -358,21 +357,26 @@ async def test_agent_id_claim_session_discovers_none_of_the_relaxed_tools(
         "continue_turn",
         "get_my_session",
         "list_events",
+        "self_write_file",
+        "self_read_file",
+        "self_list_files",
+        "self_delete_file",
+        "set_repo_binding",
+        "get_repo_binding",
+        "clear_repo_binding",
+        "list_credentials",
     }
     assert tool_names == expected_agent_chat_tools, (
-        f"an agent_id-claim session must discover exactly the agent-chat tool set; "
+        f"an agent_id-claim session must discover exactly the agent-chat-tagged tool set; "
         f"got: {sorted(tool_names)}"
     )
-    relaxed_tool_names = {
+    roster_tool_names = {
         "create_agent",
         "update_agent",
         "attach_mcp_server",
         "fork_agent",
-        "set_repo_binding",
-        "clear_repo_binding",
-        "self_write_file",
-        "self_delete_file",
     }
-    assert not (relaxed_tool_names & tool_names), (
-        f"an agent_id-claim session must not discover any relaxed tool; got: {tool_names}"
+    assert not (roster_tool_names & tool_names), (
+        f"an agent_id-claim session must not discover any tenant-wide roster tool; "
+        f"got: {tool_names}"
     )
