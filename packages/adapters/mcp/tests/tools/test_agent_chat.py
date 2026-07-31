@@ -54,7 +54,7 @@ from daimon.adapters.mcp.tools.agent_chat import (
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     MARouter,
@@ -1083,3 +1083,76 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
         f"the thread_status_idle event must survive in the transcript; got types {types!r}"
     )
     assert "agent.message" in types, "the agent.message reply must still be present"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: admission — start_turn refuses an over-balance tenant before touching MA
+# ---------------------------------------------------------------------------
+
+
+async def test_start_turn_refuses_over_balance_tenant_before_creating_session(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """start_turn on a tenant with no credit raises the terminal billing refusal
+    and never creates an MA session.
+
+    Drives the tool through the real closure (tools/call over HTTP, not the
+    impl) with a claims token that carries platform_user_id so the gate's
+    unbilled internal-token path is not taken. The tenant is seeded with no
+    ledger entries, so its balance is 0 and is_over_balance is True.
+    """
+    tenant_id = uuid.uuid4()
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(
+            session, platform="discord", workspace_id=str(tenant_id), id=tenant_id
+        )
+        account = await make_account(session, tenant=tenant)
+
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=_MA_AGENT_ID)
+    token = "over-balance-agent-token"
+    claims: dict[str, str] = {
+        "sub": str(account.id),
+        "tenant_id": str(tenant_id),
+        "role": "user",
+        "agent_id": str(agent_uuid),
+        "platform_user_id": "discord-user-over-balance",
+        "client_id": "test",
+    }
+
+    router = MARouter()
+    mcp = FastMCP(
+        name="admission-over-balance",
+        auth=StaticTokenVerifier(tokens={token: claims}),
+    )
+    mcp.add_middleware(
+        IdentityMiddleware(
+            subject_resolver=production_subject_resolver,
+            tenant_resolver=production_tenant_resolver,
+            role_resolver=production_role_resolver,
+            agent_id_resolver=production_agent_id_resolver,
+            is_admin_resolver=production_is_admin_resolver,
+            internal_resolver=production_internal_resolver,
+            sessionmaker=db_session_factory,
+        )
+    )
+    mcp.add_transform(Visibility(False, tags={"agent-chat"}))
+    runtime = _runtime(build_fake_anthropic(router.dispatch), session_factory=db_session_factory)
+    register_agent_chat_tools(mcp, runtime, billing_config=None)
+
+    with patch(
+        "daimon.adapters.mcp.tools.agent_chat.create_session",
+        new=AsyncMock(),
+    ) as mock_create_session:
+        result = await _call_tool_via_http(
+            mcp.http_app(), token, "start_turn", {"message": "hello"}
+        )
+
+    payload = result.get("result", result)
+    assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
+    assert payload.get("isError"), (
+        f"start_turn should refuse an over-balance tenant; got {payload!r}"
+    )
+    content = str(payload.get("content"))
+    assert "TERMINAL ERROR" in content, f"refusal should be a TERMINAL ERROR; got {content!r}"
+    assert "/billing" in content, f"refusal should name /billing; got {content!r}"
+    mock_create_session.assert_not_awaited()
