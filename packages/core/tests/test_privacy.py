@@ -728,6 +728,12 @@ async def test_purge_covers_every_account_or_principal_scoped_table() -> None:
             # Not an erasure gap.
             "channel_config",
             "tenant_config",
+            # Same shape: PK is (tenant_id, agent_id) and the only accounts.id FK is
+            # the nullable provenance column proof_account_id with ON DELETE SET NULL.
+            # An account purge severs who-proved-it while leaving the binding and its
+            # proof kind/timestamp intact — deleting the row would drop a whole
+            # tenant's repo mount because one member erased their account.
+            "agent_repo_binding",
             # Tenant/agent-scoped, no account/principal column — "purge account X"
             # is undefined for them; deferred to a future tenant-purge path.
             "agent_files",
