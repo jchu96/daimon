@@ -16,13 +16,19 @@ that aren't this agent's (cross-tenant AND same-tenant cross-agent, WR-03).
 Headless loop (primitives-only — no folded/auto-allow ``get_reply``):
 - ``start_turn`` creates a persistent MA session (via
   ``daimon.core.sessions.create_session`` for vault/repo/env parity) and sends
-  the first message; returns ``{"handle": <session_id>}``.
-- ``continue_turn`` sends a follow-up ``user.message``.
-- ``get_session`` returns status/metadata (poll until idle).
+  the first message; returns ``{"handle": <session_id>}``. Admission-gated:
+  runs the same balance/cap checks as the billed media tools before creating
+  a session.
+- ``continue_turn`` sends a follow-up ``user.message``. Admission-gated,
+  same as ``start_turn``.
+- ``get_session`` returns status/metadata (poll until idle). Read-only, not
+  gated.
 - ``list_events`` returns the transcript; the caller reads the reply from the
   ``agent.message`` events. Agents run ``permission_policy=always_allow``
   (``specs.py``), so sessions reach idle without tool confirmations.
-- ``list_sessions`` enumerates this agent's sessions for resume.
+  Read-only, not gated.
+- ``list_sessions`` enumerates this agent's sessions for resume. Read-only,
+  not gated.
 """
 
 from __future__ import annotations
@@ -36,9 +42,13 @@ from anthropic.types.beta import (
 )
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
-from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
+from daimon.adapters.mcp.tools._ctx import (
+    _auth,  # pyright: ignore[reportPrivateUsage]
+    _check_admission,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.adapters.mcp.tools._pagination import Page
 from daimon.adapters.mcp.tools.sessions import SessionEventOut, SessionInfo
+from daimon.core.billing import BillingConfig
 from daimon.core.defaults.ma_index import find_environment_by_daimon_tag, list_agents_by_tenant
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import ScopeContext
@@ -299,7 +309,12 @@ async def _list_events_impl(
     )
 
 
-def register_agent_chat_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
+def register_agent_chat_tools(
+    mcp: FastMCP,
+    runtime: McpRuntime,
+    *,
+    billing_config: BillingConfig | None,
+) -> None:
     """Register the agent-chat tools on ``mcp``.
 
     All tools carry ``tags={"agent-chat"}`` so the
@@ -318,6 +333,11 @@ def register_agent_chat_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     ``get_my_session`` to avoid a name collision with the tenant-scoped
     operator tools of the same name (the headless caller only ever sees this
     agent-chat set, so the "my" prefix is harmless and reads as agent-scoped).
+
+    ``start_turn`` and ``continue_turn`` run the shared ``_check_admission``
+    gate (the same balance/cap checks the media tools run) before creating a
+    session or sending an event; the four read tools stay on the bare
+    ``_auth``.
     """
 
     @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
@@ -348,7 +368,13 @@ def register_agent_chat_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         the first user message. Returns ``{"handle": "<session_id>"}`` which
         you pass to ``get_session``, ``list_events``, and ``continue_turn``.
         """
-        return await _start_turn_impl(runtime, await _auth(ctx), message)
+        auth = await _check_admission(
+            ctx,
+            sessionmaker=runtime.session_factory,
+            billing_config=billing_config,
+            tool_name="start_turn",
+        )
+        return await _start_turn_impl(runtime, auth, message)
 
     @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def continue_turn(ctx: Context, handle: str, message: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -357,7 +383,13 @@ def register_agent_chat_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         Use this to continue a multi-turn conversation. Returns
         ``{"handle": "<session_id>"}`` unchanged for chaining.
         """
-        return await _continue_turn_impl(runtime, await _auth(ctx), handle, message)
+        auth = await _check_admission(
+            ctx,
+            sessionmaker=runtime.session_factory,
+            billing_config=billing_config,
+            tool_name="continue_turn",
+        )
+        return await _continue_turn_impl(runtime, auth, handle, message)
 
     @mcp.tool(tags={"agent-chat"}, name="get_my_session")  # pyright: ignore[reportArgumentType]
     async def get_my_session(ctx: Context, handle: str) -> SessionInfo:  # pyright: ignore[reportUnusedFunction]

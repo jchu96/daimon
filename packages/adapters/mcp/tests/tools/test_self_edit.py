@@ -222,13 +222,13 @@ async def test_missing_agent_id_raises(
 _VAULT_ID = "vault_test_1"
 
 
-def _vault_list_response_for(account_id: uuid.UUID) -> dict[str, object]:
+def _vault_list_response_for(account_id: uuid.UUID, agent_id: uuid.UUID) -> dict[str, object]:
     return {
         "data": [
             {
                 "id": _VAULT_ID,
                 "type": "vault",
-                "display_name": f"daimon-mcp:{account_id}",
+                "display_name": f"daimon-mcp:{account_id}:{agent_id}",
                 "created_at": "2026-04-24T00:00:00Z",
                 "updated_at": "2026-04-24T00:00:00Z",
             }
@@ -273,6 +273,7 @@ def _api_error_response(status: int = 500) -> httpx.Response:
 def _make_stub_anthropic_for_vaults(
     *,
     account_id: uuid.UUID,
+    agent_id: uuid.UUID,
     new_cred_id: str = "cred_new_001",
     create_status: int = 200,
     delete_status: int = 204,
@@ -302,7 +303,7 @@ def _make_stub_anthropic_for_vaults(
 
         # GET /v1/vaults (list)
         if method == "GET" and path == "/v1/vaults":
-            return httpx.Response(200, json=_vault_list_response_for(account_id))
+            return httpx.Response(200, json=_vault_list_response_for(account_id, agent_id))
         # POST /v1/vaults/{vault_id}/credentials
         if method == "POST" and cred_path_re.match(path):
             if create_status != 200:
@@ -346,7 +347,7 @@ async def test_set_repo_binding_happy_path(
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
     record: list[tuple[str, str, dict[str, Any]]] = []
     client = _make_stub_anthropic_for_vaults(
-        account_id=account_id, new_cred_id="cred_happy_1", record=record
+        account_id=account_id, agent_id=agent_id, new_cred_id="cred_happy_1", record=record
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
@@ -389,7 +390,9 @@ async def test_set_repo_binding_writes_row_with_new_cred_id(
         return "ghp_TEST_PAT_002"
 
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, new_cred_id=new_id)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, new_cred_id=new_id
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -462,7 +465,9 @@ async def test_clear_repo_binding_removes_row_and_calls_vault_delete(
         )
 
     record: list[tuple[str, str, dict[str, Any]]] = []
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, record=record)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, record=record
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -494,12 +499,11 @@ async def test_clear_repo_binding_idempotent_on_no_binding(
     )
 
 
-async def test_clear_repo_binding_swallows_vault_delete_failure(
+async def test_clear_repo_binding_keeps_row_when_credential_delete_fails(
     committing_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Vault delete failure logs a warning but DB row still removed."""
+    """A credential that could not be revoked is still live, so its pointer stays."""
     tenant_id = await _seed_tenant(committing_sessionmaker)
     account_id = uuid.uuid4()
     agent_id = uuid.uuid4()
@@ -513,18 +517,93 @@ async def test_clear_repo_binding_swallows_vault_delete_failure(
             ma_secret_ref="cred_will_500",
         )
 
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, delete_status=500)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, delete_status=500
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
+
+    with pytest.raises(ToolError, match="still live"):
+        await _clear_repo_binding_impl(runtime, auth)
+
+    row = await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id)
+    assert row is not None, (
+        "the binding row is the only pointer to the credential — it must survive a "
+        "failed revocation rather than orphaning a live token"
+    )
+    assert row.ma_secret_ref == "cred_will_500", "the pointer must still name the live credential"
+
+
+async def test_clear_repo_binding_keeps_row_when_binding_was_made_from_another_account(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    """The vault is per account, the binding row is not.
+
+    A caller from a different account than the one that bound the repo cannot
+    reach the credential, so clearing must refuse instead of reporting success.
+    """
+    tenant_id = await _seed_tenant(committing_sessionmaker)
+    binding_account_id = uuid.uuid4()
+    clearing_account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    async with committing_sessionmaker.begin() as session:
+        await set_binding(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            repo_url="https://github.com/o/r",
+            default_branch="main",
+            ma_secret_ref="cred_in_another_vault",
+        )
+
+    # The only vault MA knows about belongs to the account that bound the repo.
+    client = _make_stub_anthropic_for_vaults(account_id=binding_account_id, agent_id=agent_id)
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(account_id=clearing_account_id, tenant_id=tenant_id, agent_id=agent_id)
+
+    with pytest.raises(ToolError, match="cannot be revoked"):
+        await _clear_repo_binding_impl(runtime, auth)
+
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is not None, (
+        "clearing from an account that cannot reach the credential must leave the "
+        "binding row in place rather than orphaning a live token"
+    )
+
+
+async def test_clear_repo_binding_skips_vault_when_secret_is_not_a_vault_credential(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    """A public-repo binding has no MA credential, so there is nothing to revoke."""
+    tenant_id = await _seed_tenant(committing_sessionmaker)
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    async with committing_sessionmaker.begin() as session:
+        await set_binding(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            repo_url="https://github.com/o/r",
+            default_branch="main",
+            ma_secret_ref="anon:",
+        )
+
+    record: list[tuple[str, str, dict[str, Any]]] = []
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, record=record
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
     result = await _clear_repo_binding_impl(runtime, auth)
 
-    assert result == {"cleared": True}, "vault delete failure must not block DB cleanup"
-    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
-        "DB row must still be removed even when vault delete fails"
+    assert result == {"cleared": True}, "a binding with no stored credential must clear"
+    assert record == [], (
+        f"no vault call may be made for a binding that stores no credential; got {record!r}"
     )
-    assert "vault_delete_failed" in capsys.readouterr().out, (
-        "must emit a warning naming the outcome"
+    assert await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id) is None, (
+        "DB row must be removed"
     )
 
 
@@ -542,7 +621,9 @@ async def test_set_repo_binding_vault_failure_leaves_no_row(
         return "ghp_TEST_PAT_FAIL"
 
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, create_status=500)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, create_status=500
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -588,7 +669,7 @@ async def test_set_repo_binding_db_failure_deletes_new_vault_cred(
 
     record: list[tuple[str, str, dict[str, Any]]] = []
     client = _make_stub_anthropic_for_vaults(
-        account_id=account_id, new_cred_id=new_id, record=record
+        account_id=account_id, agent_id=agent_id, new_cred_id=new_id, record=record
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
@@ -643,6 +724,7 @@ async def test_set_repo_binding_db_failure_cleanup_swallows_anthropic_error(
 
     client = _make_stub_anthropic_for_vaults(
         account_id=account_id,
+        agent_id=agent_id,
         new_cred_id="cred_cleanup_will_500",
         delete_status=500,
     )
@@ -706,7 +788,7 @@ async def test_pat_plaintext_never_in_logs(
         return SENTINEL
 
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
-    client = _make_stub_anthropic_for_vaults(account_id=account_id)
+    client = _make_stub_anthropic_for_vaults(account_id=account_id, agent_id=agent_id)
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -751,7 +833,7 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     record: list[tuple[str, str, dict[str, Any]]] = []
     new_id = "cred_new_rebind"
     client = _make_stub_anthropic_for_vaults(
-        account_id=account_id, new_cred_id=new_id, record=record
+        account_id=account_id, agent_id=agent_id, new_cred_id=new_id, record=record
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
@@ -787,6 +869,54 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     assert row.repo_url == "o/r-new", (
         "repo_url must reflect the rebind (normalized to canonical owner/repo), "
         "not the seeded original"
+    )
+
+
+async def test_set_repo_binding_rebind_raises_when_previous_credential_survives(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebinding overwrites the only pointer to the previous credential.
+
+    When that credential cannot be deleted it is still live with nothing
+    naming it, which the caller must be told about.
+    """
+    tenant_id = await _seed_tenant(committing_sessionmaker)
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    async with committing_sessionmaker.begin() as session:
+        await set_binding(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            repo_url="https://github.com/o/r-old",
+            default_branch="main",
+            ma_secret_ref="old-cred-id",
+        )
+
+    async def _fake_mint(**_kwargs: object) -> str:
+        return "ghp_TEST_PAT_REBIND_ORPHAN"
+
+    monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id,
+        agent_id=agent_id,
+        new_cred_id="cred_new_after_orphan",
+        delete_status=500,
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
+
+    with pytest.raises(ToolError, match="still live"):
+        await _set_repo_binding_impl(
+            runtime, auth, repo_url="https://github.com/o/r-new", default_branch="main"
+        )
+
+    row = await get_binding(db_session, tenant_id=tenant_id, agent_id=agent_id)
+    assert row is not None, "the rebind itself stands — only the revocation failed"
+    assert row.ma_secret_ref == "cred_new_after_orphan", (
+        "the row must point at the new credential; the raise reports the un-revoked old one"
     )
 
 

@@ -1,4 +1,4 @@
-"""Sessions tools: list / get / events / send_message.
+"""Sessions tools: list / get / events.
 
 ``register_sessions_tools(mcp, runtime)`` wires the ``@mcp.tool`` closures for
 this group; each closure delegates to a module-private ``_*_impl`` function
@@ -6,8 +6,8 @@ that can be unit-tested without a FastMCP Context.
 
 Tenant scope: a session belongs to the caller's tenant iff its ``agent.id`` is
 in ``{a.id for a in list_agents_by_tenant(...)}``. Cross-tenant ``get`` /
-``events`` / ``send_message`` raise ``ToolError("session not found")`` — terse
-and identical for unknown vs. forbidden so existence isn't leaked.
+``events`` raise ``ToolError("session not found")`` — terse and identical for
+unknown vs. forbidden so existence isn't leaked.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class SessionInfo(BaseModel):
 
 class SessionEventOut(BaseModel):
     """Permissive projection of an MA session event for ``list_session_events``
-    and ``send_message`` output.
+    output.
 
     Deliberately NOT the SDK's ``BetaManagedAgentsSessionEvent`` discriminated
     union: the MA API emits event types a pinned SDK version does not model
@@ -78,18 +78,6 @@ class SessionEventOut(BaseModel):
     # agent.message; None on status events). Kept as raw JSON blocks rather than
     # the SDK's typed content union — the caller folds agent.message text itself.
     content: list[dict[str, Any]] | None = None
-
-
-class SendMessageOut(BaseModel):
-    """Permissive projection of ``BetaManagedAgentsSendSessionEvents`` output.
-
-    Same rationale as ``SessionEventOut`` above — the SDK's send-response
-    union can carry event types a pinned SDK version does not model.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    data: list[SessionEventOut] | None = None
 
 
 async def _verify_tenant_owns_session(
@@ -174,25 +162,6 @@ async def _list_session_events_impl(
     )
 
 
-async def _send_message_impl(
-    runtime: McpRuntime,
-    auth: AuthIdentity,
-    session_id: str,
-    text: str,
-) -> SendMessageOut:
-    await _verify_tenant_owns_session(runtime, auth, session_id)
-    resp = await runtime.client.beta.sessions.events.send(
-        session_id,
-        events=[
-            {
-                "type": "user.message",
-                "content": [{"type": "text", "text": text}],
-            }
-        ],
-    )
-    return SendMessageOut.model_validate(resp.model_dump(mode="json"))
-
-
 def register_sessions_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     @mcp.tool
     async def list_sessions(  # pyright: ignore[reportUnusedFunction]
@@ -220,10 +189,3 @@ def register_sessions_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         return await _list_session_events_impl(
             runtime, await _auth(ctx), session_id, page, limit, order
         )
-
-    @mcp.tool
-    async def send_message(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context, session_id: str, text: str
-    ) -> SendMessageOut:
-        """Post a single ``user.message`` text event to a session."""
-        return await _send_message_impl(runtime, await _auth(ctx), session_id, text)

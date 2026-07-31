@@ -9,10 +9,12 @@ agent-chat tools via ``disable_components(match_all=True)`` +
 carry no ``agent-chat`` tag, so the ``match_all`` disable hides them — leaving
 ``tools/list`` empty even though ``tools/call`` still works (issue #181).
 
-For a narrowed agent session there are only six tools, so search is pointless.
-This subclass detects the narrowing (the request's ``auth`` state has a non-null
-``agent_id``) and returns the catalog unchanged, letting the visibility filter
-narrow it to exactly the agent-chat tools.
+For a narrowed agent session the catalog is small — the six ``agent_chat``
+tools plus the eight tools tagged ``agent-chat`` in ``self_edit``/``vault``
+— so search is pointless. This subclass detects the narrowing (the
+request's ``auth`` state has a non-null ``agent_id``) and returns the
+catalog unchanged, letting the visibility filter narrow it to exactly the
+agent-chat-tagged tools.
 """
 
 from __future__ import annotations

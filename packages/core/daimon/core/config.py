@@ -148,7 +148,11 @@ class DiscordSettings(BaseModel):
             "session per calling user, so no user inherits another user's "
             "session identity or permissions in a shared thread. When False, "
             "a single session is shared by every caller in the thread — a "
-            "legacy fallback, not recommended for production."
+            "legacy fallback, not recommended for production. Setting this "
+            "False also exposes credentials: the shared session's token is "
+            "minted for the thread starter's account, so any participant can "
+            "prompt the agent into calling get_cli_token and receive the "
+            "starter's bound PAT as plaintext."
         ),
     )
     bot_display_name: str = Field(

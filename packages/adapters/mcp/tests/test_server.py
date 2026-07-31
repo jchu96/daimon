@@ -55,7 +55,6 @@ async def test_create_mcp_app_registers_sessions_and_time_tools(
         "list_sessions",
         "get_session",
         "list_session_events",
-        "send_message",
         "now",
         "convert",
     }
