@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import yarl
+from cryptography.fernet import Fernet
 from daimon.adapters.slack.agent_setup import submit as submit_mod
 from daimon.adapters.slack.agent_setup.submit import (
     _SECRET_CAP,
@@ -47,7 +49,7 @@ from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.scope import TenantScopeRef
 from daimon.core.skill_sync import SyncReport
 from daimon.core.stores.scoped_config_write import set_fields
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, make_fake_ma_handler
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -97,6 +99,43 @@ def _override_users_info_admin(mock: Any) -> None:
     )
 
 
+def _github_handler_never_called(request: httpx.Request) -> httpx.Response:
+    """Default GitHub transport handler for tests that never touch a repo probe.
+
+    A MagicMock client would make every probe return a truthy mock object,
+    silently passing every access check — the gate would be inert while the
+    suite stayed green. Failing loudly here is what catches a test wiring a
+    code path onto the GitHub probe without declaring the response it expects.
+    """
+    raise AssertionError(f"unexpected GitHub API call: {request.method} {request.url}")
+
+
+def _github_handler(
+    status: int, body: dict[str, Any] | None = None
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Build a fixed-response GET handler for `https://api.github.com/repos/...`.
+
+    Every run_edit_repo_submission invocation makes at most one GitHub call
+    per submit, so a single fixed response is enough to drive is_public_repo
+    or pat_can_access_repo — whichever the code path under test reaches.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.github.com", f"unexpected host: {request.url}"
+        return httpx.Response(status, json=body if body is not None else {})
+
+    return handler
+
+
+def _build_http_client(
+    github_handler: Callable[[httpx.Request], httpx.Response] | None = None,
+) -> httpx.AsyncClient:
+    """Real httpx.AsyncClient over MockTransport — never a MagicMock stand-in."""
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(github_handler or _github_handler_never_called)
+    )
+
+
 def _build_runtime_no_db(fernet_key: str = "dummy") -> SlackRuntime:
     """Build a SlackRuntime with fake MA transport and a dummy (unused) sessionmaker.
 
@@ -116,7 +155,7 @@ def _build_runtime_no_db(fernet_key: str = "dummy") -> SlackRuntime:
         anthropic=build_fake_anthropic(make_fake_ma_handler()),
         sessionmaker=async_sessionmaker(),  # pyright: ignore[reportArgumentType]
         billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
+        http_client=_build_http_client(),
         resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
@@ -515,7 +554,7 @@ def _build_runtime_with_db(
         anthropic=build_fake_anthropic(handler),
         sessionmaker=db_factory,
         billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
+        http_client=_build_http_client(),
         resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
@@ -669,6 +708,7 @@ async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_de
     async with db_session_factory() as session:
         await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
         await session.commit()
+    await _seed_guild_account(db_session_factory, tenant_id=tenant_id)
     await _mark_reachable(db_session_factory, tenant_id=tenant_id, agent_name=_AGENT_NAME)
 
     client_fake: Any = fake_slack_web_client
@@ -681,7 +721,7 @@ async def test_run_edit_repo_submission_when_non_admin_and_agent_is_workspace_de
         ),
         sessionmaker=db_session_factory,
         billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
+        http_client=_build_http_client(_github_handler(200, {"private": False})),
         resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
@@ -1207,7 +1247,7 @@ async def test_run_paste_secrets_submission_when_admin_and_two_pairs_posts_count
         anthropic=build_fake_anthropic(_handler),
         sessionmaker=db_session_factory,
         billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
+        http_client=_build_http_client(),
         resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
     )
@@ -1260,7 +1300,7 @@ async def test_run_paste_secrets_submission_when_admin_and_two_pairs_posts_count
 
 
 # ---------------------------------------------------------------------------
-# run_edit_repo_submission preserves ma_secret_ref
+# run_edit_repo_submission — GitHub access proof gates every binding write
 # ---------------------------------------------------------------------------
 
 
@@ -1308,62 +1348,136 @@ def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-@pytest.mark.asyncio
-async def test_run_edit_repo_submission_when_pat_replace_false_preserves_inline_pat(
-    fake_slack_web_client: Any,
-    db_session_factory: Any,
-) -> None:
-    """PAT-CLOBBER regression: blank PAT edit-repo preserves the stored ma_secret_ref.
-
-    Store an inline PAT (ma_secret_ref=inline-pat:{agent_uuid}) directly on the
-    binding, then submit edit-repo with a new URL + pat_replace=False (blank PAT).
-    The binding's ma_secret_ref must still equal inline-pat:{agent_uuid} and
-    repo_url must reflect the new URL.
-    """
-    from daimon.adapters.slack.runtime import SlackRuntime
-    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
-    from daimon.core.stores.agent_repo_binding import get_binding, set_binding
-    from daimon.testing.factories import make_tenant
-
-    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
-    ma_agent_id = f"agent_{'c' * 24}"
-    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
-
-    async with db_session_factory() as session:
-        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
-        await session.commit()
-
-    async with db_session_factory() as session:
-        await set_binding(
-            session,
-            tenant_id=tenant_id,
-            agent_id=agent_uuid,
-            repo_url="https://github.com/example/old.git",
-            default_branch="main",
-            ma_secret_ref=f"inline-pat:{agent_uuid}",
-        )
-        await session.commit()
-
-    client_fake: Any = fake_slack_web_client
-    _override_users_info_admin(client_fake.mock)
-
+def _build_edit_repo_settings(*, app_id: str | None, fernet_key: str | None = None) -> MagicMock:
+    """`fernet_key` defaults to a freshly generated key, not the literal string
+    "dummy" — any test whose submit now reaches `load_agent_inline_pat` needs a
+    real Fernet key or the fernet build raises."""
     settings: MagicMock = MagicMock()
-    settings.crypto.keys = (SecretStr("dummy"),)
+    settings.crypto.keys = (SecretStr(fernet_key or Fernet.generate_key().decode()),)
     settings.mcp.public_url = None
     settings.mcp.jwt_secret = None
     settings.github = MagicMock()
-    settings.github.app_id = None
+    settings.github.app_id = app_id
+    settings.github.oauth_scopes = ("repo",)
+    return settings
 
-    runtime = SlackRuntime(
-        settings=settings,
+
+def _build_edit_repo_runtime(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    tenant_id: Any,
+    ma_agent_id: str,
+    github_handler: Callable[[httpx.Request], httpx.Response] | None = None,
+    fernet_key: str | None = None,
+    app_id: str | None = None,
+) -> SlackRuntime:
+    """Build a SlackRuntime wired for run_edit_repo_submission tests: real MA
+    transport for the agent lookup, real Postgres, and a real httpx client
+    over MockTransport for the GitHub probe(s).
+
+    `github_handler` defaults to one that fails the test if a probe is ever
+    made — declaring the expected response per test is the point (a
+    MagicMock client would instead make every probe return a truthy mock and
+    silently pass every check).
+    """
+    return SlackRuntime(
+        settings=_build_edit_repo_settings(app_id=app_id, fernet_key=fernet_key),
         anthropic=build_fake_anthropic(
             _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
         ),
         sessionmaker=db_session_factory,
         billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
+        http_client=_build_http_client(github_handler),
         resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+    )
+
+
+async def _seed_stored_pat(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: Any,
+    fernet_key: str,
+    plaintext: str,
+) -> None:
+    """Write a real per-agent credential + overlay binding — the same
+    primitives `store_inline_pat` uses — so `load_agent_inline_pat` resolves
+    it independently of whatever string the binding's own `ma_secret_ref`
+    carries."""
+    from daimon.core.github_credentials import build_multifernet, upsert_credential_encrypted
+    from daimon.core.stores.agent_github_binding import set_agent_github_binding
+
+    fernet = build_multifernet((fernet_key,))
+    await upsert_credential_encrypted(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        principal_id=agent_id,
+        github_login="(inline-pat)",
+        plaintext_token=plaintext,
+        scopes=("repo",),
+    )
+    async with db_session_factory() as session, session.begin():
+        await set_agent_github_binding(session, agent_id=agent_id, principal_id=agent_id)
+
+
+def _ephemeral_texts_for(client_fake: Any) -> list[str]:
+    ephemeral_key = ("POST", yarl.URL("https://slack.com/api/chat.postEphemeral"))
+    return [
+        call.kwargs["json"]["text"] for call in client_fake.mock.requests.get(ephemeral_key, [])
+    ]
+
+
+async def _seed_guild_account(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    tenant_id: Any,
+) -> None:
+    """Seed the accounts row `proof_account_id`'s FK requires for a proof
+    attributed to the derived guild account (the submitting workspace's
+    account for a panel-driven bind)."""
+    from daimon.core.defaults.provisioning import derive_guild_account_uuid
+    from daimon.core.stores.tenants import get_tenant
+
+    async with db_session_factory() as session:
+        tenant_row = await get_tenant(session, tenant_id)
+        await make_account(
+            session, tenant=tenant_row, id=derive_guild_account_uuid(tenant_id=tenant_id)
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_blank_pat_binds_anon_when_repo_public(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """First-time blank-token bind against a verified-public repo writes an
+    anon: binding with a public proof and reports success.
+
+    Replaces the old premise ("no App-coverage probe on Slack, so an anon:
+    binding is written unconditionally") — that gap is exactly what this
+    phase closes; the write now requires a real is_public_repo probe.
+    """
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'e' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+    await _seed_guild_account(db_session_factory, tenant_id=tenant_id)
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        github_handler=_github_handler(200, {"private": False}),
     )
 
     await run_edit_repo_submission(
@@ -1375,42 +1489,42 @@ async def test_run_edit_repo_submission_when_pat_replace_false_preserves_inline_
         view_id="V_SUBMIT_TEST",
         agent_name=_AGENT_NAME,
         parent_section="repo",
-        extra={"repo_url": "https://github.com/example/new.git", "pat": "", "pat_replace": False},
+        extra={
+            "repo_url": "https://github.com/example/verified-public.git",
+            "pat": "",
+            "pat_replace": False,
+        },
     )
 
     async with db_session_factory() as session:
         row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
 
-    assert row is not None, "binding should still exist after edit"
-    assert row.ma_secret_ref == f"inline-pat:{agent_uuid}", (
-        "blank-PAT edit-repo must preserve the stored ma_secret_ref, not clobber it to anon:"
-    )
-    assert row.repo_url == "example/new", "repo_url should be updated to the new value"
+    assert row is not None, "binding should exist after a verified-public first-time bind"
+    assert row.ma_secret_ref == "anon:", "a verified-public no-PAT bind writes an anon: binding"
+    assert row.proof_kind == "public", "the binding must record a public proof"
+    assert row.proof_at is not None, "proof_at must be recorded"
 
-    ephemeral_key = ("POST", yarl.URL("https://slack.com/api/chat.postEphemeral"))
-    assert ephemeral_key in client_fake.mock.requests, "success ephemeral should be posted"
-    ephemeral_texts = [
-        call.kwargs["json"]["text"] for call in client_fake.mock.requests[ephemeral_key]
-    ]
-    assert any(":white_check_mark:" in t for t in ephemeral_texts), (
-        "success ephemeral must be posted for the blank-PAT edit"
+    texts = _ephemeral_texts_for(client_fake)
+    assert any("Saved repo + auth" in t for t in texts), (
+        "user should see the plain save confirmation"
+    )
+    assert not any("App-covered" in t for t in texts), (
+        "Slack panel must never advertise App coverage as proof of access"
     )
 
 
 @pytest.mark.asyncio
-async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_pat(
+async def test_run_edit_repo_submission_blank_pat_no_stored_token_and_repo_private_refuses_leaving_no_proof(
     fake_slack_web_client: Any,
-    db_session_factory: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """pat_replace=True + a typed PAT still replaces (existing behavior preserved)."""
-    from cryptography.fernet import Fernet
-    from daimon.adapters.slack.runtime import SlackRuntime
+    """Blank token, no stored credential, and a private repo: the bind must
+    be refused, not silently written as anon:."""
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding
-    from daimon.testing.factories import make_tenant
 
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
-    ma_agent_id = f"agent_{'d' * 24}"
+    ma_agent_id = f"agent_{'r' * 24}"
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
 
     async with db_session_factory() as session:
@@ -1420,25 +1534,407 @@ async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_
     client_fake: Any = fake_slack_web_client
     _override_users_info_admin(client_fake.mock)
 
-    fernet_key = Fernet.generate_key().decode()
-    settings: MagicMock = MagicMock()
-    settings.crypto.keys = (SecretStr(fernet_key),)
-    settings.mcp.public_url = None
-    settings.mcp.jwt_secret = None
-    settings.github = MagicMock()
-    settings.github.app_id = None
-    settings.github.oauth_scopes = ("repo",)
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        github_handler=_github_handler(200, {"private": True}),
+    )
 
-    runtime = SlackRuntime(
-        settings=settings,
-        anthropic=build_fake_anthropic(
-            _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
-        ),
-        sessionmaker=db_session_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/private-no-token.git",
+            "pat": "",
+            "pat_replace": False,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+    assert row is None, "a private repo with no credential must refuse the bind"
+
+    texts = _ephemeral_texts_for(client_fake)
+    assert any("token" in t.lower() for t in texts), (
+        "refusal must name the fix: a token is required to bind a private repo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_blank_pat_no_stored_token_and_repo_missing_refuses_leaving_no_proof(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A 404 from the public-visibility probe (nonexistent or hidden repo)
+    refuses the bind identically to an explicitly private repo."""
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'s' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        github_handler=_github_handler(404),
+    )
+
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/does-not-exist.git",
+            "pat": "",
+            "pat_replace": False,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+    assert row is None, "a 404 from the visibility probe must refuse the bind"
+
+    texts = _ephemeral_texts_for(client_fake)
+    assert any(":x:" in t for t in texts), "a refusal ephemeral must be posted"
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_blank_pat_stored_token_covers_new_repo_binds_with_pat_proof(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Blank token, but the agent already has a stored token that can read
+    the newly-typed repo: the binding is written under that token's ref with
+    a pat proof."""
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'t' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    fernet_key = Fernet.generate_key().decode()
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+    await _seed_guild_account(db_session_factory, tenant_id=tenant_id)
+    await _seed_stored_pat(
+        db_session_factory,
+        agent_id=agent_uuid,
+        fernet_key=fernet_key,
+        plaintext="ghp_stored_covers_new_repo",
+    )
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        fernet_key=fernet_key,
+        github_handler=_github_handler(200),
+    )
+
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/stored-token-covers.git",
+            "pat": "",
+            "pat_replace": False,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+
+    assert row is not None, "a stored token that covers the repo must write the binding"
+    assert row.ma_secret_ref == f"inline-pat:{agent_uuid}", (
+        "the stored token's ref must be used for the write"
+    )
+    assert row.proof_kind == "pat", "proof must record the stored token as the access proof"
+    assert row.proof_at is not None, "proof_at must be recorded"
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_blank_pat_stored_token_cannot_access_new_repo_refuses_leaving_binding_unchanged(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Blank token, and the agent's stored token cannot read the newly-typed
+    repo: the submit is refused and the pre-existing binding's repo_url is
+    left untouched — no silent fall-through to a probe of a different repo."""
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding, set_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'u' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    fernet_key = Fernet.generate_key().decode()
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+    await _seed_stored_pat(
+        db_session_factory,
+        agent_id=agent_uuid,
+        fernet_key=fernet_key,
+        plaintext="ghp_stored_cannot_access_new_repo",
+    )
+    async with db_session_factory() as session:
+        await set_binding(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            repo_url="https://github.com/example/old-repo.git",
+            default_branch="main",
+            ma_secret_ref=f"inline-pat:{agent_uuid}",
+            proof=None,
+        )
+        await session.commit()
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        fernet_key=fernet_key,
+        github_handler=_github_handler(404),
+    )
+
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/new-repo-denied.git",
+            "pat": "",
+            "pat_replace": False,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+
+    assert row is not None, "the pre-existing binding must survive a refused re-point"
+    assert row.repo_url == "example/old-repo", "repo_url must remain the OLD value after refusal"
+    assert row.proof_kind is None, "a refused re-point must not record any new proof"
+
+    texts = _ephemeral_texts_for(client_fake)
+    assert any("stored" in t.lower() for t in texts), (
+        "refusal must name the fix: the stored token cannot read the new repo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_blank_pat_repoints_vault_credential_ref_preserved_and_records_pat_proof(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Blank token re-pointing an existing binding whose ma_secret_ref is
+    neither inline-pat: nor anon: (a vault-issued credential id) with a
+    stored token that can read the new repo: ma_secret_ref survives
+    verbatim, repo_url moves to the new value, and a fresh pat proof is
+    recorded — the keep-secret write and the proof re-establishment happen
+    in the same transaction."""
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding, set_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'v' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    fernet_key = Fernet.generate_key().decode()
+    vault_ref = "vault-cred-99"
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+    await _seed_guild_account(db_session_factory, tenant_id=tenant_id)
+    await _seed_stored_pat(
+        db_session_factory,
+        agent_id=agent_uuid,
+        fernet_key=fernet_key,
+        plaintext="ghp_vault_repoint_scenario",
+    )
+    async with db_session_factory() as session:
+        seeded = await set_binding(
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            repo_url="https://github.com/example/vault-old.git",
+            default_branch="main",
+            ma_secret_ref=vault_ref,
+            proof=None,
+        )
+        await session.commit()
+    assert seeded.proof_kind is None, "the seeded binding must start with no proof recorded"
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        fernet_key=fernet_key,
+        github_handler=_github_handler(200),
+    )
+
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/vault-new.git",
+            "pat": "",
+            "pat_replace": False,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+
+    assert row is not None, "binding should still exist after the re-point"
+    assert row.ma_secret_ref == vault_ref, (
+        "ma_secret_ref written by another surface must be preserved verbatim, not clobbered"
+    )
+    assert row.repo_url == "example/vault-new", "repo_url must move to the newly-typed repo"
+    assert row.proof_kind == "pat", "proof must be re-established against the NEW repo"
+    assert row.proof_at is not None, "proof_at must be recorded"
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_pasted_token_cannot_access_repo_refuses_and_stores_no_credential(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A pasted token that cannot read the target repo is refused before
+    either the credential is stored or a binding is written."""
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'w' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    fernet_key = Fernet.generate_key().decode()
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        fernet_key=fernet_key,
+        github_handler=_github_handler(404),
+    )
+
+    await run_edit_repo_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        agent_name=_AGENT_NAME,
+        parent_section="repo",
+        extra={
+            "repo_url": "https://github.com/example/pasted-denied.git",
+            "pat": "ghp_junk_denied",
+            "pat_replace": True,
+        },
+    )
+
+    async with db_session_factory() as session:
+        row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+    assert row is None, "a refused pasted token must write no binding"
+
+    from daimon.adapters.slack.agent_setup.write import load_agent_inline_pat
+
+    stored = await load_agent_inline_pat(runtime, agent_id=agent_uuid)
+    assert stored is None, "a refused pasted token must never be stored as a credential"
+
+    texts = _ephemeral_texts_for(client_fake)
+    assert any("token" in t.lower() for t in texts), (
+        "refusal must name the fix: paste a token that has access"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_pat_and_pat_proof(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """pat_replace=True + a typed PAT that CAN read the repo: stores the
+    token, binds the repo, and records a pat proof attributed to the
+    submitting workspace's guild account."""
+    from daimon.core.defaults.provisioning import derive_guild_account_uuid
+    from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+    from daimon.core.stores.agent_repo_binding import get_binding
+
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
+    ma_agent_id = f"agent_{'d' * 24}"
+    agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+
+    async with db_session_factory() as session:
+        await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
+        await session.commit()
+    await _seed_guild_account(db_session_factory, tenant_id=tenant_id)
+
+    client_fake: Any = fake_slack_web_client
+    _override_users_info_admin(client_fake.mock)
+
+    fernet_key = Fernet.generate_key().decode()
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        fernet_key=fernet_key,
+        github_handler=_github_handler(200),
     )
 
     await run_edit_repo_submission(
@@ -1465,43 +1961,26 @@ async def test_run_edit_repo_submission_when_pat_replace_true_stores_new_inline_
         "pat_replace=True must store the inline PAT reference"
     )
     assert row.repo_url == "example/private", "repo_url should be bound to the new value"
-
-
-# ---------------------------------------------------------------------------
-# run_edit_repo_submission first-time no-PAT bind writes anon:
-# ---------------------------------------------------------------------------
-
-
-def _build_edit_repo_settings(*, app_id: str | None) -> MagicMock:
-    settings: MagicMock = MagicMock()
-    settings.crypto.keys = (SecretStr("dummy"),)
-    settings.mcp.public_url = None
-    settings.mcp.jwt_secret = None
-    settings.github = MagicMock()
-    settings.github.app_id = app_id
-    return settings
+    assert row.proof_kind == "pat", "a pasted-token bind must record a pat proof"
+    assert row.proof_account_id == derive_guild_account_uuid(tenant_id=tenant_id), (
+        "proof must attribute the submitting workspace's guild account"
+    )
 
 
 @pytest.mark.asyncio
-async def test_run_edit_repo_submission_no_pat_binds_anon(
+async def test_run_edit_repo_submission_pasted_token_with_no_repo_url_stores_token_and_writes_no_binding(
     fake_slack_web_client: Any,
-    db_session_factory: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """First-time no-PAT bind writes an anon: binding and reports success.
-
-    No App-coverage probe on Slack: the Slack create_session call does not
-    thread session_factory, so the repo-clone path never runs on Slack today —
-    the panel must not advertise App coverage. Wiring Slack repo clone is a
-    tracked follow-up.
-    """
-    from daimon.adapters.slack.runtime import SlackRuntime
+    """A pasted token with no repo_url is stored (unchanged behavior) and
+    writes no binding — there is no repo to check access against yet."""
     from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
     from daimon.core.stores.agent_repo_binding import get_binding
-    from daimon.testing.factories import make_tenant
 
     tenant_id = derive_tenant_uuid(platform="slack", workspace_id=_TEAM_ID)
-    ma_agent_id = f"agent_{'e' * 24}"
+    ma_agent_id = f"agent_{'x' * 24}"
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
+    fernet_key = Fernet.generate_key().decode()
 
     async with db_session_factory() as session:
         await make_tenant(session, platform="slack", workspace_id=_TEAM_ID, id=tenant_id)
@@ -1510,16 +1989,11 @@ async def test_run_edit_repo_submission_no_pat_binds_anon(
     client_fake: Any = fake_slack_web_client
     _override_users_info_admin(client_fake.mock)
 
-    runtime = SlackRuntime(
-        settings=_build_edit_repo_settings(app_id=None),
-        anthropic=build_fake_anthropic(
-            _build_edit_repo_ma_handler(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
-        ),
-        sessionmaker=db_session_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+    runtime = _build_edit_repo_runtime(
+        db_session_factory,
+        tenant_id=tenant_id,
+        ma_agent_id=ma_agent_id,
+        fernet_key=fernet_key,
     )
 
     await run_edit_repo_submission(
@@ -1532,25 +2006,17 @@ async def test_run_edit_repo_submission_no_pat_binds_anon(
         agent_name=_AGENT_NAME,
         parent_section="repo",
         extra={
-            "repo_url": "https://github.com/example/covered.git",
-            "pat": "",
-            "pat_replace": False,
+            "repo_url": None,
+            "pat": "ghp_no_repo_token",
+            "pat_replace": True,
         },
     )
 
     async with db_session_factory() as session:
         row = await get_binding(session, tenant_id=tenant_id, agent_id=agent_uuid)
+    assert row is None, "no repo_url means no binding should be written"
 
-    assert row is not None, "binding should exist after first-time no-PAT bind"
-    assert row.ma_secret_ref == "anon:", "no-PAT bind writes an anon: binding"
+    from daimon.adapters.slack.agent_setup.write import load_agent_inline_pat
 
-    ephemeral_key = ("POST", yarl.URL("https://slack.com/api/chat.postEphemeral"))
-    ephemeral_texts = [
-        call.kwargs["json"]["text"] for call in client_fake.mock.requests[ephemeral_key]
-    ]
-    assert any("Saved repo + auth" in t for t in ephemeral_texts), (
-        "user should see the plain save confirmation"
-    )
-    assert not any("App-covered" in t for t in ephemeral_texts), (
-        "Slack panel must not advertise App coverage (Slack does not clone yet)"
-    )
+    stored = await load_agent_inline_pat(runtime, agent_id=agent_uuid)
+    assert stored == "ghp_no_repo_token", "the pasted token must still be stored with no repo bound"

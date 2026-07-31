@@ -23,7 +23,7 @@ from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import get_pat, upsert_credential_encrypted
 from daimon.core.memory_resource import archive_memory_store_for_agent
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
-from daimon.core.stores.agent_repo_binding import get_binding, set_binding
+from daimon.core.stores.agent_repo_binding import copy_binding, get_binding
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = structlog.get_logger()
@@ -56,6 +56,18 @@ async def copy_credential_and_repo_binding(
     non-inline-pat ref) is copied verbatim.
     A source binding backed by `inline-pat:` with no resolvable/
     decryptable source credential fails the fork loud.
+
+    Fork is a deep copy, by design: the fork inherits the source agent's
+    credential AND the source agent's recorded proof of repo access exactly
+    as they stand (via `copy_binding`, which carries `repo_url`,
+    `default_branch`, and all three proof columns forward verbatim,
+    including when they are NULL), and it may later be re-pointed at any
+    repo the inherited credential can read. This is intended, not an
+    oversight — do not "harden" this by re-deriving proof against the
+    forking principal or by gating fork behind an authorization check. A
+    source binding with no recorded proof yields a fork binding with no
+    recorded proof, which fails closed at clone time exactly the way the
+    source does.
     """
     async with sessionmaker() as session:
         source_binding = await get_binding(session, tenant_id=tenant_id, agent_id=source_agent_uuid)
@@ -92,12 +104,11 @@ async def copy_credential_and_repo_binding(
         fork_secret_ref = source_binding.ma_secret_ref
 
     async with sessionmaker.begin() as session:
-        await set_binding(
+        await copy_binding(
             session,
             tenant_id=tenant_id,
-            agent_id=fork_agent_uuid,
-            repo_url=source_binding.repo_url,
-            default_branch=source_binding.default_branch,
+            source_agent_id=source_agent_uuid,
+            target_agent_id=fork_agent_uuid,
             ma_secret_ref=fork_secret_ref,
         )
 

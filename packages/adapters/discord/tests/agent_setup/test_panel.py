@@ -1282,6 +1282,7 @@ async def test_load_repo_binding_reads_persisted_binding(
             repo_url="https://github.com/me/repo",
             default_branch="develop",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     runtime = MagicMock(spec=DiscordRuntime)

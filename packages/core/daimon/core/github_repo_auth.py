@@ -10,10 +10,9 @@ Pure function:
 
 Shell functions (injected httpx):
   resolve_clone_token — PAT short-circuit (zero GitHub I/O) -> App
-    installation-token mint -> operator fallback PAT -> raise. Never returns
-    an empty string.
-  is_app_installed_for_repo — bind-time App-coverage probe for setup panels;
-    returns False (never raises) when App creds are unset.
+    installation-token mint (only for a binding with recorded proof) ->
+    operator fallback PAT (only for a binding with a recorded
+    verified-public proof) -> raise. Never returns an empty string.
 """
 
 from __future__ import annotations
@@ -28,35 +27,53 @@ from daimon.core.github_app_auth import (
     get_installation_id_for_repo,
     mint_installation_token,
 )
-from daimon.core.stores.domain import AgentRepoBindingRow
+from daimon.core.stores.domain import AgentRepoBindingRow, RepoProofKind
 from pydantic import SecretStr
 
 log = structlog.get_logger()
 
-__all__ = ["select_clone_auth", "resolve_clone_token", "is_app_installed_for_repo"]
+__all__ = ["select_clone_auth", "resolve_clone_token"]
 
 
 def select_clone_auth(
     *,
     has_per_agent_pat: bool,
     app_installed: bool,
-    binding_is_public: bool,
+    proof_kind: RepoProofKind | None,
     has_fallback_pat: bool,
 ) -> Literal["pat", "app", "public", "none"]:
     """Decide the clone-auth mode per the precedence table.
 
-    Order: per-agent PAT (always wins) -> App installed on the repo
-    owner -> operator fallback PAT on a verified-public (``anon:``) binding
-    -> none (caller must raise; never emit an empty ``authorization_token``).
+    Order:
+      1. A per-agent PAT always wins and needs no proof — it IS the
+         credential, and the caller supplied it directly. GitHub itself
+         enforces what it can read.
+      2. An App installation token requires that the binding recorded proof
+         the binder could read the repo (``proof_kind is not None``). App
+         installation coverage on its own says nothing about who bound the
+         repo: the deployment's App is installed by repo owners for their
+         own use, not by the tenant binding the repo, so coverage alone
+         cannot stand in for a demonstrated access check.
+      3. The operator fallback token requires specifically a verified-public
+         proof kind. That token is public-read-only; serving it for anything
+         else (including a PAT-kind proof, which only demonstrates the
+         binder could read the repo with a token, not that the repo is
+         public) produces a clone that cannot work.
+      4. Otherwise none — caller must raise; never emit an empty
+         ``authorization_token``.
 
-    Pure — no I/O. Callers resolve ``app_installed`` (an installation lookup)
-    and ``has_fallback_pat`` before calling this.
+    ``proof_kind`` is the RECORDED proof read off the binding row, never a
+    fresh probe — proof is established once at bind time and is not
+    re-verified here or by any caller of this function.
+
+    Pure — no I/O, no clock. Callers resolve ``app_installed`` (an
+    installation lookup) and ``has_fallback_pat`` before calling this.
     """
     if has_per_agent_pat:
         return "pat"
-    if app_installed:
+    if app_installed and proof_kind is not None:
         return "app"
-    if binding_is_public and has_fallback_pat:
+    if proof_kind == "public" and has_fallback_pat:
         return "public"
     return "none"
 
@@ -77,9 +94,10 @@ async def resolve_clone_token(
     wins; Pitfall 2 — never mint a JWT / do an installation lookup when a PAT
     is already available). Otherwise attempts the App installation-token
     path (on-demand ``GET /repos/{owner}/{repo}/installation`` ->
-    ``mint_installation_token``), falls back to the operator fallback PAT on
-    a verified-public (``anon:``) binding, and raises ``DaimonError`` when
-    none of those apply. Never returns an empty string (MA rejects an empty
+    ``mint_installation_token``) when the binding recorded proof of access,
+    falls back to the operator fallback PAT on a binding that recorded a
+    verified-public proof, and raises ``DaimonError`` when none of those
+    apply. Never returns an empty string (MA rejects an empty
     ``authorization_token`` with a 400).
 
     Args:
@@ -106,7 +124,9 @@ async def resolve_clone_token(
         return per_agent_pat
 
     owner, repo = binding.repo_url.split("/", 1)
-    binding_is_public = binding.ma_secret_ref == "anon:"
+    # The legacy no-token string tag means "no PAT was supplied at bind
+    # time" — it is not evidence the repo is public. The binding's recorded
+    # proof is; select_clone_auth reads it directly, below.
     has_fallback_pat = bool(fallback_pat)
 
     # Best-effort App path: a transient GitHub failure on the installation
@@ -138,7 +158,7 @@ async def resolve_clone_token(
     mode = select_clone_auth(
         has_per_agent_pat=False,
         app_installed=app_token is not None,
-        binding_is_public=binding_is_public,
+        proof_kind=binding.proof_kind,
         has_fallback_pat=has_fallback_pat,
     )
 
@@ -149,42 +169,6 @@ async def resolve_clone_token(
         assert fallback_pat  # narrows: has_fallback_pat implies this is truthy
         return fallback_pat
     raise DaimonError(
-        f"No clone credential available for {binding.repo_url}: no per-agent PAT, "
-        "the GitHub App is not installed on the repo owner (or its lookup failed), "
-        "and no operator fallback PAT for a public binding."
+        f"No credential is authorized to clone {binding.repo_url}. Re-bind this repo "
+        "with a GitHub token that can read it, from the agent setup panel's GitHub option."
     )
-
-
-async def is_app_installed_for_repo(
-    http_client: httpx.AsyncClient,
-    *,
-    app_id: str | None,
-    app_private_key: SecretStr | None,
-    owner: str,
-    repo: str,
-    now: int,
-) -> bool:
-    """Bind-time App-coverage probe for setup panels.
-
-    Returns False (never raises) when App creds are unset, so panels on
-    non-App deployments just show the PAT path.
-
-    Args:
-        http_client: Injected async HTTP client. Caller owns lifecycle.
-        app_id: GitHub App id, or None if the App is not configured.
-        app_private_key: GitHub App private key, or None if not configured.
-        owner: Repository owner (org or user login).
-        repo: Repository name (no owner prefix).
-        now: Current Unix timestamp (int).
-
-    Returns:
-        True if the App is installed on the repo, False otherwise (including
-        when App creds are unset).
-    """
-    if app_id is None or app_private_key is None:
-        return False
-    jwt = build_app_jwt(app_private_key.get_secret_value(), app_id, now=now)
-    installation_id = await get_installation_id_for_repo(
-        http_client, jwt=jwt, owner=owner, repo=repo
-    )
-    return installation_id is not None

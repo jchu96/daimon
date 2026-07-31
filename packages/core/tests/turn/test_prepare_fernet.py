@@ -27,6 +27,7 @@ from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.core.stores import agent_github_binding as github_binding_store
 from daimon.core.stores import agent_repo_binding as repo_binding_store
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.prepare import bind_session
@@ -177,6 +178,7 @@ async def _seed_repo_binding_with_pat(
         repo_url="https://github.com/example-org/example-repo",
         default_branch="main",
         ma_secret_ref="anon:",
+        proof=RepoAccessProof(kind="pat", at=datetime(2026, 5, 1, tzinfo=UTC), account_id=None),
     )
     await github_binding_store.set_agent_github_binding(
         db_session, agent_id=agent_uuid, principal_id=agent_uuid

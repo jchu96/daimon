@@ -35,6 +35,7 @@ from daimon.core.defaults.skills import resolve_refs
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import (
     build_multifernet,
+    get_pat,
     upsert_credential_encrypted,
 )
 from daimon.core.ma import update_agent_with_version_retry
@@ -79,6 +80,23 @@ def mask_tail(secret: str) -> str:
     if len(secret) < 4:
         return "****"
     return f"****{secret[-4:]}"
+
+
+def owner_repo_from_url(url: str) -> str:
+    """Extract canonical ``owner/repo`` from a GitHub URL or short path.
+
+    Must stay byte-identical to
+    ``daimon.core.stores.agent_repo_binding._normalize_owner_repo`` — a probe
+    run against a differently-canonicalized string would verify a different
+    repo than the one the binding actually records.
+    """
+    return (
+        url.removeprefix("https://github.com/")
+        .removeprefix("http://github.com/")
+        .removeprefix("github.com/")
+        .removesuffix(".git")
+        .rstrip("/")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +372,41 @@ async def call_reconcile_for_panel(
         account_id=guild_account_id,
         public_url=public_url,
         managed=False,
+    )
+
+
+async def load_agent_inline_pat(runtime: SlackRuntime, *, agent_id: uuid.UUID) -> str | None:
+    """Return the inline PAT ``core/sessions.py`` would resolve for ``agent_id``, or None.
+
+    This is the exact credential ``resolve_clone_token``'s ``per_agent_pat``
+    short-circuit will use to clone any repo later bound to this agent,
+    regardless of which repo that PAT was originally verified against — which
+    is why a caller binding a *different* repo must re-verify this value
+    against it before writing a binding.
+
+    Returns None (no crypto call at all) when ``runtime.settings.crypto.keys``
+    is empty: no inline PAT can exist on a deployment that has never
+    configured crypto (storing one requires crypto too, via
+    ``store_inline_pat``), and calling ``_build_runtime_fernet`` unconditionally
+    here would raise ``ValueError`` on such a deployment, breaking a
+    previously-working bind path (same tolerance rationale as
+    ``_build_fork_fernet``).
+
+    Passes the service-default opt-in as disabled and no fallback token
+    explicitly: the operator's shared service PAT must never be treated as
+    this agent's own clone credential — letting it through here would gate
+    every re-verification on whether the shared public-read token covers the
+    repo, breaking private App-covered binds.
+    """
+    if not runtime.settings.crypto.keys:
+        return None
+    return await get_pat(
+        principal_id=agent_id,
+        agent_id=agent_id,
+        sessionmaker=runtime.sessionmaker,
+        fernet=_build_runtime_fernet(runtime),
+        allow_service_default=False,
+        fallback_pat=None,
     )
 
 

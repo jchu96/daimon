@@ -18,10 +18,11 @@ a chat user to bind a repo or manage env vars.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 import anthropic
+import httpx
 import structlog
 from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
@@ -30,6 +31,7 @@ from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivat
 from daimon.core.broker import dispatch_mint_token
 from daimon.core.broker.errors import NoBindingError, ProviderConfigError
 from daimon.core.errors import StoreError
+from daimon.core.github_visibility import pat_can_access_repo
 from daimon.core.stores.agent_files import (
     delete_agent_file,
     get_agent_file,
@@ -41,12 +43,29 @@ from daimon.core.stores.agent_repo_binding import (
     get_binding,
     set_binding,
 )
-from daimon.core.stores.domain import AgentFileRow, AgentRepoBindingRow
+from daimon.core.stores.domain import AgentFileRow, AgentRepoBindingRow, RepoAccessProof
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict
 
 logger = structlog.get_logger()
+
+
+def _owner_repo_from_url(url: str) -> str:
+    """Extract canonical ``owner/repo`` from a GitHub URL or short path.
+
+    Must stay byte-identical to
+    ``daimon.core.stores.agent_repo_binding._normalize_owner_repo`` — probing
+    a differently-canonicalized string would verify a different repo than the
+    one the binding actually records.
+    """
+    return (
+        url.removeprefix("https://github.com/")
+        .removeprefix("http://github.com/")
+        .removeprefix("github.com/")
+        .removesuffix(".git")
+        .rstrip("/")
+    )
 
 
 class AgentRepoBindingPublic(BaseModel):
@@ -205,14 +224,22 @@ async def _set_repo_binding_impl(
     repo_url: str,
     default_branch: str,
     service: Literal["github"] = "github",
+    http_client: httpx.AsyncClient | None = None,
 ) -> AgentRepoBindingPublic:
     """Bind the calling agent to a git repo.
 
-    Order of operations: mint PAT → vault credential create → DB row
-    write → old vault credential delete. Vault upload happens BEFORE the DB
-    write so a vault failure leaves no binding row. The rebind is committed
-    before the old credential is revoked, so a revocation failure raises
-    against an already-updated binding rather than rolling it back.
+    Order of operations: mint PAT → verify repo access → vault credential
+    create → DB row write → old vault credential delete. The access check runs
+    BEFORE any vault or DB work, so a refused bind uploads nothing and writes
+    no row — there is no orphan credential to compensate for. Vault upload
+    happens BEFORE the DB write so a vault failure leaves no binding row. The
+    rebind is committed before the old credential is revoked, so a revocation
+    failure raises against an already-updated binding rather than rolling it
+    back.
+
+    ``http_client`` is optional: when None, this creates and closes its own
+    ``httpx.AsyncClient`` around the verification call only. Callers pass one
+    only from tests that need to inject a mock transport.
     """
     agent_id = _require_agent_id(auth)
 
@@ -246,12 +273,36 @@ async def _set_repo_binding_impl(
         )
         raise ToolError(str(e)) from e
 
-    # 2. Discover per-agent vault.
+    # 2. Verify the minted credential can actually read the target repo,
+    # before any vault upload or DB write. Canonicalize repo_url with the
+    # same rules the store applies, so what gets probed is what gets stored.
+    owner_repo = _owner_repo_from_url(repo_url)
+
+    async def _check_access(client: httpx.AsyncClient) -> bool:
+        return await pat_can_access_repo(client, owner_repo=owner_repo, pat=token)
+
+    if http_client is not None:
+        can_access = await _check_access(http_client)
+    else:
+        async with httpx.AsyncClient() as owned_client:
+            can_access = await _check_access(owned_client)
+    if not can_access:
+        logger.warning(
+            "set_repo_binding outcome=repo_access_denied service=%s agent=%s",
+            service,
+            agent_id,
+        )
+        raise ToolError(
+            "this agent's GitHub credential cannot read that repo (or the "
+            "repo does not exist) — connect a token with access to it first"
+        )
+
+    # 3. Discover per-agent vault.
     vault_id = await _vault_id_for_agent(
         runtime.client, account_id=auth.account_id, agent_id=agent_id
     )
 
-    # 3. Capture old ref (separate read session) so we can delete after success.
+    # 4. Capture old ref (separate read session) so we can delete after success.
     async with runtime.session_factory() as session:
         old = await get_binding(
             session,
@@ -260,7 +311,7 @@ async def _set_repo_binding_impl(
         )
     old_ref = old.ma_secret_ref if old is not None else None
 
-    # 4. Upload new vault credential. this MUST succeed before any DB write.
+    # 5. Upload new vault credential. this MUST succeed before any DB write.
     try:
         new_cred = await runtime.client.beta.vaults.credentials.create(
             vault_id=vault_id,
@@ -285,10 +336,12 @@ async def _set_repo_binding_impl(
         )
         raise ToolError("vault upload failed") from e
 
-    # 5. Write binding row with NEW ref. ordering: row only after upload OK.
-    #    Symmetric BL-01 guard: if the DB write fails after vault.create succeeded,
-    #    best-effort delete the freshly-minted credential before re-raising so we
-    #    don't leak an orphan vault cred on retries.
+    # 6. Write binding row with NEW ref and a pat-kind proof (the check just
+    #    above proved a credentialed read of this exact repo). ordering: row
+    #    only after upload OK. Symmetric BL-01 guard: if the DB write fails
+    #    after vault.create succeeded, best-effort delete the freshly-minted
+    #    credential before re-raising so we don't leak an orphan vault cred
+    #    on retries.
     try:
         async with runtime.session_factory.begin() as session:
             row = await set_binding(
@@ -298,6 +351,7 @@ async def _set_repo_binding_impl(
                 repo_url=repo_url,
                 default_branch=default_branch,
                 ma_secret_ref=new_cred.id,
+                proof=RepoAccessProof(kind="pat", at=datetime.now(UTC), account_id=auth.account_id),
             )
     except Exception:
         try:
@@ -313,7 +367,7 @@ async def _set_repo_binding_impl(
             )
         raise
 
-    # 6. Delete the credential the previous binding pointed at, AFTER DB commit.
+    # 7. Delete the credential the previous binding pointed at, AFTER DB commit.
     #    A failure here means that token is still live with nothing pointing at
     #    it any more — most likely because the previous binding was made from a
     #    different account, whose vault this caller cannot reach. The rebind

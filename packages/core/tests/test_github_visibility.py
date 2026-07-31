@@ -1,4 +1,4 @@
-"""Tests for the anon-bind public-visibility guard (quick task 260616-45k).
+"""Tests for the anon-bind public-visibility guard.
 
 Boundary mock only: a real httpx.AsyncClient over httpx.MockTransport so the
 request shape and status handling are exercised end-to-end.
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from daimon.adapters.discord.github_visibility import (
+from daimon.core.github_visibility import (
     is_public_repo,
     is_valid_pat,
     pat_can_access_repo,
@@ -133,3 +133,28 @@ async def test_is_valid_pat_raises_on_500() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(httpx.HTTPStatusError):
             await is_valid_pat(client, pat="ghp_x")
+
+
+@pytest.mark.asyncio
+async def test_is_public_repo_sends_no_authorization_header_but_pat_can_access_repo_does() -> None:
+    """The operator backfill runs is_public_repo across every tenant's bound
+    repo with no credential at all. If it ever started attaching the
+    operator fallback PAT, a private repo could probe as accessible and get
+    stamped verifiably-public, re-opening the cross-tenant clone hole this
+    module exists to close."""
+    seen_headers: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(request.headers)
+        return httpx.Response(200, json={"private": False})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await is_public_repo(client, owner_repo="owner/repo")
+        await pat_can_access_repo(client, owner_repo="owner/repo", pat="ghp_good")
+
+    assert "Authorization" not in seen_headers[0], (
+        "is_public_repo must never attach a credential — it runs unauthenticated"
+    )
+    assert seen_headers[1].get("Authorization") == "Bearer ghp_good", (
+        "pat_can_access_repo must send the PAT as a Bearer token"
+    )

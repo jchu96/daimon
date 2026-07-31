@@ -1366,6 +1366,7 @@ async def test_fork_agent_impl_rekeys_source_credential_onto_fork(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     router = _fork_agent_router(
@@ -1414,6 +1415,7 @@ async def test_fork_agent_impl_raises_tool_error_on_undecryptable_source_credent
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     router = _fork_agent_router(

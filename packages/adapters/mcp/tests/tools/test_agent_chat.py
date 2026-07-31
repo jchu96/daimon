@@ -932,6 +932,7 @@ async def test_describe_agent_returns_bound_repo_url_for_bound_agent(
             repo_url="https://github.com/acme/widgets",
             default_branch="main",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     description = await _describe_agent_impl(runtime, auth)

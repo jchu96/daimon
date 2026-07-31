@@ -33,7 +33,7 @@ from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.github_credentials import delete_credential_for_principal
-from daimon.testing.factories import make_tenant
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from pydantic import HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -503,6 +503,7 @@ async def test_fork_agent_rekeys_source_credential_onto_fork(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []
@@ -576,6 +577,7 @@ async def test_fork_agent_raises_when_source_credential_unresolvable(
             repo_url="github.com/acme/repo",
             default_branch="main",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []
@@ -629,6 +631,7 @@ async def test_fork_agent_copies_anon_binding_without_error_or_credential_write(
             repo_url="github.com/acme/public-repo",
             default_branch="main",
             ma_secret_ref="anon:",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []
@@ -709,6 +712,7 @@ async def test_fork_agent_copies_repo_binding_with_rewritten_secret_ref(
             repo_url="https://github.com/acme/private-repo",
             default_branch="develop",
             ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
         )
 
     created: list[dict[str, Any]] = []
@@ -1282,6 +1286,9 @@ async def test_apply_repo_modal_persists_binding(
     from daimon.core.stores import agent_repo_binding as binding_store
 
     tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild-write")
+    # The bind writes a proof carrying account_id, whose column is a real FK
+    # to accounts.id — the submitting account must exist.
+    await make_account(db_session, tenant=tenant, id=account_id)
 
     ma_agent_id = "agent_017abc"  # MA returns prefixed strings, not UUIDs (BUG-25-01)
     expected_agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)
@@ -1313,8 +1320,8 @@ async def test_apply_repo_modal_persists_binding(
     settings = MagicMock()
     settings.crypto.keys = ()
     settings.github.oauth_scopes = ("repo",)
-    # No App creds -> is_app_installed_for_repo returns False with zero HTTP
-    # calls; a MagicMock here would be truthy and crash build_app_jwt.
+    # The bind path no longer reads App credentials at all; set to None so a
+    # stray MagicMock read elsewhere doesn't look truthy by accident.
     settings.github.app_id = None
     settings.github.app_private_key = None
     settings.mcp.public_url = None
