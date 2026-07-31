@@ -8,10 +8,15 @@ on the pushed repo:
     -> should_resync branch filter (only default_branch)
     -> bridge resolution: binding.agent_id (uuid5) -> agent_name + principal_id
        via re-derive-and-compare across the tenant's MA agents
-    -> credential selection (priority order, per-agent isolation):
-         App installation token (preferred when App-installed)
-         -> per-agent PAT overlay-only (never principal-default)
-         -> anon (public repos only)
+    -> credential selection: the SAME precedence table the interactive clone
+       path uses (github_repo_auth.select_clone_auth) — a per-agent PAT
+       overlay always wins, an App installation token requires the binding
+       recorded proof of access, the operator fallback PAT requires
+       specifically a verified-public proof, otherwise the binding is
+       unauthorized. The decision itself lives in one shared pure function;
+       this module only resolves its inputs (per-agent PAT overlay, the
+       cached installation lookup, the recorded proof) and maps its mode
+       back onto a token.
     -> sync_agent_skills (one-element repos list)
     -> update_last_sync (success + error paths)
 
@@ -37,8 +42,10 @@ import structlog
 from anthropic import AsyncAnthropic
 from cryptography.fernet import MultiFernet  # noqa: I001
 from daimon.core.config import GithubSettings
+from daimon.core.errors import DaimonError
 from daimon.core.github_app_auth import build_app_jwt, mint_installation_token
 from daimon.core.github_credentials import get_pat
+from daimon.core.github_repo_auth import select_clone_auth
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.skill_sync.orchestrator import sync_agent_skills
 from daimon.core.specs import SkillRepo
@@ -140,50 +147,106 @@ async def _select_credential(
     http_client: httpx.AsyncClient,
     github_settings: GithubSettings | None,
 ) -> str | None:
-    """Select the best available credential per the priority order with per-agent isolation.
+    """Select the credential for this binding via the shared precedence table.
 
-    Priority:
-    1. App installation token (preferred when an installation exists AND App is configured)
-    2. Per-agent PAT overlay, else operator service default, else anon
-       (binding.agent_id keyed; never falls back to principal-default)
-    3. None (anon — public repos only, when no fallback is configured either)
+    Delegates the precedence DECISION to select_clone_auth — the same pure
+    function the interactive clone path (resolve_clone_token) calls — so the
+    two paths cannot drift again: a per-agent PAT overlay always wins, an App
+    installation token requires the binding recorded proof of access, and
+    the operator fallback PAT requires specifically a verified-public proof.
 
-    Never resolves agent_id=None (principal-default). That is the credential-bleed vector.
+    Only the App-installed lookup stays distinct from the clone path: this
+    reads the cached github_app_installations table rather than a live
+    GitHub call, because the unattended batch wants the cheap read and once
+    proof gates the tier, live-vs-cached is a freshness tradeoff, not a
+    correctness one.
+
+    A per-agent token now taking precedence over an App installation token
+    (rather than the reverse) matches the interactive path. The earlier
+    concern this reverses was that sync_agent_skills re-resolved a per-agent
+    PAT internally and shadowed the App token; that is prevented
+    structurally by credential_override below, which is still passed and
+    still the single authority, so exactly one credential reaches the fetch
+    either way.
+
+    The operator fallback is no longer reachable for a binding that merely
+    has no per-agent credential — it now requires a verified-public proof.
+    This also closes the case where a binding whose stored credential was
+    deleted quietly fell through to the shared operator token.
+
+    Returns None only for the legitimate anonymous-fetch case: a binding
+    that recorded a verified-public proof on a deployment with no fallback
+    token configured. This caller's contract allows None for an
+    unauthenticated fetch, and refusing that case would break public skill
+    sync on any deployment that never configured a fallback PAT.
+
+    Raises DaimonError for every other case where no credential is
+    authorized (including a binding with no recorded proof at all), so the
+    existing per-binding boundary in _resync_one_binding records the reason
+    in last_sync_error and the batch continues onto the next binding. A
+    silent anonymous fetch is exactly the degradation mode this gate exists
+    to remove, so this never returns None for an unauthorized binding.
     """
-    # Tier 1: App installation token
-    if github_settings is not None and github_settings.app_id is not None:
-        private_key = github_settings.app_private_key
-        if private_key is not None:
-            installation = await install_store.get_for_repo(session, repo_full_name=repo_full_name)
-            if installation is not None:
-                jwt = build_app_jwt(
-                    private_key.get_secret_value(),
-                    github_settings.app_id,
-                    now=int(time.time()),
-                )
-                token = await mint_installation_token(
-                    http_client,
-                    jwt=jwt,
-                    installation_id=installation.installation_id,
-                )
-                return token
-
-    # Tier 2: per-agent PAT overlay — agent_id given, NEVER agent_id=None
-    # get_pat with agent_id resolves the overlay-only path; falls through to the
-    # opted-in operator service default when no overlay resolves, else None (anon).
-    pat = await get_pat(
+    per_agent_pat = await get_pat(
         principal_id=binding.agent_id,  # per-agent path: principal_id not used when agent_id is set
         agent_id=binding.agent_id,
         sessionmaker=sessionmaker,
         fernet=fernet,
-        allow_service_default=True,
-        fallback_pat=(
-            github_settings.fallback_pat.get_secret_value()
-            if github_settings is not None and github_settings.fallback_pat is not None
-            else None
-        ),
+        allow_service_default=False,
+        fallback_pat=None,
     )
-    return pat  # may be None (anon)
+    fallback_pat = (
+        github_settings.fallback_pat.get_secret_value()
+        if github_settings is not None and github_settings.fallback_pat is not None
+        else None
+    )
+    installation = None
+    if (
+        github_settings is not None
+        and github_settings.app_id is not None
+        and github_settings.app_private_key is not None
+    ):
+        installation = await install_store.get_for_repo(session, repo_full_name=repo_full_name)
+
+    mode = select_clone_auth(
+        has_per_agent_pat=per_agent_pat is not None,
+        app_installed=installation is not None,
+        proof_kind=binding.proof_kind,
+        has_fallback_pat=fallback_pat is not None,
+    )
+
+    if mode == "pat":
+        return per_agent_pat
+    if mode == "app":
+        assert (
+            github_settings is not None
+            and github_settings.app_id is not None
+            and github_settings.app_private_key is not None
+        )
+        assert installation is not None  # narrows: app_installed implies a cached row
+        jwt = build_app_jwt(
+            github_settings.app_private_key.get_secret_value(),
+            github_settings.app_id,
+            now=int(time.time()),
+        )
+        return await mint_installation_token(
+            http_client,
+            jwt=jwt,
+            installation_id=installation.installation_id,
+        )
+    if mode == "public":
+        assert fallback_pat is not None  # narrows: has_fallback_pat implies this is set
+        return fallback_pat
+
+    # mode == "none". A verified-public binding with no fallback PAT configured
+    # is the legitimate anonymous case (see docstring) — anything else is a
+    # binding no credential is authorized for.
+    if binding.proof_kind == "public":
+        return None
+    raise DaimonError(
+        f"No credential is authorized to sync {repo_full_name} for this binding — "
+        "it has no recorded proof of access."
+    )
 
 
 # ---------------------------------------------------------------------------
