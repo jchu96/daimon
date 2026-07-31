@@ -40,6 +40,7 @@ from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.github_credentials import delete_credential_for_principal
 from daimon.core.stores.scoped_config_read import get_scope
+from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.tenants import get_tenant
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
@@ -744,3 +745,42 @@ async def test_delete_agent_succeeds_when_store_archive_fails(
     assert mem_state.stores[store.id]["archived_at"] is None
     async with db_session_factory() as s:
         assert await get_memory_store_id(s, tenant_id=tenant.id, agent_id=agent_uuid) == store.id
+
+
+async def test_delete_agent_clears_tenant_default_naming_the_agent(
+    db_session, db_session_factory
+) -> None:
+    """Deleting the workspace default must not leave a tenant row naming a dead agent.
+
+    A tenant_config row pointing at an archived agent breaks resolution for the
+    whole install until an admin re-scopes by hand.
+    """
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_DELETE_SCOPE")
+    scope = TenantScopeRef(tenant_id=tenant.id)
+    await set_fields(db_session, scope=scope, tenant_id=tenant.id, agent_name="doomed")
+    await db_session.commit()
+
+    client = build_fake_anthropic(
+        combine_handlers(
+            _make_archive_agent_handler(),
+            make_fake_memory_store_handler(FakeMemoryStoreState()),
+            make_fake_ma_handler(),
+        )
+    )
+    await client.beta.agents.create(
+        name="doomed",
+        model="claude-sonnet-4-6",
+        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "doomed"},
+    )
+
+    runtime = MagicMock(spec=SlackRuntime)
+    runtime.anthropic = client
+    runtime.sessionmaker = db_session_factory
+
+    await write_mod.delete_agent(runtime, tenant_id=tenant.id, name="doomed")
+
+    async with db_session_factory() as s:
+        assert await get_scope(s, scope=scope) is None, (
+            "the tenant row naming the deleted agent must be gone so resolution "
+            "falls through to the deployment default"
+        )

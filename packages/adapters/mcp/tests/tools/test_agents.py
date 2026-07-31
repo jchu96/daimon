@@ -40,10 +40,11 @@ from daimon.adapters.mcp.tools.agents import (
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.scope import DeploymentDefault, TenantScopeRef
+from daimon.core.scope import ChannelScopeRef, DeploymentDefault, TenantScopeRef
 from daimon.core.specs import AgentSpec, SkillRef, SkillRepo
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
@@ -920,6 +921,107 @@ async def test_archive_agent_impl_succeeds_when_store_archive_fails(
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant.id, role=Role.ADMIN, is_admin=True)
     # Must not raise despite the 500 from the memory-store archive.
     await _archive_agent_impl(_runtime(client, session_factory=db_session_factory), auth, "doomed")
+
+
+def _archive_router(tenant_id: uuid.UUID, account_id: uuid.UUID) -> MARouter:
+    """Router serving the agent lookup and the archive call for `doomed`."""
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [
+                make_ma_agent(
+                    id="ag_d",
+                    name="doomed",
+                    metadata={
+                        "daimon_tenant": str(tenant_id),
+                        "daimon_name": "doomed",
+                        "daimon_account": str(account_id),
+                    },
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "POST",
+        r"/v1/agents/([^/]+)/archive",
+        lambda _req, m: httpx.Response(
+            200, json=make_ma_agent(id=m.group(1)).model_dump(mode="json")
+        ),
+    )
+    return router
+
+
+async def test_archive_agent_clears_scope_rows_naming_the_agent(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Archiving the tenant's default must not leave scope rows naming a dead agent."""
+    tenant = await make_tenant(db_session)
+    account_id = uuid.uuid4()
+    tenant_scope = TenantScopeRef(tenant_id=tenant.id)
+    channel_scope = ChannelScopeRef(tenant_id=tenant.id, channel_id="C_ARCHIVED_DEFAULT")
+    await set_fields(db_session, scope=tenant_scope, tenant_id=tenant.id, agent_name="doomed")
+    await set_fields(db_session, scope=channel_scope, tenant_id=tenant.id, agent_name="doomed")
+    await db_session.commit()
+
+    client = build_fake_anthropic(_archive_router(tenant.id, account_id).dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant.id, role=Role.ADMIN, is_admin=True)
+
+    await _archive_agent_impl(_runtime(client, session_factory=db_session_factory), auth, "doomed")
+
+    async with db_session_factory() as s:
+        assert await get_scope(s, scope=tenant_scope) is None, (
+            "the workspace default naming the archived agent must be cleared so "
+            "resolution falls through to the deployment default"
+        )
+        assert await get_scope(s, scope=channel_scope) is None, (
+            "the channel default naming the archived agent must be cleared too"
+        )
+
+
+async def test_archive_agent_clears_scope_rows_even_when_the_memory_store_archive_fails(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The scope clear sits outside the best-effort memory-store degrade.
+
+    A transient memory-store archive failure must not silently skip the clear —
+    that would leave the whole install unable to resolve a turn.
+    """
+    from daimon.core.stores.agent_memory_stores import insert_memory_store
+
+    tenant = await make_tenant(db_session)
+    account_id = uuid.uuid4()
+    tenant_scope = TenantScopeRef(tenant_id=tenant.id)
+    await set_fields(db_session, scope=tenant_scope, tenant_id=tenant.id, agent_name="doomed")
+    await insert_memory_store(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="ag_d"),
+        memory_store_id="memstore_X",
+    )
+    await db_session.commit()
+
+    router = _archive_router(tenant.id, account_id)
+    router.add(
+        "POST",
+        r"/v1/memory_stores/([^/]+)/archive",
+        lambda _req, _m: httpx.Response(
+            500,
+            json={"type": "error", "error": {"type": "api_error", "message": "boom"}},
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant.id, role=Role.ADMIN, is_admin=True)
+
+    await _archive_agent_impl(_runtime(client, session_factory=db_session_factory), auth, "doomed")
+
+    async with db_session_factory() as s:
+        assert await get_scope(s, scope=tenant_scope) is None, (
+            "the scope clear must still run when the memory-store archive fails"
+        )
 
 
 async def test_create_agent_impl_stamps_daimon_account_when_called() -> None:
