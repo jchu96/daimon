@@ -87,6 +87,21 @@ def lock_data_dir_root(data_dir: Path) -> None:
     os.chmod(data_dir, DATA_DIR_MODE)
 
 
+def lock_registry_file(path: Path) -> None:
+    """Chmod an existing host-owned registry file to ``_REGISTRY_MODE``. No-op if absent.
+
+    The stores lock their tmp file before the atomic rename, so a file this
+    host has written is already correct. This exists for the files a host
+    *inherits* — a registry created by a release that predates the jail keeps
+    its old default-umask mode (0644) until something happens to rewrite it,
+    which on a quiet host may be never. Since the same boot that inherits them
+    also makes ``data_dir`` traversable, leaving them is what turns an
+    unlistable-parent assumption into a readable file.
+    """
+    if path.exists():
+        os.chmod(path, _REGISTRY_MODE)
+
+
 @dataclass(frozen=True)
 class SlugPaths:
     """Every on-disk path a slug owns. The single source of truth for the layout.

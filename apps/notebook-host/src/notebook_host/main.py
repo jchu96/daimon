@@ -118,6 +118,12 @@ def create_app(settings: Settings) -> FastAPI:
             uid_start=settings.jail_uid_start,
             uid_end=settings.jail_uid_end,
             allow_unjailed=settings.allow_unjailed_spawn,
+            registry_files=(
+                settings.resolved_blogs_file,
+                settings.resolved_pids_file,
+                settings.resolved_consumed_file,
+                settings.resolved_uids_file,
+            ),
         )
         if migrated:
             _log.info(

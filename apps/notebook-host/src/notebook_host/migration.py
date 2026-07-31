@@ -27,11 +27,17 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 from fastapi import HTTPException
 
-from notebook_host.jail import SLUG_TREE_MODE, lock_data_dir_root, resolve_jail_uid
+from notebook_host.jail import (
+    SLUG_TREE_MODE,
+    lock_data_dir_root,
+    lock_registry_file,
+    resolve_jail_uid,
+)
 from notebook_host.lifecycle import safe_slug
 
 _log = logging.getLogger(__name__)
@@ -46,6 +52,7 @@ def migrate_flat_layout(
     uid_start: int,
     uid_end: int,
     allow_unjailed: bool,
+    registry_files: Sequence[Path] = (),
 ) -> list[str]:
     """Move every flat legacy slug under ``data_dir`` onto the nested layout.
 
@@ -59,12 +66,21 @@ def migrate_flat_layout(
     slug sits inside a still-unlocked parent alongside not-yet-migrated flat
     siblings.
 
+    ``registry_files`` are host-owned registry paths (``blogs.json``,
+    ``pids.json``, ...) that this host may have INHERITED from a release
+    predating the jail. They are locked in the same first step as ``data_dir``,
+    because the boot that makes ``data_dir`` traversable is exactly the boot
+    that must stop relying on an unlistable parent to hide them. Files this
+    host writes itself are already locked by their store before the rename.
+
     ``UidPoolExhaustedError`` and ``JailUnavailableError`` (from
     ``resolve_jail_uid``) are allowed to propagate uncaught: a migration that
     cannot isolate every legacy slug must abort the boot rather than leave
     some of them unjailed.
     """
     lock_data_dir_root(data_dir)
+    for registry in registry_files:
+        lock_registry_file(registry)
 
     migrated: list[str] = []
 

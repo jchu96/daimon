@@ -326,3 +326,54 @@ def test_migrate_never_touches_registry_files(tmp_path: Path) -> None:
 
     assert json.loads((tmp_path / "blogs.json").read_text()) == blogs
     assert json.loads((tmp_path / "pids.json").read_text()) == pids
+
+
+def test_migrate_locks_registry_files_inherited_at_default_umask(tmp_path: Path) -> None:
+    """A registry written by a pre-jail release must not stay world-readable.
+
+    The stores lock their tmp file before the atomic rename, so anything this
+    host writes is already 0600. The gap this covers is the file a host
+    *inherits*: the same boot that raises data_dir to 0711 stops the parent
+    from hiding it, so a 0644 blogs.json becomes readable by every jailed
+    notebook — and it lists every slug.
+    """
+    (tmp_path / "a.py").write_bytes(b"import marimo as mo\napp = mo.App()")
+    blogs = tmp_path / "blogs.json"
+    pids = tmp_path / "pids.json"
+    blogs.write_text("{}")
+    pids.write_text("{}")
+    blogs.chmod(0o644)
+    pids.chmod(0o644)
+
+    migrate_flat_layout(
+        tmp_path,
+        uids_file=_uids_file(tmp_path),
+        uid_start=_UID_START,
+        uid_end=_UID_END,
+        allow_unjailed=True,
+        registry_files=(blogs, pids),
+    )
+
+    assert blogs.stat().st_mode & 0o777 == 0o600, (
+        "an inherited blogs.json must be locked to 0600 by the migration, not "
+        "left at its default-umask mode until some later write happens to fix it"
+    )
+    assert pids.stat().st_mode & 0o777 == 0o600, (
+        "an inherited pids.json must be locked to 0600 by the migration"
+    )
+
+
+def test_migrate_tolerates_registry_files_that_do_not_exist_yet(tmp_path: Path) -> None:
+    """A first-ever boot has no registries on disk; locking them must not fail."""
+    (tmp_path / "a.py").write_bytes(b"import marimo as mo\napp = mo.App()")
+
+    migrated = migrate_flat_layout(
+        tmp_path,
+        uids_file=_uids_file(tmp_path),
+        uid_start=_UID_START,
+        uid_end=_UID_END,
+        allow_unjailed=True,
+        registry_files=(tmp_path / "blogs.json", tmp_path / "pids.json"),
+    )
+
+    assert migrated == ["a"], "migration should proceed with absent registries"
