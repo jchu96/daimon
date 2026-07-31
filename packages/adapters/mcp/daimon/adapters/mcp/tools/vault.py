@@ -1,4 +1,10 @@
-"""Vault tool: list_credentials — safe projection of caller's MCP vault credentials."""
+"""Vault tool: list_credentials — safe projection of caller's MCP vault credentials.
+
+Tagged ``agent-chat``, so it is visible only to a session whose token
+carries an agent identity — the same identity its ``agent_id`` guard needs
+to resolve the caller's per-agent vault. An ordinary chat session never
+discovers this tool.
+"""
 
 from __future__ import annotations
 
@@ -50,7 +56,7 @@ async def _list_credentials_impl(
 
 
 def register_vault_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def list_credentials(ctx: Context) -> list[VaultCredentialSummary]:  # pyright: ignore[reportUnusedFunction]
         """List credentials in the caller's MCP vault (safe projection — no secrets)."""
         return await _list_credentials_impl(runtime.client, await _auth(ctx))

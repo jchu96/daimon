@@ -6,9 +6,13 @@ Cross-agent isolation is enforced by composite-PK at the store layer
 (``(tenant_id, agent_id, key)`` for ``agent_files``;
 ``(tenant_id, agent_id)`` for ``agent_repo_binding``).
 
+All seven tools are tagged ``agent-chat`` and are therefore visible only
+to a session whose token carries an agent identity — the same identity
+their ``_require_agent_id`` precondition needs to succeed. An ordinary
+chat session never discovers this group; the setup panel is the path for
+a chat user to bind a repo or manage env vars.
+
 ``register_self_edit_tools(mcp, runtime)`` wires the ``@mcp.tool`` closures.
-Plan 02 added 4 file tools; Plan 03 adds 3 repo-binding tools; Plan 04 will
-wire this registrar into ``create_mcp_app``.
 """
 
 from __future__ import annotations
@@ -408,9 +412,18 @@ async def _clear_repo_binding_impl(
 
 
 def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
-    """Register the 7 self-edit tools (4 file tools + 3 repo-binding tools)."""
+    """Register the 7 self-edit tools (4 file tools + 3 repo-binding tools).
 
-    @mcp.tool
+    All seven carry the ``agent-chat`` tag, so the ``agent-chat`` ``Visibility``
+    baseline in ``server.py`` hides them by default, and the identity
+    middleware's narrowing reveals them only when the token carries an
+    ``agent_id`` claim — the same precondition ``_require_agent_id`` enforces
+    at the impl layer. A session with no agent identity (e.g. an ordinary
+    chat turn) never sees this group; the setup panel is the path for a
+    chat user to bind a repo or manage env vars.
+    """
+
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def self_write_file(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         key: str,
@@ -422,7 +435,7 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """
         return await _self_write_file_impl(runtime, await _auth(ctx), key=key, content=content)
 
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def self_read_file(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         key: str,
@@ -430,14 +443,14 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """Read a per-agent file by `key`. Returns null if no file exists at that key."""
         return await _self_read_file_impl(runtime, await _auth(ctx), key=key)
 
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def self_list_files(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
     ) -> list[AgentFileRow]:
         """List all keys + metadata for files in your private agent_files namespace."""
         return await _self_list_files_impl(runtime, await _auth(ctx))
 
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def self_delete_file(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         key: str,
@@ -445,7 +458,7 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """Delete a per-agent file by `key`. Idempotent — succeeds whether or not a file existed."""
         return await _self_delete_file_impl(runtime, await _auth(ctx), key=key)
 
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def set_repo_binding(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         repo_url: str,
@@ -465,14 +478,14 @@ def register_self_edit_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             service=service,
         )
 
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def get_repo_binding(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
     ) -> AgentRepoBindingPublic | None:
         """Return the current repo binding for your agent, or null if unbound."""
         return await _get_repo_binding_impl(runtime, await _auth(ctx))
 
-    @mcp.tool
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def clear_repo_binding(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
     ) -> dict[str, bool]:

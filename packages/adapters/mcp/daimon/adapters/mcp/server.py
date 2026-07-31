@@ -217,7 +217,6 @@ def create_mcp_app(
     mcp.add_transform(
         AgentChatAwareBM25SearchTransform(
             max_results=5,
-            always_visible=["list_credentials"],
             search_result_serializer=serialize_tools_for_output_markdown,
         )
     )
