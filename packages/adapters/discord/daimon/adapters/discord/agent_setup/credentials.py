@@ -23,8 +23,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import structlog
+from daimon.adapters.discord.agent_setup import authz
 from daimon.adapters.discord.agent_setup.expiry import ExpiringView
-from daimon.adapters.discord.agent_setup.state import PanelState
+from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
@@ -94,13 +95,18 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
         runtime: DiscordRuntime,
         tenant_id: uuid.UUID,
         agent_id: uuid.UUID,
+        entry: RosterEntry | None,
         on_added: OnAdded,
     ) -> None:
         super().__init__()
-        # Modal has no `.view` reference — store deps explicitly.
+        # Modal has no `.view` reference — store deps explicitly. `entry` has no
+        # default on purpose: it is the submit gate's target, and a construction
+        # site that forgot it would silently build an ungated modal, so pyright
+        # must reject it rather than let it through.
         self._runtime = runtime
         self._tenant_id = tenant_id
         self._agent_id = agent_id
+        self._entry = entry
         self._on_added = on_added
         self.content_input: discord.ui.TextInput[PasteSecretModal] = discord.ui.TextInput(
             label="KEY=VALUE lines",
@@ -112,6 +118,16 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
         self.add_item(self.content_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Submit time is the boundary: a modal opened before the caller lost
+        # Manage Server must not write, and `put_agent_file` is an upsert whose
+        # files are mounted read-write on every session of a shared agent.
+        # Before defer() so the refusal owns the first response, and before the
+        # pasted content is read at all, so nothing derived from it — not a key
+        # name, not a value — exists on the refusal path.
+        if await authz.refuse_if_shared_and_not_admin(
+            interaction, runtime=self._runtime, entry=self._entry
+        ):
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         raw = str(self.content_input.value or "")
 
@@ -292,6 +308,10 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
                 runtime=self._runtime,
                 tenant_id=self._tenant_id,
                 agent_id=self._agent_id,
+                # `EditView._on_env_vars` derives this sub-view's agent_id from
+                # the same `state.selected`, so the gate's target and the write's
+                # target are always the same agent.
+                entry=self._state.selected,
                 on_added=self._reload_and_rerender,
             )
         )
