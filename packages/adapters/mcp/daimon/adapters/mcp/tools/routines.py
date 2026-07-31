@@ -44,6 +44,21 @@ def _require_platform_user_id(auth: AuthIdentity) -> str:
     return auth.platform_user_id
 
 
+def _require_routine_owner(auth: AuthIdentity, row: RoutineRow) -> None:
+    """Owner-or-admin gate for routine mutation. Reads stay tenant-wide.
+
+    Raises the same ``"routine not found"`` text an unknown id produces, so a
+    non-owner probe cannot distinguish "forbidden" from "does not exist".
+    CLI and internal tokens have no platform user id but always carry
+    ``is_admin``, so they pass on the admin branch below — no separate
+    null-check branch is needed here.
+    """
+    if auth.is_admin:
+        return
+    if auth.platform_user_id != row.created_by_user_id:
+        raise ToolError("routine not found")
+
+
 def _compute_next_fire_at(cron_expr: str, tz: str) -> datetime:
     """Validate cron + timezone and return the next fire datetime (UTC).
 
@@ -139,6 +154,7 @@ async def _update_routine_impl(
         row = await routines_store.get_routine(session, routine_id, tenant_id=tenant_id)
         if row is None:
             raise ToolError("routine not found")
+        _require_routine_owner(auth, row)
 
         # Recompute next_fire_at only when cron or timezone is being changed.
         next_fire_at: datetime | None = None
@@ -186,6 +202,10 @@ async def _delete_routine_impl(
 ) -> DeleteResult:
     tenant_id = auth.tenant_id
     async with runtime.session_factory() as session, session.begin():
+        row = await routines_store.get_routine(session, routine_id, tenant_id=tenant_id)
+        if row is None:
+            raise ToolError("routine not found")
+        _require_routine_owner(auth, row)
         deleted = await routines_store.delete_routine(session, routine_id, tenant_id=tenant_id)
         if not deleted:
             raise ToolError("routine not found")

@@ -304,7 +304,7 @@ async def test_update_routine_patches_only_provided_fields(
     created = await create_routine(
         db_session,
         tenant_id=tenant.id,
-        created_by_user_id=None,
+        created_by_user_id="u_test",
         agent_id="agent_a",
         agent_name="daimon",
         cron_expr="0 9 * * *",
@@ -336,7 +336,7 @@ async def test_update_routine_recomputes_next_fire_at_when_cron_changes(
     created = await create_routine(
         db_session,
         tenant_id=tenant.id,
-        created_by_user_id=None,
+        created_by_user_id="u_test",
         agent_id="agent_a",
         agent_name="daimon",
         cron_expr="0 9 * * *",
@@ -368,7 +368,7 @@ async def test_update_routine_recomputes_next_fire_at_when_timezone_changes(
     created = await create_routine(
         db_session,
         tenant_id=tenant.id,
-        created_by_user_id=None,
+        created_by_user_id="u_test",
         agent_id="agent_a",
         agent_name="daimon",
         cron_expr="0 9 * * *",
@@ -423,7 +423,7 @@ async def test_delete_routine_removes_row(
     created = await create_routine(
         db_session,
         tenant_id=tenant.id,
-        created_by_user_id=None,
+        created_by_user_id="u_test",
         agent_id="agent_a",
         agent_name="daimon",
         cron_expr="* * * * *",
@@ -586,7 +586,7 @@ async def test_update_routine_renames_agent(
     created = await create_routine(
         db_session,
         tenant_id=tenant.id,
-        created_by_user_id=None,
+        created_by_user_id="u_test",
         agent_id="ag_original",
         agent_name="daimon",
         cron_expr="* * * * *",
@@ -618,7 +618,7 @@ async def test_update_routine_unknown_agent_raises_toolerror(
     created = await create_routine(
         db_session,
         tenant_id=tenant.id,
-        created_by_user_id=None,
+        created_by_user_id="u_test",
         agent_id="ag_original",
         agent_name="daimon",
         cron_expr="* * * * *",
