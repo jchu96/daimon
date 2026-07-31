@@ -1,10 +1,17 @@
 """BillingPanelView + build_billing_container + buttons for /billing.
 
-Discord-native admin check (manage_guild | administrator | owner) is re-resolved
-on every Refresh via `is_guild_admin` (D-UX-04). Admin view shows a top-up
-string select ($10/$25/$50/$100) and a UserSelect member-spend lookup that POST to
-the MCP /billing/checkout route via an authenticated internal token. Discord never
-imports stripe (TOPUP-02/OQ#4 rec (a)).
+The Discord-native admin check (manage_guild | administrator | owner) is
+re-derived from the live interaction on every render AND on every admin-select
+click — it is never trusted from the rendered view. `is_admin` on the view is a
+render hint that decides whether the two admin selects appear at all; the
+boundary is the click-time admin gate from `checks.py`, called as the first act
+of each of those callbacks before any HTTP call or usage read. Every
+interaction rebuilds the view with a fresh timeout, so a member who was an admin
+when the panel opened may not be one when they click.
+
+Admin view shows a top-up string select ($10/$25/$50/$100) and a UserSelect
+member-spend lookup that POST to the MCP /billing/checkout route via an
+authenticated internal token. Discord never imports stripe.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from daimon.adapters.discord.billing_panel.state import (
     COLOR_OVER_CAP,
     BillingPanelState,
 )
+from daimon.adapters.discord.checks import refuse_if_not_admin
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.errors import DaimonError
@@ -237,6 +245,10 @@ class _TopUpSelect(discord.ui.Select["BillingPanelView"]):
     async def callback(self, interaction: discord.Interaction) -> None:
         if self.view is None or interaction.guild_id is None:
             return
+        # The view's is_admin decided whether this select rendered; it does not
+        # decide whether the click may mint a checkout link.
+        if await refuse_if_not_admin(interaction):  # pyright: ignore[reportArgumentType]  # narrowing to the Bot-bound interaction inside our adapter
+            return
         try:
             amount = int(self.values[0])
             url = await _create_checkout(
@@ -267,6 +279,10 @@ class _MemberLookupSelect(discord.ui.UserSelect["BillingPanelView"]):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if self.view is None or interaction.guild_id is None:
+            return
+        # Per-member spend is exactly what load_billing_snapshot's member branch
+        # withholds — the gate has to run before the usage reads, not at render.
+        if await refuse_if_not_admin(interaction):  # pyright: ignore[reportArgumentType]  # narrowing to the Bot-bound interaction inside our adapter
             return
         try:
             selected = self.values[0]
