@@ -40,11 +40,18 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from slack_sdk.web.async_client import AsyncWebClient
 
-__all__ = ["refuse_if_reachable_and_not_admin"]
+__all__ = ["refuse_if_reachable_and_not_admin", "refuse_if_shared_and_not_admin"]
 
 _SEEDED_AGENT_MESSAGE = (
     ":lock: This is the workspace's built-in agent, so its setup cannot be changed "
     "from here — not even by an admin. Fork it to get an editable copy you own."
+)
+
+_SHARED_AGENT_MESSAGE = (
+    ":lock: This agent is shared — it is either the workspace's built-in agent or the "
+    "current default for this workspace or a channel — so changing its repo or its "
+    "environment variables needs workspace-admin permission. Fork it to get an "
+    "editable copy you own; the fork starts with no environment variables of its own."
 )
 
 
@@ -125,5 +132,87 @@ async def refuse_if_reachable_and_not_admin(
             "channel, so changing its setup needs workspace-admin permission. "
             "Creating or forking your own agent is not restricted."
         ),
+    )
+    return True
+
+
+async def refuse_if_shared_and_not_admin(
+    runtime: SlackRuntime,
+    web_client: AsyncWebClient,
+    *,
+    tenant_id: uuid.UUID,
+    agent_name: str,
+    channel_id: str,
+    user_id: str,
+    dev_allow_all: bool = False,
+) -> bool:
+    """Refuse an attachment write against a shared agent by a non-admin.
+
+    ``refuse_if_shared_and_not_admin`` is the gate for per-agent attachments --
+    the repo binding, the inline token, env-variable credentials. Spec-touching
+    writes route through ``refuse_if_reachable_and_not_admin`` instead.
+
+    Returns ``True`` when the caller must return early (refused); ``False``
+    when the caller should proceed. Order, each short-circuiting:
+
+    1. A live workspace admin -> allow, before any MA or DB read. This is the
+       one step ordered differently from ``refuse_if_reachable_and_not_admin``,
+       and it is what keeps an admin able to bind a repo to the workspace's
+       built-in agent -- the first-run onboarding step.
+    2. The target is a defaults-managed agent -> refuse; it ships with the
+       deployment and every member of the workspace shares it.
+    3. Otherwise read reachability fresh from the DB and refuse when the
+       target currently resolves for the workspace or some channel. An
+       unreachable agent has no shared state to defend, so any member may
+       configure it.
+
+    Both refusals carry the same message on purpose: telling the caller which
+    limb fired would say nothing they can act on, and either way the fix is the
+    same -- ask an admin, or fork.
+
+    Args:
+        runtime:        Injected ``SlackRuntime`` (sessionmaker, deployment
+                        default).
+        web_client:     Per-event ``AsyncWebClient``.
+        tenant_id:      Derived from the verified Socket Mode workspace id --
+                        never accepted from the interactive payload.
+        agent_name:     The target agent's name -- used only as a
+                        tenant-scoped lookup key.
+        channel_id:     Invoking channel, for the refusal ephemeral.
+        user_id:        Invoking user, for the admin check and the ephemeral.
+        dev_allow_all:  Testing-only admin-gate override, threaded through
+                        unchanged from ``_dev_allow_all_admin(runtime)``.
+
+    Returns:
+        ``True`` if the caller must refuse and return early, ``False`` to
+        proceed.
+    """
+    is_admin = await resolve_is_admin(web_client, user_id=user_id, dev_allow_all=dev_allow_all)
+    if is_admin:
+        return False
+
+    seeded = await find_agent_by_daimon_tag(runtime.anthropic, tenant_id=tenant_id, name=agent_name)
+    if seeded is not None and seeded.metadata.get(MA_METADATA_KEY_MANAGED) == "true":
+        await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+            channel=channel_id or user_id,
+            user=user_id,
+            text=_SHARED_AGENT_MESSAGE,
+        )
+        return True
+
+    async with runtime.sessionmaker() as session:
+        reachable = await is_agent_reachable_in_tenant(
+            session,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            default=runtime.deployment_default,
+        )
+    if not reachable:
+        return False
+
+    await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+        channel=channel_id or user_id,
+        user=user_id,
+        text=_SHARED_AGENT_MESSAGE,
     )
     return True
