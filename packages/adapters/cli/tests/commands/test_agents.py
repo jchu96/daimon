@@ -36,8 +36,10 @@ from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.errors import SpecError, StoreError
 from daimon.core.ma_resolver import new_resolver_cache
-from daimon.core.scope import DeploymentDefault
+from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.stores.identity import get_or_create_cli_principal
+from daimon.core.stores.scoped_config_read import get_scope
+from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, list_response
 from rich.console import Console
@@ -601,6 +603,59 @@ async def test_agents_archive_calls_sdk_archive(
     assert len(archive_paths) == 1, f"expected 1 archive call, got {len(archive_paths)}"
     assert archive_paths[0].endswith("/ag_doomed/archive"), (
         f"archive must use MA agent id in URL, got {archive_paths[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agents_archive_clears_scope_rows_naming_the_archived_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A channel default naming the archived agent must not survive the archive.
+
+    Same contract the Discord, Slack and MCP delete surfaces hold: without the
+    clear, the next turn in that channel resolves to an archived agent instead
+    of falling through to the tenant tier.
+    """
+    async with db_session_factory() as s, s.begin():
+        tenant = await make_tenant(s, platform="cli", workspace_id="local")
+        await get_or_create_cli_principal(s, tenant_id=tenant.id, os_user="testuser")
+        tenant_id = tenant.id
+        await set_fields(
+            s,
+            scope=ChannelScopeRef(tenant_id=tenant_id, channel_id="c1"),
+            tenant_id=tenant_id,
+            agent_name="doomed",
+        )
+        await set_fields(
+            s,
+            scope=ChannelScopeRef(tenant_id=tenant_id, channel_id="c2"),
+            tenant_id=tenant_id,
+            agent_name="survivor",
+        )
+
+    agent_data = _agent_json(agent_id="ag_doomed", name="doomed", tenant_id=tenant_id)
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
+    router.add(
+        "POST", r"/v1/agents/ag_doomed/archive", lambda req, m: httpx.Response(200, json=agent_data)
+    )
+
+    console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
+    rt = _build_rt(db_session_factory, router)
+
+    await agents_archive(rt=rt, console=console, name="doomed", yes=True)
+
+    async with db_session_factory() as s:
+        cleared = await get_scope(s, scope=ChannelScopeRef(tenant_id=tenant_id, channel_id="c1"))
+        untouched = await get_scope(s, scope=ChannelScopeRef(tenant_id=tenant_id, channel_id="c2"))
+
+    assert cleared is None, (
+        "the channel row naming the archived agent must be gone so resolution "
+        "falls through the cascade"
+    )
+    assert untouched is not None and untouched.agent_name == "survivor", (
+        "a channel row naming a different agent must survive the archive"
     )
 
 

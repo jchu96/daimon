@@ -13,6 +13,7 @@ from daimon.adapters.cli.output import emit_rows
 from daimon.adapters.cli.prompt import confirm_or_abort
 from daimon.adapters.cli.runtime import CliRuntime, build_runtime
 from daimon.adapters.cli.tenant import discover_tenant
+from daimon.core.agent_lifecycle import archive_memory_store_best_effort
 from daimon.core.config import load_settings
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
@@ -30,8 +31,10 @@ from daimon.core.defaults.metadata import (
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.defaults.reconcile_agents import reconcile_agent
 from daimon.core.errors import SpecError, StoreError
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.specs import load_agent_spec, merge_default_agent_toolset
 from daimon.core.stores.identity import get_or_create_cli_principal
+from daimon.core.stores.scoped_config_write import clear_agent_references
 from daimon.core.stores.tenants import list_tenants_by_platform
 from pydantic import BaseModel
 from rich.console import Console
@@ -259,6 +262,14 @@ def agents_archive_command(
 
 
 async def agents_archive(*, rt: CliRuntime, console: Console, name: str, yes: bool) -> None:
+    """Archive an agent, its memory store, and every scope row that names it.
+
+    Same three-step shape as the Discord and Slack panel deletes: archive the
+    MA agent, archive its memory store best-effort, then clear the scope rows.
+    Without the clear, a channel or tenant default naming this agent survives
+    the archive and turn resolution misses instead of falling through the
+    cascade.
+    """
     confirm_or_abort(console, f"archive agent {name!r}?", yes=yes)
     async with rt.sessionmaker() as session, session.begin():
         tenant_id = await discover_tenant(session)
@@ -270,6 +281,19 @@ async def agents_archive(*, rt: CliRuntime, console: Console, name: str, yes: bo
     if agent is None:
         raise StoreError(f"no agent named {name!r} in your account or system defaults.")
     await rt.anthropic.beta.agents.archive(agent.id)
+    await archive_memory_store_best_effort(
+        anthropic=rt.anthropic,
+        sessionmaker=rt.sessionmaker,
+        tenant_id=tenant_id,
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
+        log_context={"tenant_id": str(tenant_id), "agent_name": name, "ma_agent_id": agent.id},
+    )
+    # After the MA archive, never before: a failure here leaves an archived
+    # agent with stale scope rows rather than a live agent with cleared ones.
+    # Deliberately unguarded — a failure must reach run_cli's error boundary
+    # rather than degrade silently.
+    async with rt.sessionmaker.begin() as session:
+        await clear_agent_references(session, tenant_id=tenant_id, agent_name=name)
     console.print(f"[green]✓ archived agent {name!r}[/green]")
 
 
