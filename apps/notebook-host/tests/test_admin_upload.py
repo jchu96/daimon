@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from notebook_host.jail import SlugPaths, get_slug_paths
 
 _SECRET = "test-secret"
 
@@ -64,7 +65,7 @@ def _make_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClie
     settings = load_settings(_env_file=None)
 
     def spawner(
-        slug: str, file_path: Path, port: int, *, mode: str = "edit"
+        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
     ) -> subprocess.Popen[bytes]:
         m: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         m.poll.return_value = None
@@ -90,7 +91,7 @@ def test_upload_blog_writes_source_byte_exact_and_registers(
     source = b"# notebook\n" + b"x = 1\n" * 9000  # ~55 KB — the case inline source truncated on
     r = client.put(f"/upload/{_mint('blog', 'my-blog')}", content=source)
     assert r.status_code == 200, f"blog upload should succeed, got {r.status_code}: {r.text}"
-    on_disk = (tmp_path / "my-blog.py").read_bytes()
+    on_disk = get_slug_paths(tmp_path, "my-blog").notebook.read_bytes()
     assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(source).hexdigest(), (
         "source written byte-exact"
     )
@@ -105,7 +106,7 @@ def test_upload_data_writes_raw_bytes_byte_exact(
     tok = _mint("data", "my-blog", name="posterior.nc", max_bytes=1_500_000)
     r = client.put(f"/upload/{tok}", content=blob)
     assert r.status_code == 200, f"data upload should succeed, got {r.status_code}: {r.text}"
-    assert (tmp_path / "my-blog.data" / "posterior.nc").read_bytes() == blob, (
+    assert (get_slug_paths(tmp_path, "my-blog").data / "posterior.nc").read_bytes() == blob, (
         "1 MB written byte-exact"
     )
     assert r.json()["path"] == "data/posterior.nc", "agent-visible read path returned"
@@ -124,7 +125,7 @@ def test_upload_rejects_forged_token(tmp_path: Path, monkeypatch: pytest.MonkeyP
     client, _ = _make_app(tmp_path, monkeypatch)
     r = client.put(f"/upload/{_mint('blog', 'x', secret='attacker')}", content=b"evil")
     assert r.status_code == 403, "a token signed by an unknown key is rejected"
-    assert not (tmp_path / "x.py").exists(), "no file written on a forged token"
+    assert not get_slug_paths(tmp_path, "x").notebook.exists(), "no file written on a forged token"
 
 
 def test_upload_single_use_replay_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -135,7 +136,9 @@ def test_upload_single_use_replay_rejected(tmp_path: Path, monkeypatch: pytest.M
     assert r1.status_code == 200 and r2.status_code == 409, (
         "first use ok, replay of the same jti → 409"
     )
-    assert (tmp_path / "once.py").read_bytes() == b"# first\n", "replay does not overwrite"
+    assert get_slug_paths(tmp_path, "once").notebook.read_bytes() == b"# first\n", (
+        "replay does not overwrite"
+    )
 
 
 def test_upload_oversize_body_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,7 +146,7 @@ def test_upload_oversize_body_rejected(tmp_path: Path, monkeypatch: pytest.Monke
     tok = _mint("blog", "big", max_bytes=1000)
     r = client.put(f"/upload/{tok}", content=b"z" * 5000)
     assert r.status_code == 413, "body over the token's max_bytes → 413"
-    assert not (tmp_path / "big.py").exists(), "no file written when oversize"
+    assert not get_slug_paths(tmp_path, "big").notebook.exists(), "no file written when oversize"
 
 
 def test_upload_data_with_no_name_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -162,4 +165,6 @@ def test_upload_rejects_body_over_host_ceiling_under_token_max(
     tok = _mint("blog", "ceil", max_bytes=2_000_000)
     r = client.put(f"/upload/{tok}", content=b"z" * 1_100_000)
     assert r.status_code == 413, f"body over the host ceiling → 413, got {r.status_code}"
-    assert not (tmp_path / "ceil.py").exists(), "no file written when over the host ceiling"
+    assert not get_slug_paths(tmp_path, "ceil").notebook.exists(), (
+        "no file written when over the host ceiling"
+    )

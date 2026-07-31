@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
-import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -24,6 +23,7 @@ from notebook_host.blogs_store import (
 )
 from notebook_host.capability import CapabilityClaims, verify_token
 from notebook_host.config import Settings
+from notebook_host.jail import SlugPaths, ensure_slug_jail, get_slug_paths, remove_slug_tree
 from notebook_host.lifecycle import (
     NotebookProcess,
     ValidationResult,
@@ -39,12 +39,12 @@ from notebook_host.pids_store import record_from_process, save_pids
 
 class Spawner(Protocol):
     def __call__(
-        self, slug: str, file_path: Path, port: int, *, mode: Literal["edit", "run"] = "edit"
+        self, slug: str, paths: SlugPaths, port: int, *, mode: Literal["edit", "run"] = "edit"
     ) -> subprocess.Popen[bytes]: ...
 
 
 class Validator(Protocol):
-    def __call__(self, slug: str, file_path: Path) -> ValidationResult: ...
+    def __call__(self, slug: str, paths: SlugPaths) -> ValidationResult: ...
 
 
 @dataclass
@@ -115,12 +115,19 @@ def _bearer_dep(settings: Settings) -> Callable[[str | None], None]:
     return require
 
 
-def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    """Write via tmp + ``os.replace`` so a concurrent reader never sees a torn file."""
+def _atomic_write_bytes(path: Path, content: bytes, *, owner_uid: int | None = None) -> None:
+    """Write via tmp + ``os.replace`` so a concurrent reader never sees a torn file.
+
+    When ``owner_uid`` is given, the tmp file is chowned to ``(owner_uid,
+    owner_uid)`` before the replace, so the file is never visible at its final
+    path with the wrong owner.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     try:
         tmp.write_bytes(content)
+        if owner_uid is not None:
+            os.chown(tmp, owner_uid, owner_uid)
         os.replace(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
@@ -137,16 +144,15 @@ async def _spawn_tracked(
     pool exhausted), or 504 (spawn timeout). Shared by the notebook and blog
     PUT handlers so the two never drift.
     """
-    state.settings.data_dir.mkdir(parents=True, exist_ok=True)
-    path = state.settings.data_dir / f"{slug}.py"
-    path.write_bytes(source_bytes)
+    paths = ensure_slug_jail(state.settings.data_dir, slug)
+    _atomic_write_bytes(paths.notebook, source_bytes)
 
     # Confirm the cells actually execute before we tear down any
     # existing notebook for this slug. Runs off the event loop (the
     # marimo export is blocking). A failure here leaves a previously
     # published notebook for this slug untouched and serving.
     if state.validator is not None:
-        result = await asyncio.to_thread(state.validator, slug, path)
+        result = await asyncio.to_thread(state.validator, slug, paths)
         if not result.ok:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -163,7 +169,7 @@ async def _spawn_tracked(
     port = allocate_port(
         state.processes, state.settings.marimo_port_start, state.settings.marimo_port_end
     )
-    proc = state.spawner(slug, path, port, mode=mode)
+    proc = state.spawner(slug, paths, port, mode=mode)
     np = state.make_process(slug, port, proc, mode=mode)
     state.processes[slug] = np
 
@@ -227,7 +233,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 "url": np.url,
                 "port": np.port,
                 "pid": np.process.pid,
-                "size_bytes": (state.settings.data_dir / f"{slug}.py").stat().st_size,
+                "size_bytes": get_slug_paths(state.settings.data_dir, slug).notebook.stat().st_size,
                 "subprocess_ttl_seconds": ttl,
                 "expires_at": expires_at.isoformat() if expires_at is not None else None,
             }
@@ -249,8 +255,10 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 f"({len(body)} > {state.settings.max_attachment_bytes_ceiling})",
             )
         async with state.lock_for(slug):
-            data_dir = state.settings.data_dir / f"{slug}.data"
-            final_path = data_dir / name
+            # ensure the tree exists even when an attachment arrives before
+            # the first publish, with the same 0700 mode a publish would set.
+            paths = ensure_slug_jail(state.settings.data_dir, slug)
+            final_path = paths.data / name
             _atomic_write_bytes(final_path, body)
             return {
                 "slug": slug,
@@ -269,11 +277,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
         np = state.processes.pop(slug, None)
         if np is not None:
             kill(np)
-        (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
-        # A crash between the .py unlink and these rmtrees leaks the dirs;
-        # the slug is gone from state.processes so sweep won't re-discover them.
-        shutil.rmtree(state.settings.data_dir / f"{slug}.data", ignore_errors=True)
-        shutil.rmtree(state.settings.data_dir / f"{slug}_workspace", ignore_errors=True)
+        remove_slug_tree(state.settings.data_dir, slug)
         state.snapshot_pids()
 
     @router.get("/admin/notebooks", dependencies=[Depends(require_admin)])
@@ -313,7 +317,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 "url": np.url,
                 "port": np.port,
                 "pid": np.process.pid,
-                "size_bytes": (state.settings.data_dir / f"{slug}.py").stat().st_size,
+                "size_bytes": get_slug_paths(state.settings.data_dir, slug).notebook.stat().st_size,
             }
 
     @router.get("/admin/blogs", dependencies=[Depends(require_admin)])
@@ -346,9 +350,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
         if np is not None:
             kill(np)
         unregister_blog(state.settings.resolved_blogs_file, slug)
-        (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
-        shutil.rmtree(state.settings.data_dir / f"{slug}.data", ignore_errors=True)
-        shutil.rmtree(state.settings.data_dir / f"{slug}_workspace", ignore_errors=True)
+        remove_slug_tree(state.settings.data_dir, slug)
         state.snapshot_pids()
 
     @router.post("/admin/sweep", dependencies=[Depends(require_admin)])
@@ -364,9 +366,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 continue
             kill(np)
             state.processes.pop(slug, None)
-            (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
-            shutil.rmtree(state.settings.data_dir / f"{slug}.data", ignore_errors=True)
-            shutil.rmtree(state.settings.data_dir / f"{slug}_workspace", ignore_errors=True)
+            remove_slug_tree(state.settings.data_dir, slug)
             reaped.append({"slug": slug, "reason": reason, "age_s": round(np.age_s, 2)})
         if reaped:
             state.snapshot_pids()
@@ -405,7 +405,10 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 )
             name = safe_attachment_name(claims.name)
             async with state.lock_for(slug):
-                final_path = state.settings.data_dir / f"{slug}.data" / name
+                # ensure the tree exists even when an attachment arrives before
+                # the first publish, with the same 0700 mode a publish would set.
+                paths = ensure_slug_jail(state.settings.data_dir, slug)
+                final_path = paths.data / name
                 _atomic_write_bytes(final_path, body)
                 return {
                     "slug": slug,
@@ -417,7 +420,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
         mode: Literal["edit", "run"] = "run" if claims.op == "blog" else "edit"
         async with state.lock_for(slug):
             np = await _spawn_tracked(state, slug, body, mode=mode)
-            size_bytes = (state.settings.data_dir / f"{slug}.py").stat().st_size
+            size_bytes = get_slug_paths(state.settings.data_dir, slug).notebook.stat().st_size
             if claims.op == "blog":
                 register_blog(
                     state.settings.resolved_blogs_file,

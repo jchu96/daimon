@@ -15,6 +15,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from notebook_host.jail import get_slug_paths
 from notebook_host.lifecycle import validate_notebook
 
 pytestmark = pytest.mark.skipif(
@@ -57,16 +58,18 @@ def _():
 
 
 def test_validate_notebook_passes_clean_notebook(tmp_path: Path) -> None:
-    path = tmp_path / "clean.py"
-    path.write_text(_CLEAN)
-    result = validate_notebook("clean", path, timeout_s=120.0)
+    paths = get_slug_paths(tmp_path, "clean")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text(_CLEAN)
+    result = validate_notebook("clean", paths, timeout_s=120.0)
     assert result.ok, f"a clean notebook should validate; got errors: {result.errors}"
 
 
 def test_validate_notebook_flags_loop_variable_collision(tmp_path: Path) -> None:
-    path = tmp_path / "collision.py"
-    path.write_text(_COLLISION)
-    result = validate_notebook("collision", path, timeout_s=120.0)
+    paths = get_slug_paths(tmp_path, "collision")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text(_COLLISION)
+    result = validate_notebook("collision", paths, timeout_s=120.0)
     assert not result.ok, "a cross-cell loop-variable collision must fail validation"
     assert any("MultipleDefinitionError" in e for e in result.errors), (
         f"the collision should be reported as MultipleDefinitionError; got: {result.errors}"
@@ -93,9 +96,10 @@ def _():
 
 def test_validate_notebook_sandbox_installs_declared_dependency(tmp_path: Path) -> None:
     """A PEP 723 dep outside the baked set imports cleanly under --sandbox."""
-    path = tmp_path / "sandbox.py"
-    path.write_text(_SANDBOX_DEP)
-    result = validate_notebook("sandbox", path, timeout_s=180.0, sandbox=True)
+    paths = get_slug_paths(tmp_path, "sandbox")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text(_SANDBOX_DEP)
+    result = validate_notebook("sandbox", paths, timeout_s=180.0, sandbox=True)
     assert result.ok, (
         f"a declared dependency must be installed and importable under --sandbox; "
         f"got errors: {result.errors}"
@@ -106,9 +110,10 @@ def test_validate_notebook_without_sandbox_cannot_import_undeclared_dependency(
     tmp_path: Path,
 ) -> None:
     """Control: the same import fails on the baked env — sandbox is what fixes it."""
-    path = tmp_path / "no_sandbox.py"
-    path.write_text(_SANDBOX_DEP)
-    result = validate_notebook("no_sandbox", path, timeout_s=120.0, sandbox=False)
+    paths = get_slug_paths(tmp_path, "no_sandbox")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text(_SANDBOX_DEP)
+    result = validate_notebook("no_sandbox", paths, timeout_s=120.0, sandbox=False)
     assert not result.ok, (
         "cowsay is not baked into the host env; the import must fail without sandbox"
     )

@@ -1,6 +1,6 @@
 """Tests for the host-side PUT /admin/notebooks/{slug}/data/{name} endpoint.
 
-The data-PUT endpoint writes a raw blob to ``<data_dir>/<slug>.data/<name>``
+The data-PUT endpoint writes a raw blob to ``data_dir/<slug>/data/<name>``
 atomically (tmp + os.replace) and does NOT spawn marimo. It is the host
 half of the agent-side ``attach_notebook_data`` MCP tool.
 """
@@ -18,6 +18,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from notebook_host.jail import SlugPaths, get_slug_paths
 
 AUTH = "Bearer test-secret"
 NO_AUTH = "Bearer wrong-secret"
@@ -27,7 +28,7 @@ def _make_stub_spawner() -> unittest.mock.MagicMock:
     """Return a stub spawner that records calls and returns a fake Popen."""
 
     def spawner(
-        slug: str, file_path: Path, port: int, *, mode: str = "edit"
+        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
     ) -> subprocess.Popen[bytes]:
         mock_proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         mock_proc.poll.return_value = None
@@ -82,7 +83,7 @@ def test_put_data_without_bearer_returns_401(
 
 
 def test_put_data_writes_blob_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """PUT data writes raw body to <data_dir>/<slug>.data/<name> byte-for-byte."""
+    """PUT data writes raw body to data_dir/<slug>/data/<name> byte-for-byte."""
     client, _, _, _ = _make_test_app(tmp_path, monkeypatch)
     payload = b"\x00\x01\x02binary\xff\xfeblob"
     resp = client.put(
@@ -98,12 +99,13 @@ def test_put_data_writes_blob_atomically(tmp_path: Path, monkeypatch: pytest.Mon
     assert body["path"] == "data/blob.bin", (
         "response path should be the notebook-visible 'data/<name>' form"
     )
-    final_path = tmp_path / "myslug.data" / "blob.bin"
+    data_dir = get_slug_paths(tmp_path, "myslug").data
+    final_path = data_dir / "blob.bin"
     assert final_path.read_bytes() == payload, (
         "on-disk bytes should match the request body verbatim (binary-safe)"
     )
     # No tmp file should remain on disk.
-    tmp_artifacts = list((tmp_path / "myslug.data").glob(".*.tmp"))
+    tmp_artifacts = list(data_dir.glob(".*.tmp"))
     assert tmp_artifacts == [], f"no .tmp artifacts should remain; found {tmp_artifacts}"
 
 
@@ -118,8 +120,8 @@ def test_atomic_write_cleans_tmp_on_partial_failure(
     """
     from notebook_host import admin as admin_module
 
-    target_dir = tmp_path / "myslug.data"
-    target_dir.mkdir()
+    target_dir = get_slug_paths(tmp_path, "myslug").data
+    target_dir.mkdir(parents=True)
     target = target_dir / "blob.bin"
 
     real_replace = os.replace
@@ -180,7 +182,7 @@ def test_put_data_overwrites_existing(tmp_path: Path, monkeypatch: pytest.Monkey
         headers={"Authorization": AUTH},
     )
     assert r2.status_code == 200, "second PUT should succeed"
-    final = (tmp_path / "over.data" / "file.bin").read_bytes()
+    final = (get_slug_paths(tmp_path, "over").data / "file.bin").read_bytes()
     assert final == second, (
         "second body should win on overwrite; tmp+rename leaves no partial state"
     )
@@ -227,7 +229,7 @@ def test_put_data_oversize_returns_413(tmp_path: Path, monkeypatch: pytest.Monke
     )
     assert resp.status_code == 413, f"oversize body should return 413; got {resp.status_code}"
     assert "max_attachment_bytes_ceiling" in resp.text, "detail should reference the cap"
-    assert not (tmp_path / "myslug.data" / "big.bin").exists(), (
+    assert not (get_slug_paths(tmp_path, "myslug").data / "big.bin").exists(), (
         "no file should be written when the size cap is exceeded"
     )
 
@@ -270,7 +272,8 @@ async def test_concurrent_put_data_and_source_serialize(
         f"source PUT should succeed under contention; got {r_source.status_code}: {r_source.text}"
     )
     # On-disk artifacts from both ops exist.
-    assert (tmp_path / "race.data" / "d.csv").read_bytes() == b"x,y\n", (
+    race_paths = get_slug_paths(tmp_path, "race")
+    assert (race_paths.data / "d.csv").read_bytes() == b"x,y\n", (
         "data file should be readable after concurrent PUTs"
     )
-    assert (tmp_path / "race.py").exists(), "source file should exist after concurrent PUTs"
+    assert race_paths.notebook.exists(), "source file should exist after concurrent PUTs"

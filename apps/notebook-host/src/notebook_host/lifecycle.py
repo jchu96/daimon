@@ -21,6 +21,8 @@ from typing import Literal
 import httpx
 from fastapi import HTTPException, status
 
+from notebook_host.jail import SlugPaths
+
 _log = logging.getLogger(__name__)
 
 _SLUG_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -150,43 +152,44 @@ def _make_preexec(
     return _apply
 
 
-def _prepare_workspace(file_path: Path, slug: str) -> Path:
-    """Create ``<slug>_workspace/`` next to ``file_path`` and wire its symlinks.
+def _prepare_workspace(paths: SlugPaths) -> Path:
+    """Create ``paths.workspace`` and wire its symlinks, entirely inside ``paths.root``.
 
-    Layout (under ``file_path.parent``):
-        <slug>.py                    — source file (caller-owned)
-        <slug>.data/                 — data dir for attachments
-        <slug>_workspace/            — marimo cwd
-            data        -> ../<slug>.data
-            <slug>.py   -> ../<slug>.py
+    Layout (under ``paths.root``):
+        notebook.py   — source file (caller-owned)
+        data/         — data dir for attachments
+        workspace/    — marimo cwd
+            data        -> ../data
+            notebook.py -> ../notebook.py
+
+    Both symlink targets stay inside ``paths.root`` — nothing in a live
+    workspace resolves above the slug's own directory, unlike the old flat
+    layout's ``../<slug>.data`` / ``../<slug>.py`` targets, which pointed into
+    the shared ``data_dir`` and reached every other slug's files.
 
     Idempotent: stale links/files are replaced so a mid-spawn crash doesn't
     wedge the next attempt.
     """
-    data_dir_parent = file_path.parent
-    slug_data_dir = data_dir_parent / f"{slug}.data"
-    slug_data_dir.mkdir(parents=True, exist_ok=True)
-
-    workspace = data_dir_parent / f"{slug}_workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
+    paths.data.mkdir(parents=True, exist_ok=True)
+    paths.workspace.mkdir(parents=True, exist_ok=True)
 
     # Relative symlinks so the workspace dir is location-independent.
-    data_link = workspace / "data"
-    source_link = workspace / file_path.name  # e.g. "<slug>.py"
+    data_link = paths.workspace / "data"
+    source_link = paths.workspace / paths.notebook.name  # "notebook.py"
     targets: tuple[tuple[Path, Path], ...] = (
-        (data_link, Path("..") / f"{slug}.data"),
-        (source_link, Path("..") / file_path.name),
+        (data_link, Path("..") / "data"),
+        (source_link, Path("..") / paths.notebook.name),
     )
     for link, target in targets:
         if link.is_symlink() or link.exists():
             link.unlink()
         link.symlink_to(target)
-    return workspace
+    return paths.workspace
 
 
 def spawn_marimo(
     slug: str,
-    file_path: Path,
+    paths: SlugPaths,
     port: int,
     *,
     mode: Literal["edit", "run"] = "edit",
@@ -196,11 +199,12 @@ def spawn_marimo(
 ) -> subprocess.Popen[bytes]:
     """Spawn ``marimo <mode> <basename>`` on ``port`` from a per-slug workspace.
 
-    cwd is the workspace dir, so the basename arg resolves through the source
-    symlink. ``--base-url /n/<slug>`` keeps the proxy a straight passthrough.
-    ``start_new_session`` isolates the child's process group; env is scrubbed
-    so notebook code can't read the admin bearer; RLIMIT_AS/CPU (Linux) cap
-    runaway notebooks (inherited by the sandbox's re-exec'd descendants).
+    cwd is ``paths.workspace``, so the basename arg resolves through the
+    source symlink. ``--base-url /n/<slug>`` keeps the proxy a straight
+    passthrough. ``start_new_session`` isolates the child's process group;
+    env is scrubbed so notebook code can't read the admin bearer; RLIMIT_AS/CPU
+    (Linux) cap runaway notebooks (inherited by the sandbox's re-exec'd
+    descendants).
 
     ``sandbox`` adds ``--sandbox``, which makes marimo install the notebook's
     PEP 723 ``dependencies`` into an isolated uv venv — the only way a notebook
@@ -211,12 +215,12 @@ def spawn_marimo(
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv not on PATH")
-    workspace = _prepare_workspace(file_path, slug)
+    workspace = _prepare_workspace(paths)
     cmd = [uv, "run", "--with", "marimo", "marimo", mode]
     if sandbox:
         cmd.append("--sandbox")
     cmd += [
-        file_path.name,
+        paths.notebook.name,
         "--no-token",
         "--headless",
         "--host",
@@ -226,7 +230,7 @@ def spawn_marimo(
         "--base-url",
         f"/n/{slug}",
     ]
-    log_path = file_path.parent / f"{slug}.marimo.log"
+    log_path = paths.log
     log_fh = open(log_path, "ab")  # noqa: SIM115 — owned by subprocess
     preexec = _make_preexec(rlimit_as_bytes, rlimit_cpu_seconds)
     if preexec is None and sys.platform != "linux" and (rlimit_as_bytes or rlimit_cpu_seconds):
@@ -298,7 +302,7 @@ def _extract_cell_errors(output: str) -> list[str]:
 
 def validate_notebook(
     slug: str,
-    file_path: Path,
+    paths: SlugPaths,
     *,
     timeout_s: float,
     sandbox: bool = False,
@@ -329,13 +333,13 @@ def validate_notebook(
     uv = shutil.which("uv")
     if uv is None:
         raise RuntimeError("uv not on PATH")
-    workspace = _prepare_workspace(file_path, slug)
+    workspace = _prepare_workspace(paths)
     preexec = _make_preexec(rlimit_as_bytes, rlimit_cpu_seconds)
     with tempfile.TemporaryDirectory() as tmp:
         cmd = [uv, "run", "--with", "marimo", "marimo", "export", "html"]
         if sandbox:
             cmd.append("--sandbox")
-        cmd += [file_path.name, "-o", str(Path(tmp) / "check.html")]
+        cmd += [paths.notebook.name, "-o", str(Path(tmp) / "check.html")]
         try:
             proc = subprocess.run(  # noqa: S603
                 cmd,

@@ -15,7 +15,6 @@ import logging
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -23,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from notebook_host.admin import AdminState, create_admin_router
 from notebook_host.blogs_store import load_blogs
 from notebook_host.config import Settings
+from notebook_host.jail import SlugPaths, ensure_slug_jail, remove_slug_tree
 from notebook_host.lifecycle import (
     NotebookProcess,
     ValidationResult,
@@ -48,24 +48,24 @@ def create_app(settings: Settings) -> FastAPI:
     # the same mode as the spawn, so both read the on-disk source (already
     # written by the PUT handler) through the same detector.
     def _spawner(
-        slug: str, file_path: Path, port: int, *, mode: Literal["edit", "run"] = "edit"
+        slug: str, paths: SlugPaths, port: int, *, mode: Literal["edit", "run"] = "edit"
     ) -> subprocess.Popen[bytes]:
         return spawn_marimo(
             slug,
-            file_path,
+            paths,
             port,
             mode=mode,
-            sandbox=has_inline_script_metadata(file_path.read_text(encoding="utf-8")),
+            sandbox=has_inline_script_metadata(paths.notebook.read_text(encoding="utf-8")),
             rlimit_as_bytes=settings.marimo_rlimit_as_bytes or None,
             rlimit_cpu_seconds=settings.marimo_rlimit_cpu_seconds or None,
         )
 
-    def _validator(slug: str, file_path: Path) -> ValidationResult:
+    def _validator(slug: str, paths: SlugPaths) -> ValidationResult:
         return validate_notebook(
             slug,
-            file_path,
+            paths,
             timeout_s=settings.validation_timeout_seconds,
-            sandbox=has_inline_script_metadata(file_path.read_text(encoding="utf-8")),
+            sandbox=has_inline_script_metadata(paths.notebook.read_text(encoding="utf-8")),
             rlimit_as_bytes=settings.marimo_rlimit_as_bytes or None,
             rlimit_cpu_seconds=settings.marimo_rlimit_cpu_seconds or None,
         )
@@ -115,21 +115,22 @@ def create_app(settings: Settings) -> FastAPI:
 async def _spawn_blog_process(state: AdminState, slug: str) -> bool:
     """Spawn a registered blog in run mode and track it. Returns True on success.
 
-    Source must already exist on the persistent volume at ``data_dir/<slug>.py``.
-    Used by boot respawn and the sweep's self-heal. A failure (missing source,
-    pool exhausted, spawn timeout) logs and returns False — callers must not let
-    one bad blog abort their loop. The caller is responsible for popping any
-    stale entry for ``slug`` before calling (so its port frees up for reuse).
+    Source must already exist on the persistent volume at
+    ``data_dir/<slug>/notebook.py``. Used by boot respawn and the sweep's
+    self-heal. A failure (missing source, pool exhausted, spawn timeout) logs
+    and returns False — callers must not let one bad blog abort their loop.
+    The caller is responsible for popping any stale entry for ``slug`` before
+    calling (so its port frees up for reuse).
     """
-    path = state.settings.data_dir / f"{slug}.py"
-    if not path.exists():
-        _log.warning("blog %r has no source at %s; skipping respawn", slug, path)
+    paths = ensure_slug_jail(state.settings.data_dir, slug)
+    if not paths.notebook.exists():
+        _log.warning("blog %r has no source at %s; skipping respawn", slug, paths.notebook)
         return False
     try:
         port = allocate_port(
             state.processes, state.settings.marimo_port_start, state.settings.marimo_port_end
         )
-        proc = state.spawner(slug, path, port, mode="run")
+        proc = state.spawner(slug, paths, port, mode="run")
     except HTTPException as err:
         _log.warning("blog %r respawn could not start: %s", slug, err.detail)
         return False
@@ -163,8 +164,10 @@ async def _sweep_once(state: AdminState) -> bool:
     """One sweep pass. Returns True if it mutated state.processes.
 
     Blogs (run mode): never age-reaped; a dead one is respawned from disk
-    (self-heal). Ephemeral notebooks (edit mode): reaped + source-deleted when
-    should_reap is true.
+    (self-heal). Ephemeral notebooks (edit mode): reaped + their whole slug
+    tree (source, attachments, workspace, log) removed when should_reap is
+    true — the background sweep and the two delete endpoints share identical
+    cleanup semantics by construction.
     """
     mutated = False
     for slug in list(state.processes.keys()):
@@ -180,7 +183,7 @@ async def _sweep_once(state: AdminState) -> bool:
             continue
         kill(np)
         state.processes.pop(slug, None)
-        (state.settings.data_dir / f"{slug}.py").unlink(missing_ok=True)
+        remove_slug_tree(state.settings.data_dir, slug)
         mutated = True
     # Self-heal any registered blog that isn't currently running. This covers a
     # respawn that failed earlier (popped from state.processes but still in the

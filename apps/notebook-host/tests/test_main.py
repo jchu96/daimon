@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from notebook_host.jail import SlugPaths, get_slug_paths
 
 pytestmark = pytest.mark.asyncio
 
 
 def _make_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, alive: bool = True
-) -> tuple[Any, list[tuple[str, Path, int, str]]]:
+) -> tuple[Any, list[tuple[str, SlugPaths, int, str]]]:
     """AdminState with a mode-recording stub spawner + monkeypatched wait_for_port."""
     import notebook_host.main as main_mod
     from notebook_host.admin import AdminState
@@ -27,12 +28,12 @@ def _make_state(
     monkeypatch.setenv("DAIMON_NOTEBOOK__SPAWN_TIMEOUT_SECONDS", "2.0")
     settings = load_settings(_env_file=None)
 
-    calls: list[tuple[str, Path, int, str]] = []
+    calls: list[tuple[str, SlugPaths, int, str]] = []
 
     def spawner(
-        slug: str, file_path: Path, port: int, *, mode: str = "edit"
+        slug: str, paths: SlugPaths, port: int, *, mode: str = "edit"
     ) -> subprocess.Popen[bytes]:
-        calls.append((slug, file_path, port, mode))
+        calls.append((slug, paths, port, mode))
         proc: unittest.mock.MagicMock = unittest.mock.MagicMock(spec=subprocess.Popen)
         proc.poll.return_value = None if alive else 0
         proc.pid = 7777
@@ -53,7 +54,9 @@ async def test_respawn_registered_blogs_spawns_run_mode_from_disk(
     from notebook_host.main import _respawn_registered_blogs  # pyright: ignore[reportPrivateUsage]
 
     state, calls = _make_state(tmp_path, monkeypatch)
-    (tmp_path / "pre-radar.py").write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
+    paths = get_slug_paths(tmp_path, "pre-radar")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
     register_blog(tmp_path / "blogs.json", BlogRecord(slug="pre-radar", created_at=1.0))
 
     respawned = await _respawn_registered_blogs(state)
@@ -85,7 +88,9 @@ async def test_sweep_once_respawns_dead_blog(
     from notebook_host.main import _sweep_once  # pyright: ignore[reportPrivateUsage]
 
     state, calls = _make_state(tmp_path, monkeypatch, alive=True)
-    (tmp_path / "pre-radar.py").write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
+    paths = get_slug_paths(tmp_path, "pre-radar")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
     # Place a DEAD run-mode process directly in state to simulate a crashed kernel.
     dead = state.make_process(
         "pre-radar",
@@ -108,14 +113,48 @@ async def test_sweep_once_reaps_dead_edit_notebook(
     from notebook_host.main import _sweep_once  # pyright: ignore[reportPrivateUsage]
 
     state, _calls = _make_state(tmp_path, monkeypatch)
-    (tmp_path / "ephemeral.py").write_text("# x", encoding="utf-8")
+    paths = get_slug_paths(tmp_path, "ephemeral")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# x", encoding="utf-8")
     dead = state.make_process("ephemeral", 8601, _dead_proc(), mode="edit")
     state.processes["ephemeral"] = dead
 
     await _sweep_once(state)
 
     assert "ephemeral" not in state.processes, "a dead edit-mode notebook must still be reaped"
-    assert not (tmp_path / "ephemeral.py").exists(), "reaping an edit notebook deletes its source"
+    assert not paths.notebook.exists(), "reaping an edit notebook deletes its source"
+
+
+async def test_sweep_once_removes_attachments_and_workspace_when_reaping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The background sweep's reap branch removes the whole slug tree, not just the source.
+
+    Pins the closed MEDIUM finding: the old reap branch only unlinked the
+    source, leaking attachments and the workspace on the persistent volume
+    forever once the slug was popped from state.processes.
+    """
+    from notebook_host.main import _sweep_once  # pyright: ignore[reportPrivateUsage]
+
+    state, _calls = _make_state(tmp_path, monkeypatch)
+    paths = get_slug_paths(tmp_path, "leaky")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# x", encoding="utf-8")
+    paths.data.mkdir(parents=True, exist_ok=True)
+    (paths.data / "big.nc").write_bytes(b"a" * 1024)
+    paths.workspace.mkdir(parents=True, exist_ok=True)
+    (paths.workspace / "data").symlink_to(Path("..") / "data")
+    (paths.workspace / "notebook.py").symlink_to(Path("..") / "notebook.py")
+
+    dead = state.make_process("leaky", 8602, _dead_proc(), mode="edit")
+    state.processes["leaky"] = dead
+
+    await _sweep_once(state)
+
+    assert "leaky" not in state.processes, "a dead edit-mode notebook must be reaped"
+    assert paths.root.exists() is False, (
+        "the whole slug tree — source, attachment, and workspace — must be gone after one sweep"
+    )
 
 
 async def test_sweep_once_reconciles_registered_blog_missing_from_processes(
@@ -125,7 +164,9 @@ async def test_sweep_once_reconciles_registered_blog_missing_from_processes(
     from notebook_host.main import _sweep_once  # pyright: ignore[reportPrivateUsage]
 
     state, calls = _make_state(tmp_path, monkeypatch)
-    (tmp_path / "pre-orphan.py").write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
+    paths = get_slug_paths(tmp_path, "pre-orphan")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
     # Registered in blogs.json, but NOT in state.processes (a prior respawn failed).
     register_blog(tmp_path / "blogs.json", BlogRecord(slug="pre-orphan", created_at=1.0))
     assert "pre-orphan" not in state.processes
