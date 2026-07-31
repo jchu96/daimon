@@ -156,6 +156,70 @@ async def unset_fields(
         await session.flush()
 
 
+async def clear_agent_references(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent_name: str,
+) -> int:
+    """Clear every channel- and tenant-scope row in one tenant that names an agent.
+
+    Called when an agent goes away (deleted or archived). A scope row still
+    naming a dead agent makes resolution fail for that channel — or, for the
+    tenant row, for the whole install — until someone re-scopes by hand.
+    Clearing the name lets the cascade fall through to the next tier.
+
+    Every mutation is delegated to `unset_fields` rather than issued as a bulk
+    UPDATE, because `unset_fields` already owns the two rules that matter here:
+    a row whose config fields all become NULL is removed outright, and a row
+    carrying mode='user_active' survives the clear because that mode IS the
+    propagation. Agent deletion is a rare admin action, so the per-row loop
+    costs nothing worth optimizing away.
+
+    `user_config` is deliberately left alone: `resolve()` never consults the
+    user tier, so clearing it would change nothing observable.
+
+    Returns the number of scope rows cleared. The caller owns the transaction.
+    """
+    # Materialize the channel ids before mutating: unset_fields may remove rows,
+    # so iterating a live result set while it writes would be wrong.
+    channel_ids: list[str] = list(
+        (
+            await session.execute(
+                select(ChannelConfig.channel_id).where(
+                    ChannelConfig.tenant_id == tenant_id,
+                    ChannelConfig.agent_name == agent_name,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    tenant_row_matches = (
+        await session.execute(
+            select(TenantConfig.tenant_id).where(
+                TenantConfig.tenant_id == tenant_id,
+                TenantConfig.agent_name == agent_name,
+            )
+        )
+    ).scalar_one_or_none() is not None
+
+    for channel_id in channel_ids:
+        await unset_fields(
+            session,
+            scope=ChannelScopeRef(tenant_id=tenant_id, channel_id=channel_id),
+            fields=["agent_name"],
+        )
+    if tenant_row_matches:
+        await unset_fields(
+            session,
+            scope=TenantScopeRef(tenant_id=tenant_id),
+            fields=["agent_name"],
+        )
+
+    return len(channel_ids) + (1 if tenant_row_matches else 0)
+
+
 async def delete_propagation_row(
     session: AsyncSession,
     *,
