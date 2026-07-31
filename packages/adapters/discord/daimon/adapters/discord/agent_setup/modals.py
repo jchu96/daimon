@@ -16,7 +16,7 @@ Four modals are added on top of the Plan-03 lifecycle modals:
 from __future__ import annotations
 
 import asyncio
-import time
+from datetime import UTC, datetime
 
 import httpx
 import structlog
@@ -35,7 +35,6 @@ from daimon.adapters.discord.agent_setup.write import (
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
-from daimon.core.github_repo_auth import is_app_installed_for_repo
 from daimon.core.github_visibility import (
     is_public_repo,
     is_valid_pat,
@@ -43,6 +42,7 @@ from daimon.core.github_visibility import (
 )
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.stores.agent_repo_binding import set_binding as set_agent_repo_binding
+from daimon.core.stores.domain import RepoAccessProof
 
 import discord
 
@@ -312,6 +312,8 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
             else:
                 pat_last4: str | None = None
                 ma_secret_ref: str
+                proof: RepoAccessProof
+                now = datetime.now(UTC)
                 if pat:
                     # Verify the pasted PAT actually grants access to this repo BEFORE
                     # binding. Otherwise a guild could bind a repo it does not control
@@ -337,6 +339,7 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                         plaintext_pat=pat,
                     )
                     pat_last4 = pat[-4:]
+                    proof = RepoAccessProof(kind="pat", at=now, account_id=self.state.account_id)
                 else:
                     owner_repo = _owner_repo_from_url(url)
                     # A blank PAT field does NOT mean "no inline PAT will
@@ -365,53 +368,34 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                         # The stored PAT covers this repo -> it (not App/public) is
                         # what will clone it, so record that ref and skip both probes.
                         ma_secret_ref = f"inline-pat:{agent_uuid}"
+                        proof = RepoAccessProof(
+                            kind="pat", at=now, account_id=self.state.account_id
+                        )
                     else:
-                        # No inline PAT -> probe GitHub App coverage first. If the
-                        # App is installed on the repo owner, App mode will clone it
-                        # (public or private) without the operator fallback PAT, so the
-                        # public-only visibility check is unnecessary. A probe failure
-                        # must never block the bind (T-97-12) -- it degrades to the
-                        # existing public-repo check, same as an App-less deployment.
-                        owner, repo_name = owner_repo.split("/", 1)
-                        app_covered = False
+                        # No inline PAT -> a bind with no token can only be trusted
+                        # against a repo anyone can read, because the only credential
+                        # that will ever clone this binding afterward is the
+                        # operator's public-read-only fallback PAT. GitHub App
+                        # installation is irrelevant here: an App is installed by a
+                        # repo owner for their own tenant, and its installation is
+                        # keyed by repo, not by the tenant doing the binding here —
+                        # so App coverage proves nothing about whether THIS binder
+                        # may read the repo. Always probe public visibility instead.
                         async with httpx.AsyncClient() as http_client:
-                            try:
-                                app_covered = await is_app_installed_for_repo(
-                                    http_client,
-                                    app_id=self.runtime.settings.github.app_id,
-                                    app_private_key=self.runtime.settings.github.app_private_key,
-                                    owner=owner,
-                                    repo=repo_name,
-                                    now=int(time.time()),
-                                )
-                            except Exception:  # noqa: BLE001 -- T-97-12: a coverage probe is best-effort UI; ANY failure (HTTP, or a malformed App key raising from build_app_jwt) must degrade to the public-repo check, never block the bind.
-                                _log.warning(
-                                    "agent_setup.repo_auth.app_coverage_probe_failed",
-                                    agent_name=agent_name,
-                                    repo_url=url,
-                                )
-                                coverage_note = "Couldn't verify App coverage."
-                            if app_covered:
-                                coverage_note = (
-                                    "✅ App-covered (clones via the configured GitHub App)"
-                                )
-                            else:
-                                # No App coverage (or unverifiable) -> the only remaining
-                                # clone token will be the operator fallback PAT, which is
-                                # public-only. Verify the repo is public BEFORE writing an
-                                # anon: binding, so a private repo can never be cloned
-                                # cross-tenant with the operator token.
-                                public = await is_public_repo(http_client, owner_repo=owner_repo)
-                                if not public:
-                                    raise DaimonError(
-                                        "This repo isn't visible to the shared service account "
-                                        "(it's private, or it doesn't exist) — paste a PAT or "
-                                        "connect your GitHub to bind it."
-                                    )
+                            public = await is_public_repo(http_client, owner_repo=owner_repo)
+                        if not public:
+                            raise DaimonError(
+                                "This repo isn't publicly readable (it's private, or it "
+                                "doesn't exist) — paste a GitHub token that can read it "
+                                "to bind it."
+                            )
                         # No inline PAT -> no per-agent credential is written. The resync
                         # path is agent-overlay-only and never consults a principal-default, so
                         # mark the ref as anonymous rather than implying a fallback exists.
                         ma_secret_ref = "anon:"
+                        proof = RepoAccessProof(
+                            kind="public", at=now, account_id=self.state.account_id
+                        )
 
                 # Persist binding via the dedicated store.
                 async with self.runtime.sessionmaker.begin() as session:
@@ -422,6 +406,7 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                         repo_url=url,
                         default_branch=branch,
                         ma_secret_ref=ma_secret_ref,
+                        proof=proof,
                     )
 
                 self.state.apply_repo_modal(url=url, branch=branch, pat_last4=pat_last4)
