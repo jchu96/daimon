@@ -247,6 +247,15 @@ class RepoAuthModal(discord.ui.Modal, title="GitHub — repo pin + token"):
                 "Enter a repo URL, a GitHub token, or both.", ephemeral=True
             )
             return
+        # Submit time is the boundary: a modal opened before the caller lost
+        # Manage Server must not write. Runs before defer() so the refusal owns
+        # the first response, and before the log line below so a refused
+        # submission leaves no record of the masked token or of a repo URL the
+        # caller had no authority to bind.
+        if await authz.refuse_if_shared_and_not_admin(
+            interaction, runtime=self.runtime, entry=self.state.selected
+        ):
+            return
         _log.info(
             "agent_setup.repo_auth.submit",
             agent_name=agent_name,
