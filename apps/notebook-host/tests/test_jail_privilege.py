@@ -32,8 +32,16 @@ import time
 from pathlib import Path
 
 import pytest
-from notebook_host.jail import build_jailed_preexec, ensure_slug_jail
+from notebook_host.blogs_store import BlogRecord, save_blogs
+from notebook_host.jail import (
+    DATA_DIR_MODE,
+    build_jailed_preexec,
+    ensure_slug_jail,
+    lock_data_dir_root,
+    save_uid_registry,
+)
 from notebook_host.lifecycle import scrub_env
+from notebook_host.pids_store import save_pids
 
 _UID_A = 100001
 _UID_B = 100002
@@ -94,8 +102,15 @@ def test_child_drops_to_uid_gid_and_clears_supplementary_groups(tmp_path: Path) 
 @pytest.mark.slow
 @pytest.mark.skipif(os.geteuid() != 0, reason="uid drop requires root")
 def test_own_subtree_reachable_via_relative_path(tmp_path: Path) -> None:
-    """With cwd inside its own workspace, a jailed process can read its own data/ via a relative path."""
+    """With cwd inside its own workspace, a jailed process can read its own data/ via a relative path.
+
+    ``data_dir`` (``tmp_path``) is locked to the real production mode
+    (``DATA_DIR_MODE`` / 0711) here, not left at whatever the pytest fixture
+    happens to default to — this proves reachability against the actual
+    constraint a dropped uid faces in production, not an accidental one.
+    """
     paths = ensure_slug_jail(tmp_path, "slug-a", uid=_UID_A)
+    lock_data_dir_root(tmp_path)
     seeded = paths.data / "x.txt"
     seeded.write_bytes(b"hello-from-a")
     os.chown(seeded, _UID_A, _UID_A)
@@ -112,17 +127,50 @@ def test_own_subtree_reachable_via_relative_path(tmp_path: Path) -> None:
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.geteuid() != 0, reason="uid drop requires root")
+def test_own_subtree_reachable_via_absolute_path(tmp_path: Path) -> None:
+    """A jailed process can reach its own subtree by ABSOLUTE path, under the real data_dir mode.
+
+    This is the exact property plan 05's live rehearsal found broken: under
+    the old (incorrect) ``data_dir`` mode of 0700, resolving an absolute path
+    requires the ``x`` bit on every component, so a dropped uid could not
+    even reach its OWN ``HOME`` — every non-break-glass ``uv run`` spawn
+    failed. Testing only cross-slug denial (as this module did before) let
+    that unusable jail look correct; this test defends the other half.
+    """
+    paths = ensure_slug_jail(tmp_path, "slug-a", uid=_UID_A)
+    lock_data_dir_root(tmp_path)
+    seeded = paths.home / "x.txt"
+    seeded.write_bytes(b"hello-from-a-home")
+    os.chown(seeded, _UID_A, _UID_A)
+    os.chmod(seeded, 0o600)
+
+    code = _READ_CODE.format(path=str(seeded))
+    result = _run_as_uid(_UID_A, code)  # no cwd inside the tree — pure absolute resolution
+    assert result.returncode == 0, f"child should exit cleanly; stderr={result.stderr}"
+    body = json.loads(result.stdout)
+    assert body.get("data") == "hello-from-a-home", (
+        f"own-subtree absolute-path read should succeed and return the seeded bytes, got {body}"
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.geteuid() != 0, reason="uid drop requires root")
 def test_cross_slug_relative_escape_denied(tmp_path: Path) -> None:
-    """A relative '..' traversal into a sibling slug's data is denied."""
+    """A relative '..' traversal into a sibling slug's data is denied.
+
+    ``data_dir`` is locked to the real production mode (0711, traversable)
+    here, not the old incorrect 0700 — this proves the denial comes from
+    ``slug-b``'s own 0700 boundary, which is the actual isolation mechanism,
+    not from an accidentally-untraversable parent.
+    """
     paths_a = ensure_slug_jail(tmp_path, "slug-a", uid=_UID_A)
     paths_b = ensure_slug_jail(tmp_path, "slug-b", uid=_UID_B)
     secret = paths_b.data / "secret.txt"
     secret.write_bytes(b"top-secret")
     os.chown(secret, _UID_B, _UID_B)
     os.chmod(secret, 0o600)
-    # data_dir itself is the 0700 root:root boundary every slug root sits under.
     os.chown(tmp_path, 0, 0)
-    os.chmod(tmp_path, 0o700)
+    lock_data_dir_root(tmp_path)
 
     code = _READ_CODE.format(path="../../slug-b/data/secret.txt")
     result = _run_as_uid(_UID_A, code, cwd=str(paths_a.workspace))
@@ -136,7 +184,15 @@ def test_cross_slug_relative_escape_denied(tmp_path: Path) -> None:
 @pytest.mark.slow
 @pytest.mark.skipif(os.geteuid() != 0, reason="uid drop requires root")
 def test_cross_slug_absolute_escape_denied(tmp_path: Path) -> None:
-    """An absolute-path read into a sibling slug's data is denied — same wall as the relative case."""
+    """An absolute-path read into a sibling slug's data is denied — same wall as the relative case.
+
+    ``data_dir`` is locked to the real production mode (0711, traversable) —
+    an absolute path CAN resolve through it, but ``slug-b``'s own 0700
+    boundary still denies the read. This is the case plan 05's rehearsal
+    proved broken under the old 0700 parent mode (nothing could resolve
+    ANY absolute path through it, own subtree included); this test proves
+    the corrected mode still holds the cross-slug wall.
+    """
     paths_a = ensure_slug_jail(tmp_path, "slug-a", uid=_UID_A)
     paths_b = ensure_slug_jail(tmp_path, "slug-b", uid=_UID_B)
     secret = paths_b.data / "secret.txt"
@@ -144,7 +200,7 @@ def test_cross_slug_absolute_escape_denied(tmp_path: Path) -> None:
     os.chown(secret, _UID_B, _UID_B)
     os.chmod(secret, 0o600)
     os.chown(tmp_path, 0, 0)
-    os.chmod(tmp_path, 0o700)
+    lock_data_dir_root(tmp_path)
 
     code = _READ_CODE.format(path=str(secret))
     result = _run_as_uid(_UID_A, code, cwd=str(paths_a.workspace))
@@ -158,26 +214,36 @@ def test_cross_slug_absolute_escape_denied(tmp_path: Path) -> None:
 @pytest.mark.slow
 @pytest.mark.skipif(os.geteuid() != 0, reason="uid drop requires root")
 def test_registry_files_unreachable(tmp_path: Path) -> None:
-    """blogs.json and uids.json — host-owned state outside every jail — are unreadable by a jailed uid."""
+    """blogs.json/pids.json/uids.json are unreadable by a jailed uid, by their OWN mode.
+
+    ``data_dir`` is locked to the real production mode (0711, traversable) —
+    the old test locked it to 0700, which made this assertion pass for the
+    wrong reason (an untraversable parent, not the file's own mode). The
+    files are written through the real production save_* functions rather
+    than hand-authored, so this also proves those functions actually emit
+    0600 on disk, not merely that a manually-chmod'ed file would be denied.
+    """
     paths_a = ensure_slug_jail(tmp_path, "slug-a", uid=_UID_A)
     blogs = tmp_path / "blogs.json"
+    pids = tmp_path / "pids.json"
     uids = tmp_path / "uids.json"
-    blogs.write_text("{}", encoding="utf-8")
-    uids.write_text("{}", encoding="utf-8")
-    os.chown(blogs, 0, 0)
-    os.chown(uids, 0, 0)
-    os.chmod(blogs, 0o600)
-    os.chmod(uids, 0o600)
+    save_blogs(blogs, {"slug-a": BlogRecord(slug="slug-a", created_at=1.0)})
+    save_pids(pids, {})
+    save_uid_registry(uids, {"slug-a": _UID_A})
     os.chown(tmp_path, 0, 0)
-    os.chmod(tmp_path, 0o700)
+    lock_data_dir_root(tmp_path)
 
-    for registry_path in (blogs, uids):
+    for registry_path in (blogs, pids, uids):
+        assert registry_path.stat().st_mode & 0o777 == 0o600, (
+            f"{registry_path.name} must actually be written at mode 0600 by the real save path"
+        )
         code = _READ_CODE.format(path=str(registry_path))
         result = _run_as_uid(_UID_A, code, cwd=str(paths_a.workspace))
         assert result.returncode == 0, f"child should exit cleanly; stderr={result.stderr}"
         body = json.loads(result.stdout)
         assert body.get("error") == "PermissionError", (
-            f"{registry_path.name} must be unreadable by a jailed uid, got {body}"
+            f"{registry_path.name} must be unreadable by a jailed uid via its own mode "
+            f"(data_dir is traversable at {oct(DATA_DIR_MODE)}), got {body}"
         )
 
 
@@ -215,12 +281,18 @@ def test_uv_and_marimo_run_under_the_dropped_uid(tmp_path: Path) -> None:
     """uv run --with marimo actually works under a dropped uid, given a per-slug HOME.
 
     This is the single most important test in the phase — it is the thing
-    that was predicted to sink the whole mechanism (CONTEXT.md D-02).
+    that was predicted to sink the whole mechanism (CONTEXT.md D-02), and the
+    thing plan 05's real-container rehearsal proved WAS broken: this test did
+    not lock ``data_dir`` to its real production mode, so it validated `uv`
+    against a permission state production never actually has. It now calls
+    ``lock_data_dir_root`` (the exact function ``migration.py`` calls on every
+    boot) before spawning, closing that gap.
     """
     uv = shutil.which("uv")
     if uv is None:
         pytest.skip("uv not on PATH")
     paths = ensure_slug_jail(tmp_path, "slug-a", uid=_UID_A)
+    lock_data_dir_root(tmp_path)
     env = scrub_env(dict(os.environ))
     env["HOME"] = str(paths.home)
 

@@ -322,3 +322,53 @@ def test_build_jailed_preexec_returns_a_callable_for_any_uid() -> None:
 
     preexec = build_jailed_preexec(1000, rlimit_as_bytes=None, rlimit_cpu_seconds=None)
     assert callable(preexec), "build_jailed_preexec must always return a callable"
+
+
+# ─── target mode set: 0711 parent / 0600 registries / 0700 slug tree ─────────
+#
+# The root-gated tests in test_jail_privilege.py prove these modes actually
+# enforce the isolation boundary (uid drops require CAP_SETUID, unavailable
+# in default CI), but they never run unprivileged. This test defends the
+# mode VALUES themselves without root, so a regression — parent mode drift,
+# a registry write reverting to the default umask, an accidental change to
+# the slug tree mode — fails in the default suite rather than only under a
+# root-gated run that never executes in CI.
+
+
+def test_data_dir_slug_tree_and_registry_modes_match_the_documented_target(tmp_path: Path) -> None:
+    """Non-root proof of the corrected mode set, using the real production write paths."""
+    from notebook_host.blogs_store import BlogRecord, save_blogs
+    from notebook_host.jail import (
+        DATA_DIR_MODE,
+        SLUG_TREE_MODE,
+        ensure_slug_jail,
+        lock_data_dir_root,
+        save_uid_registry,
+    )
+    from notebook_host.pids_store import save_pids
+
+    paths = ensure_slug_jail(tmp_path, "abc")
+    lock_data_dir_root(tmp_path)
+
+    blogs = tmp_path / "blogs.json"
+    pids = tmp_path / "pids.json"
+    uids = tmp_path / "uids.json"
+    save_blogs(blogs, {"abc": BlogRecord(slug="abc", created_at=1.0)})
+    save_pids(pids, {})
+    save_uid_registry(uids, {"abc": 100000})
+
+    assert DATA_DIR_MODE == 0o711, "the documented parent mode constant must be 0711"
+    assert tmp_path.stat().st_mode & 0o777 == 0o711, (
+        "data_dir must be locked to 0711 — traversable by any uid, listable by none"
+    )
+    assert SLUG_TREE_MODE == 0o700, (
+        "the documented slug tree mode constant must be unchanged at 0700"
+    )
+    for d in (paths.root, paths.data, paths.workspace, paths.home):
+        assert d.stat().st_mode & 0o777 == 0o700, (
+            f"{d} must remain the real 0700 isolation boundary"
+        )
+    for registry in (blogs, pids, uids):
+        assert registry.stat().st_mode & 0o777 == 0o600, (
+            f"{registry.name} must be written at mode 0600, not the default-umask mode"
+        )

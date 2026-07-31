@@ -87,7 +87,9 @@ def test_migrate_untouched_flat_tree_converges_and_second_call_is_noop(tmp_path:
     assert json.loads((tmp_path / "pids.json").read_text()) == pids_payload, (
         "pids.json must never be treated as a slug and must be left byte-identical"
     )
-    assert tmp_path.stat().st_mode & 0o777 == 0o700, "data_dir itself must be locked to 0700"
+    assert tmp_path.stat().st_mode & 0o777 == 0o711, (
+        "data_dir itself must be locked to 0711 (traversable, not listable)"
+    )
     for d in (
         tmp_path / "a",
         tmp_path / "a" / "data",
