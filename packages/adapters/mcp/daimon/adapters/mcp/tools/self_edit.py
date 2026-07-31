@@ -80,9 +80,15 @@ def _require_agent_id(auth: AuthIdentity) -> uuid.UUID:
     return auth.agent_id
 
 
-async def _vault_id_for_account(client: AsyncAnthropic, account_id: uuid.UUID) -> str:
-    """Return the per-account daimon-mcp vault id (mirrors tools/vault.py)."""
-    display_name = f"daimon-mcp:{account_id}"
+async def _vault_id_for_agent(
+    client: AsyncAnthropic, *, account_id: uuid.UUID, agent_id: uuid.UUID
+) -> str:
+    """Return the per-agent daimon-mcp vault id.
+
+    Mirrors the name core provisioning writes when it bootstraps an agent's
+    vault (mirrors tools/vault.py).
+    """
+    display_name = f"daimon-mcp:{account_id}:{agent_id}"
     matching = [v async for v in client.beta.vaults.list() if v.display_name == display_name]
     if not matching:
         raise ToolError(
@@ -222,8 +228,10 @@ async def _set_repo_binding_impl(
         )
         raise ToolError(str(e)) from e
 
-    # 2. Discover per-account vault.
-    vault_id = await _vault_id_for_account(runtime.client, auth.account_id)
+    # 2. Discover per-agent vault.
+    vault_id = await _vault_id_for_agent(
+        runtime.client, account_id=auth.account_id, agent_id=agent_id
+    )
 
     # 3. Capture old ref (separate read session) so we can delete after success.
     async with runtime.session_factory() as session:
@@ -361,7 +369,9 @@ async def _clear_repo_binding_impl(
     # lookup only — if credentials.delete itself ever raised ToolError it would
     # be the wrong outcome label.
     try:
-        vault_id = await _vault_id_for_account(runtime.client, auth.account_id)
+        vault_id = await _vault_id_for_agent(
+            runtime.client, account_id=auth.account_id, agent_id=agent_id
+        )
     except ToolError:
         # No vault for this account — nothing to delete remotely.
         logger.warning(
