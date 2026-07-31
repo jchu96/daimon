@@ -222,13 +222,13 @@ async def test_missing_agent_id_raises(
 _VAULT_ID = "vault_test_1"
 
 
-def _vault_list_response_for(account_id: uuid.UUID) -> dict[str, object]:
+def _vault_list_response_for(account_id: uuid.UUID, agent_id: uuid.UUID) -> dict[str, object]:
     return {
         "data": [
             {
                 "id": _VAULT_ID,
                 "type": "vault",
-                "display_name": f"daimon-mcp:{account_id}",
+                "display_name": f"daimon-mcp:{account_id}:{agent_id}",
                 "created_at": "2026-04-24T00:00:00Z",
                 "updated_at": "2026-04-24T00:00:00Z",
             }
@@ -273,6 +273,7 @@ def _api_error_response(status: int = 500) -> httpx.Response:
 def _make_stub_anthropic_for_vaults(
     *,
     account_id: uuid.UUID,
+    agent_id: uuid.UUID,
     new_cred_id: str = "cred_new_001",
     create_status: int = 200,
     delete_status: int = 204,
@@ -302,7 +303,7 @@ def _make_stub_anthropic_for_vaults(
 
         # GET /v1/vaults (list)
         if method == "GET" and path == "/v1/vaults":
-            return httpx.Response(200, json=_vault_list_response_for(account_id))
+            return httpx.Response(200, json=_vault_list_response_for(account_id, agent_id))
         # POST /v1/vaults/{vault_id}/credentials
         if method == "POST" and cred_path_re.match(path):
             if create_status != 200:
@@ -346,7 +347,7 @@ async def test_set_repo_binding_happy_path(
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
     record: list[tuple[str, str, dict[str, Any]]] = []
     client = _make_stub_anthropic_for_vaults(
-        account_id=account_id, new_cred_id="cred_happy_1", record=record
+        account_id=account_id, agent_id=agent_id, new_cred_id="cred_happy_1", record=record
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
@@ -389,7 +390,9 @@ async def test_set_repo_binding_writes_row_with_new_cred_id(
         return "ghp_TEST_PAT_002"
 
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, new_cred_id=new_id)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, new_cred_id=new_id
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -462,7 +465,9 @@ async def test_clear_repo_binding_removes_row_and_calls_vault_delete(
         )
 
     record: list[tuple[str, str, dict[str, Any]]] = []
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, record=record)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, record=record
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -513,7 +518,9 @@ async def test_clear_repo_binding_swallows_vault_delete_failure(
             ma_secret_ref="cred_will_500",
         )
 
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, delete_status=500)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, delete_status=500
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -542,7 +549,9 @@ async def test_set_repo_binding_vault_failure_leaves_no_row(
         return "ghp_TEST_PAT_FAIL"
 
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
-    client = _make_stub_anthropic_for_vaults(account_id=account_id, create_status=500)
+    client = _make_stub_anthropic_for_vaults(
+        account_id=account_id, agent_id=agent_id, create_status=500
+    )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -588,7 +597,7 @@ async def test_set_repo_binding_db_failure_deletes_new_vault_cred(
 
     record: list[tuple[str, str, dict[str, Any]]] = []
     client = _make_stub_anthropic_for_vaults(
-        account_id=account_id, new_cred_id=new_id, record=record
+        account_id=account_id, agent_id=agent_id, new_cred_id=new_id, record=record
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
@@ -643,6 +652,7 @@ async def test_set_repo_binding_db_failure_cleanup_swallows_anthropic_error(
 
     client = _make_stub_anthropic_for_vaults(
         account_id=account_id,
+        agent_id=agent_id,
         new_cred_id="cred_cleanup_will_500",
         delete_status=500,
     )
@@ -706,7 +716,7 @@ async def test_pat_plaintext_never_in_logs(
         return SENTINEL
 
     monkeypatch.setattr("daimon.adapters.mcp.tools.self_edit.dispatch_mint_token", _fake_mint)
-    client = _make_stub_anthropic_for_vaults(account_id=account_id)
+    client = _make_stub_anthropic_for_vaults(account_id=account_id, agent_id=agent_id)
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
 
@@ -751,7 +761,7 @@ async def test_set_repo_binding_rebind_deletes_old_credential(
     record: list[tuple[str, str, dict[str, Any]]] = []
     new_id = "cred_new_rebind"
     client = _make_stub_anthropic_for_vaults(
-        account_id=account_id, new_cred_id=new_id, record=record
+        account_id=account_id, agent_id=agent_id, new_cred_id=new_id, record=record
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(account_id=account_id, tenant_id=tenant_id, agent_id=agent_id)
