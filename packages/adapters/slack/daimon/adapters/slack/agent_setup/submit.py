@@ -16,10 +16,18 @@ Pattern mirrors ``privacy_panel/submit.py`` exactly — same Decision dataclass
 shape, same evaluate-then-spawn discipline, same boundary catch tuple.
 
 Threat register:
-- Creation (new agent, fork) and per-agent attachments (repo binding, env
-  variables) are open to every workspace member — there is nothing an admin
-  has approved for a brand-new agent, and attachments never enter the agent
-  spec. Configuration that touches the agent spec an admin approved (model,
+- Creation (new agent, fork) is open to every workspace member — there is
+  nothing an admin has approved for a brand-new agent.
+- Per-agent attachments (repo binding, inline token, env variables) never
+  enter the agent spec, so they are exempt from the spec gate's absolutism
+  about defaults-managed agents — an admin configuring the workspace's
+  built-in agent is a supported first-run step. They are NOT open to
+  non-admins on a shared agent: ``run_edit_repo_submission`` and
+  ``run_paste_secrets_submission`` both re-check
+  ``refuse_if_shared_and_not_admin`` fresh, after the ack, before any MA
+  request or store write, because a repo re-point or a secret overwrite
+  changes state every member's turns depend on.
+- Configuration that touches the agent spec an admin approved (model,
   system prompt, skills, MCP servers) re-checks the shared ``agent_setup.gate``
   helper fresh, after the ack, before any MA request or store write.
 - Secret VALUES are validated then passed to the
@@ -1271,14 +1279,33 @@ async def run_paste_secrets_submission(
 ) -> None:
     """Post-ack: write validated secrets to agent_files store.
 
-    Env-variable credentials are a per-agent attachment that never enters
-    the agent spec, so this form is open to every workspace member —
-    including against the workspace's current default agent.
+    Env-variable credentials are a per-agent attachment that never enters the
+    agent spec, so they are exempt from the spec gate's built-in agent
+    absolutism — an admin populating the built-in agent's environment is a
+    supported first-run step. They are refused for a non-admin whenever the
+    target is the built-in agent or a current default, though, because
+    put_agent_file is an upsert and the resulting file is mounted read-write
+    on every session of that shared agent.
     CRITICAL: only key NAMES appear in logs and ephemeral.
     Secret values are consumed here and never propagated further.
     """
     try:
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+        # Ahead of the MA lookup, the pairs read, and every write — so a
+        # refused submission makes no MA request and logs nothing derived from
+        # the submitted pairs.
+        refused = await gate.refuse_if_shared_and_not_admin(
+            runtime,
+            web_client,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            channel_id=channel_id,
+            user_id=user_id,
+            dev_allow_all=_dev_allow_all_admin(runtime),
+        )
+        if refused:
+            return
 
         ma_agent = await find_agent_by_daimon_tag(
             runtime.anthropic, tenant_id=tenant_id, name=agent_name
