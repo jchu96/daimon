@@ -26,6 +26,13 @@ the field it writes is part of the agent spec:
 
 A new mutating control belongs to one of those two sets. Pick its gate from the
 set the field is in, not from the button it happens to sit next to.
+
+The one deliberate exception is `credential_modals.py`, whose write is bounded
+by a single-use `credential_requests` token rather than by guild-admin status:
+the agent asks a specific member for a specific key, and consuming the token is
+what authorizes exactly that one write. It is not reachable from this panel and
+is not an exception you can extend — a control a member reaches by clicking has
+no such token and belongs to one of the two sets above.
 """
 
 from __future__ import annotations
