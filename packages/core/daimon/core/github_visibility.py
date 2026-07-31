@@ -1,8 +1,9 @@
 """GitHub repo public-visibility check for the anon-bind guardrail, plus a
 repo-free PAT identity check for the PAT-only credential path.
 
-Lives in the Discord adapter (not core): core must not import adapters, and the
-bind path is already adapter-side I/O. The operator fallback PAT only clones
+These probes are shared by every bind path — Discord, Slack, the MCP
+self-edit tool, and the operator backfill — which is why they live in core
+rather than under any single adapter. The operator fallback PAT only clones
 ``anon:`` bindings, so an ``anon:`` binding must be verified-public at bind time
 — otherwise a guild could bind a private repo as ``anon:`` and clone it
 cross-tenant with the operator token. ``is_valid_pat`` covers the sibling case

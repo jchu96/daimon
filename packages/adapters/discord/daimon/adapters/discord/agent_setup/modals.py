@@ -32,15 +32,15 @@ from daimon.adapters.discord.agent_setup.write import (
     store_inline_pat,
     validate_model_id,
 )
-from daimon.adapters.discord.github_visibility import (
-    is_public_repo,
-    is_valid_pat,
-    pat_can_access_repo,
-)
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
 from daimon.core.github_repo_auth import is_app_installed_for_repo
+from daimon.core.github_visibility import (
+    is_public_repo,
+    is_valid_pat,
+    pat_can_access_repo,
+)
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.stores.agent_repo_binding import set_binding as set_agent_repo_binding
 
