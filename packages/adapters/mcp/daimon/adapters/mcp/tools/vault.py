@@ -36,11 +36,13 @@ async def _list_credentials_impl(
     client: AsyncAnthropic,
     auth: AuthIdentity,
 ) -> list[VaultCredentialSummary]:
-    display_name = f"daimon-mcp:{auth.account_id}"
+    if auth.agent_id is None:
+        raise ToolError("agent_id missing — token was not minted for an agent session")
+    display_name = f"daimon-mcp:{auth.account_id}:{auth.agent_id}"
     matching = [v async for v in client.beta.vaults.list() if v.display_name == display_name]
     if not matching:
         raise ToolError(
-            "no MCP vault found for this account — run a session first to bootstrap the vault"
+            "no MCP vault found for this agent — run a session first to bootstrap the vault"
         )
     vault_id = min(matching, key=lambda v: v.created_at).id
     creds = [c async for c in client.beta.vaults.credentials.list(vault_id=vault_id)]
