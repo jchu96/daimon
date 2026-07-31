@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 from notebook_host.pids_store import (
     PidRecord,
     load_pids,
@@ -96,12 +97,21 @@ def test_reap_orphans_skips_dead_pids(tmp_path: Path) -> None:
     assert load_pids(path) == {}, "pids file must be cleared after sweep"
 
 
-def test_reap_orphans_kills_live_process(tmp_path: Path) -> None:
-    """A live PID listed in pids.json is SIGTERM'd and disappears."""
-    # Spawn a real child we can prove was killed. Use a long-running
-    # python so it doesn't exit on its own before reap runs.
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)"],
+@pytest.mark.skipif(sys.platform != "linux", reason="identity check reads /proc, Linux only")
+def test_reap_orphans_kills_live_process_whose_cmdline_matches_slug(tmp_path: Path) -> None:
+    """A live PID whose cmdline still identifies it as that slug's marimo is SIGTERM'd."""
+    # Spawn a real child we can prove was killed. Its argv carries the same
+    # markers spawn_marimo's cmd does (`marimo` + `--base-url /n/<slug>`), so
+    # the identity check recognizes it without needing marimo installed.
+    child = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "--base-url",
+            "/n/live",
+            "marimo",
+        ],
     )
     try:
         path = tmp_path / "pids.json"
@@ -113,7 +123,7 @@ def test_reap_orphans_kills_live_process(tmp_path: Path) -> None:
         reaped = reap_orphans(path, term_wait_seconds=3.0)
 
         assert [r.slug for r in reaped] == ["live"], (
-            "a live PID listed in pids.json must be reported as reaped"
+            "a live PID whose cmdline still names this slug's marimo must be reaped"
         )
         # The child should now be dead — give it a moment to exit cleanly
         # under SIGTERM and confirm via wait().
@@ -127,6 +137,52 @@ def test_reap_orphans_kills_live_process(tmp_path: Path) -> None:
         if child.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(child.pid, 9)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="identity check reads /proc, Linux only")
+def test_reap_orphans_does_not_signal_live_pid_whose_cmdline_does_not_match_slug(
+    tmp_path: Path,
+) -> None:
+    """A live PID whose cmdline does not name the recorded slug must not be signalled.
+
+    Regression test for the defect: PIDs are recycled by the OS, so a
+    persisted record's PID can now belong to an unrelated process (here, the
+    test process itself). Liveness alone must not be treated as proof of
+    identity.
+    """
+    path = tmp_path / "pids.json"
+    own_pid = os.getpid()
+    save_pids(
+        path,
+        {"stale": PidRecord(slug="stale", pid=own_pid, port=8100, started_at=time.time())},
+    )
+
+    reaped = reap_orphans(path, term_wait_seconds=0.2)
+
+    assert reaped == [], "a PID whose cmdline does not match the recorded slug must not be reaped"
+    assert os.kill(own_pid, 0) is None, "the test process itself must still be alive"
+    assert load_pids(path) == {}, "the stale record is still cleared from the file"
+
+
+def test_reap_orphans_on_non_linux_platform_signals_nothing_and_still_empties_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a platform without /proc, no identity can be confirmed, so nothing is signalled."""
+    import notebook_host.pids_store as pids_store_mod
+
+    monkeypatch.setattr(pids_store_mod.sys, "platform", "darwin")
+    path = tmp_path / "pids.json"
+    own_pid = os.getpid()
+    save_pids(
+        path,
+        {"stale": PidRecord(slug="stale", pid=own_pid, port=8100, started_at=time.time())},
+    )
+
+    reaped = reap_orphans(path, term_wait_seconds=0.2)
+
+    assert reaped == [], "non-Linux platforms cannot verify identity, so nothing is signalled"
+    assert os.kill(own_pid, 0) is None, "the test process itself must still be alive"
+    assert load_pids(path) == {}, "the file is still emptied even when nothing was signalled"
 
 
 def test_record_from_process_accepts_float_timestamp() -> None:

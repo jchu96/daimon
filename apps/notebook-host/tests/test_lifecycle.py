@@ -53,6 +53,10 @@ def test_settings_defaults_match_documented_values() -> None:
     assert settings.data_dir == Path("/data/notebooks"), (
         "data_dir default should be Path('/data/notebooks')"
     )
+    assert settings.jail_uid_start == 100000, "jail_uid_start default should be 100000"
+    assert settings.jail_uid_end == 100999, "jail_uid_end default should be 100999"
+    assert settings.allow_unjailed_spawn is False, "allow_unjailed_spawn default should be False"
+    assert settings.uids_file is None, "uids_file default should be unset"
 
 
 def test_settings_env_override_applied(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,6 +88,38 @@ def test_resolved_blogs_file_honors_explicit_override(monkeypatch: pytest.Monkey
     settings = load_settings(_env_file=None)
     assert settings.resolved_blogs_file == Path("/tmp/custom-blogs.json"), (
         "explicit blogs_file path must be used verbatim"
+    )
+
+
+def test_resolved_uids_file_defaults_to_data_dir_uids_json() -> None:
+    """uids_file unset -> resolved_uids_file is data_dir / 'uids.json'."""
+    from notebook_host.config import load_settings
+
+    settings = load_settings(_env_file=None)
+    assert settings.resolved_uids_file == settings.data_dir / "uids.json", (
+        "default uid registry must live next to the source files on the volume"
+    )
+
+
+def test_resolved_uids_file_honors_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit DAIMON_NOTEBOOK__UIDS_FILE wins over the data_dir default."""
+    monkeypatch.setenv("DAIMON_NOTEBOOK__UIDS_FILE", "/tmp/custom-uids.json")
+    from notebook_host.config import load_settings
+
+    settings = load_settings(_env_file=None)
+    assert settings.resolved_uids_file == Path("/tmp/custom-uids.json"), (
+        "explicit uids_file path must be used verbatim"
+    )
+
+
+def test_allow_unjailed_spawn_env_override_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DAIMON_NOTEBOOK__ALLOW_UNJAILED_SPAWN=true reflects on resolved Settings."""
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ALLOW_UNJAILED_SPAWN", "true")
+    from notebook_host.config import load_settings
+
+    settings = load_settings(_env_file=None)
+    assert settings.allow_unjailed_spawn is True, (
+        "allow_unjailed_spawn should reflect the env override value"
     )
 
 
@@ -342,14 +378,16 @@ async def test_spawn_marimo_then_kill(tmp_path: Path) -> None:
     """spawn_marimo + wait_for_port returns True; kill makes is_alive() False."""
     import time
 
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import NotebookProcess, kill, spawn_marimo, wait_for_port
 
     slug = "test-nb"
     port = 8199
-    file_path = tmp_path / f"{slug}.py"
-    file_path.write_text(NOTEBOOK_TEMPLATE % slug, encoding="utf-8")
+    paths = get_slug_paths(tmp_path, slug)
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text(NOTEBOOK_TEMPLATE % slug, encoding="utf-8")
 
-    proc = spawn_marimo(slug, file_path, port)
+    proc = spawn_marimo(slug, paths, port)
     np = NotebookProcess(
         slug=slug,
         port=port,
@@ -416,134 +454,168 @@ def test_make_preexec_returns_callable_on_linux_with_limits(
     )
 
 
-# ─── _prepare_workspace (43-02) ───────────────────────────────────────────────
+# ─── _prepare_workspace (nested per-slug layout) ──────────────────────────────
 
 
 def test_prepare_workspace_creates_workspace_dir(tmp_path: Path) -> None:
-    """_prepare_workspace creates <slug>_workspace/ next to file_path."""
+    """_prepare_workspace creates data_dir/<slug>/workspace/."""
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    workspace = _prepare_workspace(file_path, "myslug")
-    assert workspace == tmp_path / "myslug_workspace", (
-        "workspace dir should be <data_dir>/<slug>_workspace"
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    workspace = _prepare_workspace(paths)
+    assert workspace == tmp_path / "myslug" / "workspace", (
+        "workspace dir should be data_dir/<slug>/workspace"
     )
     assert workspace.is_dir(), "workspace dir should exist and be a directory"
 
 
 def test_prepare_workspace_creates_data_dir(tmp_path: Path) -> None:
-    """_prepare_workspace creates <slug>.data/ if it does not exist."""
+    """_prepare_workspace creates data_dir/<slug>/data/ if it does not exist."""
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    _prepare_workspace(file_path, "myslug")
-    assert (tmp_path / "myslug.data").is_dir(), (
-        "<slug>.data/ should be created so attach-after-publish works"
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    _prepare_workspace(paths)
+    assert (tmp_path / "myslug" / "data").is_dir(), (
+        "data_dir/<slug>/data/ should be created so attach-after-publish works"
     )
 
 
 def test_prepare_workspace_leaves_existing_data_dir_untouched(tmp_path: Path) -> None:
-    """_prepare_workspace does not wipe pre-existing files in <slug>.data/."""
+    """_prepare_workspace does not wipe pre-existing files in data_dir/<slug>/data/."""
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    data_dir = tmp_path / "myslug.data"
-    data_dir.mkdir()
-    (data_dir / "existing.csv").write_bytes(b"col,val\n1,2\n")
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.data.mkdir(parents=True)
+    (paths.data / "existing.csv").write_bytes(b"col,val\n1,2\n")
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    _prepare_workspace(file_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    _prepare_workspace(paths)
 
-    assert (data_dir / "existing.csv").read_bytes() == b"col,val\n1,2\n", (
+    assert (paths.data / "existing.csv").read_bytes() == b"col,val\n1,2\n", (
         "pre-existing attachment must survive workspace setup (publish-after-attach)"
     )
 
 
 def test_prepare_workspace_creates_data_symlink(tmp_path: Path) -> None:
-    """workspace/data is a symlink to ../<slug>.data."""
+    """workspace/data is a symlink to ../data."""
     import os as _os
 
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    workspace = _prepare_workspace(file_path, "myslug")
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    workspace = _prepare_workspace(paths)
 
     data_link = workspace / "data"
     assert data_link.is_symlink(), "workspace/data should be a symlink"
-    assert _os.readlink(data_link) == str(Path("..") / "myslug.data"), (
-        "data symlink target should be the relative path ../<slug>.data"
+    assert _os.readlink(data_link) == str(Path("..") / "data"), (
+        "data symlink target should be the relative path ../data"
     )
     # And it must resolve to the actual data dir.
-    assert data_link.resolve() == (tmp_path / "myslug.data").resolve(), (
-        "data symlink should resolve to <data_dir>/<slug>.data"
+    assert data_link.resolve() == paths.data.resolve(), (
+        "data symlink should resolve to data_dir/<slug>/data"
     )
 
 
 def test_prepare_workspace_creates_source_symlink(tmp_path: Path) -> None:
-    """workspace/<slug>.py is a symlink to ../<slug>.py (D2 basename invariant)."""
+    """workspace/notebook.py is a symlink to ../notebook.py (basename invariant)."""
     import os as _os
 
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    workspace = _prepare_workspace(file_path, "myslug")
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    workspace = _prepare_workspace(paths)
 
-    source_link = workspace / "myslug.py"
-    assert source_link.is_symlink(), "workspace/<slug>.py should be a symlink"
-    assert _os.readlink(source_link) == str(Path("..") / "myslug.py"), (
-        "source symlink target should be ../<slug>.py"
+    source_link = workspace / "notebook.py"
+    assert source_link.is_symlink(), "workspace/notebook.py should be a symlink"
+    assert _os.readlink(source_link) == str(Path("..") / "notebook.py"), (
+        "source symlink target should be ../notebook.py"
     )
-    assert source_link.resolve() == file_path.resolve(), (
+    assert source_link.resolve() == paths.notebook.resolve(), (
         "source symlink must resolve to the real source file"
     )
 
 
 def test_prepare_workspace_is_idempotent(tmp_path: Path) -> None:
     """Calling _prepare_workspace twice produces the same final state, no errors."""
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    workspace1 = _prepare_workspace(file_path, "myslug")
-    workspace2 = _prepare_workspace(file_path, "myslug")
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    workspace1 = _prepare_workspace(paths)
+    workspace2 = _prepare_workspace(paths)
 
     assert workspace1 == workspace2, "two calls should return the same workspace path"
     assert (workspace2 / "data").is_symlink(), "data symlink should still exist after re-prepare"
-    assert (workspace2 / "myslug.py").is_symlink(), (
+    assert (workspace2 / "notebook.py").is_symlink(), (
         "source symlink should still exist after re-prepare"
     )
     # And they still resolve correctly.
-    assert (workspace2 / "data").resolve() == (tmp_path / "myslug.data").resolve()
-    assert (workspace2 / "myslug.py").resolve() == file_path.resolve()
+    assert (workspace2 / "data").resolve() == paths.data.resolve()
+    assert (workspace2 / "notebook.py").resolve() == paths.notebook.resolve()
 
 
 def test_prepare_workspace_replaces_stale_symlink(tmp_path: Path) -> None:
     """A stale symlink pointing nowhere is replaced cleanly (crash-recovery shape)."""
+    from notebook_host.jail import get_slug_paths
     from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    workspace = tmp_path / "myslug_workspace"
-    workspace.mkdir()
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    workspace = tmp_path / "myslug" / "workspace"
+    workspace.mkdir(parents=True)
     # Pre-create a broken symlink at the location we'll want.
     bad_link = workspace / "data"
     bad_link.symlink_to(Path("..") / "nope-does-not-exist")
 
-    _prepare_workspace(file_path, "myslug")
+    _prepare_workspace(paths)
 
     assert (workspace / "data").is_symlink(), "data symlink must still be a symlink"
-    assert (workspace / "data").resolve() == (tmp_path / "myslug.data").resolve(), (
+    assert (workspace / "data").resolve() == paths.data.resolve(), (
         "stale broken symlink must be replaced with the correct target"
     )
 
 
+def test_prepare_workspace_symlinks_resolve_inside_slug_root(tmp_path: Path) -> None:
+    """Every entry under workspace/ resolves to a path inside paths.root — the containment
+    invariant that replaces the old design's deliberate `..`-past-the-root traversal."""
+    from notebook_host.jail import get_slug_paths
+    from notebook_host.lifecycle import _prepare_workspace  # pyright: ignore[reportPrivateUsage]
+
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    workspace = _prepare_workspace(paths)
+
+    root_resolved = paths.root.resolve()
+    entries = list(workspace.iterdir())
+    assert entries, "workspace should contain the two wired symlinks"
+    for entry in entries:
+        assert entry.resolve().is_relative_to(root_resolved), (
+            f"{entry} resolves outside the slug root {root_resolved} — isolation boundary violated"
+        )
+
+
 def test_spawn_marimo_uses_workspace_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """spawn_marimo sets Popen cwd= to <data_dir>/<slug>_workspace, not data_dir."""
+    """spawn_marimo sets Popen cwd= to data_dir/<slug>/workspace, not data_dir/<slug>."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -560,26 +632,22 @@ def test_spawn_marimo_uses_workspace_cwd(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100)
 
-    assert captured.get("cwd") == str(tmp_path / "myslug_workspace"), (
-        "Popen cwd should be the per-slug workspace dir, not file_path.parent"
+    assert captured.get("cwd") == str(tmp_path / "myslug" / "workspace"), (
+        "Popen cwd should be the per-slug workspace dir, not the slug root"
     )
-    # marimo edit must receive file_path.name (basename), not the full path.
-    cmd = captured.get("args")
-    if cmd is None:
-        # Popen positional arg is the cmd list (we used *args).
-        # fake_popen signature didn't capture positional — re-call with shape.
-        pass
 
 
 def test_spawn_marimo_still_uses_basename_arg(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """spawn_marimo passes file_path.name (not full path) to marimo edit."""
+    """spawn_marimo passes the literal 'notebook.py' (not the full path) to marimo edit."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -596,13 +664,14 @@ def test_spawn_marimo_still_uses_basename_arg(
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100)
 
     # marimo edit <basename> — the basename appears, the full path does not.
-    assert "myslug.py" in captured_args, "marimo edit arg should be the basename"
-    assert str(file_path) not in captured_args, (
+    assert "notebook.py" in captured_args, "marimo edit arg should be the basename"
+    assert str(paths.notebook) not in captured_args, (
         "absolute path must not appear; basename + workspace cwd is the contract"
     )
 
@@ -612,6 +681,7 @@ def test_spawn_marimo_creates_workspace_and_data_dirs(
 ) -> None:
     """spawn_marimo side-effect: workspace + data dir + symlinks exist after call."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -625,23 +695,28 @@ def test_spawn_marimo_creates_workspace_and_data_dirs(
         lambda *a, **kw: sentinel,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
     )
 
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100)
 
-    assert (tmp_path / "myslug_workspace").is_dir(), "workspace dir must exist after spawn"
-    assert (tmp_path / "myslug.data").is_dir(), "data dir must exist after spawn"
-    assert (tmp_path / "myslug_workspace" / "data").is_symlink(), (
+    assert (tmp_path / "myslug" / "workspace").is_dir(), "workspace dir must exist after spawn"
+    assert (tmp_path / "myslug" / "data").is_dir(), "data dir must exist after spawn"
+    assert (tmp_path / "myslug" / "workspace" / "data").is_symlink(), (
         "data symlink must exist after spawn"
     )
-    assert (tmp_path / "myslug_workspace" / "myslug.py").is_symlink(), (
+    assert (tmp_path / "myslug" / "workspace" / "notebook.py").is_symlink(), (
         "source symlink must exist after spawn"
+    )
+    assert (tmp_path / "myslug" / "marimo.log").exists(), (
+        "marimo log should be opened inside the slug root"
     )
 
 
 def test_spawn_marimo_passes_preexec_fn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """spawn_marimo wires preexec_fn into subprocess.Popen when limits + Linux."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(lifecycle.sys, "platform", "linux")
     monkeypatch.setattr(
@@ -659,11 +734,12 @@ def test_spawn_marimo_passes_preexec_fn(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
 
-    file_path = tmp_path / "x.py"
-    file_path.write_text("")
+    paths = get_slug_paths(tmp_path, "slug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("")
     lifecycle.spawn_marimo(
         "slug",
-        file_path,
+        paths,
         8100,
         rlimit_as_bytes=4_000_000_000,
         rlimit_cpu_seconds=3600,
@@ -671,6 +747,204 @@ def test_spawn_marimo_passes_preexec_fn(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert captured.get("preexec_fn") is not None, (
         "spawn_marimo must pass a non-None preexec_fn when rlimits set on Linux"
     )
+
+
+# ─── HOME / jail_uid wiring ────────────────────────────────────────────────────
+
+
+def _capture_spawn_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **spawn_kwargs: object
+) -> dict[str, str]:
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    captured: dict[str, object] = {}
+    sentinel_proc = _make_fake_popen()
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel_proc
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, **spawn_kwargs)  # pyright: ignore[reportArgumentType]
+    env = captured.get("env")
+    assert isinstance(env, dict), "spawn_marimo must pass env= to Popen"
+    return env
+
+
+def test_spawn_marimo_sets_home_to_slug_home_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spawn_marimo always sets HOME to paths.home, jailed or not."""
+    from notebook_host.jail import get_slug_paths
+
+    env = _capture_spawn_env(monkeypatch, tmp_path)
+    paths = get_slug_paths(tmp_path, "myslug")
+    assert env["HOME"] == str(paths.home), (
+        "HOME must point into the slug's own tree, or uv's cache write fails"
+    )
+
+
+def test_spawn_marimo_preserves_virtual_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """VIRTUAL_ENV survives scrub_env unchanged — it's what keeps the baked stack."""
+    monkeypatch.setenv("VIRTUAL_ENV", "/app/.venv")
+    env = _capture_spawn_env(monkeypatch, tmp_path)
+    assert env["VIRTUAL_ENV"] == "/app/.venv", (
+        "VIRTUAL_ENV must flow through unchanged so headerless notebooks keep "
+        "the baked pandas/numpy/pymc stack"
+    )
+
+
+def test_spawn_marimo_env_still_has_no_daimon_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The DAIMON_* scrub guarantee is unbroken by the HOME/jail_uid additions."""
+    monkeypatch.setenv("DAIMON_NOTEBOOK__ADMIN_SECRET", "shhhh")
+    env = _capture_spawn_env(monkeypatch, tmp_path)
+    daimon_keys = [k for k in env if k.startswith("DAIMON_")]
+    assert daimon_keys == [], f"all DAIMON_-prefixed vars must still be stripped; got {daimon_keys}"
+
+
+def test_spawn_marimo_with_jail_uid_none_uses_rlimit_only_preexec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """jail_uid=None with no rlimits configured on Linux yields preexec_fn=None,
+    exactly matching _make_preexec's own pre-existing behaviour."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(lifecycle.sys, "platform", "linux")
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    captured: dict[str, object] = {}
+    sentinel_proc = _make_fake_popen()
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel_proc
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, jail_uid=None)
+
+    assert captured.get("preexec_fn") is None, (
+        "jail_uid=None with no rlimits must leave preexec_fn None, unchanged from before "
+        "the jail existed"
+    )
+
+
+def test_spawn_marimo_with_jail_uid_set_always_has_a_preexec_fn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """jail_uid=4242 yields a non-None preexec_fn even with both rlimits None —
+    a path where the old rlimit-only preexec would have returned None."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    captured: dict[str, object] = {}
+    sentinel_proc = _make_fake_popen()
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel_proc
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, jail_uid=4242)
+
+    assert captured.get("preexec_fn") is not None, (
+        "jail_uid set must always yield a preexec_fn, even with no rlimits configured"
+    )
+
+
+def test_validate_notebook_with_jail_uid_chowns_the_temp_export_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """validate_notebook(jail_uid=...) chowns its TemporaryDirectory to that uid."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    chown_calls: list[tuple[str, int, int]] = []
+
+    def fake_chown(path: object, uid: int, gid: int) -> None:
+        chown_calls.append((str(path), uid, gid))
+
+    monkeypatch.setattr(lifecycle.os, "chown", fake_chown)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.validate_notebook("myslug", paths, timeout_s=5.0, jail_uid=4242)
+
+    assert len(chown_calls) == 1, f"expected exactly one os.chown call, got {chown_calls}"
+    chowned_path, uid, gid = chown_calls[0]
+    assert chowned_path, "chown must target a real path (the export temp dir)"
+    assert uid == 4242, "chown must target the jail uid"
+    assert gid == 4242, "chown must target the matching primary group (gid == uid)"
+
+
+def test_validate_notebook_without_jail_uid_never_calls_chown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """validate_notebook(jail_uid=None) does not call os.chown at all."""
+    from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
+
+    monkeypatch.setattr(
+        lifecycle.shutil,
+        "which",
+        lambda _x: "/usr/bin/uv",  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+    chown_calls: list[object] = []
+    monkeypatch.setattr(
+        lifecycle.os,
+        "chown",
+        lambda *a, **kw: chown_calls.append((a, kw)),  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    )
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.validate_notebook("myslug", paths, timeout_s=5.0, jail_uid=None)
+
+    assert chown_calls == [], "jail_uid=None must never call os.chown"
 
 
 # ─── sandbox / inline-script-metadata tests ──────────────────────────────────
@@ -708,6 +982,7 @@ def _capture_spawn_cmd(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, sandbox: bool
 ) -> list[str]:
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -722,9 +997,10 @@ def _capture_spawn_cmd(
         return sentinel_proc
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100, sandbox=sandbox)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, sandbox=sandbox)
     return captured_args
 
 
@@ -736,7 +1012,7 @@ def test_spawn_marimo_inserts_sandbox_flag_after_edit_when_sandbox(
     assert cmd[cmd.index("edit") + 1] == "--sandbox", (
         "--sandbox must immediately follow `edit`, before the notebook basename"
     )
-    assert cmd.index("--sandbox") < cmd.index("myslug.py"), (
+    assert cmd.index("--sandbox") < cmd.index("notebook.py"), (
         "--sandbox must precede the file arg so marimo treats it as a flag, not the target"
     )
 
@@ -815,6 +1091,7 @@ def test_spawn_marimo_uses_run_subcommand_when_mode_run(
 ) -> None:
     """spawn_marimo(mode='run') emits `marimo run`, never `marimo edit`."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -829,9 +1106,10 @@ def test_spawn_marimo_uses_run_subcommand_when_mode_run(
         return sentinel
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100, mode="run")
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, mode="run")
 
     assert "run" in captured, "mode='run' must invoke `marimo run`"
     assert "edit" not in captured, "mode='run' must not invoke `marimo edit`"
@@ -845,6 +1123,7 @@ def test_spawn_marimo_defaults_to_edit_mode(
 ) -> None:
     """Without an explicit mode, spawn_marimo still emits `marimo edit` (back-compat)."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -859,9 +1138,10 @@ def test_spawn_marimo_defaults_to_edit_mode(
         return sentinel
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100)
 
     assert _marimo_subcommand(captured) == "edit", "default mode must be edit"
 
@@ -871,6 +1151,7 @@ def test_spawn_marimo_run_mode_with_sandbox_places_flag_after_run(
 ) -> None:
     """--sandbox must follow `run` and precede the basename (same rule as edit)."""
     from notebook_host import lifecycle
+    from notebook_host.jail import get_slug_paths
 
     monkeypatch.setattr(
         lifecycle.shutil,
@@ -885,16 +1166,17 @@ def test_spawn_marimo_run_mode_with_sandbox_places_flag_after_run(
         return sentinel
 
     monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
-    file_path = tmp_path / "myslug.py"
-    file_path.write_text("# stub", encoding="utf-8")
-    lifecycle.spawn_marimo("myslug", file_path, 8100, mode="run", sandbox=True)
+    paths = get_slug_paths(tmp_path, "myslug")
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("# stub", encoding="utf-8")
+    lifecycle.spawn_marimo("myslug", paths, 8100, mode="run", sandbox=True)
 
     assert _marimo_subcommand(captured) == "run", "marimo subcommand must be `run`"
     marimo_subcommand_idx = len(captured) - 1 - captured[::-1].index("marimo") + 1
     assert captured[marimo_subcommand_idx + 1] == "--sandbox", (
         "--sandbox must immediately follow `run`"
     )
-    assert captured.index("--sandbox") < captured.index("myslug.py"), (
+    assert captured.index("--sandbox") < captured.index("notebook.py"), (
         "--sandbox must precede the notebook basename"
     )
 
