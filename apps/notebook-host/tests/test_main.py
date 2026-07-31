@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import runpy
 import subprocess
 import unittest.mock
@@ -199,6 +200,87 @@ async def test_sweep_once_reconciles_registered_blog_missing_from_processes(
     assert state.processes["pre-orphan"].is_alive(), "reconciled blog must be alive"
     assert calls[-1][3] == "run", "reconcile respawn must use run mode"
     assert mutated is True, "respawning an orphaned blog mutates state"
+
+
+async def test_sweep_skips_slug_unregistered_between_outer_scan_and_inner_reread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The self-heal loop's outer `load_blogs` is a stale candidate scan.
+
+    If the slug was unregistered between that scan and the inner re-read taken
+    under the lock, the sweep must not respawn it.
+    """
+    import notebook_host.main as main_mod
+    from notebook_host.main import _sweep_once  # pyright: ignore[reportPrivateUsage]
+
+    state, calls = _make_state(tmp_path, monkeypatch)
+    call_count = 0
+    real_load_blogs = main_mod.load_blogs
+
+    def fake_load_blogs(path: Path) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            from notebook_host.blogs_store import BlogRecord
+
+            return {"ghost-blog": BlogRecord(slug="ghost-blog", created_at=1.0)}
+        return real_load_blogs(path)  # empty — nothing was ever actually registered
+
+    monkeypatch.setattr(main_mod, "load_blogs", fake_load_blogs)
+
+    mutated = await _sweep_once(state)
+
+    assert calls == [], "the spawner must never be called for a slug that vanished under the lock"
+    assert mutated is False, "skipping a stale candidate is not a mutation"
+
+
+async def test_sweep_does_not_respawn_a_blog_deleted_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete that unregisters a blog while holding its slug lock must not be
+    undone by a sweep tick that was already mid-flight for that slug.
+
+    Driven deterministically: the test itself holds `state.lock_for(slug)` —
+    the same lock object `delete_blog` acquires in production — forcing the
+    sweep task to block on it exactly as it would against a real concurrent
+    delete. While the sweep is blocked, the test performs the delete's
+    registry/tree mutations (what `delete_blog` does under this same lock),
+    then releases — letting the sweep's inner re-read observe the slug gone.
+    """
+    from notebook_host.blogs_store import BlogRecord, load_blogs, register_blog, unregister_blog
+    from notebook_host.jail import remove_slug_tree
+    from notebook_host.main import _sweep_once  # pyright: ignore[reportPrivateUsage]
+
+    state, _calls = _make_state(tmp_path, monkeypatch)
+    slug = "doomed"
+    paths = get_slug_paths(tmp_path, slug)
+    paths.notebook.parent.mkdir(parents=True, exist_ok=True)
+    paths.notebook.write_text("import marimo as mo\napp = mo.App()", encoding="utf-8")
+    register_blog(tmp_path / "blogs.json", BlogRecord(slug=slug, created_at=1.0))
+    # Registered but absent from state.processes — a self-heal candidate,
+    # exactly the shape a blog has right after delete_blog's unregister step
+    # but before its tree removal finishes.
+    assert slug not in state.processes
+
+    lock = state.lock_for(slug)
+    await lock.acquire()
+    try:
+        sweep_task = asyncio.create_task(_sweep_once(state))
+        # Give the sweep task a turn so it reaches the (now-blocked) lock
+        # acquire inside the self-heal loop.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        unregister_blog(tmp_path / "blogs.json", slug)
+        remove_slug_tree(tmp_path, slug, uids_file=state.settings.resolved_uids_file)
+    finally:
+        lock.release()
+
+    mutated = await sweep_task
+
+    assert slug not in state.processes, "a blog deleted under the lock must not be respawned"
+    assert slug not in load_blogs(tmp_path / "blogs.json"), "registry stays clear"
+    assert not paths.root.exists(), "the deleted tree must not be recreated by the sweep"
+    assert mutated is False, "skipping a deleted-under-the-lock slug is not a mutation"
 
 
 # ─── fail-closed boot gate (D-05) ────────────────────────────────────────────

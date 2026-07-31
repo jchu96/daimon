@@ -245,9 +245,21 @@ async def _sweep_once(state: AdminState) -> bool:
     # registry) — without this, such a blog would stay down until the next host
     # boot. Boot does the same via _respawn_registered_blogs; doing it every
     # sweep makes "retry next sweep" actually true.
+    #
+    # The outer load_blogs is a cheap candidate scan taken outside any lock, so
+    # it can race delete_blog: a slug it names may already be mid-delete (or
+    # finish deleting) before we get here. Re-reading load_blogs a second time
+    # *inside* the same per-slug lock delete_blog holds is what closes that
+    # window — a candidate that was unregistered under the lock is dropped
+    # instead of respawned. The double read looks redundant; it is not.
     for slug in load_blogs(state.settings.resolved_blogs_file):
-        if slug not in state.processes and await _spawn_blog_process(state, slug):
-            mutated = True
+        async with state.lock_for(slug):
+            if slug not in load_blogs(state.settings.resolved_blogs_file):
+                continue
+            if slug in state.processes:
+                continue
+            if await _spawn_blog_process(state, slug):
+                mutated = True
     return mutated
 
 

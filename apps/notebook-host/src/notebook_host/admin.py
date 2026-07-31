@@ -325,13 +325,18 @@ def create_admin_router(state: AdminState) -> APIRouter:
         dependencies=[Depends(require_admin)],
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def delete_notebook(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
+    async def delete_notebook(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
         slug = safe_slug(slug)
-        np = state.processes.pop(slug, None)
-        if np is not None:
-            kill(np)
-        remove_slug_tree(state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file)
-        state.snapshot_pids()
+        async with state.lock_for(slug):
+            np = state.processes.pop(slug, None)
+            if np is not None:
+                # kill blocks up to 5s (SIGTERM wait); must not block the
+                # event loop now that the handler is async.
+                await asyncio.to_thread(kill, np)
+            remove_slug_tree(
+                state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
+            )
+            state.snapshot_pids()
 
     @router.get("/admin/notebooks", dependencies=[Depends(require_admin)])
     def list_notebooks() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -397,14 +402,22 @@ def create_admin_router(state: AdminState) -> APIRouter:
         dependencies=[Depends(require_admin)],
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def delete_blog(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
+    async def delete_blog(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
         slug = safe_slug(slug)
-        np = state.processes.pop(slug, None)
-        if np is not None:
-            kill(np)
-        unregister_blog(state.settings.resolved_blogs_file, slug)
-        remove_slug_tree(state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file)
-        state.snapshot_pids()
+        async with state.lock_for(slug):
+            # Unregister first, while the lock is held, so the registry stops
+            # naming this slug before anything blocking (kill) starts. This is
+            # what lets the sweep's self-heal, re-reading the registry under
+            # the same lock, see the slug is already gone rather than racing
+            # to respawn it.
+            unregister_blog(state.settings.resolved_blogs_file, slug)
+            np = state.processes.pop(slug, None)
+            if np is not None:
+                await asyncio.to_thread(kill, np)
+            remove_slug_tree(
+                state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
+            )
+            state.snapshot_pids()
 
     @router.post("/admin/sweep", dependencies=[Depends(require_admin)])
     def sweep() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
