@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import (
@@ -148,3 +150,52 @@ def test_factory_has_no_stripe_route_when_billing_absent() -> None:
     app = create_mcp_app(settings=settings, billing_config=None)
     route_paths = [r.path for r in app.routes if isinstance(r, Route)]
     assert "/webhooks/stripe" not in route_paths, "stripe route absent when billing unconfigured"
+
+
+class _WarningCollector(logging.Handler):
+    """Collects log records emitted directly on the ``fastmcp`` logger.
+
+    ``pytest``'s ``caplog`` fixture only ever attaches its capture handler to
+    the *root* logger, but ``fastmcp`` disables propagation on its own
+    top-level logger at import time (``fastmcp/utilities/logging.py``'s
+    ``configure_logging``), so a duplicate-registration warning never reaches
+    root and ``caplog`` cannot see it. Attaching this handler directly to the
+    ``fastmcp`` logger observes it at the point ``fastmcp`` itself emits it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+async def test_create_mcp_app_logs_no_duplicate_tool_registrations(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A second tool registered under a name that already exists silently
+    replaces the first in local_provider.list_tools() — the only observable
+    signal is a WARNING log record. Assembling the full app (Discord settings
+    present, so the channel tools register too) must produce none, so a
+    future collision between two tool groups fails this test instead of
+    shipping as an unreachable tool.
+    """
+    settings = _settings(
+        jwt_secret=SecretStr("a" * 32),
+        public_url=HttpUrl("https://x/mcp"),
+    )
+    collector = _WarningCollector()
+    fastmcp_logger = logging.getLogger("fastmcp")
+    fastmcp_logger.addHandler(collector)
+    try:
+        create_mcp_app(
+            settings=settings,
+            sessionmaker=sessionmaker,
+            auth=StaticTokenVerifier(tokens={}),
+            anthropic=build_stub_anthropic(),
+        )
+    finally:
+        fastmcp_logger.removeHandler(collector)
+    duplicates = [r.getMessage() for r in collector.records if "already exists" in r.getMessage()]
+    assert not duplicates, f"duplicate tool/component registrations found: {duplicates}"
