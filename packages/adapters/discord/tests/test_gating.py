@@ -7,6 +7,7 @@ from daimon.adapters.discord.gating import should_process_message
 DAIMON_ID = "111"
 HUMAN_ID = "222"
 QA_BOT_ID = "333"
+QA_ADMIN_BOT_ID = "555"
 OTHER_BOT_ID = "444"
 
 
@@ -47,7 +48,7 @@ def test_gate_rejects_bot_author_when_no_qa_bot_configured() -> None:
         bot_mentioned=True,
         guild_id="g1",
         self_user_id=DAIMON_ID,
-        qa_bot_user_id=None,
+        qa_bot_user_ids=(),
     ), "with no allow-list, every bot-authored mention is rejected"
 
 
@@ -58,7 +59,7 @@ def test_gate_admits_allow_listed_qa_bot() -> None:
         bot_mentioned=True,
         guild_id="g1",
         self_user_id=DAIMON_ID,
-        qa_bot_user_id=QA_BOT_ID,
+        qa_bot_user_ids=(QA_BOT_ID,),
     ), "the allow-listed QA bot's mention must start a turn like a human's"
 
 
@@ -69,8 +70,8 @@ def test_gate_rejects_unlisted_bot_when_qa_bot_configured() -> None:
         bot_mentioned=True,
         guild_id="g1",
         self_user_id=DAIMON_ID,
-        qa_bot_user_id=QA_BOT_ID,
-    ), "the allow-list admits exactly one bot, not bots in general"
+        qa_bot_user_ids=(QA_BOT_ID,),
+    ), "the allow-list admits only listed ids, never bots in general"
 
 
 def test_gate_rejects_self_authored_mention_when_allow_listed_to_own_id() -> None:
@@ -80,8 +81,31 @@ def test_gate_rejects_self_authored_mention_when_allow_listed_to_own_id() -> Non
         bot_mentioned=True,
         guild_id="g1",
         self_user_id=DAIMON_ID,
-        qa_bot_user_id=DAIMON_ID,
+        qa_bot_user_ids=(DAIMON_ID,),
     ), "allow-listing daimon's own id must not arm an unbounded self-trigger loop"
+
+
+def test_gate_admits_each_of_two_allow_listed_bots() -> None:
+    for author_id in (QA_BOT_ID, QA_ADMIN_BOT_ID):
+        assert should_process_message(
+            author_is_bot=True,
+            author_id=author_id,
+            bot_mentioned=True,
+            guild_id="g1",
+            self_user_id=DAIMON_ID,
+            qa_bot_user_ids=(QA_BOT_ID, QA_ADMIN_BOT_ID),
+        ), "both an admin and a non-admin driver must be able to start turns"
+
+
+def test_gate_rejects_self_authored_mention_when_listed_alongside_others() -> None:
+    assert not should_process_message(
+        author_is_bot=True,
+        author_id=DAIMON_ID,
+        bot_mentioned=True,
+        guild_id="g1",
+        self_user_id=DAIMON_ID,
+        qa_bot_user_ids=(QA_BOT_ID, DAIMON_ID),
+    ), "the self-trigger refusal must not be bypassable by padding the allow-list"
 
 
 def test_gate_rejects_qa_bot_when_not_mentioned() -> None:
@@ -91,7 +115,7 @@ def test_gate_rejects_qa_bot_when_not_mentioned() -> None:
         bot_mentioned=False,
         guild_id="g1",
         self_user_id=DAIMON_ID,
-        qa_bot_user_id=QA_BOT_ID,
+        qa_bot_user_ids=(QA_BOT_ID,),
     ), "the allow-list relaxes the bot-author check only, not the mention requirement"
 
 
@@ -102,5 +126,5 @@ def test_gate_rejects_qa_bot_in_dm() -> None:
         bot_mentioned=True,
         guild_id=None,
         self_user_id=DAIMON_ID,
-        qa_bot_user_id=QA_BOT_ID,
+        qa_bot_user_ids=(QA_BOT_ID,),
     ), "the allow-list relaxes the bot-author check only, not the guild requirement"

@@ -155,16 +155,18 @@ class DiscordSettings(BaseModel):
             "starter's bound PAT as plaintext."
         ),
     )
-    qa_bot_user_id: str | None = Field(
-        default=None,
+    qa_bot_user_ids: tuple[str, ...] = Field(
+        default=(),
         description=(
-            "Discord user id of a single automated QA bot allowed to start "
-            "turns by mention. Bot-authored mentions are rejected by default; "
-            "this allow-lists exactly one so a harness can drive the mention "
-            "path end-to-end without a human. Leave unset outside test "
-            "deployments -- an allow-listed bot spends real credit. Setting "
-            "it to the bot's own id is refused at the gate, since that would "
-            "make every turn trigger the next one."
+            "Discord user ids of automated QA bots allowed to start turns by "
+            "mention. Bot-authored mentions are rejected by default; these are "
+            "allow-listed so a harness can drive the mention path end-to-end "
+            "without a human. Several are supported because admin-gated tools "
+            "need a caller holding Manage Server while the refusal paths need "
+            "one without it. Leave empty outside test deployments -- an "
+            "allow-listed bot spends real credit. As a tuple field this must "
+            'be set as a JSON array, e.g. \'["123","456"]\'. daimon\'s own id '
+            "is refused at the gate even if listed."
         ),
     )
     bot_display_name: str = Field(
