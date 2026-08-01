@@ -287,8 +287,13 @@ def _env_runtime(client: AsyncAnthropic) -> McpRuntime:
     )
 
 
-async def test_create_environment_impl_raises_when_not_admin() -> None:
-    """Non-admin caller is rejected before any MA call."""
+async def test_create_environment_impl_does_not_refuse_non_admin() -> None:
+    """Creating an environment is ungated -- it is inert until an admin scopes to it.
+
+    Asserts only that the admin gate does not fire; the call proceeds past it and
+    fails later on the stub client, which is enough to distinguish "refused up
+    front" from "allowed through".
+    """
     auth = AuthIdentity(
         account_id=uuid.uuid4(),
         tenant_id=uuid.uuid4(),
@@ -296,10 +301,11 @@ async def test_create_environment_impl_raises_when_not_admin() -> None:
         is_admin=False,
     )
     spec = EnvironmentSpec(name="e")
-    with pytest.raises(ToolError) as exc_info:
+    with pytest.raises(Exception) as exc_info:  # noqa: B017, PT011
         await _create_environment_impl(_env_runtime(MagicMock(spec=AsyncAnthropic)), auth, spec)
-    assert str(exc_info.value) == _D28_MESSAGE, (
-        "_create_environment_impl must refuse non-admin with admin-required message"
+    assert str(exc_info.value) != _D28_MESSAGE, (
+        "create_environment must not refuse a non-admin -- gating it blocks the "
+        "ordinary onboarding ask while buying no isolation"
     )
 
 

@@ -88,7 +88,12 @@ async def _create_environment_impl(
     auth: AuthIdentity,
     spec: EnvironmentSpec,
 ) -> EnvironmentInfo:
-    _require_admin(auth)
+    # Deliberately ungated, unlike update/archive below. A freshly created
+    # environment is inert: nothing routes to it until an admin scopes an agent
+    # onto a channel or the workspace via set_agent_default, which is gated. So
+    # the gate here bought no isolation while blocking the ordinary onboarding
+    # ask -- "make me an agent that can run pymc" -- for every non-admin.
+    # Matches create_agent / fork_agent, which are ungated for the same reason.
     await _reject_environment_name_collision(runtime, auth, spec.name)
     payload = spec.model_dump(exclude_none=True)
     payload["metadata"] = build_metadata(tenant_id=auth.tenant_id, name=spec.name)
@@ -130,8 +135,10 @@ async def _archive_environment_impl(
 
 def register_environment_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     # Reads are untagged and ungated — full visibility for every session,
-    # matching the agents/skills read tools (admin-tag/gate agreement: only
-    # mutating tools carry tags={"admin"} + the _require_admin impl gate).
+    # matching the agents/skills read tools. Mutations carry tags={"admin"} plus
+    # the _require_admin impl gate, with one deliberate exception:
+    # create_environment is ungated, because a new environment is inert until an
+    # admin scopes an agent onto it. See the comment on _create_environment_impl.
     @mcp.tool
     async def list_environments(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
@@ -145,7 +152,7 @@ def register_environment_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         """Return one environment by name."""
         return await _get_environment_impl(runtime, await _auth(ctx), name)
 
-    @mcp.tool(tags={"admin"})
+    @mcp.tool
     async def create_environment(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         spec: EnvironmentSpec,
