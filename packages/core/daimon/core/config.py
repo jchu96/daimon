@@ -155,6 +155,18 @@ class DiscordSettings(BaseModel):
             "starter's bound PAT as plaintext."
         ),
     )
+    qa_bot_user_id: str | None = Field(
+        default=None,
+        description=(
+            "Discord user id of a single automated QA bot allowed to start "
+            "turns by mention. Bot-authored mentions are rejected by default; "
+            "this allow-lists exactly one so a harness can drive the mention "
+            "path end-to-end without a human. Leave unset outside test "
+            "deployments -- an allow-listed bot spends real credit. Setting "
+            "it to the bot's own id is refused at the gate, since that would "
+            "make every turn trigger the next one."
+        ),
+    )
     bot_display_name: str = Field(
         default="daimon",
         # Constrained because the value flows into user-facing surfaces with

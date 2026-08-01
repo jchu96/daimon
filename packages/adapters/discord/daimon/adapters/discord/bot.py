@@ -512,8 +512,10 @@ class DaimonBot(commands.Bot):
     async def on_message(self, message: discord.Message) -> None:
         """Gate on mention, resolve TenantContext once + run the non-ready self-heal gate,
         then orchestrate a turn in a thread."""
+        discord_settings = self.runtime.settings.discord
         if not should_process_message(
             author_is_bot=message.author.bot,
+            author_id=str(message.author.id),
             # Explicit @-mention only. `mentioned_in` returns True for @everyone/@here
             # (it short-circuits on message.mention_everyone), which would make the bot
             # reply to every mass ping. message.mentions excludes @everyone/@here and
@@ -521,6 +523,8 @@ class DaimonBot(commands.Bot):
             bot_mentioned=self.user is not None
             and any(user.id == self.user.id for user in message.mentions),
             guild_id=str(message.guild.id) if message.guild else None,
+            self_user_id=str(self.user.id) if self.user is not None else None,
+            qa_bot_user_id=discord_settings.qa_bot_user_id if discord_settings else None,
         ):
             return
         if self.draining:
