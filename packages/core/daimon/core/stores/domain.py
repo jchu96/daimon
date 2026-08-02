@@ -96,6 +96,7 @@ class TenantRow(BaseModel):
     platform: str  # "discord" | "cli"
     external_id: str  # = folded workspace_id
     provision_status: str  # "ready" | "pending" | "failed"
+    last_reconcile_error: str | None = None
     archived_at: datetime | None = None
     registered_at: datetime
     created_at: datetime

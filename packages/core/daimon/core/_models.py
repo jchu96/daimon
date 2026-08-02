@@ -53,6 +53,7 @@ class Tenant(Base):
     provision_status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'ready'")
     )
+    last_reconcile_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
