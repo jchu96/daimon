@@ -1057,7 +1057,7 @@ async def test_purge_account_rolls_back_new_table_rows_on_failure(
     assert surviving_login == "rb-gh", "github_credentials row must survive rolled-back purge"
 
     surviving_oauth_states = await github_oauth_states_store.count_states_for_platform_user(
-        db_session, platform="discord", platform_user_id="user-rb-new"
+        db_session, platform="discord", platform_user_id="user-rb-new", tenant_id=tenant.id
     )
     assert surviving_oauth_states == 1, "oauth-state row must survive rolled-back purge"
 

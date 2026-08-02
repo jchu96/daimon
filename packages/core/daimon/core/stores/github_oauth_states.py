@@ -22,7 +22,7 @@ async def delete_states_for_platform_user(
     *,
     platform: str,
     platform_user_id: str,
-    tenant_id: uuid.UUID | None = None,
+    tenant_id: uuid.UUID,
 ) -> int:
     """Delete ALL oauth-state rows for a (platform, platform_user_id). Idempotent.
 
@@ -37,22 +37,20 @@ async def delete_states_for_platform_user(
     (the CLI auth flow writes such rows), as well as real platform/external_id pairs
     for platform principals.
 
-    `tenant_id` (optional): adds `AND tenant_id = :tenant_id`. Callers should
-    always pass it: neither `os_user` (CLI) nor a platform `external_id` is
-    globally unique. Two machines can both be `ubuntu`, and Slack user ids are
+    `tenant_id` is required: neither `os_user` (CLI) nor a platform `external_id`
+    is globally unique. Two machines can both be `ubuntu`, and Slack user ids are
     workspace-scoped (`U123` in two workspaces are two different humans), so a
-    tenant-agnostic delete erases another tenant's in-flight handshake rows.
-    None is left permitted only for a deliberate cross-tenant sweep of ghost
-    rows under stale tenant_ids (re-key drift); it must not be used for a
-    per-account GDPR purge.
+    tenant-agnostic delete would erase another tenant's in-flight handshake rows.
+    A deliberate cross-tenant sweep of ghost rows under stale tenant_ids (re-key
+    drift) needs a separate, explicitly-named helper — it must not be this one.
     """
-    predicates = [
-        GitHubOauthState.platform == platform,
-        GitHubOauthState.platform_user_id == platform_user_id,
-    ]
-    if tenant_id is not None:
-        predicates.append(GitHubOauthState.tenant_id == tenant_id)
-    result = await session.execute(delete(GitHubOauthState).where(*predicates))
+    result = await session.execute(
+        delete(GitHubOauthState).where(
+            GitHubOauthState.platform == platform,
+            GitHubOauthState.platform_user_id == platform_user_id,
+            GitHubOauthState.tenant_id == tenant_id,
+        )
+    )
     rowcount = cast(CursorResult[Any], result).rowcount
     await session.flush()
     return rowcount
@@ -63,18 +61,23 @@ async def count_states_for_platform_user(
     *,
     platform: str,
     platform_user_id: str,
-    tenant_id: uuid.UUID | None = None,
+    tenant_id: uuid.UUID,
 ) -> int:
     """Count oauth-state rows that `delete_states_for_platform_user` would delete. Read-only.
 
-    Pass the SAME `tenant_id` argument the delete caller uses, or the preview
-    diverges from the purge (parity contract in daimon.core.privacy).
+    `tenant_id` is required and always applied — the same predicate the delete
+    uses, unconditionally, so the preview cannot diverge from the purge (parity
+    contract in daimon.core.privacy). There is no optional-scope branch to
+    misuse: a caller that genuinely needs a cross-tenant count needs a separate,
+    explicitly-named helper, not a `None` passed here.
     """
-    predicates = [
-        GitHubOauthState.platform == platform,
-        GitHubOauthState.platform_user_id == platform_user_id,
-    ]
-    if tenant_id is not None:
-        predicates.append(GitHubOauthState.tenant_id == tenant_id)
-    stmt = select(func.count()).select_from(GitHubOauthState).where(*predicates)
+    stmt = (
+        select(func.count())
+        .select_from(GitHubOauthState)
+        .where(
+            GitHubOauthState.platform == platform,
+            GitHubOauthState.platform_user_id == platform_user_id,
+            GitHubOauthState.tenant_id == tenant_id,
+        )
+    )
     return int((await session.execute(stmt)).scalar_one())

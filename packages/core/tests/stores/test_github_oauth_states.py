@@ -10,6 +10,7 @@ a removed store write path.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 
 from daimon.core._models import Tenant
@@ -65,6 +66,7 @@ async def test_delete_states_for_platform_user_removes_live_consumed_and_expired
         db_session,
         platform=platform,
         platform_user_id=platform_user_id,
+        tenant_id=tenant_id,
     )
 
     assert rowcount == 3, (
@@ -87,11 +89,11 @@ async def test_delete_states_for_platform_user_leaves_other_users_untouched(
     )
 
     await store.delete_states_for_platform_user(
-        db_session, platform=platform, platform_user_id="target-user"
+        db_session, platform=platform, platform_user_id="target-user", tenant_id=tenant_id
     )
 
     count_other = await store.count_states_for_platform_user(
-        db_session, platform=platform, platform_user_id="other-user"
+        db_session, platform=platform, platform_user_id="other-user", tenant_id=tenant_id
     )
     assert count_other == 1, "other-user's oauth-state row must survive the delete"
 
@@ -117,7 +119,7 @@ async def test_delete_states_for_platform_user_scoped_by_tenant_for_colliding_id
     assert deleted == 1, "only tenant_a's U123 handshake row should be deleted"
 
     count_b = await store.count_states_for_platform_user(
-        db_session, platform=platform, platform_user_id="U123"
+        db_session, platform=platform, platform_user_id="U123", tenant_id=tenant_b
     )
     assert count_b == 1, "tenant_b's identically-named user's row must survive"
 
@@ -135,13 +137,28 @@ async def test_count_states_for_platform_user_matches_delete_rowcount(
         )
 
     count_before = await store.count_states_for_platform_user(
-        db_session, platform=platform, platform_user_id=platform_user_id
+        db_session, platform=platform, platform_user_id=platform_user_id, tenant_id=tenant_id
     )
     deleted = await store.delete_states_for_platform_user(
-        db_session, platform=platform, platform_user_id=platform_user_id
+        db_session, platform=platform, platform_user_id=platform_user_id, tenant_id=tenant_id
     )
 
     assert count_before == deleted, (
         "count helper must equal the rowcount delete returns for the same seed (parity)"
     )
     assert count_before == 3, "expected 3 seeded rows"
+
+
+def test_tenant_id_has_no_default_on_either_helper() -> None:
+    """The previous guard against a divergent preview/purge count was a
+    docstring sentence ("pass the SAME tenant_id"), and it was not enough — a
+    caller passed None anyway (the folded privacy-preview-tenant-drift bug).
+    `tenant_id` is now a required keyword on both helpers with no conditional
+    predicate to omit; this test fails immediately if a future author
+    reintroduces an optional/default tenant_id, before the bug can recur."""
+    for fn in (store.delete_states_for_platform_user, store.count_states_for_platform_user):
+        parameter = inspect.signature(fn).parameters["tenant_id"]
+        assert parameter.default is inspect.Parameter.empty, (
+            f"{fn.__name__}'s tenant_id must stay a required keyword with no default — "
+            "an optional tenant_id is what let the preview and purge diverge before"
+        )
