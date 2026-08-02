@@ -128,7 +128,9 @@ async def test_seed_flips_ready_when_report_succeeds_and_default_agent_resolves(
         new_callable=AsyncMock,
         return_value=ApplyReport(),
     ):
-        await bot._seed_tenant_defaults(tenant_id=tenant_id, guild=guild)  # pyright: ignore[reportPrivateUsage]
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
 
     tr = await get_tenant_liveness(db_session_factory, tenant_id)
     assert tr is not None and tr.provision_status == "ready", (
@@ -157,7 +159,9 @@ async def test_seed_flips_failed_when_default_agent_missing_from_ma(
             return_value=ApplyReport(),
         ),
     ):
-        await bot._seed_tenant_defaults(tenant_id=tenant_id, guild=guild)  # pyright: ignore[reportPrivateUsage]
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
 
     tr = await get_tenant_liveness(db_session_factory, tenant_id)
     assert tr is not None and tr.provision_status == "failed", (
@@ -207,7 +211,9 @@ async def test_seed_flips_failed_when_report_fails_regardless_of_roster(
         new_callable=AsyncMock,
         return_value=failing_report,
     ):
-        await bot._seed_tenant_defaults(tenant_id=tenant_id, guild=guild)  # pyright: ignore[reportPrivateUsage]
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
 
     tr = await get_tenant_liveness(db_session_factory, tenant_id)
     assert tr is not None and tr.provision_status == "failed", (
@@ -241,7 +247,9 @@ async def test_seed_skips_roster_check_when_deployment_default_has_no_agent_name
             return_value=ApplyReport(),
         ),
     ):
-        await bot._seed_tenant_defaults(tenant_id=tenant_id, guild=guild)  # pyright: ignore[reportPrivateUsage]
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
 
     tr = await get_tenant_liveness(db_session_factory, tenant_id)
     assert tr is not None and tr.provision_status == "ready", (
@@ -279,7 +287,9 @@ async def test_seed_ma_error_during_roster_check_flips_failed_via_existing_bound
         new_callable=AsyncMock,
         return_value=ApplyReport(),
     ):
-        await bot._seed_tenant_defaults(tenant_id=tenant_id, guild=guild)  # pyright: ignore[reportPrivateUsage]
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
 
     tr = await get_tenant_liveness(db_session_factory, tenant_id)
     assert tr is not None and tr.provision_status == "failed", (

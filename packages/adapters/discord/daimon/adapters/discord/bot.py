@@ -37,6 +37,7 @@ from daimon.adapters.discord.vision import (
 from daimon.core.config import Settings
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.provisioning import provision_tenant, reconcile_tenant_defaults
+from daimon.core.defaults.report import Action, ApplyReport
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
@@ -155,6 +156,19 @@ def _build_snag_embed() -> discord.Embed:
         title="⚠️ Setup hit a snag",
         description="Setup hit a snag — still working on it. Mention me to nudge it along.",
         color=_EMBED_COLOR,
+    )
+
+
+def _report_has_changes(report: ApplyReport) -> bool:
+    """Whether a reconcile report records any outcome that is not a no-op skip,
+    across all four resource kinds. Pure -- no I/O.
+
+    Drives the boot sweep's confirmation-embed suppression: an all-skipped
+    report is the steady state once the reconcile's per-resource hash gate is
+    satisfied, so a quiet deploy stays quiet."""
+    return any(
+        o.action is not Action.SKIPPED
+        for o in (*report.agents, *report.environments, *report.skills, *report.system_config)
     )
 
 
@@ -311,9 +325,19 @@ class DaimonBot(commands.Bot):
         except SQLAlchemyError:
             log.exception("guild_seed_status_flip_failed", tenant_id=str(tenant_id))
 
-    async def _seed_tenant_defaults(self, *, tenant_id: uuid.UUID, guild: discord.Guild) -> None:
+    async def _seed_tenant_defaults(
+        self, *, tenant_id: uuid.UUID, guild: discord.Guild, was_ready: bool
+    ) -> None:
         """Background MA seed. Owns the pending→ready/failed status flip.
-        Posts the ✅/⚠️ follow-up on terminal state. In-flight guard prevents duplicate seeds.
+        Posts the ✅/⚠️ follow-up on terminal state, EXCEPT the ready embed is
+        suppressed when the tenant was already ready before this reconcile and
+        the reconcile changed nothing -- a quiet boot sweep stays quiet (D-23).
+        In-flight guard prevents duplicate seeds.
+
+        `was_ready`: the tenant's provision_status immediately before this call,
+        passed explicitly by the caller (which already has the row) rather than
+        re-read here -- a first-run or recovering install (was_ready=False)
+        always gets its confirmation regardless of what the reconcile reports.
         """
         if tenant_id in self._seeding:
             return
@@ -348,13 +372,21 @@ class DaimonBot(commands.Bot):
                             tenant_id=str(tenant_id),
                             agent_name=agent_name,
                         )
-            await set_provision_status(
-                self.runtime.sessionmaker,
-                tenant_id=tenant_id,
-                status="ready" if seed_ok else "failed",
-            )
-            embed = _build_ready_embed() if seed_ok else _build_snag_embed()
-            await self._post_to_guild(guild, embed)
+            if seed_ok:
+                await set_provision_status(
+                    self.runtime.sessionmaker,
+                    tenant_id=tenant_id,
+                    status="ready",
+                )
+                if not was_ready or _report_has_changes(report):
+                    await self._post_to_guild(guild, _build_ready_embed())
+            else:
+                await set_provision_status(
+                    self.runtime.sessionmaker,
+                    tenant_id=tenant_id,
+                    status="failed",
+                )
+                await self._post_to_guild(guild, _build_snag_embed())
         except (DaimonError, _anthropic.APIError, discord.HTTPException) as exc:
             log.warning("guild_seed_failed", tenant_id=str(tenant_id), error=str(exc))
             # Best-effort flip before posting so the tenant is never left wedged in
@@ -384,7 +416,9 @@ class DaimonBot(commands.Bot):
             status="pending",
             clear_archive=True,
         )
-        self._spawn(self._seed_tenant_defaults(tenant_id=result.tenant_id, guild=guild))
+        self._spawn(
+            self._seed_tenant_defaults(tenant_id=result.tenant_id, guild=guild, was_ready=False)
+        )
 
     async def on_ready(self) -> None:
         """Forward-only reconcile sweep: provision-if-missing, re-seed pending/failed,
@@ -394,9 +428,13 @@ class DaimonBot(commands.Bot):
         known_guild_ids = {tr.external_id for tr in tenants}
         sem = asyncio.Semaphore(_SWEEP_CONCURRENCY)
 
-        async def _bounded_seed(*, tenant_id: uuid.UUID, guild: discord.Guild) -> None:
+        async def _bounded_seed(
+            *, tenant_id: uuid.UUID, guild: discord.Guild, was_ready: bool
+        ) -> None:
             async with sem:
-                await self._seed_tenant_defaults(tenant_id=tenant_id, guild=guild)
+                await self._seed_tenant_defaults(
+                    tenant_id=tenant_id, guild=guild, was_ready=was_ready
+                )
 
         # Provision guilds joined while the bot was down.
         for guild in self.guilds:
@@ -418,7 +456,7 @@ class DaimonBot(commands.Bot):
             await self._post_to_guild(
                 guild, _build_welcome_embed(_resolve_bot_display_name(self.runtime.settings))
             )
-            self._spawn(_bounded_seed(tenant_id=result.tenant_id, guild=guild))
+            self._spawn(_bounded_seed(tenant_id=result.tenant_id, guild=guild, was_ready=False))
 
         # Reconcile every registered, joined tenant against the shipped defaults on
         # every boot, not just the ones stuck in pending/failed. Because every
@@ -433,7 +471,11 @@ class DaimonBot(commands.Bot):
             if guild is None:
                 log.warning("registered_guild_not_joined", external_id=tr.external_id)
                 continue
-            self._spawn(_bounded_seed(tenant_id=tr.id, guild=guild))
+            self._spawn(
+                _bounded_seed(
+                    tenant_id=tr.id, guild=guild, was_ready=tr.provision_status == "ready"
+                )
+            )
             missing = check_missing_permissions(guild.me.guild_permissions)
             if missing:
                 log.warning(
@@ -499,7 +541,9 @@ class DaimonBot(commands.Bot):
             log.warning("guild_join_failed", guild_id=guild_id, error=str(exc))
             return
         # Background seed → flips status + posts the ✅/⚠️ follow-up.
-        self._spawn(self._seed_tenant_defaults(tenant_id=result.tenant_id, guild=guild))
+        self._spawn(
+            self._seed_tenant_defaults(tenant_id=result.tenant_id, guild=guild, was_ready=False)
+        )
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         """Soft-archive: stamp archived_at=now(). NO row delete."""
@@ -556,7 +600,9 @@ class DaimonBot(commands.Bot):
                 return
             if tr.provision_status == "failed":
                 # Self-heal: re-seed if idle (in-flight guard). NEVER show "failed" to the user.
-                self._spawn(self._seed_tenant_defaults(tenant_id=tr.id, guild=guild))
+                self._spawn(
+                    self._seed_tenant_defaults(tenant_id=tr.id, guild=guild, was_ready=False)
+                )
                 await message.channel.send(_setting_up_message(bot_display_name))
                 return
             if tr.provision_status == "pending":

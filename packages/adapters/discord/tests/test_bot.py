@@ -950,6 +950,124 @@ class TestOnReadySweepWidenedReconcile:
         mock_reconcile.assert_not_awaited()
 
 
+class TestReadyEmbedSuppression:
+    """The ready embed is suppressed on the boot sweep when a reconcile changes
+    nothing for an already-ready tenant (D-23); a real propagation or a failure
+    always announces itself."""
+
+    @patch("daimon.adapters.discord.bot.set_provision_status", new_callable=AsyncMock)
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_boot_sweep_posts_no_embed_when_a_ready_tenant_had_nothing_to_change(
+        self,
+        mock_reconcile: AsyncMock,
+        mock_set_provision_status: AsyncMock,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """was_ready=True + an all-skipped report must post exactly zero messages."""
+        from daimon.core.defaults.report import ApplyReport
+
+        mock_reconcile.return_value = ApplyReport()
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(900000020)
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=uuid.uuid4(), guild=guild, was_ready=True
+        )
+
+        assert guild.system_channel.send.await_count == 0, (  # pyright: ignore[reportUnknownMemberType]
+            "an already-ready tenant with an all-skipped report must post zero messages"
+        )
+
+    @patch("daimon.adapters.discord.bot.set_provision_status", new_callable=AsyncMock)
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_boot_sweep_posts_the_embed_when_a_ready_tenant_actually_changed(
+        self,
+        mock_reconcile: AsyncMock,
+        mock_set_provision_status: AsyncMock,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """was_ready=True but the report records a real change: the ready embed posts."""
+        from daimon.core.defaults.report import Action, ApplyReport, ResourceOutcome
+
+        report = ApplyReport()
+        report.add(ResourceOutcome(kind="agent", name="test-agent", action=Action.UPDATED))
+        mock_reconcile.return_value = report
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(900000021)
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=uuid.uuid4(), guild=guild, was_ready=True
+        )
+
+        guild.system_channel.send.assert_awaited_once()  # pyright: ignore[reportUnknownMemberType]
+        embed = guild.system_channel.send.await_args.kwargs["embed"]  # pyright: ignore[reportUnknownMemberType]
+        assert "ready" in (embed.title or "").lower(), (
+            "a report recording a real change must still post the ready embed"
+        )
+
+    @patch("daimon.adapters.discord.bot.set_provision_status", new_callable=AsyncMock)
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_a_pending_tenant_still_gets_its_embed_on_an_all_skipped_report(
+        self,
+        mock_reconcile: AsyncMock,
+        mock_set_provision_status: AsyncMock,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """was_ready=False (first-run/recovery) is never suppressed, even on an
+        all-skipped report."""
+        from daimon.core.defaults.report import ApplyReport
+
+        mock_reconcile.return_value = ApplyReport()
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(900000022)
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=uuid.uuid4(), guild=guild, was_ready=False
+        )
+
+        guild.system_channel.send.assert_awaited_once()  # pyright: ignore[reportUnknownMemberType]
+        embed = guild.system_channel.send.await_args.kwargs["embed"]  # pyright: ignore[reportUnknownMemberType]
+        assert "ready" in (embed.title or "").lower(), (
+            "a first-run/recovery seed (was_ready=False) must not be suppressed "
+            "even on an all-skipped report"
+        )
+
+    @patch("daimon.adapters.discord.bot.set_provision_status", new_callable=AsyncMock)
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_a_failed_reconcile_still_posts_the_snag_embed(
+        self,
+        mock_reconcile: AsyncMock,
+        mock_set_provision_status: AsyncMock,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A failed reconcile always posts the snag embed, regardless of was_ready."""
+        from daimon.core.defaults.report import Action, ApplyReport, ResourceOutcome
+
+        report = ApplyReport()
+        report.add(
+            ResourceOutcome(kind="skill", name="broken-skill", action=Action.FAILED, error="boom")
+        )
+        mock_reconcile.return_value = report
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(900000023)
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=uuid.uuid4(), guild=guild, was_ready=True
+        )
+
+        guild.system_channel.send.assert_awaited_once()  # pyright: ignore[reportUnknownMemberType]
+        embed = guild.system_channel.send.await_args.kwargs["embed"]  # pyright: ignore[reportUnknownMemberType]
+        assert "snag" in (embed.title or "").lower(), "every failure must still announce itself"
+
+
 def _make_thread_message_for_bot(
     *,
     content: str = "<@999> hello",
