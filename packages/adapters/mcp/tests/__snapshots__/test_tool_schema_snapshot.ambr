@@ -1845,6 +1845,38 @@
         'type': 'object',
       }),
     }),
+    'post_github_app_install_link': dict({
+      'description': '''
+        Post a button inviting the user to install daimon's GitHub App.
+        
+        Call this when the user wants daimon to reach a private repository
+        and has no token to paste, or when a sync failed because the repo is
+        not readable. Posts a button in the thread; clicking it opens the
+        install page on GitHub, where the user chooses which repositories to
+        grant access to.
+        
+        This tool CANNOT tell whether the install happened — a link button
+        gives no signal back. After the user says they installed it, verify
+        by attempting the sync again: the installation is resolved live at
+        that point.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'purpose': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'channel_id',
+          'purpose',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'post_wizard': dict({
       'description': '''
         Post a multi-step form in the channel instead of asking in prose.

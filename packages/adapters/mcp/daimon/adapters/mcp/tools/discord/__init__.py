@@ -16,6 +16,9 @@ constructed per-call via the ``rest_client(token)`` async context manager.
 
 from __future__ import annotations
 
+from daimon.adapters.mcp.tools.discord._app_install_button import (
+    _post_app_install_button_impl as _post_app_install_button_impl,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.adapters.mcp.tools.discord._client import (
     _require_discord_identity as _require_discord_identity,  # pyright: ignore[reportPrivateUsage]
 )

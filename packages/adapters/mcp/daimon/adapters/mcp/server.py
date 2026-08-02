@@ -50,6 +50,7 @@ from daimon.adapters.mcp.tools.agent_removal import register_agent_removal_tools
 from daimon.adapters.mcp.tools.channels import register_channel_tools
 from daimon.adapters.mcp.tools.cli_token import register_cli_token_tool
 from daimon.adapters.mcp.tools.credential_requests import register_credential_request_tools
+from daimon.adapters.mcp.tools.github_app import register_github_app_tools
 from daimon.adapters.mcp.tools.media import register_media_tools, register_upload_tool
 from daimon.adapters.mcp.tools.notebook import register_notebook_tools
 from daimon.adapters.mcp.tools.propagation import register_propagation_tools
@@ -261,6 +262,7 @@ def create_mcp_app(
     environments.register_environment_tools(mcp, runtime)
     vault.register_vault_tools(mcp, runtime)
     register_credential_request_tools(mcp, runtime)
+    register_github_app_tools(mcp, runtime)
     register_wizard_tools(mcp, runtime)
     skills.register_skill_tools(mcp, runtime)
     sessions.register_sessions_tools(mcp, runtime)
