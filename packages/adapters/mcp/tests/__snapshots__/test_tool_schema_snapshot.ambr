@@ -1,0 +1,3430 @@
+# serializer version: 1
+# name: test_rendered_tool_schema_matches_snapshot
+  dict({
+    'archive_agent': dict({
+      'description': '''
+        Archive the MA agent and delete from the tenant pool.
+        
+        Also clears any channel or workspace default naming the agent, so turns
+        in those scopes fall back to the next tier instead of failing to resolve.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'archive_environment': dict({
+      'description': 'Archive the MA environment and delete from the tenant pool.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'attach_mcp_server': dict({
+      'description': '''
+        Attach a no-auth MCP server to an agent.
+        
+        Use this ONLY for MCP servers that do not require authentication.
+        The tool patches the agent's ``mcp_servers`` with
+        ``{name: server_name, type: "url", url: url}`` AND appends a
+        matching ``mcp_toolset`` entry to ``tools`` (required by MA, which
+        rejects an agent whose ``mcp_servers`` entries aren't each
+        referenced by a ``mcp_toolset``). Existing entries are preserved.
+        If a server with the same ``server_name`` is already attached, the
+        new ``url`` replaces it (last-write-wins) and the existing
+        ``mcp_toolset`` is reused (no duplicate). If both ``server_name``
+        and ``url`` already match, this is a no-op.
+        
+        For MCP servers that REQUIRE an auth token, do NOT collect the
+        token in chat — direct the user to ``/agent-setup`` -> MCPs modal.
+        Tokens sent in chat end up in Discord channel history and MA's
+        tenant-wide session event log; the modal flow is the only
+        supported path for auth-required servers.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'server_name': dict({
+            'type': 'string',
+          }),
+          'url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'server_name',
+          'url',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'clear_agent_default': dict({
+      'description': '''
+        Remove the agent default from a channel or the whole workspace.
+        
+        When ``channel_id`` is provided only that channel's default is cleared;
+        omit it to clear the workspace-wide default.  If the scope had no
+        default the call is a no-op (idempotent).  Requires Manage Server (admin).
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'clear_repo_binding': dict({
+      'description': '''
+        Remove the repo binding for your agent.
+        
+        Idempotent — succeeds whether or not a binding existed.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'continue_turn': dict({
+      'description': '''
+        Send a follow-up message on an existing session.
+        
+        Use this to continue a multi-turn conversation. Returns
+        ``{"handle": "<session_id>"}`` unchanged for chaining.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'handle': dict({
+            'type': 'string',
+          }),
+          'message': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'handle',
+          'message',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'convert': dict({
+      'description': '''
+        Convert an ISO-8601 ``time`` from ``from_tz`` to ``to_tz``.
+        
+        Naive input is interpreted as ``from_tz``; aware input must agree
+        with ``from_tz`` at that wall time.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'from_tz': dict({
+            'type': 'string',
+          }),
+          'time': dict({
+            'type': 'string',
+          }),
+          'to_tz': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'time',
+          'from_tz',
+          'to_tz',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'create_agent': dict({
+      'description': '''
+        Create a new agent. Pass fields directly — there is NO ``spec`` wrapper.
+        
+        Required: ``name`` and ``model`` (e.g. ``"claude-sonnet-4-6"``).
+        Optional: ``description``, ``system`` (the system prompt), ``tools``,
+        ``mcp_servers``, and ``skill_repos`` — GitHub repos to sync skills from,
+        e.g. ``[{"url": "https://github.com/owner/repo", "branch": "main"}]``.
+        
+        Do not pass a ``skills`` field here. To add skills, either sync a repo via
+        ``skill_repos`` or use the ``skills_*`` tools after the agent is created.
+      ''',
+      'parameters': dict({
+        '$defs': dict({
+          'BetaManagedAgentsAgentToolConfigParams': dict({
+            'description': 'Configuration override for a specific tool within a toolset.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'name': dict({
+                'enum': list([
+                  'bash',
+                  'edit',
+                  'read',
+                  'write',
+                  'glob',
+                  'grep',
+                  'web_fetch',
+                  'web_search',
+                ]),
+                'type': 'string',
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'required': list([
+              'name',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAgentToolset20260401Params': dict({
+            'description': '''
+              Configuration for built-in agent tools.
+              
+              Use this to enable or disable groups of tools available to the agent.
+            ''',
+            'properties': dict({
+              'configs': dict({
+                'items': dict({
+                  '$ref': '#/$defs/BetaManagedAgentsAgentToolConfigParams',
+                }),
+                'type': 'array',
+              }),
+              'default_config': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAgentToolsetDefaultConfigParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'agent_toolset_20260401',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAgentToolsetDefaultConfigParams': dict({
+            'description': 'Default configuration for all tools in a toolset.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAlwaysAllowPolicyParam': dict({
+            'description': 'Tool calls are automatically approved without user confirmation.',
+            'properties': dict({
+              'type': dict({
+                'const': 'always_allow',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAlwaysAskPolicyParam': dict({
+            'description': 'Tool calls require user confirmation before execution.',
+            'properties': dict({
+              'type': dict({
+                'const': 'always_ask',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsCustomToolInputSchemaParam': dict({
+            'additionalProperties': True,
+            'description': 'JSON Schema for custom tool input parameters.',
+            'properties': dict({
+              'properties': dict({
+                'anyOf': list([
+                  dict({
+                    'additionalProperties': True,
+                    'type': 'object',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'required': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'object',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsCustomToolParams': dict({
+            'description': '''
+              A custom tool that is executed by the API client rather than the agent.
+              
+              When the agent calls this tool, an `agent.custom_tool_use` event is emitted and the session goes idle, waiting for the client to provide the result via a `user.custom_tool_result` event.
+            ''',
+            'properties': dict({
+              'description': dict({
+                'type': 'string',
+              }),
+              'input_schema': dict({
+                '$ref': '#/$defs/BetaManagedAgentsCustomToolInputSchemaParam',
+              }),
+              'name': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'custom',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'description',
+              'input_schema',
+              'name',
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsMCPToolConfigParams': dict({
+            'description': 'Configuration override for a specific MCP tool.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'name': dict({
+                'type': 'string',
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'required': list([
+              'name',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsMCPToolsetDefaultConfigParams': dict({
+            'description': 'Default configuration for all tools from an MCP server.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsMCPToolsetParams': dict({
+            'description': 'Configuration for tools from an MCP server defined in `mcp_servers`.',
+            'properties': dict({
+              'configs': dict({
+                'items': dict({
+                  '$ref': '#/$defs/BetaManagedAgentsMCPToolConfigParams',
+                }),
+                'type': 'array',
+              }),
+              'default_config': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsMCPToolsetDefaultConfigParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'mcp_server_name': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'mcp_toolset',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'mcp_server_name',
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsURLMCPServerParams': dict({
+            'description': 'URL-based MCP server connection.',
+            'properties': dict({
+              'name': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'url',
+                'type': 'string',
+              }),
+              'url': dict({
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'name',
+              'type',
+              'url',
+            ]),
+            'type': 'object',
+          }),
+          'SkillRepo': dict({
+            'additionalProperties': False,
+            'description': '''
+              Authoring-time reference to a GitHub skill repository.
+              
+              Used by the `sync_agent_skills` orchestrator. Excluded from
+              `AgentSpec.model_dump()` because skill_repos do not serialize to MA —
+              the sync pipeline turns them into uploaded `BetaManagedAgentsSkillParams`.
+            ''',
+            'properties': dict({
+              'branch': dict({
+                'default': 'main',
+                'type': 'string',
+              }),
+              'path': dict({
+                'default': '',
+                'type': 'string',
+              }),
+              'split': dict({
+                'default': True,
+                'type': 'boolean',
+              }),
+              'url': dict({
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'url',
+            ]),
+            'type': 'object',
+          }),
+        }),
+        'additionalProperties': False,
+        'properties': dict({
+          'description': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'mcp_servers': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  '$ref': '#/$defs/BetaManagedAgentsURLMCPServerParams',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'model': dict({
+            'anyOf': list([
+              dict({
+                'enum': list([
+                  'claude-sonnet-5',
+                  'claude-fable-5',
+                  'claude-opus-4-8',
+                  'claude-opus-4-7',
+                  'claude-opus-4-6',
+                  'claude-sonnet-4-6',
+                  'claude-haiku-4-5',
+                  'claude-haiku-4-5-20251001',
+                  'claude-opus-4-5',
+                  'claude-opus-4-5-20251101',
+                  'claude-sonnet-4-5',
+                  'claude-sonnet-4-5-20250929',
+                ]),
+                'type': 'string',
+              }),
+              dict({
+                'type': 'string',
+              }),
+            ]),
+          }),
+          'name': dict({
+            'type': 'string',
+          }),
+          'skill_repos': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  '$ref': '#/$defs/SkillRepo',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'system': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'tools': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'anyOf': list([
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsAgentToolset20260401Params',
+                    }),
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsMCPToolsetParams',
+                    }),
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsCustomToolParams',
+                    }),
+                  ]),
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'required': list([
+          'name',
+          'model',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'create_attachment_upload_url': dict({
+      'description': '''
+        Mint a one-time upload URL for a raw data file in a notebook/blog workspace.
+        
+        Produce the bytes in your sandbox (e.g. idata.to_netcdf("posterior.nc")) then
+        PUT the file to upload_url with curl -sS -X PUT --data-binary @posterior.nc
+        "<upload_url>". This is the ONLY way to attach large data — base64 through a
+        tool argument cannot carry ~1 MB.
+        
+        name is the agent-visible filename (charset [A-Za-z0-9_][A-Za-z0-9_.-]{0,63},
+        no slash); it becomes data/<name> inside the notebook. slug must match the slug
+        you publish the notebook/blog under. Returns {upload_url, slug, upload_expires_at}.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+          'slug': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'slug',
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'create_blog_upload_url': dict({
+      'description': '''
+        Mint a one-time upload URL for a PERMANENT, shareable blog (run mode).
+        
+        Get the blog's .py into a sandbox file, then PUT it to upload_url. slug is
+        required and becomes part of the permanent public URL — choose a meaningful,
+        stable name. The host validates that the cells execute before serving; the
+        curl response carries the live url on success or a 422 with the failing cells.
+        
+        Returns {upload_url, slug, upload_expires_at}. Upload with:
+        curl -sS -X PUT --data-binary @<file> "<upload_url>". Never paste large file
+        contents into a tool argument.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'slug': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'slug',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'create_environment': dict({
+      'description': 'Create a new environment from an EnvironmentSpec.',
+      'parameters': dict({
+        '$defs': dict({
+          'BetaCloudConfigParams': dict({
+            'additionalProperties': False,
+            'description': '''
+              Request params for `cloud` environment configuration.
+              
+              Fields default to null; on update, omitted fields preserve the
+              existing value.
+            ''',
+            'properties': dict({
+              'networking': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaUnrestrictedNetworkParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaLimitedNetworkParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'packages': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaPackagesParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'cloud',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaLimitedNetworkParams': dict({
+            'additionalProperties': False,
+            'description': '''
+              Limited network request params.
+              
+              Fields default to null; on update, omitted fields preserve the
+              existing value.
+            ''',
+            'properties': dict({
+              'allow_mcp_servers': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'allow_package_managers': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'allowed_hosts': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'limited',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaPackagesParams': dict({
+            'additionalProperties': False,
+            'description': '''
+              Specify packages (and optionally their versions) available in this environment.
+              
+              When versioning, use the version semantics relevant for the package manager, e.g. for `pip` use `package==1.0.0`. You are responsible for validating the package and version exist. Unversioned installs the latest.
+            ''',
+            'properties': dict({
+              'apt': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'cargo': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'gem': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'go': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'npm': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'pip': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'packages',
+                'type': 'string',
+              }),
+            }),
+            'type': 'object',
+          }),
+          'BetaUnrestrictedNetworkParam': dict({
+            'additionalProperties': False,
+            'description': 'Unrestricted network access.',
+            'properties': dict({
+              'type': dict({
+                'const': 'unrestricted',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'EnvironmentSpec': dict({
+            'additionalProperties': False,
+            'description': '''
+              Authoring shape for an environment YAML file.
+              
+              Mirrors `anthropic.types.beta.environment_create_params.EnvironmentCreateParams`
+              with `extra="forbid"` so authoring typos fail before any MA write. The SDK's
+              `BetaCloudConfigParams` TypedDict is the nested type for `config` — no
+              re-declaration here. `metadata` is intentionally omitted: the upload call
+              synthesizes `{daimon_account, daimon_name}` at the SDK boundary.
+            ''',
+            'properties': dict({
+              'config': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaCloudConfigParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+              }),
+              'description': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+              }),
+              'name': dict({
+                'type': 'string',
+              }),
+              'scope': dict({
+                'anyOf': list([
+                  dict({
+                    'enum': list([
+                      'organization',
+                      'account',
+                    ]),
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+              }),
+            }),
+            'required': list([
+              'name',
+            ]),
+            'type': 'object',
+          }),
+        }),
+        'additionalProperties': False,
+        'properties': dict({
+          'spec': dict({
+            '$ref': '#/$defs/EnvironmentSpec',
+          }),
+        }),
+        'required': list([
+          'spec',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'create_notebook_upload_url': dict({
+      'description': '''
+        Mint a one-time upload URL for an ephemeral marimo notebook.
+        
+        Get your notebook's .py into a sandbox file (author it incrementally with
+        write/edit + read-back, or curl it from an origin), then PUT the file to the
+        returned upload_url — the source never goes through a tool argument (which
+        truncates large notebooks).
+        
+        Returns {upload_url, slug, upload_expires_at}. upload_expires_at is when the
+        URL stops working (~5 min); use it promptly. Pass slug to reuse a stable URL
+        across iterations, or omit it for a fresh random one.
+        
+        Then upload with: curl -sS -X PUT --data-binary @<file> "<upload_url>". The
+        curl response JSON carries the live url (and expires_at for notebooks); share
+        that. Never paste large file contents into a tool argument.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'slug': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'create_routine': dict({
+      'description': '''
+        Create a routine in the caller's tenant partition.
+        
+        ``agent_name`` MUST be the exact daimon-side display name of an
+        existing agent on this tenant (e.g. ``"daimon"``, ``"daimon-copy"``,
+        ``"research-bot"``). It is NOT:
+        
+        - a free-text description of the routine
+        - a Discord mention, tag fragment, or user handle
+        - a routine label or trigger phrase
+        - the name of a tool, MCP, or skill
+        
+        The tool resolves ``agent_name`` to a live MA agent id at the call
+        boundary; an unknown name raises ``ToolError`` and the
+        routine is not created.
+        
+        If you are the calling agent and do not know which agent to bind the
+        routine to, DEFAULT to your own name (the one you were addressed as
+        in this conversation). Do NOT guess from context — if ambiguous, ask
+        the user which agent should own the routine.
+        
+        Example: a user says "daimon, create a routine that pings me every
+        5 minutes with the message 'ping'". The correct call is
+        ``create_routine(agent_name="daimon", cron_expr="*/5 * * * *",
+        timezone="UTC", trigger_message="ping")``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'cron_expr': dict({
+            'type': 'string',
+          }),
+          'enabled': dict({
+            'default': True,
+            'type': 'boolean',
+          }),
+          'timezone': dict({
+            'type': 'string',
+          }),
+          'trigger_message': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'cron_expr',
+          'timezone',
+          'trigger_message',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'delete_blog': dict({
+      'description': '''
+        Un-publish a blog you previously published (frees its host port).
+        
+        slug is the same slug you passed to create_blog_upload_url.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'slug': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'slug',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'delete_routine': dict({
+      'description': 'Delete a routine (hard delete, tenant-scoped).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'routine_id': dict({
+            'format': 'uuid',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'routine_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'delete_skill': dict({
+      'description': 'Delete a skill and all its versions.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'describe_agent': dict({
+      'description': '''
+        Describe the agent associated with this MCP token.
+        
+        Returns the agent's name, system-prompt summary, skill identifiers,
+        and configured environment. No parameters — agent identity is read
+        from the token claim (confused-deputy mitigation).
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'detach_mcp_server': dict({
+      'description': '''
+        Detach an attached MCP server from an agent.
+        
+        Removes the named entry from ``mcp_servers`` AND its matching
+        ``mcp_toolset`` entry from ``tools`` together — MA rejects an agent
+        whose ``mcp_servers`` entries aren't each referenced by a
+        ``mcp_toolset``, so both must go in the same update. Every other
+        attached server, skill, and tool is preserved. The reserved built-in
+        daimon server cannot be detached.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'server_name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'server_name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'fetch_youtube_transcript': dict({
+      'description': '''
+        Fetch the transcript of a public YouTube video for summarization or Q&A.
+        
+        Use this when the user shares a YouTube URL and asks about the video's
+        content — summaries, key points, quotes, "what did they say at X". Do
+        NOT use it for unrelated chat about a video the user mentions without
+        asking for content help.
+        
+        The returned transcript includes [HH:MM:SS] timestamps every ~30
+        seconds and bracketed visual notes (e.g. "[shows chart]") for moments
+        not captured by audio. Use timestamps when you cite specific moments
+        in your reply ("around 12:30 they discuss...").
+        
+        Limitations:
+        - Public videos only. Private and unlisted URLs will error out — tell
+          the user the video must be public.
+        - Free-tier quota is 8 hours of YouTube video per day across the whole
+          deployment. If you see a quota error, tell the user honestly.
+        - Returns English transcripts. For non-English content, the speakers'
+          original words are preserved but section labels are English.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'url': dict({
+            'description': '''
+              A public YouTube video URL. Accepts youtube.com/watch?v=,
+              youtu.be/, /embed/, /shorts/, /live/ shapes.
+            ''',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'url',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'fork_agent': dict({
+      'description': 'Clone an agent within the tenant pool under a new name.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'new_name': dict({
+            'type': 'string',
+          }),
+          'source_name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'source_name',
+          'new_name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'generate_audio': dict({
+      'description': '''
+        Generate audio from a speaker-tagged script and store it for later posting.
+        
+        Scripts use uppercase [TAG] prefixes to mark speaker turns:
+        
+            [NARRATOR] This is the brief.
+            [HOST_A] Welcome to the show.
+            [HOST_B] Let me break this down...
+        
+        SCRIPT TONE — follow these strictly:
+        - Be direct and informative. State what happened, what it means, and
+          what's next. No hype, no cheerleading, no "incredible", "amazing",
+          "groundbreaking", "game-changing", or "exciting".
+        - Don't praise the community, the team, or the work. Report on it.
+        - Don't editorialize with superlatives. "The team shipped X" not
+          "The team shipped an absolutely stellar X".
+        - Conversational is fine. Enthusiasm about genuinely surprising things
+          is fine. But the default register is a calm, smart briefing — not a
+          hype reel.
+        - Never end with a generic motivational sign-off ("keep up the amazing
+          work!", "the future is bright!", "can't wait to see what's next!").
+          End with substance or just stop.
+        
+        The MP3 is stored under "{title}.mp3". Post it back to the SAME
+        channel or thread where the user asked — pass the filename via
+        ``send_message``'s ``file_handles`` parameter. Never post to a
+        different channel unless the user explicitly names one.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'script': dict({
+            'type': 'string',
+          }),
+          'title': dict({
+            'type': 'string',
+          }),
+          'voices': dict({
+            'anyOf': list([
+              dict({
+                'additionalProperties': dict({
+                  'enum': list([
+                    'Zephyr',
+                    'Puck',
+                    'Charon',
+                    'Kore',
+                    'Fenrir',
+                    'Leda',
+                    'Orus',
+                    'Aoede',
+                    'Callirrhoe',
+                    'Autonoe',
+                    'Enceladus',
+                    'Iapetus',
+                    'Umbriel',
+                    'Algieba',
+                    'Despina',
+                    'Erinome',
+                    'Algenib',
+                    'Rasalgethi',
+                    'Laomedeia',
+                    'Achernar',
+                    'Alnilam',
+                    'Schedar',
+                    'Gacrux',
+                    'Pulcherrima',
+                    'Achird',
+                    'Zubenelgenubi',
+                    'Vindemiatrix',
+                    'Sadachbia',
+                    'Sadaltager',
+                    'Sulafat',
+                  ]),
+                  'type': 'string',
+                }),
+                'type': 'object',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': "Map speaker tag -> Gemini voice. Default is Charon for all speakers — only override if the user explicitly requests different voices. Example: {'HOST_A': 'Fenrir', 'HOST_B': 'Charon'}.",
+          }),
+        }),
+        'required': list([
+          'script',
+          'title',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'generate_image': dict({
+      'description': '''
+        Generate an image from a text prompt using Gemini.
+        
+        Returns the filename. Post it back to the SAME channel or thread
+        where the user asked — pass it via ``send_message``'s
+        ``file_handles`` parameter. Never post to a different channel
+        unless the user explicitly names one.
+        
+        ``aspect_ratio`` must be one of: 1:1, 1:4, 1:8, 2:3, 3:2, 3:4,
+        4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9. Defaults to 1:1.
+        
+        ``title`` is used as the filename (without extension). Use lowercase
+        kebab-case, e.g. "sunset-landscape" -> "sunset-landscape.jpg".
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'aspect_ratio': dict({
+            'default': '1:1',
+            'type': 'string',
+          }),
+          'prompt': dict({
+            'type': 'string',
+          }),
+          'title': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'prompt',
+          'title',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_agent': dict({
+      'description': '''
+        Look up an agent by name.
+        
+        Returns the agent's attached ``mcp_servers`` (name + url) and
+        ``skills``. Custom skill entries include ``name`` — the resolved
+        display title (``null`` if the underlying skill was deleted);
+        anthropic skill entries have a readable ``skill_id`` and no name.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_cli_token': dict({
+      'description': '''
+        Mint a short-lived CLI access token for the named service.
+        
+        Fails with a ``ToolError`` when the calling agent has no credential
+        bound for that service — see the ``cli-auth`` skill for the
+        per-agent binding flow. On success, returns the token as plaintext
+        (e.g. for ``export GH_TOKEN=$(...)``).
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'service': dict({
+            'enum': list([
+              'github',
+              'gcloud',
+            ]),
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'service',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_environment': dict({
+      'description': 'Return one environment by name.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_message': dict({
+      'description': 'Fetch a single message by channel and message id (Slack: the message ts).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'message_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'channel_id',
+          'message_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_my_session': dict({
+      'description': '''
+        Get one session's status and metadata (no reply text, read-only).
+        
+        Use this to check whether a turn has finished (``status`` becomes
+        ``idle``/``terminated``) before reading the transcript with
+        ``list_events``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'handle': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'handle',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_repo_binding': dict({
+      'description': 'Return the current repo binding for your agent, or null if unbound.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'get_routine': dict({
+      'description': 'Get a routine by id (tenant-scoped; raises if not found or cross-tenant).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'routine_id': dict({
+            'format': 'uuid',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'routine_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_session': dict({
+      'description': 'Look up a session by id (tenant-scoped).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'session_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'session_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'get_skill': dict({
+      'description': 'Look up a skill by name. Returns detail including version count.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'list_agents': dict({
+      'description': '''
+        List agents in the tenant pool, including each agent's attached
+        ``mcp_servers`` and ``skills``. ``page`` is reserved for future pagination.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'page': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_blogs': dict({
+      'description': '''
+        List the blogs you've published (slug, url, alive). Use to review or
+        clean up — pass a slug to delete_blog to reclaim a host port.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_channels': dict({
+      'description': 'List channels in this server/workspace that you can view.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_credentials': dict({
+      'description': "List credentials in the caller's MCP vault (safe projection — no secrets).",
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_env_credential_keys': dict({
+      'description': '''
+        List the environment variable KEY NAMES currently set on an agent.
+        
+        Returns names only, never a value — so the agent can see what is
+        configured without a value ever entering chat. To add a variable,
+        use ``request_env_credential``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'list_environments': dict({
+      'description': 'List environments in the tenant pool. ``page`` is reserved for future pagination.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'page': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_events': dict({
+      'description': '''
+        List a session's events — the transcript.
+        
+        The agent's reply is in the ``agent.message`` events. Call this once
+        ``get_session`` reports the session is idle to read what the agent said.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'handle': dict({
+            'type': 'string',
+          }),
+          'limit': dict({
+            'anyOf': list([
+              dict({
+                'type': 'integer',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'order': dict({
+            'anyOf': list([
+              dict({
+                'enum': list([
+                  'asc',
+                  'desc',
+                ]),
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'page': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'required': list([
+          'handle',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'list_my_sessions': dict({
+      'description': '''
+        List this agent's sessions (id, status, title, timestamps).
+        
+        ``id`` is the handle you pass to ``get_session``, ``list_events``, and
+        ``continue_turn``. Scoped to this agent only. No parameters — identity
+        is read from the token claim.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_routines': dict({
+      'description': "List all routines in the caller's tenant partition.",
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_session_events': dict({
+      'description': 'List events for a session (SDK pass-through, single page).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'limit': dict({
+            'anyOf': list([
+              dict({
+                'type': 'integer',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'order': dict({
+            'anyOf': list([
+              dict({
+                'enum': list([
+                  'asc',
+                  'desc',
+                ]),
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'page': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'session_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'session_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'list_sessions': dict({
+      'description': 'List sessions in the tenant pool. ``agent_name`` narrows to one agent.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'page': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_skills': dict({
+      'description': 'List all custom skills.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'list_threads': dict({
+      'description': '''
+        List active and archived public threads for a channel.
+        
+        Archived private threads are not listed.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'now': dict({
+      'description': 'Return the current wall-clock time in the given IANA timezone as ISO-8601.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'tz': dict({
+            'default': 'UTC',
+            'type': 'string',
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'parse_link': dict({
+      'description': '''
+        Extract IDs from a Discord URL.
+        
+        Supports discord.com, ptb.discord.com, and canary.discord.com URLs.
+        
+        After parsing:
+        - If link_type is "channel": use read_channel(channel_id)
+        - If link_type is "message_or_thread": try read_thread(thread_id) first;
+          if read_thread fails, it is a message: use get_message(channel_id, message_id)
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'url',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'post_wizard': dict({
+      'description': '''
+        Post a multi-step form in the channel instead of asking in prose.
+        
+        Each entry in ``steps`` is single-choice, multi-select, or free-text.
+        A step may carry one finished image by passing the file-store handle
+        returned by the image-generation tool — never a URL, never a diagram
+        source. Server channels and threads are supported; direct messages
+        are not. A form that exceeds a platform ceiling (too many steps, too
+        many options, too large a label) raises an error naming the offending
+        step — split the form into a shorter follow-up and retry.
+        
+        AFTER CALLING THIS TOOL YOU MUST END YOUR TURN IMMEDIATELY. Do not
+        narrate the form, do not continue the conversation, and do not call
+        another tool. The user's answers arrive later as a brand-new message.
+      ''',
+      'parameters': dict({
+        '$defs': dict({
+          'Option': dict({
+            'description': 'One selectable option on a `choice` or `multi` step.',
+            'properties': dict({
+              'description': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+                'description': 'Optional secondary text shown alongside the option label.',
+              }),
+              'label': dict({
+                'description': 'Human-readable button/select-option text shown to the user.',
+                'type': 'string',
+              }),
+              'value': dict({
+                'description': 'Stable machine value recorded in the answer when this option is chosen.',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'label',
+              'value',
+            ]),
+            'type': 'object',
+          }),
+          'Step': dict({
+            'description': 'One screen of the wizard: a question plus how it is answered.',
+            'properties': dict({
+              'allow_custom': dict({
+                'default': True,
+                'description': 'Whether the user may add a free-text option alongside the listed options.',
+                'type': 'boolean',
+              }),
+              'image_handle': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+                'description': 'File-store handle id previously returned by the image-generation tool -- a finished PNG, never a URL and never a diagram source. Anything that produces an image does so upstream, before the handle is attached here.',
+              }),
+              'image_url': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+                'description': 'Server-populated; ignored when supplied by the caller.',
+              }),
+              'key': dict({
+                'description': "Stable identifier for this step's answer; must be unique across the form.",
+                'type': 'string',
+              }),
+              'kind': dict({
+                '$ref': '#/$defs/StepKind',
+                'description': 'Whether this step is a single choice, a multi-select, or free text.',
+              }),
+              'max': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'integer',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+                'description': 'Maximum number of selections allowed on a `multi` step.',
+              }),
+              'min': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'integer',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+                'default': None,
+                'description': 'Minimum number of selections required on a `multi` step.',
+              }),
+              'options': dict({
+                'description': 'The selectable options for a `choice` or `multi` step. Unused for `text`.',
+                'items': dict({
+                  '$ref': '#/$defs/Option',
+                }),
+                'type': 'array',
+              }),
+              'question': dict({
+                'description': 'The question text shown to the user on this step.',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'key',
+              'question',
+              'kind',
+            ]),
+            'type': 'object',
+          }),
+          'StepKind': dict({
+            'description': 'The three step shapes a wizard form can author.',
+            'enum': list([
+              'choice',
+              'multi',
+              'text',
+            ]),
+            'type': 'string',
+          }),
+        }),
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'prompt': dict({
+            'type': 'string',
+          }),
+          'steps': dict({
+            'items': dict({
+              '$ref': '#/$defs/Step',
+            }),
+            'type': 'array',
+          }),
+        }),
+        'required': list([
+          'prompt',
+          'steps',
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'read_channel': dict({
+      'description': '''
+        Read recent messages from a channel, oldest-first.
+        
+        For threads use read_thread.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'limit': dict({
+            'default': 50,
+            'type': 'integer',
+          }),
+        }),
+        'required': list([
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'read_thread': dict({
+      'description': '''
+        Read messages from a thread, oldest-first.
+        
+        Discord: thread_id is the thread's channel id; use before for older messages.
+        Slack: thread_id is channel_id:thread_ts (e.g. C0123456789:1717171717.123456);
+        before is ignored.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'before': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'limit': dict({
+            'default': 50,
+            'type': 'integer',
+          }),
+          'thread_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'thread_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'remove_env_credential': dict({
+      'description': '''
+        Remove one environment variable from an agent.
+        
+        Idempotent: removing a key that is not currently set still succeeds
+        — the result's ``removed`` flag reports whether the key was actually
+        present. To ADD a variable, use ``request_env_credential`` instead;
+        entry always goes through the private modal flow, never through chat.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'key': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'key',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'remove_skill': dict({
+      'description': '''
+        Detach one attached skill from an agent.
+        
+        Accepts either the skill's raw ``skill_id`` or its resolved display
+        name. Every other attached skill and the agent's base tool set are
+        preserved.
+        
+        This is a DIFFERENT operation from ``delete_skill`` /
+        ``skills_delete``, which destroy a skill for every agent in the
+        tenant. ``remove_skill`` only detaches this one agent's reference —
+        the skill resource itself, and any other agent that has it attached,
+        is untouched.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'skill_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'skill_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'request_env_credential': dict({
+      'description': '''
+        Request an environment secret from the user via a private modal.
+        
+        Call this INSTEAD of ever accepting a secret value in chat. Posts a
+        button in the thread naming the exact env key; clicking it opens a
+        native Discord modal where the user enters the value privately — it
+        never appears in this channel or in your context. Once added, the
+        credential becomes usable by everyone who talks to ``agent_name``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'key': dict({
+            'type': 'string',
+          }),
+          'purpose': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'key',
+          'purpose',
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'request_mcp_credential': dict({
+      'description': '''
+        Request an auth-required MCP server's credential via a private modal.
+        
+        Call this INSTEAD of ever accepting a token value in chat, and instead
+        of ``attach_mcp_server`` when the server requires authentication.
+        Posts a button in the thread naming the exact server; clicking it
+        opens a native Discord modal where the user enters the token
+        privately — it never appears in this channel or in your context.
+        Once added, the credential becomes usable by everyone who talks to
+        ``agent_name``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'server_name': dict({
+            'type': 'string',
+          }),
+          'url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'server_name',
+          'url',
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'search_messages': dict({
+      'description': '''
+        Search messages with server-side filters.
+        
+        Limit caps at 25 per page — paginate with offset. When the search is
+        scoped to channel_ids, total_results is the exact count for those
+        channels (you must be able to view them; they are rejected before
+        searching). Unscoped searches report only the visible rows — the
+        guild-wide count is withheld because it includes channels you cannot
+        view. Slack: only content + limit are supported (other filters are
+        Discord-only), and 1:1 DM hits are only returned in a DM with daimon.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'author_ids': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'type': 'string',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'author_types': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'type': 'string',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'channel_ids': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'type': 'string',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'content': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'has': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'type': 'string',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'limit': dict({
+            'default': 25,
+            'type': 'integer',
+          }),
+          'mentions': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'type': 'string',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'offset': dict({
+            'default': 0,
+            'type': 'integer',
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
+    'self_delete_file': dict({
+      'description': 'Delete a per-agent file by `key`. Idempotent — succeeds whether or not a file existed.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'key': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'key',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'self_list_files': dict({
+      'description': 'List all keys + metadata for files in your private agent_files namespace.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'self_read_file': dict({
+      'description': 'Read a per-agent file by `key`. Returns null if no file exists at that key.',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'key': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'key',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'self_write_file': dict({
+      'description': '''
+        Write or overwrite a per-agent file under `key`.
+        
+        Stored in your private agent_files namespace; isolated from other agents.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'content': dict({
+            'type': 'string',
+          }),
+          'key': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'key',
+          'content',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'send_message': dict({
+      'description': '''
+        Post a message to a Discord channel.
+        
+        Only call this when the user explicitly asks you to send or post something
+        to Discord. Do NOT call it to share results, summaries, or outputs unless
+        the user specifically requested a Discord post. Deliver output in your reply
+        instead.
+        
+        ``attachments=[{url, filename}]`` fetches over https (<=25 MiB each).
+        ``file_handles=[filename, ...]`` references files previously stored
+        in the media FileStore by ``generate_audio`` or ``generate_image``.
+        Combined cap of 10 attachments per message.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'attachments': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'additionalProperties': dict({
+                    'type': 'string',
+                  }),
+                  'type': 'object',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'content': dict({
+            'type': 'string',
+          }),
+          'file_handles': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'type': 'string',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'required': list([
+          'channel_id',
+          'content',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'set_agent_default': dict({
+      'description': '''
+        Set the agent that responds by default in a channel or the whole workspace.
+        
+        When ``channel_id`` is provided the default is scoped to that channel;
+        omit it to set the workspace-wide default.  Any existing default at the
+        chosen scope is replaced (last-write-wins; an audit stamp is recorded by
+        core).  Requires Manage Server (admin).
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'channel_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'required': list([
+          'agent_name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'set_repo_binding': dict({
+      'description': '''
+        Bind your agent to a git repo.
+        
+        Mints a credential, stores it in your MA Vault, and records the binding.
+        Replaces any existing binding for your agent.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'default_branch': dict({
+            'type': 'string',
+          }),
+          'repo_url': dict({
+            'type': 'string',
+          }),
+          'service': dict({
+            'const': 'github',
+            'default': 'github',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'repo_url',
+          'default_branch',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'skills_delete': dict({
+      'description': 'Delete a skill and all its versions (alias of ``delete_skill``).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'skills_get': dict({
+      'description': '''
+        Look up a skill by name (alias of ``get_skill``).
+        
+        Returns detail including version count.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'skills_list': dict({
+      'description': 'List all custom skills (alias of ``list_skills``).',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+        }),
+        'type': 'object',
+      }),
+    }),
+    'skills_sync': dict({
+      'description': '''
+        Sync skills from a GitHub repository (alias of ``sync_skills``).
+        
+        Discovers SKILL.md and creates or updates them.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'branch': dict({
+            'default': 'main',
+            'type': 'string',
+          }),
+          'path': dict({
+            'default': '',
+            'type': 'string',
+          }),
+          'url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'url',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'start_turn': dict({
+      'description': '''
+        Start a new conversation turn with the agent and return a handle.
+        
+        Creates a persistent MA session with vault/repo/env parity and sends
+        the first user message. Returns ``{"handle": "<session_id>"}`` which
+        you pass to ``get_session``, ``list_events``, and ``continue_turn``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'message': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'message',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'sync_skills': dict({
+      'description': '''
+        Sync skills from a GitHub repository. Discovers SKILL.md and creates or updates them.
+        
+        LOCAL-FIRST: before syncing an external repo, call ``list_skills`` to see
+        what is already installed and prefer an existing skill over pulling a
+        near-duplicate. Only sync an external repo the user explicitly asked for.
+        
+        Synced skills are added to this tenant's shared skill registry (visible to
+        every agent in the tenant), so name where they came from when you report
+        back — the returned ``source_url``/``branch``/``path`` echo that provenance.
+        
+        Before calling, inspect the repo structure to determine the correct ``path``
+        parameter (empty string = repo root). ``branch`` defaults to ``"main"``.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'branch': dict({
+            'default': 'main',
+            'type': 'string',
+          }),
+          'path': dict({
+            'default': '',
+            'type': 'string',
+          }),
+          'url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'url',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'update_agent': dict({
+      'description': '''
+        Patch-update an agent.
+        
+        Scalar fields (``model``, ``description``, ``system``) replace.
+        List fields (``tools``, ``mcp_servers``, ``skills``) UNION with the
+        agent's current state — caller's entries win on collision. To remove
+        an existing entry, use the ``/agent-setup`` panel.
+        
+        ``skills`` accepts skill NAMES, e.g.
+        ``skills=["build-models", "compare-models"]`` — names are resolved to MA
+        skill ids server-side. The explicit dict form
+        ``{"type": "custom", "skill_id": "skill_..."}`` still works.
+      ''',
+      'parameters': dict({
+        '$defs': dict({
+          'BetaManagedAgentsAgentToolConfigParams': dict({
+            'description': 'Configuration override for a specific tool within a toolset.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'name': dict({
+                'enum': list([
+                  'bash',
+                  'edit',
+                  'read',
+                  'write',
+                  'glob',
+                  'grep',
+                  'web_fetch',
+                  'web_search',
+                ]),
+                'type': 'string',
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'required': list([
+              'name',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAgentToolset20260401Params': dict({
+            'description': '''
+              Configuration for built-in agent tools.
+              
+              Use this to enable or disable groups of tools available to the agent.
+            ''',
+            'properties': dict({
+              'configs': dict({
+                'items': dict({
+                  '$ref': '#/$defs/BetaManagedAgentsAgentToolConfigParams',
+                }),
+                'type': 'array',
+              }),
+              'default_config': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAgentToolsetDefaultConfigParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'agent_toolset_20260401',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAgentToolsetDefaultConfigParams': dict({
+            'description': 'Default configuration for all tools in a toolset.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAlwaysAllowPolicyParam': dict({
+            'description': 'Tool calls are automatically approved without user confirmation.',
+            'properties': dict({
+              'type': dict({
+                'const': 'always_allow',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAlwaysAskPolicyParam': dict({
+            'description': 'Tool calls require user confirmation before execution.',
+            'properties': dict({
+              'type': dict({
+                'const': 'always_ask',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsAnthropicSkillParams': dict({
+            'description': 'An Anthropic-managed skill.',
+            'properties': dict({
+              'skill_id': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'anthropic',
+                'type': 'string',
+              }),
+              'version': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'required': list([
+              'skill_id',
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsCustomSkillParams': dict({
+            'description': 'A user-created custom skill.',
+            'properties': dict({
+              'skill_id': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'custom',
+                'type': 'string',
+              }),
+              'version': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'string',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'required': list([
+              'skill_id',
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsCustomToolInputSchemaParam': dict({
+            'additionalProperties': True,
+            'description': 'JSON Schema for custom tool input parameters.',
+            'properties': dict({
+              'properties': dict({
+                'anyOf': list([
+                  dict({
+                    'additionalProperties': True,
+                    'type': 'object',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'required': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'object',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsCustomToolParams': dict({
+            'description': '''
+              A custom tool that is executed by the API client rather than the agent.
+              
+              When the agent calls this tool, an `agent.custom_tool_use` event is emitted and the session goes idle, waiting for the client to provide the result via a `user.custom_tool_result` event.
+            ''',
+            'properties': dict({
+              'description': dict({
+                'type': 'string',
+              }),
+              'input_schema': dict({
+                '$ref': '#/$defs/BetaManagedAgentsCustomToolInputSchemaParam',
+              }),
+              'name': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'custom',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'description',
+              'input_schema',
+              'name',
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsMCPToolConfigParams': dict({
+            'description': 'Configuration override for a specific MCP tool.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'name': dict({
+                'type': 'string',
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'required': list([
+              'name',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsMCPToolsetDefaultConfigParams': dict({
+            'description': 'Default configuration for all tools from an MCP server.',
+            'properties': dict({
+              'enabled': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'permission_policy': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAllowPolicyParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsAlwaysAskPolicyParam',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+            }),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsMCPToolsetParams': dict({
+            'description': 'Configuration for tools from an MCP server defined in `mcp_servers`.',
+            'properties': dict({
+              'configs': dict({
+                'items': dict({
+                  '$ref': '#/$defs/BetaManagedAgentsMCPToolConfigParams',
+                }),
+                'type': 'array',
+              }),
+              'default_config': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaManagedAgentsMCPToolsetDefaultConfigParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'mcp_server_name': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'mcp_toolset',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'mcp_server_name',
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaManagedAgentsURLMCPServerParams': dict({
+            'description': 'URL-based MCP server connection.',
+            'properties': dict({
+              'name': dict({
+                'type': 'string',
+              }),
+              'type': dict({
+                'const': 'url',
+                'type': 'string',
+              }),
+              'url': dict({
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'name',
+              'type',
+              'url',
+            ]),
+            'type': 'object',
+          }),
+        }),
+        'additionalProperties': False,
+        'properties': dict({
+          'description': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'mcp_servers': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  '$ref': '#/$defs/BetaManagedAgentsURLMCPServerParams',
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'model': dict({
+            'anyOf': list([
+              dict({
+                'enum': list([
+                  'claude-sonnet-5',
+                  'claude-fable-5',
+                  'claude-opus-4-8',
+                  'claude-opus-4-7',
+                  'claude-opus-4-6',
+                  'claude-sonnet-4-6',
+                  'claude-haiku-4-5',
+                  'claude-haiku-4-5-20251001',
+                  'claude-opus-4-5',
+                  'claude-opus-4-5-20251101',
+                  'claude-sonnet-4-5',
+                  'claude-sonnet-4-5-20250929',
+                ]),
+                'type': 'string',
+              }),
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'name': dict({
+            'type': 'string',
+          }),
+          'skills': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'anyOf': list([
+                    dict({
+                      'type': 'string',
+                    }),
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsAnthropicSkillParams',
+                    }),
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsCustomSkillParams',
+                    }),
+                  ]),
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'system': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'tools': dict({
+            'anyOf': list([
+              dict({
+                'items': dict({
+                  'anyOf': list([
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsAgentToolset20260401Params',
+                    }),
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsMCPToolsetParams',
+                    }),
+                    dict({
+                      '$ref': '#/$defs/BetaManagedAgentsCustomToolParams',
+                    }),
+                  ]),
+                }),
+                'type': 'array',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'update_environment': dict({
+      'description': 'Patch-update an environment. Omitted (None) fields are preserved.',
+      'parameters': dict({
+        '$defs': dict({
+          'BetaCloudConfigParams': dict({
+            'description': '''
+              Request params for `cloud` environment configuration.
+              
+              Fields default to null; on update, omitted fields preserve the
+              existing value.
+            ''',
+            'properties': dict({
+              'networking': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaUnrestrictedNetworkParam',
+                  }),
+                  dict({
+                    '$ref': '#/$defs/BetaLimitedNetworkParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'packages': dict({
+                'anyOf': list([
+                  dict({
+                    '$ref': '#/$defs/BetaPackagesParams',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'cloud',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaLimitedNetworkParams': dict({
+            'description': '''
+              Limited network request params.
+              
+              Fields default to null; on update, omitted fields preserve the
+              existing value.
+            ''',
+            'properties': dict({
+              'allow_mcp_servers': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'allow_package_managers': dict({
+                'anyOf': list([
+                  dict({
+                    'type': 'boolean',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'allowed_hosts': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'limited',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+          'BetaPackagesParams': dict({
+            'description': '''
+              Specify packages (and optionally their versions) available in this environment.
+              
+              When versioning, use the version semantics relevant for the package manager, e.g. for `pip` use `package==1.0.0`. You are responsible for validating the package and version exist. Unversioned installs the latest.
+            ''',
+            'properties': dict({
+              'apt': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'cargo': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'gem': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'go': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'npm': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'pip': dict({
+                'anyOf': list([
+                  dict({
+                    'items': dict({
+                      'type': 'string',
+                    }),
+                    'type': 'array',
+                  }),
+                  dict({
+                    'type': 'null',
+                  }),
+                ]),
+              }),
+              'type': dict({
+                'const': 'packages',
+                'type': 'string',
+              }),
+            }),
+            'type': 'object',
+          }),
+          'BetaUnrestrictedNetworkParam': dict({
+            'description': 'Unrestricted network access.',
+            'properties': dict({
+              'type': dict({
+                'const': 'unrestricted',
+                'type': 'string',
+              }),
+            }),
+            'required': list([
+              'type',
+            ]),
+            'type': 'object',
+          }),
+        }),
+        'additionalProperties': False,
+        'properties': dict({
+          'config': dict({
+            'anyOf': list([
+              dict({
+                '$ref': '#/$defs/BetaCloudConfigParams',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'description': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'name': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'name',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'update_routine': dict({
+      'description': '''
+        PATCH-update a routine. Only provided fields are changed.
+        
+        ``agent_name`` reassigns the routine to a different daimon-tagged agent;
+        the tool resolves it to a live MA agent id at the call boundary.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'cron_expr': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'enabled': dict({
+            'anyOf': list([
+              dict({
+                'type': 'boolean',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'routine_id': dict({
+            'format': 'uuid',
+            'type': 'string',
+          }),
+          'timezone': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'trigger_message': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'required': list([
+          'routine_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
+  })
+# ---
