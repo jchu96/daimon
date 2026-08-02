@@ -86,6 +86,31 @@ replacement is entered privately. Once a credential is added via either
 tool, it becomes usable by everyone who talks to that agent — say so when
 you post the button.
 
+## Which agent answers where
+
+Members reach an agent only by @mentioning the bot in the channel they're
+posting in — there is one bot for the whole workspace, not one bot per agent,
+so no configuration step ever adds a new bot to the server. What a mention
+resolves to — which agent answers — is controlled by the binding path below,
+not by anything the member does.
+
+Two admin-only tools control that binding, scoped by whether a channel is given:
+
+```
+set_agent_default(agent_name, channel_id)   # channel_id given -> this channel only
+set_agent_default(agent_name)               # channel_id omitted -> workspace-wide default
+clear_agent_default(channel_id)             # clears one channel's override
+clear_agent_default()                       # clears the workspace-wide default
+```
+
+Resolution cascades channel override first, then the workspace default — a
+channel with its own override always wins over the workspace default, and
+clearing a channel's override falls it back to whatever the workspace
+default resolves to next. Both tools require a workspace admin (Manage
+Server); a non-admin caller is refused with no write. The equivalent surface
+without chat is the setup panel's **Set as default…** door, which writes the
+same channel/workspace scopes and shows the same cascade.
+
 ## Scheduled routines
 
 The agent creates routines itself, with
