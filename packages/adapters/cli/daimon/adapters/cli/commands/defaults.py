@@ -7,11 +7,14 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from daimon.adapters.cli.errors import run_cli
 from daimon.adapters.cli.flags import JSON_OPTION
 from daimon.adapters.cli.runtime import CliRuntime, build_runtime
 from daimon.core.config import load_settings
 from daimon.core.defaults.apply import apply_defaults
-from daimon.core.defaults.report import ApplyReport, ResourceOutcome
+from daimon.core.defaults.provisioning import verify_tenant_defaults
+from daimon.core.defaults.report import ApplyReport, ResourceOutcome, classify_verification
+from daimon.core.stores.tenants import list_tenants_by_platform
 from rich.console import Console
 from rich.table import Table
 
@@ -96,4 +99,146 @@ async def defaults_apply(
     else:
         _format_report_table(console, report)
     if report.is_failure():
+        raise typer.Exit(code=1)
+
+
+@dataclasses.dataclass(frozen=True)
+class _TenantVerification:
+    """One tenant's classification from a dry-run verify pass."""
+
+    platform: str
+    external_id: str
+    status: str
+    changed: tuple[dict[str, str], ...]
+
+
+def _tenant_label(*, platform: str, external_id: str) -> str:
+    return f"{platform}:{external_id}"
+
+
+def _format_verify_table(
+    console: Console, results: list[_TenantVerification], *, awaiting_reseed: int
+) -> None:
+    for v in results:
+        label = _tenant_label(platform=v.platform, external_id=v.external_id)
+        if v.status == "in_sync":
+            console.print(f"{label}: in sync")
+        elif v.status == "diverged":
+            names = ", ".join(f"{c['kind']}:{c['name']}" for c in v.changed)
+            console.print(f"{label}: diverged ({names})")
+        else:
+            console.print(f"{label}: unverifiable — could not compare against the shipped spec")
+    console.print(
+        f"{awaiting_reseed} tenant(s) skipped as awaiting re-seed (pending or failed "
+        "provisioning, not a spec divergence)"
+    )
+
+
+def _format_verify_json(
+    console: Console, results: list[_TenantVerification], *, awaiting_reseed: int
+) -> None:
+    payload = {
+        "tenants": [
+            {
+                "platform": v.platform,
+                "external_id": v.external_id,
+                "status": v.status,
+                "changed": list(v.changed),
+            }
+            for v in results
+        ],
+        "awaiting_reseed": awaiting_reseed,
+        "ok": all(v.status == "in_sync" for v in results),
+    }
+    console.print(json.dumps(payload), soft_wrap=True, highlight=False, markup=False)
+
+
+@defaults_app.command(
+    "verify",
+    help="Verify every ready install's live resources match the shipped defaults.",
+)
+def defaults_verify_command(
+    as_json: Annotated[bool, JSON_OPTION] = False,
+    defaults_root: Annotated[Path, typer.Option("--defaults-root")] = Path("defaults"),
+) -> None:
+    """Walk every ready install and confirm its live resources already match the
+    shipped defaults tree, without writing anything.
+
+    Each tenant is dry-run reconciled against `defaults_root`; an all-skipped
+    result means that tenant's resources already match what would be seeded,
+    exactly as a real reconcile would report. Exits nonzero if any tenant has
+    drifted from the shipped spec, or if any tenant's comparison could not be
+    made at all (both are treated as a failed verification — an install this
+    command could not vouch for must not read as passing).
+    """
+    settings = load_settings()
+    console = Console(highlight=False)
+
+    async def _with_defaults() -> None:
+        async with build_runtime(settings) as rt:
+            await defaults_verify(
+                rt=rt,
+                console=console,
+                as_json=as_json,
+                defaults_root=defaults_root,
+            )
+
+    run_cli(_with_defaults(), console=console)
+
+
+async def defaults_verify(
+    *,
+    rt: CliRuntime,
+    console: Console,
+    as_json: bool,
+    defaults_root: Path,
+) -> None:
+    public_url = str(rt.settings.mcp.public_url) if rt.settings.mcp.public_url is not None else None
+    tenants = await list_tenants_by_platform(rt.sessionmaker)
+
+    results: list[_TenantVerification] = []
+    awaiting_reseed = 0
+    for tenant in tenants:
+        if tenant.archived_at is not None:
+            continue
+        if tenant.provision_status != "ready":
+            # Pending/failed tenants are the boot sweep's job to re-seed, not a
+            # propagation bug — counting them as diverged would make an unrelated
+            # provisioning problem look like a shipped-spec/live-state mismatch.
+            awaiting_reseed += 1
+            continue
+        # Sequential, deliberately: this runs in a deploy step against a provider
+        # with rate limits, and the ready-tenant count here is small enough that
+        # parallelizing would only add provider-side contention risk for no gain.
+        report = await verify_tenant_defaults(
+            rt.anthropic, defaults_root, tenant_id=tenant.id, public_url=public_url
+        )
+        outcome = classify_verification(report)
+        results.append(
+            _TenantVerification(
+                platform=tenant.platform,
+                external_id=tenant.external_id,
+                status=outcome.status,
+                changed=tuple({"kind": c.kind, "name": c.name} for c in outcome.changed),
+            )
+        )
+
+    if as_json:
+        _format_verify_json(console, results, awaiting_reseed=awaiting_reseed)
+    else:
+        _format_verify_table(console, results, awaiting_reseed=awaiting_reseed)
+
+    failing = [v for v in results if v.status != "in_sync"]
+    if not as_json:
+        if failing:
+            console.print(
+                f"verify: FAILED — {len(failing)}/{len(results)} ready tenant(s) diverged "
+                "or unverifiable"
+            )
+        else:
+            console.print(
+                f"verify: OK — {len(results)} ready tenant(s) in sync, "
+                f"{awaiting_reseed} awaiting re-seed"
+            )
+    if failing:
         raise typer.Exit(code=1)
