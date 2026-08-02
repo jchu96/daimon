@@ -17,6 +17,7 @@ from daimon.adapters.mcp.tools.propagation import (
     _clear_agent_default_impl,  # pyright: ignore[reportPrivateUsage]
     _set_agent_default_impl,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.core.routing_facts import build_clear_default_note, build_set_default_note
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault, TenantScopeRef
 from daimon.core.stores.domain import Role
 from daimon.core.stores.scoped_config_read import get_scope
@@ -81,6 +82,9 @@ async def test_set_agent_default_persists_at_workspace_scope(
     assert result.agent_name == "writer", "result must echo back the agent_name that was set"
     assert result.scope == "workspace", "no channel_id means workspace scope"
     assert result.previous_agent_name is None, "scope had no prior default"
+    assert result.routing_note == build_set_default_note(
+        agent_name="writer", scope_label="workspace"
+    ), "routing_note must equal the core function's output for the same inputs"
 
     row = await get_scope(db_session, scope=TenantScopeRef(tenant_id=tenant_id))
     assert row is not None, "set_agent_default must create a TenantConfig row"
@@ -129,6 +133,9 @@ async def test_set_agent_default_persists_at_channel_scope(
 
     assert result.scope == f"channel:{channel_id}", "result must report the channel scope label"
     assert result.agent_name == "channel-agent", "result must echo back the agent_name"
+    assert result.routing_note == build_set_default_note(
+        agent_name="channel-agent", scope_label=f"channel:{channel_id}"
+    ), "routing_note must equal the core function's output for the same inputs"
 
     row = await get_scope(
         db_session,
@@ -154,6 +161,9 @@ async def test_clear_agent_default_removes_workspace_default(
     result = await _clear_agent_default_impl(_runtime(committing_sessionmaker), auth, None)
 
     assert result.cleared is True, "cleared must be True when a default existed"
+    assert result.routing_note == build_clear_default_note(scope_label="workspace", cleared=True), (
+        "routing_note must equal the core function's output for the same inputs"
+    )
 
     row = await get_scope(db_session, scope=TenantScopeRef(tenant_id=tenant_id))
     assert row is None or row.agent_name is None, (
@@ -170,6 +180,14 @@ async def test_clear_agent_default_is_idempotent_when_no_default(
     result = await _clear_agent_default_impl(_runtime(committing_sessionmaker), auth, None)
 
     assert result.cleared is False, "cleared must be False when scope had no agent_name"
+    assert result.routing_note == build_clear_default_note(
+        scope_label="workspace", cleared=False
+    ), "no-op clear's routing_note must equal the core function's output for cleared=False"
+    assert build_clear_default_note(
+        scope_label="workspace", cleared=False
+    ) != build_clear_default_note(scope_label="workspace", cleared=True), (
+        "clear_agent_default's note must distinguish cleared from no-op"
+    )
 
 
 # ---------------------------------------------------------------------------

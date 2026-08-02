@@ -21,6 +21,7 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.core.routing_facts import build_clear_default_note, build_set_default_note
 from daimon.core.scope import ChannelScopeRef, TenantScopeRef
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields, unset_fields
@@ -37,6 +38,10 @@ class SetDefaultResult:
     """The newly-set default agent name."""
     previous_agent_name: str | None
     """The agent name that was overwritten, or None if the scope had no prior default."""
+    routing_note: str
+    """The routing truth the caller should report back: members reach the agent
+    only by @mentioning the bot, and there is one bot for the whole workspace,
+    not one per agent. Supplied by the tool rather than recalled from a prompt."""
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,10 @@ class ClearDefaultResult:
     """'workspace' or 'channel:<channel_id>'"""
     cleared: bool
     """True if there was an agent_name to clear; False if the scope had none."""
+    routing_note: str
+    """The routing truth the caller should report back: which scope no longer
+    has a default (or had none to begin with), and the same mention
+    requirement. Supplied by the tool rather than recalled from a prompt."""
 
 
 async def _set_agent_default_impl(
@@ -83,6 +92,7 @@ async def _set_agent_default_impl(
         scope=scope_label,
         agent_name=agent_name,
         previous_agent_name=prior_agent,
+        routing_note=build_set_default_note(agent_name=agent_name, scope_label=scope_label),
     )
 
 
@@ -114,7 +124,11 @@ async def _clear_agent_default_impl(
                 actor_account_id=auth.account_id,
             )
 
-    return ClearDefaultResult(scope=scope_label, cleared=had_default)
+    return ClearDefaultResult(
+        scope=scope_label,
+        cleared=had_default,
+        routing_note=build_clear_default_note(scope_label=scope_label, cleared=had_default),
+    )
 
 
 def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:

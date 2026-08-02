@@ -23,6 +23,7 @@ from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel
 from daimon.adapters.discord.checks import is_guild_admin
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.routing_facts import build_clear_default_note, build_set_default_note
 from daimon.core.scope import (
     ChannelConfigRow,
     ChannelScopeRef,
@@ -55,12 +56,18 @@ class ScopeBlock:
 
 def build_set_default_container(
     blocks: list[ScopeBlock],
+    *,
+    note: str | None = None,
 ) -> discord.ui.Container[discord.ui.LayoutView]:
     """Pure C9 container builder. Takes pre-resolved ScopeBlock list; no I/O.
 
     Layout: header, hairline, then per-block a TextDisplay with three lines
     (bold scope label / backtick agent name / dim audit line), with air_gap
-    separators between blocks.
+    separators between blocks. When ``note`` is present, it renders as a
+    final dim TextDisplay after the scope blocks — the routing truth for the
+    action that was just taken. Every re-render that is not the direct
+    confirmation of a set/clear passes ``note=None`` so it appears only at
+    the moment the belief forms.
     """
     container: discord.ui.Container[discord.ui.LayoutView] = discord.ui.Container()
     container.add_item(layout.header("⚙️ Default agent"))
@@ -70,6 +77,9 @@ def build_set_default_container(
             container.add_item(layout.air_gap())
         block_text = f"**{block.scope_label}**\n⚙️ `{block.agent_name}`\n-# {block.audit_line}"
         container.add_item(discord.ui.TextDisplay(block_text))
+    if note is not None:
+        container.add_item(layout.air_gap())
+        container.add_item(discord.ui.TextDisplay(f"-# {note}"))
     return container
 
 
@@ -77,6 +87,18 @@ def _channel_scope_label(channel_id: int, channel_name: str | None) -> str:
     if channel_name:
         return f"#{channel_name}"
     return f"#{channel_id}"
+
+
+def _scope_label_for_note(
+    scope: ChannelScopeRef | TenantScopeRef,
+    interaction: discord.Interaction,  # type: ignore[type-arg]  # only used for guild.get_channel cache lookup
+) -> str:
+    """Human-readable scope label for the routing note: 'whole server' or '#channel-name'."""
+    if isinstance(scope, TenantScopeRef):
+        return "whole server"
+    guild = interaction.guild  # type: ignore[union-attr]
+    channel_obj = guild.get_channel(int(scope.channel_id)) if guild is not None else None
+    return f"#{channel_obj.name}" if channel_obj is not None else f"#{scope.channel_id}"  # type: ignore[union-attr]
 
 
 async def _resolve_row_audit(
@@ -297,6 +319,7 @@ class SetDefaultView(ExpiringView, discord.ui.LayoutView):
         runtime: DiscordRuntime,
         allowed_user_id: int,
         blocks: list[ScopeBlock] | None = None,
+        note: str | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.state = state
@@ -308,7 +331,7 @@ class SetDefaultView(ExpiringView, discord.ui.LayoutView):
         channel_default_exists = current_channel is not None and bool(current_channel.agent_name)
         server_default_exists = tenant_row is not None and bool(tenant_row.agent_name)
 
-        container = build_set_default_container(blocks or [])
+        container = build_set_default_container(blocks or [], note=note)
         container.add_item(layout.hairline())
 
         action_select = _ActionSelect(
@@ -376,12 +399,17 @@ class SetDefaultView(ExpiringView, discord.ui.LayoutView):
                 cascade = await list_guild_propagations(session, tenant_id=tenant_id)
                 self.state.cascade_view = cascade
                 blocks = await _build_scope_blocks(self.state, interaction, session)
+            note = build_set_default_note(
+                agent_name=self.state.selected.name,
+                scope_label=_scope_label_for_note(scope, interaction),
+            )
             await interaction.edit_original_response(
                 view=SetDefaultView(
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     blocks=blocks,
+                    note=note,
                 ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -413,12 +441,20 @@ class SetDefaultView(ExpiringView, discord.ui.LayoutView):
                 cascade = await list_guild_propagations(session, tenant_id=tenant_id)
                 self.state.cascade_view = cascade
                 blocks = await _build_scope_blocks(self.state, interaction, session)
+            # The clear option only appears in the action select when a default
+            # exists at this scope (see channel_default_exists/server_default_exists
+            # above), so reaching _do_clear always means something was cleared.
+            note = build_clear_default_note(
+                scope_label=_scope_label_for_note(scope, interaction),
+                cleared=True,
+            )
             await interaction.edit_original_response(
                 view=SetDefaultView(
                     self.state,
                     runtime=self.runtime,
                     allowed_user_id=self.allowed_user_id,
                     blocks=blocks,
+                    note=note,
                 ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )

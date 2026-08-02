@@ -31,6 +31,7 @@ from daimon.adapters.discord.agent_setup.set_default import (
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.errors import StoreError
+from daimon.core.routing_facts import build_clear_default_note, build_set_default_note
 from daimon.core.scope import (
     ChannelConfigRow,
     ChannelScopeRef,
@@ -42,7 +43,7 @@ from daimon.core.specs import AgentSpec
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_account, make_tenant
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -465,6 +466,36 @@ def test_build_set_default_container_empty_blocks_shows_only_header() -> None:
     assert len(block_displays) == 0, "no block TextDisplays when block list is empty"
 
 
+def test_build_set_default_container_renders_note_when_present() -> None:
+    """When `note` is given, it renders as a final dim TextDisplay after the blocks."""
+    blocks = [ScopeBlock(scope_label="whole server", agent_name="alice", audit_line="set")]
+    note = build_set_default_note(agent_name="alice", scope_label="whole server")
+
+    container = build_set_default_container(blocks, note=note)
+
+    all_text = " ".join(
+        item.content or ""
+        for item in container.children
+        if isinstance(item, discord.ui.TextDisplay)
+    )
+    assert note in all_text, "the note text must appear in the rendered container"
+    assert f"-# {note}" in all_text, "the note must use the same dim (-#) convention as audit lines"
+
+
+def test_build_set_default_container_omits_note_when_none() -> None:
+    """When `note` is omitted, no note text is rendered."""
+    blocks = [ScopeBlock(scope_label="whole server", agent_name="alice", audit_line="set")]
+
+    container = build_set_default_container(blocks)
+
+    all_text = " ".join(
+        item.content or ""
+        for item in container.children
+        if isinstance(item, discord.ui.TextDisplay)
+    )
+    assert "@mention" not in all_text, "no routing note must appear when note is None"
+
+
 # ---------------------------------------------------------------------------
 # SetDefaultView construction tests
 # ---------------------------------------------------------------------------
@@ -627,6 +658,113 @@ async def test_open_set_default_swaps_onto_the_panel_message() -> None:
     interaction.response.send_message.assert_not_called()
     view_kwarg = interaction.response.edit_message.call_args.kwargs["view"]
     assert isinstance(view_kwarg, SetDefaultView), "open_set_default must swap in a SetDefaultView"
+
+    all_text = " ".join(
+        item.content or ""
+        for item in _walk_children(view_kwarg)
+        if isinstance(item, discord.ui.TextDisplay)
+    )
+    assert "@mention" not in all_text, (
+        "the container rendered on plain open must carry no routing note"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _do_set / _do_clear: the routing note rides the confirmation, not plain open
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_do_set_confirmation_carries_the_routing_note(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The container `_do_set` renders after a write carries the routing note."""
+    guild_id = 424242
+    tenant = await make_tenant(db_session, workspace_id=str(guild_id))
+    actor = await make_account(db_session, tenant=tenant)
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.sessionmaker = db_session_factory
+
+    state = PanelState.initial(
+        roster=[_entry("writer")],
+        account_id=actor.id,
+        platform_principal_id=uuid.uuid4(),
+        is_admin=True,
+        guild_id=guild_id,
+        channel_id=1001,
+    )
+    view = SetDefaultView(state, runtime=runtime, allowed_user_id=42)
+
+    interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.guild = None
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await view._do_set(  # pyright: ignore[reportPrivateUsage]  # exercising the write path under test
+        interaction, TenantScopeRef(tenant_id=uuid.UUID(int=0))
+    )
+
+    interaction.edit_original_response.assert_called_once()
+    rendered_view = interaction.edit_original_response.call_args.kwargs["view"]
+    all_text = " ".join(
+        item.content or ""
+        for item in _walk_children(rendered_view)
+        if isinstance(item, discord.ui.TextDisplay)
+    )
+    expected_note = build_set_default_note(agent_name="writer", scope_label="whole server")
+    assert expected_note in all_text, "the confirmation container must carry the routing note"
+
+
+@pytest.mark.asyncio
+async def test_do_clear_confirmation_carries_the_routing_note(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The container `_do_clear` renders after a write carries the routing note."""
+    guild_id = 434343
+    tenant = await make_tenant(db_session, workspace_id=str(guild_id))
+    actor = await make_account(db_session, tenant=tenant)
+    await set_fields(
+        db_session,
+        scope=TenantScopeRef(tenant_id=tenant.id),
+        tenant_id=tenant.id,
+        agent_name="writer",
+        actor_account_id=actor.id,
+    )
+    runtime = MagicMock(spec=DiscordRuntime)
+    runtime.sessionmaker = db_session_factory
+
+    state = PanelState.initial(
+        roster=[_entry("writer")],
+        account_id=actor.id,
+        platform_principal_id=uuid.uuid4(),
+        is_admin=True,
+        guild_id=guild_id,
+        channel_id=1001,
+    )
+    view = SetDefaultView(state, runtime=runtime, allowed_user_id=42)
+
+    interaction = MagicMock()
+    interaction.guild_id = guild_id
+    interaction.guild = None
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await view._do_clear(  # pyright: ignore[reportPrivateUsage]  # exercising the write path under test
+        interaction, TenantScopeRef(tenant_id=uuid.UUID(int=0))
+    )
+
+    interaction.edit_original_response.assert_called_once()
+    rendered_view = interaction.edit_original_response.call_args.kwargs["view"]
+    all_text = " ".join(
+        item.content or ""
+        for item in _walk_children(rendered_view)
+        if isinstance(item, discord.ui.TextDisplay)
+    )
+    expected_note = build_clear_default_note(scope_label="whole server", cleared=True)
+    assert expected_note in all_text, "the confirmation container must carry the routing note"
 
 
 # ---------------------------------------------------------------------------
