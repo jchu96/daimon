@@ -163,6 +163,45 @@ async def reconcile_tenant_defaults(
     )
 
 
+async def verify_tenant_defaults(
+    client: AsyncAnthropic,
+    defaults_root: Path,
+    *,
+    tenant_id: uuid.UUID,
+    public_url: str | None = None,
+) -> ApplyReport:
+    """Read-only check: does this tenant's live MA state already match the shipped spec?
+
+    Sibling to `reconcile_tenant_defaults` rather than a flag on it — that function's
+    contract (non-dry-run, adapter owns the status flip) is unchanged, and a caller
+    that wants a real reconcile keeps calling it exactly as before.
+
+    Calls the same `_reconcile_core` spine with `dry_run=True` and the preflight
+    disabled (dry-run must be 100% read-only, so probing MA's model allowlist would
+    be pointless — no write is coming either way). Every reconcile branch already
+    honors `dry_run`: an unchanged resource still short-circuits to SKIPPED on the
+    fingerprint match before the dry-run check ever applies, and a resource that
+    would otherwise be created or updated returns that action instead of writing.
+    So an all-SKIPPED report is not a heuristic proxy for "in sync" — it IS the
+    answer a real reconcile would give, because it is the same comparison a real
+    reconcile makes, just with the write suppressed.
+
+    A FAILED outcome means the comparison itself could not be made (a provider read
+    failed) — a different condition from divergence, and callers must not conflate
+    the two by treating a failure as either "in sync" or "diverged". Use
+    `daimon.core.defaults.report.classify_verification` to tell them apart.
+    """
+    return await _reconcile_core(
+        client,
+        defaults_root,
+        tenant_id=tenant_id,
+        account_id=_derive_account_uuid(tenant_id),
+        dry_run=True,
+        run_preflight=False,
+        public_url=public_url,
+    )
+
+
 async def archive_tenant(
     session_factory: async_sessionmaker[AsyncSession],
     *,

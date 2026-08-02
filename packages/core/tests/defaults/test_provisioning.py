@@ -33,8 +33,9 @@ from daimon.core.defaults.provisioning import (
     _derive_account_uuid,  # pyright: ignore[reportPrivateUsage]
     provision_tenant,
     reconcile_tenant_defaults,
+    verify_tenant_defaults,
 )
-from daimon.core.defaults.report import Action
+from daimon.core.defaults.report import Action, classify_verification
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.stores import tenant_ledger
 from daimon.testing.ma import EMPTY_CLOUD_CONFIG, MARouter, list_response
@@ -928,6 +929,330 @@ async def test_provision_tenant_trial_credit_idempotent_on_reprovision(
     balance = await tenant_ledger.get_balance(db_session, tenant_id=tenant_id)
     assert balance == Decimal("5.00"), (
         "re-provisioning the same guild must not double-credit (idempotency_key: trial:{tenant_id})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# verify_tenant_defaults: dry-run read-only comparison against the shipped spec
+# ---------------------------------------------------------------------------
+
+
+def _build_stateful_router(
+    *, tenant_id: uuid.UUID, skill_name: str = "cli-auth"
+) -> tuple[MARouter, list[int]]:
+    """Router with just enough CRUD to run one REAL reconcile, so the resources'
+    MA-echoed metadata (including the daimon_spec_hash the reconcile itself
+    computed) can be replayed verbatim by a follow-up dry-run verify. Recomputing
+    the fingerprint by hand would risk disagreeing with the code under test —
+    replaying what MA actually stored cannot.
+
+    Returns the router and a single-element write-count list, incremented by
+    every create/archive handler (including the preflight probe), so a caller
+    can snapshot the count before a dry-run call and assert it is unchanged after.
+    """
+    canonical_skill_title = tenant_scoped_display_title(tenant_id=tenant_id, name=skill_name)
+    state: dict[str, Any] = {
+        "agent": None,
+        "environment": None,
+        "skill_created": False,
+        "preflight_probe": None,
+    }
+    write_count = [0]
+
+    def list_agents(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        return list_response([state["agent"]] if state["agent"] else [])
+
+    def list_envs(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        return list_response([state["environment"]] if state["environment"] else [])
+
+    def list_skills(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        if not state["skill_created"]:
+            return list_response([])
+        return list_response(
+            [
+                SkillListResponse(
+                    id="sk_v1",
+                    type="custom",
+                    display_title=canonical_skill_title,
+                    latest_version="1",
+                    created_at=_CREATED_AT.isoformat(),
+                    updated_at=_CREATED_AT.isoformat(),
+                    source="custom",
+                ).model_dump(mode="json")
+            ]
+        )
+
+    def create_skill(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        write_count[0] += 1
+        state["skill_created"] = True
+        return httpx.Response(
+            200,
+            json=SkillListResponse(
+                id="sk_v1",
+                type="custom",
+                display_title=canonical_skill_title,
+                latest_version="1",
+                created_at=_CREATED_AT.isoformat(),
+                updated_at=_CREATED_AT.isoformat(),
+                source="custom",
+            ).model_dump(mode="json"),
+        )
+
+    def create_env(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        write_count[0] += 1
+        body: dict[str, Any] = json.loads(req.content)
+        env = BetaEnvironment(
+            id="env_v1",
+            type="environment",
+            name=body["name"],
+            config=EMPTY_CLOUD_CONFIG,
+            metadata=body.get("metadata", {}),
+            description=body.get("description") or "",
+            created_at="2026-04-21T00:00:00Z",
+            updated_at="2026-04-21T00:00:00Z",
+        ).model_dump(mode="json")
+        state["environment"] = env
+        return httpx.Response(200, json=env)
+
+    def _model_config(raw_model: Any) -> BetaManagedAgentsModelConfig:
+        # The preflight probe posts `model` as a bare string id; a real reconcile
+        # create posts the dict shape dump_agent_spec produces. Normalize both to
+        # the SDK's response model type.
+        model_id = raw_model if isinstance(raw_model, str) else raw_model.get("id", raw_model)
+        return BetaManagedAgentsModelConfig(id=model_id)
+
+    def create_or_probe_agent(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        write_count[0] += 1
+        body: dict[str, Any] = json.loads(req.content)
+        metadata: dict[str, Any] = body.get("metadata", {})
+        if metadata.get("daimon_preflight") == "true":
+            # Preflight probe: throwaway agent, never stored as tenant state.
+            # Stash it so the immediately-following archive call has a valid
+            # object to echo back — the SDK validates the archive response body
+            # against the same schema as create.
+            probe = BetaManagedAgentsAgent(
+                id="ag_preflight",
+                type="agent",
+                name=body["name"],
+                model=_model_config(body["model"]),
+                metadata=metadata,
+                description=None,
+                created_at=_CREATED_AT,
+                updated_at=_CREATED_AT,
+                version=1,
+                mcp_servers=[],
+                skills=[],
+                tools=[],
+                system=None,
+            ).model_dump(mode="json")
+            state["preflight_probe"] = probe
+            return httpx.Response(200, json=probe)
+        # MA's response `tools`/`mcp_servers`/`skills` shapes differ from the
+        # request's config-only shape (they carry server-populated fields like
+        # `enabled`/`permission_policy`); echoing the request body verbatim
+        # fails response validation. These fields don't participate in the
+        # SKIPPED decision (only `daimon_spec_hash` in `metadata` does, and
+        # `ma_has_corruption` short-circuits when `public_url` is None, as it
+        # is throughout this test), so a fixed empty shape is a valid stand-in.
+        agent = BetaManagedAgentsAgent(
+            id="ag_v1",
+            type="agent",
+            name=body["name"],
+            model=_model_config(body["model"]),
+            metadata=metadata,
+            description=body.get("description"),
+            created_at=_CREATED_AT,
+            updated_at=_CREATED_AT,
+            version=1,
+            mcp_servers=[],
+            skills=[],
+            tools=[],
+            system=body.get("system"),
+        ).model_dump(mode="json")
+        state["agent"] = agent
+        return httpx.Response(200, json=agent)
+
+    def archive_agent(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        write_count[0] += 1
+        return httpx.Response(200, json=state["preflight_probe"])
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", list_agents)
+    router.add("GET", r"/v1/environments", list_envs)
+    router.add("GET", r"/v1/skills", list_skills)
+    router.add("POST", r"/v1/skills", create_skill)
+    router.add("POST", r"/v1/environments", create_env)
+    router.add("POST", r"/v1/agents", create_or_probe_agent)
+    router.add("POST", r"/v1/agents/[^/]+/archive", archive_agent)
+    return router, write_count
+
+
+async def test_verify_tenant_defaults_in_sync_report_makes_zero_write_requests(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The load-bearing assertion: a tenant whose live resources already match the
+    spec produces an all-SKIPPED report, classified in_sync, and the dry-run pass
+    that produced it made ZERO write requests against the fake provider transport."""
+    _write_seed_tree(tmp_path)
+    result = await provision_tenant(
+        db_session_factory, platform="discord", workspace_id="guild-verify-sync"
+    )
+    router, write_count = _build_stateful_router(tenant_id=result.tenant_id)
+    client = build_fake_anthropic_http(router.dispatch)
+
+    # Build real state once: a genuine reconcile creates the skill/env/agent.
+    first = await reconcile_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    assert not first.is_failure(), "seeding reconcile must succeed before verifying"
+
+    writes_before_verify = write_count[0]
+    report = await verify_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+
+    assert write_count[0] == writes_before_verify, (
+        "verify_tenant_defaults must make zero write requests: "
+        f"{write_count[0] - writes_before_verify} write(s) occurred during the dry-run pass"
+    )
+    all_outcomes = [*report.agents, *report.environments, *report.skills]
+    assert all(o.action == Action.SKIPPED for o in all_outcomes), (
+        f"expected every outcome to be SKIPPED once resources match the spec, got: "
+        f"{[(o.kind, o.name, o.action) for o in all_outcomes]!r}"
+    )
+    outcome = classify_verification(report)
+    assert outcome.status == "in_sync", f"expected in_sync, got {outcome.status!r}"
+    assert outcome.changed == (), "in_sync classification must carry no changed resources"
+
+
+async def test_verify_tenant_defaults_classifies_missing_agent_as_diverged(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A tenant whose spec's agent is absent from MA classifies as diverged,
+    naming that agent."""
+    _write_seed_tree(tmp_path)
+    result = await provision_tenant(
+        db_session_factory, platform="discord", workspace_id="guild-verify-missing"
+    )
+    router, _write_count = _build_stateful_router(tenant_id=result.tenant_id)
+    client = build_fake_anthropic_http(router.dispatch)
+
+    # Build real state for env/skill only, never for the agent.
+    first = await reconcile_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    assert not first.is_failure()
+
+    # A second router with an empty agent list (env/skill state carried over via a
+    # fresh dict keyed the same way) simulates the agent never having reached MA.
+    missing_agent_router = MARouter()
+    missing_agent_router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    missing_agent_router.add(
+        "GET",
+        r"/v1/environments",
+        lambda req, _m: list_response(
+            [
+                BetaEnvironment(
+                    id="env_v1",
+                    type="environment",
+                    name="default",
+                    config=EMPTY_CLOUD_CONFIG,
+                    metadata={
+                        MA_METADATA_KEY_TENANT: str(result.tenant_id),
+                        MA_METADATA_KEY_NAME: "default",
+                    },
+                    description="",
+                    created_at="2026-04-21T00:00:00Z",
+                    updated_at="2026-04-21T00:00:00Z",
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    canonical_skill_title = tenant_scoped_display_title(tenant_id=result.tenant_id, name="cli-auth")
+    missing_agent_router.add(
+        "GET",
+        r"/v1/skills",
+        lambda req, _m: list_response(
+            [
+                SkillListResponse(
+                    id="sk_v1",
+                    type="custom",
+                    display_title=canonical_skill_title,
+                    latest_version="1",
+                    created_at="2026-04-21T00:00:00Z",
+                    updated_at="2026-04-21T00:00:00Z",
+                    source="custom",
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    report = await verify_tenant_defaults(
+        build_fake_anthropic_http(missing_agent_router.dispatch),
+        tmp_path,
+        tenant_id=result.tenant_id,
+    )
+    outcome = classify_verification(report)
+    assert outcome.status == "diverged", f"expected diverged, got {outcome.status!r}"
+    assert ("agent", "daimon") in [(c.kind, c.name) for c in outcome.changed], (
+        f"expected the missing agent named in the divergence, got: {outcome.changed!r}"
+    )
+
+
+async def test_verify_tenant_defaults_classifies_fingerprint_mismatch_as_diverged(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A tenant whose agent fingerprint no longer matches the spec (the spec
+    changed since the last reconcile) classifies as diverged, naming that agent."""
+    _write_seed_tree(tmp_path)
+    result = await provision_tenant(
+        db_session_factory, platform="discord", workspace_id="guild-verify-drift"
+    )
+    router, _write_count = _build_stateful_router(tenant_id=result.tenant_id)
+    client = build_fake_anthropic_http(router.dispatch)
+
+    first = await reconcile_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    assert not first.is_failure()
+
+    # The spec changed since that reconcile ran (model bumped) — MA still carries
+    # the OLD spec_hash, so a fresh fingerprint no longer matches it.
+    (tmp_path / "agents" / "daimon.yaml").write_text("name: daimon\nmodel: claude-opus-4-7\n")
+
+    report = await verify_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    outcome = classify_verification(report)
+    assert outcome.status == "diverged", f"expected diverged, got {outcome.status!r}"
+    assert ("agent", "daimon") in [(c.kind, c.name) for c in outcome.changed], (
+        f"expected the drifted agent named in the divergence, got: {outcome.changed!r}"
+    )
+
+
+async def test_verify_tenant_defaults_classifies_provider_read_failure_as_unverifiable(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A provider read failure classifies as unverifiable, never as in_sync —
+    a failed comparison must not be read as a passing one."""
+    (tmp_path / "skills").mkdir(parents=True)
+    skill_dir = tmp_path / "skills" / "cli-auth"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: cli-auth\ndescription: seed skill for provisioning tests.\n---\n\n# cli-auth\n"
+    )
+    result = await provision_tenant(
+        db_session_factory, platform="discord", workspace_id="guild-verify-unverifiable"
+    )
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/skills",
+        lambda req, _m: httpx.Response(
+            500,
+            json={"type": "error", "error": {"type": "api_error", "message": "upstream outage"}},
+        ),
+    )
+    report = await verify_tenant_defaults(
+        build_fake_anthropic_http(router.dispatch), tmp_path, tenant_id=result.tenant_id
+    )
+    outcome = classify_verification(report)
+    assert outcome.status == "unverifiable", (
+        f"a provider read failure must classify as unverifiable, not {outcome.status!r}"
     )
 
 
