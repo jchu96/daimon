@@ -17,8 +17,10 @@ from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAge
 from daimon.core.billing import BillingConfig
 from daimon.core.config import McpSettings
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
-from daimon.core.ma_resolver import MAResolverMissError, new_resolver_cache
-from daimon.core.scope import DeploymentDefault
+from daimon.core.ma_resolver import MAResolverMissError, ResolverCache, new_resolver_cache
+from daimon.core.scope import ChannelScopeRef, DeploymentDefault
+from daimon.core.stores.scoped_config_read import get_scope
+from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.turn.admission import Admission, AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.deps import TurnDeps
 from daimon.testing.ma import EMPTY_CLOUD_CONFIG, MARouter, build_fake_anthropic, list_response
@@ -35,7 +37,13 @@ from daimon.testing.factories import (  # isort: skip
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
 
-def _agent(*, agent_id: str, name: str, tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
+def _agent(
+    *,
+    agent_id: str,
+    name: str,
+    tenant_id: uuid.UUID,
+    archived_at: datetime | None = None,
+) -> BetaManagedAgentsAgent:
     now = datetime.now(UTC)
     return BetaManagedAgentsAgent(
         id=agent_id,
@@ -54,7 +62,7 @@ def _agent(*, agent_id: str, name: str, tenant_id: uuid.UUID) -> BetaManagedAgen
         skills=[],
         created_at=now,
         updated_at=now,
-        archived_at=None,
+        archived_at=archived_at,
     )
 
 
@@ -102,6 +110,32 @@ def _resolved_router(*, tenant_id: uuid.UUID) -> MARouter:
     return router
 
 
+def _archived_agent_router(
+    *, tenant_id: uuid.UUID, dead_agent_id: str, dead_agent: BetaManagedAgentsAgent
+) -> MARouter:
+    """Router with a live environment plus a retrieve-only archived agent.
+
+    Deliberately has no agent LIST route: the resolver's TTL-cache hit
+    returns `dead_agent_id` without ever calling the tag lookup, mirroring
+    the real staleness -- an id cached while the agent was live, archived
+    since.
+    """
+    env = _env(env_id="env_1", name="default", tenant_id=tenant_id)
+    router = MARouter()
+    router.add(
+        "GET",
+        rf"/v1/agents/{dead_agent_id}",
+        lambda req, _m: httpx.Response(200, json=_agent_payload(dead_agent)),
+    )
+    router.add("GET", r"/v1/environments", lambda req, _m: list_response([_env_payload(env)]))
+    router.add(
+        "GET",
+        r"/v1/environments/env_1",
+        lambda req, _m: httpx.Response(200, json=_env_payload(env)),
+    )
+    return router
+
+
 def _billing_config() -> BillingConfig:
     return BillingConfig(
         secret_key=SecretStr("sk_test"),
@@ -118,12 +152,13 @@ def _deps(
     defaults_root: Path,
     router: MARouter,
     billing_config: BillingConfig | None = None,
+    resolver_cache: ResolverCache | None = None,
 ) -> TurnDeps:
     return TurnDeps(
         anthropic=build_fake_anthropic(router.dispatch),
         sessionmaker=sessionmaker,
         deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
+        resolver_cache=resolver_cache if resolver_cache is not None else new_resolver_cache(),
         defaults_root=defaults_root,
         mcp=McpSettings(),
         billing_config=billing_config,
@@ -374,3 +409,140 @@ async def test_admit_gate_order_config_bail_wins_over_over_balance(
             channel_id="chan-1",
             now=_NOW,
         )
+
+
+async def test_admit_raises_resolver_miss_when_the_resolved_agent_is_archived(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A resolved agent id that was live when cached but has since been
+    archived out of band must raise MAResolverMissError -- the resolver's own
+    liveness step never runs on this path (admission always passes
+    cached_id=None), so a TTL-cache hit can hand back a dead id unchecked."""
+    tenant = await make_tenant(db_session)
+    await set_fields(
+        db_session,
+        scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-1"),
+        tenant_id=tenant.id,
+        agent_name="doomed-agent",
+        environment_name="default",
+    )
+    await db_session.commit()
+
+    dead_agent = _agent(
+        agent_id="ag_dead",
+        name="doomed-agent",
+        tenant_id=tenant.id,
+        archived_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+    router = _archived_agent_router(
+        tenant_id=tenant.id, dead_agent_id="ag_dead", dead_agent=dead_agent
+    )
+    cache = new_resolver_cache()
+    cache[(tenant.id, "agent", "doomed-agent")] = "ag_dead"
+
+    deps = _deps(
+        sessionmaker=db_session_factory,
+        defaults_root=tmp_path,
+        router=router,
+        resolver_cache=cache,
+    )
+
+    with pytest.raises(MAResolverMissError) as exc_info:
+        await admit(
+            deps,
+            tenant_id=tenant.id,
+            platform="discord",
+            external_user_id="user-1",
+            channel_id="chan-1",
+            now=_NOW,
+        )
+
+    assert exc_info.value.kind == "agent", (
+        "an archived agent must raise the agent-kind resolver miss"
+    )
+    assert exc_info.value.daimon_tag == "doomed-agent", (
+        "the raised error must name the scoped agent tag the channel resolved to"
+    )
+
+
+async def test_admit_clears_the_scope_row_that_named_an_archived_agent(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """The self-heal clears every channel-scope row in the tenant naming the
+    archived agent -- not just the channel that triggered this turn -- while
+    leaving a row naming a different agent untouched."""
+    tenant = await make_tenant(db_session)
+    # The channel this turn resolves through: agent_name + environment_name.
+    await set_fields(
+        db_session,
+        scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-1"),
+        tenant_id=tenant.id,
+        agent_name="doomed-agent",
+        environment_name="default",
+    )
+    # A second channel naming the same dead agent with no other field set --
+    # clearing agent_name leaves nothing, so the row must auto-delete.
+    await set_fields(
+        db_session,
+        scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-2"),
+        tenant_id=tenant.id,
+        agent_name="doomed-agent",
+    )
+    # A third channel naming a different agent -- must survive the clear.
+    await set_fields(
+        db_session,
+        scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-3"),
+        tenant_id=tenant.id,
+        agent_name="other-agent",
+    )
+    await db_session.commit()
+
+    dead_agent = _agent(
+        agent_id="ag_dead",
+        name="doomed-agent",
+        tenant_id=tenant.id,
+        archived_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+    router = _archived_agent_router(
+        tenant_id=tenant.id, dead_agent_id="ag_dead", dead_agent=dead_agent
+    )
+    cache = new_resolver_cache()
+    cache[(tenant.id, "agent", "doomed-agent")] = "ag_dead"
+
+    deps = _deps(
+        sessionmaker=db_session_factory,
+        defaults_root=tmp_path,
+        router=router,
+        resolver_cache=cache,
+    )
+
+    with pytest.raises(MAResolverMissError):
+        await admit(
+            deps,
+            tenant_id=tenant.id,
+            platform="discord",
+            external_user_id="user-1",
+            channel_id="chan-1",
+            now=_NOW,
+        )
+
+    async with db_session_factory() as s:
+        chan1 = await get_scope(s, scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-1"))
+        chan2 = await get_scope(s, scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-2"))
+        chan3 = await get_scope(s, scope=ChannelScopeRef(tenant_id=tenant.id, channel_id="chan-3"))
+
+    assert chan1 is not None and chan1.agent_name is None, (
+        "the triggering channel's agent_name must be cleared; environment_name "
+        "survives so the row itself is not deleted"
+    )
+    assert chan2 is None, (
+        "a second channel naming the same dead agent with agent_name as its "
+        "only field must be deleted outright once that field is cleared"
+    )
+    assert chan3 is not None and chan3.agent_name == "other-agent", (
+        "a channel naming a different agent must be untouched by the tenant-wide clear"
+    )

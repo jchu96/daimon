@@ -8,12 +8,13 @@ Plan 88-04: per-(thread,account) session keying (flag-gated) + unconditional rol
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
-from anthropic.types.beta import BetaManagedAgentsSession
+from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
 from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
@@ -24,6 +25,7 @@ from daimon.core.config import McpSettings
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
+from daimon.testing.ma import EMPTY_CLOUD_CONFIG
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -54,6 +56,40 @@ def _make_fake_session(session_id: str = "sess_test") -> BetaManagedAgentsSessio
     )
 
 
+def _make_fake_agent(name: str = "test-agent") -> BetaManagedAgentsAgent:
+    """A live (non-archived) agent -- the realistic default for `agents.retrieve`.
+
+    `archived_at` defaults to `None` on the SDK model; every test in this file
+    that needs an archived agent constructs its own with `archived_at` set.
+    """
+    return BetaManagedAgentsAgent(
+        id="ag_test",
+        version=1,
+        name=name,
+        type="agent",
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
+        created_at=datetime(2026, 4, 28, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
+        mcp_servers=[],
+        metadata={},
+        skills=[],
+        tools=[],
+    )
+
+
+def _make_fake_environment(name: str = "test-env") -> BetaEnvironment:
+    return BetaEnvironment(
+        id="env_test",
+        name=name,
+        type="environment",
+        config=EMPTY_CLOUD_CONFIG,
+        created_at="2026-04-28T00:00:00Z",
+        updated_at="2026-04-28T00:00:00Z",
+        description="",
+        metadata={},
+    )
+
+
 def _make_runtime(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
@@ -68,8 +104,11 @@ def _make_runtime(
     discord_settings.per_caller_thread_sessions = per_caller_thread_sessions
     settings.discord = discord_settings
     anthropic = AsyncMock()
-    anthropic.beta.agents.retrieve = AsyncMock()
-    anthropic.beta.environments.retrieve = AsyncMock()
+    # A live agent/environment by default -- admit() now reads archived_at off
+    # the retrieved agent, so an unconfigured AsyncMock (whose attributes are
+    # themselves truthy mocks) would wrongly look archived on every turn.
+    anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())
+    anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
     resolver_cache = new_resolver_cache()
     deployment_default = DeploymentDefault()
     return DiscordRuntime(
