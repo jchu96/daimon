@@ -8,11 +8,16 @@ from typing import Annotated, Final, cast
 
 import typer
 from daimon.adapters.cli.errors import run_cli
-from daimon.adapters.cli.flags import JSON_OPTION, YES_OPTION
+from daimon.adapters.cli.flags import GUILD_OPTION, JSON_OPTION, TENANT_OPTION, YES_OPTION
 from daimon.adapters.cli.output import emit_rows
 from daimon.adapters.cli.prompt import confirm_or_abort
 from daimon.adapters.cli.runtime import CliRuntime, build_runtime
-from daimon.adapters.cli.tenant import discover_tenant
+from daimon.adapters.cli.tenant import (
+    TenantSelector,
+    discover_tenant,
+    resolve_tenant_display,
+    resolve_tenant_override,
+)
 from daimon.core.agent_lifecycle import archive_memory_store_best_effort
 from daimon.core.config import load_settings
 from daimon.core.defaults.ma_index import (
@@ -41,6 +46,16 @@ from rich.console import Console
 
 agents_app = typer.Typer(help="Agents: create, list, get, update, archive, fork.")
 
+
+@agents_app.callback()
+def agents_callback(
+    ctx: typer.Context,
+    tenant: Annotated[str | None, TENANT_OPTION] = None,
+    guild: Annotated[str | None, GUILD_OPTION] = None,
+) -> None:
+    ctx.obj = TenantSelector(tenant_id=tenant, guild_id=guild)
+
+
 _CREATE_FIELDS: Final = frozenset(
     {
         "name",
@@ -57,21 +72,26 @@ _CREATE_FIELDS: Final = frozenset(
 
 @agents_app.command("list")
 def agents_list_command(
+    ctx: typer.Context,
     as_json: Annotated[bool, JSON_OPTION] = False,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await agents_list(rt=rt, console=console, as_json=as_json)
+            await agents_list(rt=rt, console=console, as_json=as_json, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
 
-async def agents_list(*, rt: CliRuntime, console: Console, as_json: bool) -> None:
+async def agents_list(
+    *, rt: CliRuntime, console: Console, as_json: bool, selector: TenantSelector | None = None
+) -> None:
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -87,6 +107,7 @@ async def agents_list(*, rt: CliRuntime, console: Console, as_json: bool) -> Non
 
 @agents_app.command("get")
 def agents_get_command(
+    ctx: typer.Context,
     name: str,
     as_json: Annotated[bool, JSON_OPTION] = False,
     include_archived: Annotated[
@@ -99,6 +120,7 @@ def agents_get_command(
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
@@ -108,6 +130,7 @@ def agents_get_command(
                 name=name,
                 as_json=as_json,
                 include_archived=include_archived,
+                selector=selector,
             )
 
     run_cli(_with_defaults(), console=console)
@@ -120,9 +143,11 @@ async def agents_get(
     name: str,
     as_json: bool,
     include_archived: bool = False,
+    selector: TenantSelector | None = None,
 ) -> None:
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -142,22 +167,27 @@ async def agents_get(
 
 @agents_app.command("create")
 def agents_create_command(
+    ctx: typer.Context,
     path: Path,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await agents_create(rt=rt, console=console, path=path)
+            await agents_create(rt=rt, console=console, path=path, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
 
-async def agents_create(*, rt: CliRuntime, console: Console, path: Path) -> None:
+async def agents_create(
+    *, rt: CliRuntime, console: Console, path: Path, selector: TenantSelector | None = None
+) -> None:
     spec = load_agent_spec(path)
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -190,15 +220,17 @@ async def agents_create(*, rt: CliRuntime, console: Console, path: Path) -> None
 
 @agents_app.command("update")
 def agents_update_command(
+    ctx: typer.Context,
     name: str,
     path: Path,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await agents_update(rt=rt, console=console, name=name, path=path)
+            await agents_update(rt=rt, console=console, name=name, path=path, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
@@ -209,6 +241,7 @@ async def agents_update(
     console: Console,
     name: str,
     path: Path,
+    selector: TenantSelector | None = None,
 ) -> None:
     spec = load_agent_spec(path)
     if spec.name != name:
@@ -217,7 +250,8 @@ async def agents_update(
             "Fork under the new name instead."
         )
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -248,20 +282,29 @@ async def agents_update(
 
 @agents_app.command("archive")
 def agents_archive_command(
+    ctx: typer.Context,
     name: str,
     yes: Annotated[bool, YES_OPTION] = False,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await agents_archive(rt=rt, console=console, name=name, yes=yes)
+            await agents_archive(rt=rt, console=console, name=name, yes=yes, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
 
-async def agents_archive(*, rt: CliRuntime, console: Console, name: str, yes: bool) -> None:
+async def agents_archive(
+    *,
+    rt: CliRuntime,
+    console: Console,
+    name: str,
+    yes: bool,
+    selector: TenantSelector | None = None,
+) -> None:
     """Archive an agent, its memory store, and every scope row that names it.
 
     Same three-step shape as the Discord and Slack panel deletes: archive the
@@ -270,9 +313,14 @@ async def agents_archive(*, rt: CliRuntime, console: Console, name: str, yes: bo
     the archive and turn resolution misses instead of falling through the
     cascade.
     """
-    confirm_or_abort(console, f"archive agent {name!r}?", yes=yes)
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
+        tenant_label = await resolve_tenant_display(session, tenant_id)
+        # Confirmation fires AFTER the tenant resolves and BEFORE any write (the
+        # principal bootstrap below), so an operator who mistyped --guild sees
+        # the resolved tenant named here rather than archiving in the wrong one.
+        confirm_or_abort(console, f"archive agent {name!r} in {tenant_label}?", yes=yes)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -302,15 +350,17 @@ async def agents_archive(*, rt: CliRuntime, console: Console, name: str, yes: bo
     help=("Create a new MA agent seeded from the source's content and a local row pointing at it."),
 )
 def agents_fork_command(
+    ctx: typer.Context,
     src: str,
     dst: str | None = typer.Argument(default=None),
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await agents_fork(rt=rt, console=console, src=src, dst=dst)
+            await agents_fork(rt=rt, console=console, src=src, dst=dst, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
@@ -321,6 +371,7 @@ async def agents_fork(
     console: Console,
     src: str,
     dst: str | None,
+    selector: TenantSelector | None = None,
 ) -> None:
     if dst is None:
         raise typer.BadParameter("destination name is required for fork")
@@ -329,7 +380,8 @@ async def agents_fork(
             f"fork target name {dst!r} conflicts with source; provide a different name."
         )
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )

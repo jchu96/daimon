@@ -7,3 +7,11 @@ import typer
 JSON_OPTION = typer.Option(..., "--json", help="Emit JSON instead of a table.")
 YES_OPTION = typer.Option(..., "--yes", "-y", help="Skip the confirmation prompt.")
 TRACE_OPTION = typer.Option(..., "--trace", help="Verbose event output (chat only).")
+TENANT_OPTION = typer.Option(
+    ..., "--tenant", help="Operate on this tenant uuid instead of the local CLI tenant."
+)
+GUILD_OPTION = typer.Option(
+    ...,
+    "--guild",
+    help="Operate on the tenant for this Discord guild id instead of the local CLI tenant.",
+)

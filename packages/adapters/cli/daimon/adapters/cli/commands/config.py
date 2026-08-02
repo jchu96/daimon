@@ -5,10 +5,10 @@ from typing import Annotated
 
 import typer
 from daimon.adapters.cli.errors import run_cli
-from daimon.adapters.cli.flags import JSON_OPTION
+from daimon.adapters.cli.flags import GUILD_OPTION, JSON_OPTION, TENANT_OPTION
 from daimon.adapters.cli.output import emit_rows
 from daimon.adapters.cli.runtime import build_runtime
-from daimon.adapters.cli.tenant import discover_tenant
+from daimon.adapters.cli.tenant import TenantSelector, discover_tenant, resolve_tenant_override
 from daimon.core.config import Settings, load_settings
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.scope import (
@@ -34,6 +34,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 config_app = typer.Typer(
     help="Config: get/set/unset/propagate across scopes.",
 )
+
+
+@config_app.callback()
+def config_callback(
+    ctx: typer.Context,
+    tenant: Annotated[str | None, TENANT_OPTION] = None,
+    guild: Annotated[str | None, GUILD_OPTION] = None,
+) -> None:
+    ctx.obj = TenantSelector(tenant_id=tenant, guild_id=guild)
+
 
 _VALID_KEYS: frozenset[str] = frozenset({"agent_name", "environment_name"})
 _ALL_FIELDS: list[ConfigField] = ["agent_name", "environment_name"]
@@ -107,6 +117,7 @@ class _RawRow(BaseModel):
 
 @config_app.command("get")
 def config_get_command(
+    ctx: typer.Context,
     as_json: Annotated[bool, JSON_OPTION] = False,
     scope: Annotated[
         str | None,
@@ -131,9 +142,15 @@ def config_get_command(
         raise typer.BadParameter("--scope is mutually exclusive with --channel and --account")
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
     run_cli(
         _config_get_command_entry(
-            settings, as_json=as_json, scope_str=scope, channel_str=channel, account_str=account
+            settings,
+            as_json=as_json,
+            scope_str=scope,
+            channel_str=channel,
+            account_str=account,
+            selector=selector,
         ),
         console=console,
     )
@@ -146,10 +163,12 @@ async def _config_get_command_entry(
     scope_str: str | None,
     channel_str: str | None,
     account_str: str | None,
+    selector: TenantSelector | None = None,
 ) -> None:
     console = Console(highlight=False)
     async with build_runtime(settings) as rt, rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         principal = await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -240,6 +259,7 @@ async def _config_get_entry(
 
 @config_app.command("set")
 def config_set_command(
+    ctx: typer.Context,
     kv: str,
     scope: Annotated[str, typer.Option("--scope", help="Target scope (default: user)")] = "user",
 ) -> None:
@@ -247,8 +267,12 @@ def config_set_command(
     key_raw, value = _parse_kv(kv)
     key = _validate_key(key_raw)
     console = Console(highlight=False)
+    selector = ctx.obj
     run_cli(
-        _config_set_command_entry(settings, key=key, value=value, scope_str=scope), console=console
+        _config_set_command_entry(
+            settings, key=key, value=value, scope_str=scope, selector=selector
+        ),
+        console=console,
     )
 
 
@@ -258,10 +282,12 @@ async def _config_set_command_entry(
     key: ConfigField,
     value: str,
     scope_str: str,
+    selector: TenantSelector | None = None,
 ) -> None:
     console = Console(highlight=False)
     async with build_runtime(settings) as rt, rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         principal = await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -318,13 +344,18 @@ async def _config_set_entry(
 
 @config_app.command("unset")
 def config_unset_command(
+    ctx: typer.Context,
     key: str,
     scope: Annotated[str, typer.Option("--scope", help="Target scope (default: user)")] = "user",
 ) -> None:
     settings = load_settings()
     validated = _validate_key(key)
     console = Console(highlight=False)
-    run_cli(_config_unset_command_entry(settings, key=validated, scope_str=scope), console=console)
+    selector = ctx.obj
+    run_cli(
+        _config_unset_command_entry(settings, key=validated, scope_str=scope, selector=selector),
+        console=console,
+    )
 
 
 async def _config_unset_command_entry(
@@ -332,10 +363,12 @@ async def _config_unset_command_entry(
     *,
     key: ConfigField,
     scope_str: str,
+    selector: TenantSelector | None = None,
 ) -> None:
     console = Console(highlight=False)
     async with build_runtime(settings) as rt, rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         principal = await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -368,6 +401,7 @@ async def _config_unset_entry(
 
 @config_app.command("propagate")
 def config_propagate_command(
+    ctx: typer.Context,
     to: Annotated[list[str], typer.Option("--to", help="Target scope(s)")],
     from_scope: Annotated[
         str, typer.Option("--from", help="Source scope (default: user)")
@@ -380,9 +414,15 @@ def config_propagate_command(
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
     run_cli(
         _config_propagate_command_entry(
-            settings, to_strs=to, from_str=from_scope, fields_str=fields_str, reset=reset
+            settings,
+            to_strs=to,
+            from_str=from_scope,
+            fields_str=fields_str,
+            reset=reset,
+            selector=selector,
         ),
         console=console,
     )
@@ -395,10 +435,12 @@ async def _config_propagate_command_entry(
     from_str: str,
     fields_str: str | None,
     reset: bool,
+    selector: TenantSelector | None = None,
 ) -> None:
     console = Console(highlight=False)
     async with build_runtime(settings) as rt, rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         principal = await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )

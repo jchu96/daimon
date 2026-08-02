@@ -7,11 +7,16 @@ from typing import Annotated
 import httpx
 import typer
 from daimon.adapters.cli.errors import run_cli
-from daimon.adapters.cli.flags import JSON_OPTION, YES_OPTION
+from daimon.adapters.cli.flags import GUILD_OPTION, JSON_OPTION, TENANT_OPTION, YES_OPTION
 from daimon.adapters.cli.output import emit_rows
 from daimon.adapters.cli.prompt import confirm_or_abort
 from daimon.adapters.cli.runtime import CliRuntime, build_runtime
-from daimon.adapters.cli.tenant import discover_tenant
+from daimon.adapters.cli.tenant import (
+    TenantSelector,
+    discover_tenant,
+    resolve_tenant_display,
+    resolve_tenant_override,
+)
 from daimon.core.config import load_settings
 from daimon.core.defaults.ma_index import find_skill_by_display_title, list_skills_lenient
 from daimon.core.defaults.metadata import strip_tenant_prefix, tenant_scoped_display_title
@@ -29,6 +34,15 @@ from rich.table import Table
 skills_app = typer.Typer(help="Skills: sync, list, get, delete.")
 
 
+@skills_app.callback()
+def skills_callback(
+    ctx: typer.Context,
+    tenant: Annotated[str | None, TENANT_OPTION] = None,
+    guild: Annotated[str | None, GUILD_OPTION] = None,
+) -> None:
+    ctx.obj = TenantSelector(tenant_id=tenant, guild_id=guild)
+
+
 # ---------------------------------------------------------------------------
 # sync
 # ---------------------------------------------------------------------------
@@ -36,16 +50,18 @@ skills_app = typer.Typer(help="Skills: sync, list, get, delete.")
 
 @skills_app.command("sync")
 def skills_sync_command(
+    ctx: typer.Context,
     url: str,
     branch: Annotated[str, typer.Option("--branch")] = "main",
     path: Annotated[str, typer.Option("--path")] = "",
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await sync_skills(rt, console, url=url, branch=branch, path=path)
+            await sync_skills(rt, console, url=url, branch=branch, path=path, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
@@ -58,9 +74,11 @@ async def sync_skills(
     branch: str,
     path: str,
     http_client: httpx.AsyncClient | None = None,
+    selector: TenantSelector | None = None,
 ) -> None:
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -116,6 +134,7 @@ def _parse_repo_arg(raw: str) -> SkillRepo:
 
 @skills_app.command("sync-agent")
 def skills_sync_agent_command(
+    ctx: typer.Context,
     agent: Annotated[str, typer.Argument(help="MA agent name (workspace-unique)")],
     repo: Annotated[
         list[str],
@@ -132,6 +151,7 @@ def skills_sync_agent_command(
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     if not repo:
         console.print("[red]No repositories provided. Pass at least one --repo URL.[/red]")
@@ -141,7 +161,7 @@ def skills_sync_agent_command(
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await sync_agent(rt, console, agent_name=agent, repos=repos)
+            await sync_agent(rt, console, agent_name=agent, repos=repos, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
@@ -153,6 +173,7 @@ async def sync_agent(
     agent_name: str,
     repos: list[SkillRepo],
     http_client: httpx.AsyncClient | None = None,
+    selector: TenantSelector | None = None,
 ) -> None:
     """Implementation seam.
 
@@ -162,7 +183,8 @@ async def sync_agent(
     `MockTransport`-backed client without monkey-patching `httpx`).
     """
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         principal = await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -240,21 +262,26 @@ async def sync_agent(
 
 @skills_app.command("list")
 def skills_list_command(
+    ctx: typer.Context,
     as_json: Annotated[bool, JSON_OPTION] = False,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await list_skills(rt, console, as_json=as_json)
+            await list_skills(rt, console, as_json=as_json, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
 
-async def list_skills(rt: CliRuntime, console: Console, *, as_json: bool) -> None:
+async def list_skills(
+    rt: CliRuntime, console: Console, *, as_json: bool, selector: TenantSelector | None = None
+) -> None:
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -286,22 +313,32 @@ async def list_skills(rt: CliRuntime, console: Console, *, as_json: bool) -> Non
 
 @skills_app.command("get")
 def skills_get_command(
+    ctx: typer.Context,
     name: str,
     as_json: Annotated[bool, JSON_OPTION] = False,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await get_skill(rt, console, name=name, as_json=as_json)
+            await get_skill(rt, console, name=name, as_json=as_json, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
 
-async def get_skill(rt: CliRuntime, console: Console, *, name: str, as_json: bool) -> None:
+async def get_skill(
+    rt: CliRuntime,
+    console: Console,
+    *,
+    name: str,
+    as_json: bool,
+    selector: TenantSelector | None = None,
+) -> None:
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
@@ -326,23 +363,34 @@ async def get_skill(rt: CliRuntime, console: Console, *, name: str, as_json: boo
 
 @skills_app.command("delete")
 def skills_delete_command(
+    ctx: typer.Context,
     name: str,
     yes: Annotated[bool, YES_OPTION] = False,
 ) -> None:
     settings = load_settings()
     console = Console(highlight=False)
+    selector = ctx.obj
 
     async def _with_defaults() -> None:
         async with build_runtime(settings) as rt:
-            await delete_skill(rt, console, name=name, yes=yes)
+            await delete_skill(rt, console, name=name, yes=yes, selector=selector)
 
     run_cli(_with_defaults(), console=console)
 
 
-async def delete_skill(rt: CliRuntime, console: Console, *, name: str, yes: bool) -> None:
-    confirm_or_abort(console, f"delete skill {name!r}?", yes=yes)
+async def delete_skill(
+    rt: CliRuntime,
+    console: Console,
+    *,
+    name: str,
+    yes: bool,
+    selector: TenantSelector | None = None,
+) -> None:
     async with rt.sessionmaker() as session, session.begin():
-        tenant_id = await discover_tenant(session)
+        override = await resolve_tenant_override(session, selector)
+        tenant_id = await discover_tenant(session, override=override)
+        tenant_label = await resolve_tenant_display(session, tenant_id)
+        confirm_or_abort(console, f"delete skill {name!r} in {tenant_label}?", yes=yes)
         await get_or_create_cli_principal(
             session, tenant_id=tenant_id, os_user=rt.settings.cli.local_user
         )
