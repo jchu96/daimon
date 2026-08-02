@@ -249,10 +249,15 @@ RELAXED_TOOL_NAMES = (
     "update_agent",
     "attach_mcp_server",
     "fork_agent",
+    "create_environment",
 )
-"""The four agents.py tools whose blast radius is one agent, not the whole
-tenant — relaxed onto the open (non-admin-visible, non-admin-callable)
-surface. Untagged, so a non-admin chat session's search surfaces them."""
+"""Tools whose blast radius is one agent, or nothing at all, rather than the
+whole tenant — relaxed onto the open (non-admin-visible, non-admin-callable)
+surface. Untagged, so a non-admin chat session's search surfaces them.
+
+`create_environment` is the "nothing at all" case: the environment it creates is
+unreachable until an admin scopes an agent onto it via the gated
+`set_agent_default`."""
 
 AGENT_IDENTITY_SCOPED_TOOL_NAMES = (
     "set_repo_binding",
@@ -407,11 +412,16 @@ STILL_ADMIN_TOOL_NAMES = (
     "clear_agent_default",
     "archive_agent",
     "sync_skills",
-    "create_environment",
     "update_environment",
     "archive_environment",
 )
-"""Tools whose blast radius is the whole tenant — stay admin-only after this plan."""
+"""Tools whose blast radius is the whole tenant, and stay admin-only.
+
+`create_environment` is deliberately absent: a new environment is inert until an
+admin scopes an agent onto it, so its blast radius is nothing until a gated call
+widens it. Mutating an environment others already resolve to is a different
+matter, which is why `update_environment` and `archive_environment` stay here.
+"""
 
 
 @pytest.mark.parametrize("tool_name", STILL_ADMIN_TOOL_NAMES)

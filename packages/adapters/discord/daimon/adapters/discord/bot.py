@@ -524,7 +524,7 @@ class DaimonBot(commands.Bot):
             and any(user.id == self.user.id for user in message.mentions),
             guild_id=str(message.guild.id) if message.guild else None,
             self_user_id=str(self.user.id) if self.user is not None else None,
-            qa_bot_user_id=discord_settings.qa_bot_user_id if discord_settings else None,
+            qa_bot_user_ids=discord_settings.qa_bot_user_ids if discord_settings else (),
         ):
             return
         if self.draining:
