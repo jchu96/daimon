@@ -281,6 +281,7 @@ async def test_create_agent_impl_syncs_skill_repos(
     settings.github.app_id = None  # no App configured in these sync tests
     settings.github.app_private_key = None
     settings.github.fallback_pat = None
+    settings.github.max_tarball_decompressed_bytes = 200 * 1024 * 1024
     runtime = McpRuntime(
         session_factory=db_session_factory,
         client=anthropic_client,
@@ -445,6 +446,7 @@ async def test_create_agent_impl_returns_sync_warnings_on_partial_failure(
     settings.github.app_id = None  # no App configured in these sync tests
     settings.github.app_private_key = None
     settings.github.fallback_pat = None
+    settings.github.max_tarball_decompressed_bytes = 200 * 1024 * 1024
     runtime = McpRuntime(
         session_factory=db_session_factory,
         client=anthropic_client,

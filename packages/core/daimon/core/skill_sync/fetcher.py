@@ -1,4 +1,8 @@
-"""PAT-authenticated GitHub tarball fetcher.
+"""GitHub tarball fetcher, authenticated with an optional bearer credential.
+
+The credential may be a personal access token or a GitHub App installation
+token — both are opaque bearer strings from this module's perspective; the
+caller (the orchestrator) resolves which kind to hand in.
 
 Architectural rule: this module does NOT catch exceptions. Errors raise; the
 orchestrator (named boundary) handles them. The four error CLASSES below are
@@ -11,20 +15,21 @@ import io
 
 import httpx
 import structlog
+from daimon.core.github_repo_auth import normalize_owner_repo
 
 _log = structlog.get_logger(__name__)
 
 
 class PATMissingError(Exception):
-    """No PAT available for the principal (or per-agent overlay)."""
+    """No credential was available for the principal (or per-agent overlay)."""
 
 
 class GitHubAuthError(Exception):
-    """401/403 from GitHub — bad PAT or insufficient scopes."""
+    """401/403 from GitHub — bad credential or insufficient scopes."""
 
 
 class GitHubUnreachable(Exception):
-    """404 from GitHub — repo or branch does not exist (or PAT cannot see it)."""
+    """404 from GitHub — repo or branch does not exist (or the credential cannot see it)."""
 
 
 class TarballTooLarge(Exception):
@@ -38,23 +43,8 @@ class RepoCollisionError(Exception):
     """Two repos in the same agent produced the same sanitized skill name."""
 
 
-def _normalize_owner_repo(url: str) -> str:
-    """Extract `owner/repo` from a URL or short-form path.
-
-    Accepts: 'https://github.com/owner/repo', 'github.com/owner/repo',
-    'owner/repo', any with a trailing '/' or '.git'.
-    """
-    return (
-        url.removeprefix("https://github.com/")
-        .removeprefix("http://github.com/")
-        .removeprefix("github.com/")
-        .removesuffix(".git")
-        .rstrip("/")
-    )
-
-
 class GitHubTarballFetcher:
-    """Fetch a GitHub repo tarball authenticated with a PAT.
+    """Fetch a GitHub repo tarball authenticated with an optional bearer credential.
 
     DI: takes an injected `httpx.AsyncClient`. Does NOT construct one per call
     (per architecture rule §"Prefer Pure Functions and Dependency Injection").
@@ -70,12 +60,19 @@ class GitHubTarballFetcher:
         self._http = http_client
         self._max_tarball_bytes = max_tarball_bytes
 
-    async def fetch_tarball(self, *, pat: str | None, url: str, branch: str) -> bytes:
-        owner_repo = _normalize_owner_repo(url)
+    async def fetch_tarball(self, *, credential: str | None, url: str, branch: str) -> bytes:
+        """Download the tarball for ``url`` at ``branch``.
+
+        ``credential`` is the resolved bearer token (personal access token or
+        GitHub App installation token) to send as ``Authorization: token
+        <credential>``. ``None`` means an unauthenticated fetch — how public
+        repos sync when no credential resolves.
+        """
+        owner_repo = normalize_owner_repo(url)
         api = f"https://api.github.com/repos/{owner_repo}/tarball/{branch}"
         headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
-        if pat is not None:
-            headers["Authorization"] = f"token {pat}"
+        if credential is not None:
+            headers["Authorization"] = f"token {credential}"
         cap = self._max_tarball_bytes
         async with self._http.stream(
             "GET",

@@ -539,7 +539,7 @@ async def sync_agent_skills(
 
             try:
                 tarball = await fetcher.fetch_tarball(
-                    pat=credential, url=repo.url, branch=repo.branch
+                    credential=credential, url=repo.url, branch=repo.branch
                 )
             except (GitHubAuthError, GitHubUnreachable, TarballTooLarge) as err:
                 report.skipped_repos.append((repo.url, type(err).__name__))

@@ -505,7 +505,7 @@ async def _create_new_skill(
     fetcher = GitHubTarballFetcher(http_client)
     try:
         tarball = await fetcher.fetch_tarball(
-            pat=None,
+            credential=None,
             url=us_row.source_repo_url,
             branch=us_row.source_repo_branch,
         )
