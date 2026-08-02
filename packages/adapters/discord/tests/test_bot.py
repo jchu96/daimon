@@ -1068,6 +1068,129 @@ class TestReadyEmbedSuppression:
         assert "snag" in (embed.title or "").lower(), "every failure must still announce itself"
 
 
+class TestReconcileFailureReasonPersistence:
+    """A failed boot reconcile records why on the tenant row, and a later
+    success clears it (D-08)."""
+
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_a_failed_reconcile_records_the_reason_on_the_tenant_row(
+        self,
+        mock_reconcile: AsyncMock,
+        db_session: AsyncSession,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A resource-level failure in the report is composed into a reason
+        naming the failing resource's kind and name, and persisted."""
+        from daimon.core.defaults.provisioning import provision_tenant
+        from daimon.core.defaults.report import Action, ApplyReport, ResourceOutcome
+        from daimon.core.stores.tenants import get_tenant_liveness
+
+        guild_id = "900000030"
+        result = await provision_tenant(
+            db_session_factory, platform="discord", workspace_id=guild_id
+        )
+        tenant_id = result.tenant_id
+
+        report = ApplyReport()
+        report.add(
+            ResourceOutcome(
+                kind="skill", name="broken-skill", action=Action.FAILED, error="upload 503"
+            )
+        )
+        mock_reconcile.return_value = report
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(int(guild_id))
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=True
+        )
+
+        tr = await get_tenant_liveness(db_session_factory, tenant_id)
+        assert tr is not None
+        assert tr.provision_status == "failed"
+        assert tr.last_reconcile_error is not None
+        assert "skill" in tr.last_reconcile_error, "reason must name the failing resource kind"
+        assert "broken-skill" in tr.last_reconcile_error, "reason must name the failing resource"
+
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_a_successful_reconcile_clears_a_previously_recorded_reason(
+        self,
+        mock_reconcile: AsyncMock,
+        db_session: AsyncSession,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A tenant with a stale failed status and reason from a prior boot is
+        cleared once a subsequent reconcile succeeds."""
+        from daimon.core.defaults.provisioning import provision_tenant
+        from daimon.core.defaults.report import ApplyReport
+        from daimon.core.stores.tenants import get_tenant_liveness, set_provision_status
+
+        guild_id = "900000031"
+        result = await provision_tenant(
+            db_session_factory, platform="discord", workspace_id=guild_id
+        )
+        tenant_id = result.tenant_id
+        await set_provision_status(
+            db_session_factory, tenant_id=tenant_id, status="failed", reason="stale failure"
+        )
+        mock_reconcile.return_value = ApplyReport()
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(int(guild_id))
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
+
+        tr = await get_tenant_liveness(db_session_factory, tenant_id)
+        assert tr is not None
+        assert tr.provision_status == "ready"
+        assert tr.last_reconcile_error is None, (
+            "a successful reconcile must clear a previously recorded reason"
+        )
+
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_an_unexpected_exception_records_only_the_exception_type(
+        self,
+        mock_reconcile: AsyncMock,
+        db_session: AsyncSession,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The unexpected-error branch records the exception TYPE only -- never
+        its message body, which may carry request/response content."""
+        from daimon.core.defaults.provisioning import provision_tenant
+        from daimon.core.stores.tenants import get_tenant_liveness
+
+        guild_id = "900000032"
+        result = await provision_tenant(
+            db_session_factory, platform="discord", workspace_id=guild_id
+        )
+        tenant_id = result.tenant_id
+
+        secret_message = "leaked-credential-abc123 in request body"
+        mock_reconcile.side_effect = ValueError(secret_message)
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(int(guild_id))
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=False
+        )
+
+        tr = await get_tenant_liveness(db_session_factory, tenant_id)
+        assert tr is not None
+        assert tr.provision_status == "failed"
+        assert tr.last_reconcile_error is not None
+        assert "ValueError" in tr.last_reconcile_error, "reason must name the exception type"
+        assert secret_message not in tr.last_reconcile_error, (
+            "the exception's message body must never be recorded for an unexpected error"
+        )
+
+
 def _make_thread_message_for_bot(
     *,
     content: str = "<@999> hello",

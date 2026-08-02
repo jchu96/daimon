@@ -172,6 +172,24 @@ def _report_has_changes(report: ApplyReport) -> bool:
     )
 
 
+def _compose_failure_reason(report: ApplyReport) -> str | None:
+    """Compose a persisted reason from a report's failed outcomes only, one
+    line per failure naming the resource kind, name, and its recorded error.
+    Pure -- no I/O. Returns None when the report has no failures.
+
+    Composed ONLY from the outcome's own recorded fields -- never a raw
+    exception repr of a credentialed request -- so a provider secret or
+    request body can never land in this operator-visible column."""
+    failures = [
+        o
+        for o in (*report.agents, *report.environments, *report.skills, *report.system_config)
+        if o.action is Action.FAILED
+    ]
+    if not failures:
+        return None
+    return "\n".join(f"{o.kind} {o.name!r}: {o.error}" for o in failures)
+
+
 def _pick_post_channel(guild: discord.Guild) -> discord.abc.Messageable | None:
     """Channel fallback: system_channel (writable) → first sendable text channel.
 
@@ -314,13 +332,13 @@ class DaimonBot(commands.Bot):
                 log.warning("guild_post_dm_failed", guild_id=str(guild.id), error=str(exc))
         log.warning("guild_post_skipped", guild_id=str(guild.id))
 
-    async def _flip_failed_best_effort(self, tenant_id: uuid.UUID) -> None:
+    async def _flip_failed_best_effort(self, tenant_id: uuid.UUID, *, reason: str | None) -> None:
         """Best-effort pending→failed flip. A DB hiccup can make the flip itself
         raise; swallowing it here keeps the snag embed posting and the seed handler
         alive. The on_ready sweep is the designed backstop if the flip is lost."""
         try:
             await set_provision_status(
-                self.runtime.sessionmaker, tenant_id=tenant_id, status="failed"
+                self.runtime.sessionmaker, tenant_id=tenant_id, status="failed", reason=reason
             )
         except SQLAlchemyError:
             log.exception("guild_seed_status_flip_failed", tenant_id=str(tenant_id))
@@ -357,6 +375,7 @@ class DaimonBot(commands.Bot):
                 public_url=public_url,
             )
             seed_ok = not report.is_failure()
+            roster_failure_reason: str | None = None
             if seed_ok:
                 agent_name = self.runtime.deployment_default.agent_name
                 if agent_name is None:
@@ -367,6 +386,10 @@ class DaimonBot(commands.Bot):
                     )
                     if default_agent is None:
                         seed_ok = False
+                        roster_failure_reason = (
+                            f"agent {agent_name!r}: default agent missing from roster "
+                            "after reconcile"
+                        )
                         log.warning(
                             "guild_seed_default_agent_missing",
                             tenant_id=str(tenant_id),
@@ -377,14 +400,17 @@ class DaimonBot(commands.Bot):
                     self.runtime.sessionmaker,
                     tenant_id=tenant_id,
                     status="ready",
+                    clear_reason=True,
                 )
                 if not was_ready or _report_has_changes(report):
                     await self._post_to_guild(guild, _build_ready_embed())
             else:
+                reason = roster_failure_reason or _compose_failure_reason(report)
                 await set_provision_status(
                     self.runtime.sessionmaker,
                     tenant_id=tenant_id,
                     status="failed",
+                    reason=reason,
                 )
                 await self._post_to_guild(guild, _build_snag_embed())
         except (DaimonError, _anthropic.APIError, discord.HTTPException) as exc:
@@ -392,11 +418,18 @@ class DaimonBot(commands.Bot):
             # Best-effort flip before posting so the tenant is never left wedged in
             # 'pending' — a raise inside this handler would NOT be caught by the
             # sibling except clause below and would skip the snag embed entirely.
-            await self._flip_failed_best_effort(tenant_id)
+            await self._flip_failed_best_effort(tenant_id, reason=f"{type(exc).__name__}: {exc}")
             await self._post_to_guild(guild, _build_snag_embed())
-        except Exception:  # noqa: BLE001 — background-task supervisor boundary
+        except Exception as exc:  # noqa: BLE001 — background-task supervisor boundary
             log.exception("guild_seed_unexpected", tenant_id=str(tenant_id))
-            await self._flip_failed_best_effort(tenant_id)
+            # This branch's message body may carry anything (an unclassified bug,
+            # not a known API/Daimon error), and the reason column is read by an
+            # operator and an alerting pass -- record only the type name, never
+            # the message, so an unexpected exception can't smuggle request/response
+            # content into the persisted reason.
+            await self._flip_failed_best_effort(
+                tenant_id, reason=f"unexpected error: {type(exc).__name__}"
+            )
             await self._post_to_guild(guild, _build_snag_embed())
         finally:
             self._seeding.discard(tenant_id)
