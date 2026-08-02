@@ -37,6 +37,7 @@ from daimon.adapters.mcp.tools.agents import (
     _update_agent_impl,
     register_agent_tools,
 )
+from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
 from daimon.core.ma_identity import derive_agent_uuid
@@ -4428,4 +4429,225 @@ async def test_fork_agent_impl_allows_non_admin_source_with_no_daimon_account(
     )
     assert isinstance(result, AgentInfo), (
         "non-admin fork of the unstamped seeded agent must succeed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proactive merged-count cap enforcement (D-16): update_agent must refuse a
+# merge that exceeds the shared per-agent cap BEFORE calling agents.update,
+# so chat refuses at the same number the /agent-setup panel disables at.
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_skill(skill_id: str) -> dict[str, Any]:
+    # "version" is required by the SDK response model (make_ma_agent below
+    # builds a real BetaManagedAgentsAgent) but not by the update-patch
+    # BetaManagedAgentsSkillParams shape the extra key is simply ignored there.
+    return {"type": "anthropic", "skill_id": skill_id, "version": "1"}
+
+
+def _url_mcp_server(name: str) -> dict[str, Any]:
+    return {"name": name, "type": "url", "url": f"https://{name}.example.com/mcp"}
+
+
+def _cap_router(
+    *,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    existing_skills: list[dict[str, Any]],
+    existing_mcp_servers: list[dict[str, Any]],
+    update_calls: list[dict[str, Any]],
+) -> MARouter:
+    """MARouter for an agent already holding `existing_skills` /
+    `existing_mcp_servers`. Every POST /v1/agents/{id} (agents.update) that
+    reaches the transport is recorded in `update_calls` — the proactive-cap
+    tests assert this list stays empty."""
+
+    def on_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        body = json_body(req)
+        update_calls.append(body)
+        # The response model requires "version" on every skill entry; the
+        # update-patch shape (BetaManagedAgentsSkillParams) does not, so
+        # merge_skills_with_ma's MA-preserved extras omit it. Backfill for
+        # the response only — the assertions below inspect `update_calls`
+        # (the raw request body), not this response.
+        response_skills = [{**s, "version": s.get("version", "1")} for s in body.get("skills", [])]
+        return httpx.Response(
+            200,
+            json=make_ma_agent(
+                id="ag_a",
+                name="a",
+                skills=response_skills or existing_skills,
+                mcp_servers=body.get("mcp_servers", existing_mcp_servers),
+            ).model_dump(mode="json"),
+        )
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [
+                make_ma_agent(
+                    id="ag_a",
+                    name="a",
+                    metadata={
+                        "daimon_tenant": str(tenant_id),
+                        "daimon_name": "a",
+                        "daimon_account": str(account_id),
+                    },
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200,
+            json=make_ma_agent(
+                id="ag_a",
+                name="a",
+                skills=existing_skills,
+                mcp_servers=existing_mcp_servers,
+            ).model_dump(mode="json"),
+        ),
+    )
+    router.add("POST", r"/v1/agents/([^/]+)", on_update)
+    return router
+
+
+async def test_update_agent_refuses_when_merged_skills_exceed_the_product_cap() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    existing_skills = [_anthropic_skill(f"existing-{i}") for i in range(AGENT_SKILL_CAP - 1)]
+    new_skills = [_anthropic_skill("new-a"), _anthropic_skill("new-b")]
+    update_calls: list[dict[str, Any]] = []
+    router = _cap_router(
+        tenant_id=tenant_id,
+        account_id=account_id,
+        existing_skills=existing_skills,
+        existing_mcp_servers=[],
+        update_calls=update_calls,
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update_agent_impl(
+            _runtime(client),
+            auth,
+            name="a",
+            model=None,
+            description=None,
+            system=None,
+            tools=None,
+            mcp_servers=None,
+            skills=new_skills,  # type: ignore[arg-type]
+        )
+    assert str(AGENT_SKILL_CAP) in str(exc_info.value), (
+        f"refusal must name the cap; got {exc_info.value}"
+    )
+    assert not update_calls, "the merged-count refusal must fire before any agents.update request"
+
+
+async def test_update_agent_allows_a_skill_merge_exactly_at_the_cap() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    existing_skills = [_anthropic_skill(f"existing-{i}") for i in range(AGENT_SKILL_CAP - 1)]
+    new_skills = [_anthropic_skill("new-a")]
+    update_calls: list[dict[str, Any]] = []
+    router = _cap_router(
+        tenant_id=tenant_id,
+        account_id=account_id,
+        existing_skills=existing_skills,
+        existing_mcp_servers=[],
+        update_calls=update_calls,
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    result = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="a",
+        model=None,
+        description=None,
+        system=None,
+        tools=None,
+        mcp_servers=None,
+        skills=new_skills,  # type: ignore[arg-type]
+    )
+    assert isinstance(result, AgentInfo), "a merge landing exactly at the cap must succeed"
+    assert len(update_calls) == 1, "the at-cap merge must reach agents.update exactly once"
+    assert len(update_calls[0]["skills"]) == AGENT_SKILL_CAP, (
+        "the merged patch must carry exactly AGENT_SKILL_CAP skills"
+    )
+
+
+async def test_update_agent_refuses_when_merged_mcp_servers_exceed_the_product_cap() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    existing_mcp_servers = [_url_mcp_server(f"existing-{i}") for i in range(AGENT_MCP_CAP - 1)]
+    new_mcp_servers = [_url_mcp_server("new-a"), _url_mcp_server("new-b")]
+    update_calls: list[dict[str, Any]] = []
+    router = _cap_router(
+        tenant_id=tenant_id,
+        account_id=account_id,
+        existing_skills=[],
+        existing_mcp_servers=existing_mcp_servers,
+        update_calls=update_calls,
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update_agent_impl(
+            _runtime(client),
+            auth,
+            name="a",
+            model=None,
+            description=None,
+            system=None,
+            tools=None,
+            mcp_servers=new_mcp_servers,  # type: ignore[arg-type]
+            skills=None,
+        )
+    assert str(AGENT_MCP_CAP) in str(exc_info.value), (
+        f"refusal must name the cap; got {exc_info.value}"
+    )
+    assert not update_calls, "the merged-count refusal must fire before any agents.update request"
+
+
+async def test_update_agent_allows_an_mcp_merge_exactly_at_the_cap() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    existing_mcp_servers = [_url_mcp_server(f"existing-{i}") for i in range(AGENT_MCP_CAP - 1)]
+    new_mcp_servers = [_url_mcp_server("new-a")]
+    update_calls: list[dict[str, Any]] = []
+    router = _cap_router(
+        tenant_id=tenant_id,
+        account_id=account_id,
+        existing_skills=[],
+        existing_mcp_servers=existing_mcp_servers,
+        update_calls=update_calls,
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    result = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="a",
+        model=None,
+        description=None,
+        system=None,
+        tools=None,
+        mcp_servers=new_mcp_servers,  # type: ignore[arg-type]
+        skills=None,
+    )
+    assert isinstance(result, AgentInfo), "a merge landing exactly at the cap must succeed"
+    assert len(update_calls) == 1, "the at-cap merge must reach agents.update exactly once"
+    assert len(update_calls[0]["mcp_servers"]) == AGENT_MCP_CAP, (
+        "the merged patch must carry exactly AGENT_MCP_CAP mcp servers"
     )

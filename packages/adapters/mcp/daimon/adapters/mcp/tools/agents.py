@@ -31,6 +31,7 @@ from daimon.adapters.mcp.tools._ctx import (
 )
 from daimon.core import agent_lifecycle
 from daimon.core.agent_guidance import apply_credential_guidance
+from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     find_agents_by_daimon_tag,
@@ -460,8 +461,28 @@ async def _update_agent_impl(
         patch: dict[str, Any] = dict(scalar_patch)
         if resolved_skills is not None:
             patch["skills"] = merge_skills_with_ma(resolved_skills, fresh)
+            merged_skill_count = len(patch["skills"])
+            if merged_skill_count > AGENT_SKILL_CAP:
+                raise ToolError(
+                    f"Cannot attach skills: the merged skill set ({merged_skill_count}) exceeds "
+                    f"this organization's per-agent skill limit ({AGENT_SKILL_CAP}). No skills "
+                    "were changed. Attach fewer skills, or remove existing ones via the "
+                    "/agent-setup panel before adding more."
+                )
         if mcp_servers is not None:
             patch["mcp_servers"] = merge_mcp_servers_with_ma(mcp_servers, fresh)
+            # merge_mcp_servers_with_ma's return type is `list | None` at the
+            # signature level (None only for a None input), but `mcp_servers`
+            # is guaranteed non-None in this branch, so the merged result is
+            # never actually None — `or []` only satisfies the static type.
+            merged_mcp_count = len(patch["mcp_servers"] or [])
+            if merged_mcp_count > AGENT_MCP_CAP:
+                raise ToolError(
+                    f"Cannot attach MCP servers: the merged server set ({merged_mcp_count}) "
+                    f"exceeds this organization's per-agent MCP-server limit ({AGENT_MCP_CAP}). "
+                    "No servers were changed. Attach fewer servers, or remove existing ones via "
+                    "the /agent-setup panel before adding more."
+                )
         if tools is not None:
             patch["tools"] = _union_tools(tools, fresh)
         # #141: attaching skills to an agent that lacks agent_toolset_20260401 produces a
