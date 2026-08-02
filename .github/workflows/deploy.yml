@@ -183,3 +183,27 @@ jobs:
               cd /etc/daimon
               sudo -E docker compose -f compose.worker.yml run --rm smoke
             '
+
+      - name: Verify deployed installs match shipped defaults
+        # No environment gate, deliberately: this runs on every staging deploy
+        # AND every production promote — unlike the smoke turn above, which is
+        # scoped to staging only. A production install drifting from the
+        # shipped spec is exactly the failure mode this step exists to catch.
+        #
+        # Own timeout, sized larger than the smoke turn's: this walks every
+        # ready install's resources sequentially against the provider, not a
+        # single turn, so its budget scales with install count rather than
+        # with one turn's latency. Revisit this budget as installs grow.
+        timeout-minutes: 10
+        run: |
+          # Same failure discipline as the smoke turn step above: no VM-status
+          # precheck, no error-suppressing fallback. A deploy whose installs
+          # could not be checked against the shipped defaults must fail loudly,
+          # not read green — that silent gap is exactly what this step closes.
+          gcloud compute ssh ${{ vars.GCP_AR_REPO }}-workers --zone "$ZONE" \
+            --tunnel-through-iap --command '
+              export DAIMON_IMAGE="${{ steps.tags.outputs.daimon }}"
+              export DOCKER_CONFIG=/root/.docker
+              cd /etc/daimon
+              sudo -E docker compose -f compose.worker.yml run --rm smoke defaults verify
+            '
