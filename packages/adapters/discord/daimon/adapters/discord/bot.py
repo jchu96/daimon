@@ -420,15 +420,20 @@ class DaimonBot(commands.Bot):
             )
             self._spawn(_bounded_seed(tenant_id=result.tenant_id, guild=guild))
 
-        # Re-seed any listed tenant stuck in pending/failed; per-guild permission
-        # check + tree sync for joined guilds.
+        # Reconcile every registered, joined tenant against the shipped defaults on
+        # every boot, not just the ones stuck in pending/failed. Because every
+        # deploy restarts this process, this loop is how a defaults edit (a prompt
+        # rewrite, a new skill) reaches an already-provisioned install without any
+        # hand-run command. An in-sync tenant costs roughly 13-15 provider read
+        # calls here and zero writes -- the reconcile's own per-resource fingerprint
+        # gate turns a hash match into a skip -- bounded by the sweep's concurrency
+        # cap above. Per-guild permission check + tree sync for joined guilds.
         for tr in tenants:
             guild = self.get_guild(int(tr.external_id))
             if guild is None:
                 log.warning("registered_guild_not_joined", external_id=tr.external_id)
                 continue
-            if tr.provision_status in ("pending", "failed"):
-                self._spawn(_bounded_seed(tenant_id=tr.id, guild=guild))
+            self._spawn(_bounded_seed(tenant_id=tr.id, guild=guild))
             missing = check_missing_permissions(guild.me.guild_permissions)
             if missing:
                 log.warning(

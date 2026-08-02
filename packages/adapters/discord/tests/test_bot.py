@@ -814,6 +814,142 @@ class TestOnReadySweepProvisioning:
         )
 
 
+class TestOnReadySweepWidenedReconcile:
+    """The re-seed loop reconciles every registered, joined tenant on boot, not
+    just tenants stuck in pending/failed (D-06)."""
+
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_boot_sweep_reconciles_a_tenant_that_is_already_ready(
+        self,
+        mock_reconcile: AsyncMock,
+        db_session: AsyncSession,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A tenant already in status='ready' still gets `_seed_tenant_defaults`
+        invoked on boot -- the whole point of widening the sweep."""
+        from daimon.core.defaults.provisioning import provision_tenant
+        from daimon.core.defaults.report import ApplyReport
+        from daimon.core.ma_identity import derive_tenant_uuid
+
+        guild_id = 900000010
+        await provision_tenant(
+            db_session_factory,
+            platform="discord",
+            workspace_id=str(guild_id),
+            signup_credit=Decimal("0"),
+        )
+        # provision_tenant leaves provision_status at its server default, "ready".
+        tenant_id = derive_tenant_uuid(platform="discord", workspace_id=str(guild_id))
+        mock_reconcile.return_value = ApplyReport()
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        bot._connection._guilds = {guild_id: _make_sweep_guild(guild_id)}  # pyright: ignore[reportPrivateUsage]
+        bot.tree.clear_commands = MagicMock()  # type: ignore[method-assign]
+        bot.tree.sync = AsyncMock()  # type: ignore[method-assign]
+
+        await bot.on_ready()
+        while bot._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            import asyncio as _asyncio
+
+            await _asyncio.gather(*list(bot._bg_tasks))  # pyright: ignore[reportPrivateUsage]
+
+        mock_reconcile.assert_awaited_once()
+        assert mock_reconcile.await_args is not None
+        assert mock_reconcile.await_args.kwargs["tenant_id"] == tenant_id, (
+            "an already-ready tenant must still be reconciled against the shipped "
+            "defaults on boot (D-06)"
+        )
+
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_boot_sweep_still_reconciles_pending_and_failed_tenants(
+        self,
+        mock_reconcile: AsyncMock,
+        db_session: AsyncSession,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Pre-existing behavior is not lost: tenants stuck in pending or failed
+        are still reconciled on boot."""
+        from daimon.core.defaults.provisioning import provision_tenant
+        from daimon.core.defaults.report import ApplyReport
+        from daimon.core.ma_identity import derive_tenant_uuid
+        from daimon.core.stores.tenants import set_provision_status
+
+        guild_pending = 900000011
+        guild_failed = 900000012
+        await provision_tenant(
+            db_session_factory,
+            platform="discord",
+            workspace_id=str(guild_pending),
+            signup_credit=Decimal("0"),
+        )
+        await provision_tenant(
+            db_session_factory,
+            platform="discord",
+            workspace_id=str(guild_failed),
+            signup_credit=Decimal("0"),
+        )
+        tenant_pending = derive_tenant_uuid(platform="discord", workspace_id=str(guild_pending))
+        tenant_failed = derive_tenant_uuid(platform="discord", workspace_id=str(guild_failed))
+        await set_provision_status(db_session_factory, tenant_id=tenant_pending, status="pending")
+        await set_provision_status(db_session_factory, tenant_id=tenant_failed, status="failed")
+        mock_reconcile.return_value = ApplyReport()
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        bot._connection._guilds = {  # pyright: ignore[reportPrivateUsage]
+            guild_pending: _make_sweep_guild(guild_pending),
+            guild_failed: _make_sweep_guild(guild_failed),
+        }
+        bot.tree.clear_commands = MagicMock()  # type: ignore[method-assign]
+        bot.tree.sync = AsyncMock()  # type: ignore[method-assign]
+
+        await bot.on_ready()
+        while bot._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            import asyncio as _asyncio
+
+            await _asyncio.gather(*list(bot._bg_tasks))  # pyright: ignore[reportPrivateUsage]
+
+        reconciled_tenant_ids = {c.kwargs["tenant_id"] for c in mock_reconcile.await_args_list}
+        assert tenant_pending in reconciled_tenant_ids, (
+            "a pending tenant must be reconciled on boot"
+        )
+        assert tenant_failed in reconciled_tenant_ids, "a failed tenant must be reconciled on boot"
+
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_boot_sweep_skips_a_registered_tenant_whose_guild_is_not_joined(
+        self,
+        mock_reconcile: AsyncMock,
+        db_session: AsyncSession,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A registered tenant whose guild the bot has not (re)joined is never
+        reconciled -- the not-joined guard still holds."""
+        from daimon.core.defaults.provisioning import provision_tenant
+
+        guild_id = 900000013
+        await provision_tenant(
+            db_session_factory,
+            platform="discord",
+            workspace_id=str(guild_id),
+            signup_credit=Decimal("0"),
+        )
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        # No guild registered in bot._connection._guilds -- the bot has not joined it.
+        bot.tree.clear_commands = MagicMock()  # type: ignore[method-assign]
+        bot.tree.sync = AsyncMock()  # type: ignore[method-assign]
+
+        await bot.on_ready()
+        while bot._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            import asyncio as _asyncio
+
+            await _asyncio.gather(*list(bot._bg_tasks))  # pyright: ignore[reportPrivateUsage]
+
+        mock_reconcile.assert_not_awaited()
+
+
 def _make_thread_message_for_bot(
     *,
     content: str = "<@999> hello",
