@@ -50,6 +50,7 @@ __all__ = [
     "select_clone_auth",
     "resolve_clone_token",
     "select_skill_sync_auth",
+    "resolve_skill_sync_token",
 ]
 
 type InstallationLookup = Callable[[str, str], Awaitable[int | None]]
@@ -284,3 +285,134 @@ async def resolve_clone_token(
         f"No credential is authorized to clone {binding.repo_url}. Re-bind this repo "
         "with a GitHub token that can read it, from the agent setup panel's GitHub option."
     )
+
+
+async def resolve_skill_sync_token(
+    http_client: httpx.AsyncClient,
+    *,
+    repo_url: str,
+    per_agent_pat: str | None,
+    fallback_pat: str | None,
+    app_id: str | None,
+    app_private_key: SecretStr | None,
+    installation_lookup: InstallationLookup | None,
+    now: int,
+) -> str | None:
+    """Resolve the skill-sync token for a bare repo URL.
+
+    Structurally parallel to ``resolve_clone_token`` — same ordering, same
+    short-circuit discipline — differing only in its inputs (no binding, no
+    proof kind; an injected installation lookup instead of an always-live
+    one) and in returning ``None`` for the anonymous case where the clone
+    path raises.
+
+    Short-circuits on ``per_agent_pat`` before any GitHub HTTP call, before
+    building an App JWT, and before invoking ``installation_lookup`` — the
+    same reasoning ``resolve_clone_token`` records: never mint a JWT or do an
+    installation lookup when a per-agent credential is already available. An
+    empty string is "no token", exactly as the clone path treats it.
+
+    The App tier is only attempted when ``installation_lookup`` is not
+    ``None`` AND both App settings (``app_id``, ``app_private_key``) are
+    present — passing ``installation_lookup=None`` skips the App tier
+    entirely, including the JWT build, with zero outbound requests. This is
+    how a caller with no live-or-cached installation source opts out of the
+    App tier rather than being forced to inject a lookup that always returns
+    ``None``.
+
+    ``installation_lookup`` is injected precisely so an interactive caller
+    can pass a live GitHub lookup (``get_installation_id_for_repo``) while an
+    unattended batch caller passes a cheap read of the cached
+    ``github_app_installations`` table — that freshness choice belongs to
+    the caller, not to this function.
+
+    The App path is best-effort: a lookup-or-mint failure raising
+    ``httpx.HTTPError`` degrades to "App unavailable" (logged, repo + error
+    only — never a token) and falls through to the fallback/anonymous
+    decision, mirroring ``resolve_clone_token``'s degradation so a transient
+    GitHub failure never fails a sync a fallback token could still serve. A
+    malformed App private key still raises from ``build_app_jwt`` (operator
+    misconfiguration must fail loudly, not be silently masked).
+
+    ``None`` means an unauthenticated (anonymous) fetch, which the skill
+    fetchers already accept — it is the only way public skill sync works on
+    a deployment that never configured an operator fallback token. This is
+    the one behavioral difference from ``resolve_clone_token``, which raises
+    instead of returning ``None`` for its equivalent "none" tier: anonymous
+    is a legitimate outcome here, not a refusal.
+
+    See also ``resolve_clone_token``, the clone-path sibling of this
+    function: the two share this tier ordering on purpose and differ only in
+    their inputs and in this anonymous-versus-raise tail.
+
+    Args:
+        http_client: Injected async HTTP client. Caller owns lifecycle.
+        repo_url: A raw or `owner/repo` GitHub repo reference (normalized
+            internally via ``normalize_owner_repo``).
+        per_agent_pat: Already-resolved per-agent PAT overlay, or None.
+        fallback_pat: Operator-wide fallback PAT, or None/empty (treated the
+            same — an empty string is "no token").
+        app_id: GitHub App id, or None if the App is not configured.
+        app_private_key: GitHub App private key, or None if not configured.
+        installation_lookup: Injected `(owner, repo) -> installation_id |
+            None` callable, or None to skip the App tier entirely.
+        now: Current Unix timestamp (int) — caller provides this so the App
+            JWT mint stays pure (no clock read inside this module).
+
+    Returns:
+        The resolved token (PAT or minted installation token or fallback
+        PAT), or None for the legitimate anonymous case.
+
+    Raises:
+        DaimonError: When ``repo_url`` does not normalize to `owner/repo` —
+            a malformed reference must not silently fall through to an
+            anonymous fetch of a different (or no) repo.
+    """
+    # Empty string is "no token" (same as fallback_pat's bool() handling below);
+    # returning it verbatim would emit an empty authorization_token (MA 400s).
+    if per_agent_pat:
+        return per_agent_pat
+
+    normalized = normalize_owner_repo(repo_url)
+    if "/" not in normalized:
+        raise DaimonError(
+            f"'{repo_url}' does not resolve to a usable owner/repo reference for skill sync."
+        )
+    owner, repo = normalized.split("/", 1)
+    has_fallback_pat = bool(fallback_pat)
+
+    # Best-effort App path: a transient GitHub failure on the installation
+    # lookup / token mint must not fail a sync a fallback token could still
+    # serve. On any HTTP error, degrade to "App unavailable" and fall through
+    # to the fallback/none decision. A malformed App private key still raises
+    # from build_app_jwt (operator misconfig — fail loud so it is fixed, not
+    # silently masked).
+    app_token: str | None = None
+    if installation_lookup is not None and app_id is not None and app_private_key is not None:
+        app_jwt = build_app_jwt(app_private_key.get_secret_value(), app_id, now=now)
+        try:
+            installation_id = await installation_lookup(owner, repo)
+            if installation_id is not None:
+                app_token = await mint_installation_token(
+                    http_client, jwt=app_jwt, installation_id=installation_id
+                )
+        except httpx.HTTPError as err:
+            log.warning(
+                "github_repo_auth.skill_sync_app_path_failed",
+                repo_url=normalized,
+                error=str(err),
+            )
+
+    mode = select_skill_sync_auth(
+        has_per_agent_pat=False,
+        app_installed=app_token is not None,
+        has_fallback_pat=has_fallback_pat,
+    )
+
+    if mode == "app":
+        assert app_token is not None  # narrows: app_installed implies a minted token
+        return app_token
+    if mode == "public":
+        assert fallback_pat  # narrows: has_fallback_pat implies this is truthy
+        return fallback_pat
+    return None
