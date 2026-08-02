@@ -53,6 +53,19 @@ async def get_tenant_liveness(
         return await get_tenant(session, tenant_id)
 
 
+_LAST_RECONCILE_ERROR_MAX_LENGTH = 2000
+_LAST_RECONCILE_ERROR_TRUNCATION_MARKER = "... [truncated]"
+
+
+def _truncate_reason(reason: str) -> str:
+    """Cap a reconcile-failure reason so a pathological provider error body
+    cannot bloat the tenants table. Appends a marker when truncated."""
+    if len(reason) <= _LAST_RECONCILE_ERROR_MAX_LENGTH:
+        return reason
+    cutoff = _LAST_RECONCILE_ERROR_MAX_LENGTH - len(_LAST_RECONCILE_ERROR_TRUNCATION_MARKER)
+    return reason[:cutoff] + _LAST_RECONCILE_ERROR_TRUNCATION_MARKER
+
+
 async def set_provision_status(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -60,14 +73,29 @@ async def set_provision_status(
     status: str | None = None,
     archive: bool = False,
     clear_archive: bool = False,
+    reason: str | None = None,
+    clear_reason: bool = False,
 ) -> None:
-    """Update provision_status and/or archived_at for a tenant.
+    """Update provision_status, archived_at, and/or last_reconcile_error for a tenant.
 
-    Raises StoreError when archive and clear_archive are both set (mutually exclusive).
+    Raises StoreError when archive and clear_archive are both set, or when
+    reason and clear_reason are both set (each pair is mutually exclusive).
     No-ops when all keyword args are their defaults.
+
+    A caller flipping a tenant back to `status="ready"` after a successful
+    reconcile must pass `clear_reason=True` explicitly — this store does not
+    infer clearing from the status value, so the semantics live in exactly one
+    place (the caller), not split between here and there. Leaving a reason
+    behind a successful reconcile would let a stale failure be read as current.
+
+    `reason` is capped at `_LAST_RECONCILE_ERROR_MAX_LENGTH` characters (with a
+    truncation marker appended) before being written, so an unbounded provider
+    error body cannot bloat the row.
     """
     if archive and clear_archive:
         raise StoreError("archive and clear_archive are mutually exclusive")
+    if reason is not None and clear_reason:
+        raise StoreError("reason and clear_reason are mutually exclusive")
     values: dict[str, object] = {}
     if status is not None:
         values["provision_status"] = status
@@ -75,6 +103,10 @@ async def set_provision_status(
         values["archived_at"] = func.now()
     elif clear_archive:
         values["archived_at"] = None
+    if reason is not None:
+        values["last_reconcile_error"] = _truncate_reason(reason)
+    elif clear_reason:
+        values["last_reconcile_error"] = None
     if not values:
         return
     async with session_factory() as session, session.begin():

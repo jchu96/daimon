@@ -145,3 +145,116 @@ async def test_set_provision_status_updates_tenant(
     archived_row = await get_tenant(db_session, tenant_id)
     assert archived_row is not None
     assert archived_row.archived_at is not None, "archive=True must set archived_at"
+
+
+async def test_set_provision_status_writes_reason_with_failed_status(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A reason passed alongside a failed status is persisted and readable via get_tenant."""
+    await make_tenant(db_session, workspace_id="guild-reason-write")
+    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+
+    tenant_id = derive_tenant_uuid(platform="discord", workspace_id="guild-reason-write")
+
+    await set_provision_status(
+        db_session_factory,
+        tenant_id=tenant_id,
+        status="failed",
+        reason="agent seed failed: repo not found",
+    )
+
+    row = await get_tenant(db_session, tenant_id)
+    assert isinstance(row, TenantRow), "get_tenant must return a TenantRow, not the ORM"
+    assert row.provision_status == "failed", "status should be written alongside the reason"
+    assert row.last_reconcile_error == "agent seed failed: repo not found", (
+        "reason should be persisted verbatim when under the cap"
+    )
+
+
+async def test_set_provision_status_clear_reason_sets_it_back_to_none(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """clear_reason=True clears a previously-written reason back to NULL."""
+    await make_tenant(db_session, workspace_id="guild-reason-clear")
+    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+
+    tenant_id = derive_tenant_uuid(platform="discord", workspace_id="guild-reason-clear")
+
+    await set_provision_status(
+        db_session_factory, tenant_id=tenant_id, status="failed", reason="transient blip"
+    )
+    await set_provision_status(
+        db_session_factory, tenant_id=tenant_id, status="ready", clear_reason=True
+    )
+
+    row = await get_tenant(db_session, tenant_id)
+    assert row is not None
+    assert row.last_reconcile_error is None, "clear_reason=True must reset the reason to NULL"
+
+
+async def test_set_provision_status_raises_when_reason_and_clear_reason_both_set(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Passing both reason and clear_reason is rejected, mirroring the archive pair."""
+    await make_tenant(db_session, workspace_id="guild-reason-conflict")
+    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+
+    tenant_id = derive_tenant_uuid(platform="discord", workspace_id="guild-reason-conflict")
+
+    with pytest.raises(StoreError, match="mutually exclusive"):
+        await set_provision_status(
+            db_session_factory, tenant_id=tenant_id, reason="x", clear_reason=True
+        )
+
+
+async def test_set_provision_status_leaves_existing_reason_untouched_when_neither_passed(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A call passing neither reason nor clear_reason must not disturb an existing reason.
+
+    Regression guard: every pre-existing set_provision_status caller (status-only,
+    archive-only) must keep working without accidentally clearing a recorded reason.
+    """
+    await make_tenant(db_session, workspace_id="guild-reason-untouched")
+    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+
+    tenant_id = derive_tenant_uuid(platform="discord", workspace_id="guild-reason-untouched")
+
+    await set_provision_status(
+        db_session_factory, tenant_id=tenant_id, status="failed", reason="original reason"
+    )
+    await set_provision_status(db_session_factory, tenant_id=tenant_id, archive=True)
+
+    row = await get_tenant(db_session, tenant_id)
+    assert row is not None
+    assert row.last_reconcile_error == "original reason", (
+        "a call touching neither reason nor clear_reason must leave an existing reason intact"
+    )
+
+
+async def test_set_provision_status_truncates_reason_longer_than_cap(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A reason longer than the stated cap is stored truncated with a marker."""
+    await make_tenant(db_session, workspace_id="guild-reason-truncate")
+    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+
+    tenant_id = derive_tenant_uuid(platform="discord", workspace_id="guild-reason-truncate")
+    long_reason = "x" * 3000
+
+    await set_provision_status(
+        db_session_factory, tenant_id=tenant_id, status="failed", reason=long_reason
+    )
+
+    row = await get_tenant(db_session, tenant_id)
+    assert row is not None
+    assert row.last_reconcile_error is not None
+    assert len(row.last_reconcile_error) <= 2000, "stored reason must not exceed the stated cap"
+    assert row.last_reconcile_error.endswith("[truncated]"), (
+        "a truncated reason must carry a visible truncation marker"
+    )
