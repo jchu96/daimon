@@ -50,7 +50,7 @@ from daimon.adapters.mcp.tools.agent_removal import register_agent_removal_tools
 from daimon.adapters.mcp.tools.channels import register_channel_tools
 from daimon.adapters.mcp.tools.cli_token import register_cli_token_tool
 from daimon.adapters.mcp.tools.credential_requests import register_credential_request_tools
-from daimon.adapters.mcp.tools.media import register_media_tools
+from daimon.adapters.mcp.tools.media import register_media_tools, register_upload_tool
 from daimon.adapters.mcp.tools.notebook import register_notebook_tools
 from daimon.adapters.mcp.tools.propagation import register_propagation_tools
 from daimon.adapters.mcp.tools.wizard import register_wizard_tools
@@ -221,18 +221,18 @@ def create_mcp_app(
         )
     )
 
-    # Build Gemini client + FileStore when DAIMON_GEMINI__API_KEY is
-    # configured. Both are optional — without a Gemini key the media tools
-    # skip registration and the rest of the mcp surface boots normally.
+    # The file store is independent of Gemini: it backs upload_file (below)
+    # and the three generation tools alike, so it is always constructed.
+    # Only the Gemini client is conditional on DAIMON_GEMINI__API_KEY — without
+    # it, the three generation tools skip registration and the rest of the mcp
+    # surface (including file storage) boots normally.
     gemini_client: genai.Client | None = None
-    file_store: FileStore | None = None
-    file_store_dir: Path | None = None
+    file_store_dir: Path = effective_settings.mcp.file_store_dir or (
+        Path(tempfile.gettempdir()) / "daimon-mcp-files"
+    )
+    file_store: FileStore = FileStore(base_dir=file_store_dir)
     if effective_settings.gemini.api_key is not None:
         gemini_client = genai.Client(api_key=effective_settings.gemini.api_key.get_secret_value())
-        file_store_dir = effective_settings.mcp.file_store_dir or (
-            Path(tempfile.gettempdir()) / "daimon-mcp-files"
-        )
-        file_store = FileStore(base_dir=file_store_dir)
 
     notebook_rate_limiter = RateLimiter(
         max_requests=effective_settings.notebook.publish_rate_per_hour,
@@ -276,7 +276,10 @@ def create_mcp_app(
     register_notebook_tools(mcp, runtime)  # notebook publish (raises when unconfigured)
     register_propagation_tools(mcp, runtime)  # set/clear agent default
 
-    if gemini_client is not None and file_store is not None:
+    register_upload_tool(mcp, file_store=file_store)
+    log.info("mcp.file_store_ready", store_dir=str(file_store_dir))
+
+    if gemini_client is not None:
         register_media_tools(
             mcp,
             gemini_client=gemini_client,
@@ -285,9 +288,9 @@ def create_mcp_app(
             billing_config=effective_billing_config,
             markup=effective_settings.billing.markup,
         )
-        log.info("mcp.media_tools_registered", store_dir=str(file_store_dir))
+        log.info("mcp.generation_tools_registered")
     else:
-        log.info("mcp.media_tools_skipped", reason="DAIMON_GEMINI__API_KEY not set")
+        log.info("mcp.generation_tools_skipped", reason="DAIMON_GEMINI__API_KEY not set")
 
     app = mcp.http_app()
     app.state.mcp = mcp

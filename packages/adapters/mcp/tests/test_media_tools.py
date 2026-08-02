@@ -11,6 +11,7 @@ neither regardless of outcome; a depleted ledger denies with a
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import uuid
@@ -30,7 +31,7 @@ from daimon.adapters.mcp.file_store import FileStore
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.adapters.mcp.services.audio import TTS_MODEL
 from daimon.adapters.mcp.services.image import IMAGE_MODEL
-from daimon.adapters.mcp.tools.media import register_media_tools
+from daimon.adapters.mcp.tools.media import register_media_tools, register_upload_tool
 from daimon.core.config import (
     AnthropicSettings,
     DatabaseSettings,
@@ -147,6 +148,90 @@ async def test_generate_audio_rejects_empty_script(tmp_path: Path) -> None:
                 "generate_audio",
                 {"script": "   \n  ", "title": "empty"},
             )
+
+
+# ---------------------------------------------------------------------------
+# upload_file: round trip, malformed input, over-ceiling, no-gemini-key wiring
+# ---------------------------------------------------------------------------
+
+
+def _register_upload(mcp: FastMCP, tmp_path: Path) -> None:
+    mcp.add_middleware(_SeedAuthMiddleware(_trusted_auth()))
+    register_upload_tool(mcp, file_store=FileStore(base_dir=tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_upload_file_round_trips_the_exact_bytes_and_mime_type(tmp_path: Path) -> None:
+    mcp = FastMCP(name="t")
+    _register_upload(mcp, tmp_path)
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    encoded = base64.b64encode(png_bytes).decode()
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "upload_file",
+            {"data": encoded, "title": "chart", "mime_type": "image/png"},
+        )
+    assert not result.is_error, f"round trip should succeed: {result!r}"
+    text = " ".join(part.text for part in result.content if hasattr(part, "text"))
+    handle_id = text.split("handle id ")[1].split("'")[1]
+
+    store = FileStore(base_dir=tmp_path)
+    handle = store.get(handle_id)
+    assert handle.data == png_bytes, "stored bytes should exactly match the uploaded payload"
+    assert handle.content_type == "image/png", "stored mime type should match the declared one"
+
+
+@pytest.mark.asyncio
+async def test_upload_file_rejects_malformed_base64(tmp_path: Path) -> None:
+    mcp = FastMCP(name="t")
+    _register_upload(mcp, tmp_path)
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="not valid base64"):
+            await client.call_tool(
+                "upload_file",
+                {"data": "not-valid-base64!!!", "title": "bad", "mime_type": "text/plain"},
+            )
+
+
+@pytest.mark.asyncio
+async def test_upload_file_rejects_payload_over_the_ceiling(tmp_path: Path) -> None:
+    mcp = FastMCP(name="t")
+    _register_upload(mcp, tmp_path)
+    oversized = base64.b64encode(b"\x00" * 3_500_000).decode()
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="create_attachment_upload_url"):
+            await client.call_tool(
+                "upload_file",
+                {"data": oversized, "title": "big", "mime_type": "application/octet-stream"},
+            )
+
+
+async def test_upload_file_registers_without_an_image_generation_key(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Regression guard: file storage no longer depends on DAIMON_GEMINI__API_KEY."""
+    settings = Settings(
+        database=DatabaseSettings(url=PostgresDsn("postgresql+asyncpg://u:p@h/d")),
+        anthropic=AnthropicSettings(api_key=SecretStr("sk-test")),
+        mcp=McpSettings(
+            public_url=HttpUrl("https://t.example.com/mcp"),
+            file_store_dir=tmp_path,
+        ),
+    )
+    app = create_mcp_app(
+        settings=settings,
+        sessionmaker=sessionmaker,
+        auth=StaticTokenVerifier(tokens={}),
+    )
+    mcp = app.state.mcp
+    registered = {t.name for t in await mcp.local_provider.list_tools()}
+    assert "upload_file" in registered, "upload_file should register with no gemini key configured"
+    generation_tools = {"generate_image", "generate_audio", "fetch_youtube_transcript"}
+    assert not (registered & generation_tools), (
+        "generation tools should NOT register with no gemini key configured"
+    )
 
 
 # ---------------------------------------------------------------------------

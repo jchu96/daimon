@@ -133,10 +133,10 @@ async def _send_message_impl(  # pyright: ignore[reportUnusedFunction]
                 files.extend(await _build_files(attachments, session=http_session))
     if file_handles:
         if runtime.file_store is None:
-            raise ToolError(
-                "file_handles requires the media file store to be configured "
-                "(set DAIMON_GEMINI__API_KEY on the mcp process)"
-            )
+            # The mcp server always constructs a file store today (see
+            # server.py); this branch only guards a runtime that skipped
+            # that wiring (e.g. a test-built McpRuntime), not a missing key.
+            raise ToolError("file_handles requires the mcp process's file store to be available")
         files.extend(await _build_files_from_handles(file_handles, store=runtime.file_store))
 
     async with rest_client(token) as c:
