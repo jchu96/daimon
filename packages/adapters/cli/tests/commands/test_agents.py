@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
 from typing import cast
@@ -23,6 +26,8 @@ from anthropic.types.beta.beta_managed_agents_mcp_toolset_default_config import 
     BetaManagedAgentsMCPToolsetDefaultConfig,
 )
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
+from daimon.adapters.cli import main as main_mod
+from daimon.adapters.cli.commands import agents as agents_cmd
 from daimon.adapters.cli.commands.agents import (
     agents_archive,
     agents_create,
@@ -35,15 +40,17 @@ from daimon.adapters.cli.runtime import CliRuntime
 from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.errors import SpecError, StoreError
+from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.stores.identity import get_or_create_cli_principal
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import MARouter, list_response
+from daimon.testing.ma import MARouter, build_stub_anthropic, list_response
 from rich.console import Console
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from typer.testing import CliRunner
 
 # These tests create their tenant explicitly as cli:local (the tenant
 # discover_tenant derives for the CLI) and tag MA resources against it, so they
@@ -979,4 +986,202 @@ async def test_agents_fork_rejects_when_destination_name_exists_in_tenant(
 
     assert post_calls == [], (
         "fork must not POST to /v1/agents when destination name already exists in the tenant"
+    )
+
+
+# ---------------------------------------------------------------------------
+# --tenant/--guild override (behavioral, via CliRunner + the real Typer app)
+# ---------------------------------------------------------------------------
+
+
+def _install_agents_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    anthropic: AsyncAnthropic,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    rt = object.__new__(CliRuntime)
+    object.__setattr__(rt, "settings", cast(Settings, _FakeSettings()))
+    object.__setattr__(rt, "anthropic", anthropic)
+    object.__setattr__(rt, "sessionmaker", sessionmaker)
+    object.__setattr__(rt, "deployment_default", DeploymentDefault())
+    object.__setattr__(rt, "resolver_cache", new_resolver_cache())
+
+    @asynccontextmanager
+    async def fake_build_runtime(_settings: Settings) -> AsyncIterator[CliRuntime]:
+        yield rt
+
+    monkeypatch.setattr(agents_cmd, "build_runtime", fake_build_runtime)
+    monkeypatch.setattr(agents_cmd, "load_settings", lambda: cast(Settings, _FakeSettings()))
+
+
+def test_agents_list_with_guild_override_lists_that_guilds_agents(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--guild reaches discover_tenant, so an operator can see another guild's
+    roster without ever holding a session in that guild."""
+    guild_id = "override-guild-1"
+    guild_tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+            await make_tenant(s, platform="discord", workspace_id=guild_id, id=guild_tenant_id)
+
+    asyncio.run(seed())
+
+    guild_agent = _agent_json(
+        agent_id="ag_guild", name="guild-only-agent", tenant_id=guild_tenant_id
+    )
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, m: list_response([guild_agent]))
+    transport = httpx.MockTransport(router.dispatch)
+    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
+    anthropic = AsyncAnthropic(api_key="test", http_client=http_client)
+
+    _install_agents_runtime(monkeypatch, anthropic=anthropic, sessionmaker=schema_sessionmaker)
+
+    without_override = CliRunner().invoke(main_mod.app, ["agents", "list"])
+    assert without_override.exit_code == 0, without_override.stdout
+    assert "guild-only-agent" not in without_override.stdout, (
+        "the local cli:local tenant must not see another guild's agents"
+    )
+
+    with_override = CliRunner().invoke(main_mod.app, ["agents", "--guild", guild_id, "list"])
+    assert with_override.exit_code == 0, with_override.stdout
+    assert "guild-only-agent" in with_override.stdout, (
+        "--guild must resolve to that guild's tenant and list its agents"
+    )
+
+
+def test_agents_list_with_tenant_override_accepts_a_uuid(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--tenant accepts a raw tenant uuid directly, not just a guild id."""
+
+    async def seed() -> uuid.UUID:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+            other = await make_tenant(s, platform="discord", workspace_id="other-guild")
+            return other.id
+
+    other_tenant_id = asyncio.run(seed())
+
+    other_agent = _agent_json(
+        agent_id="ag_other", name="other-tenant-agent", tenant_id=other_tenant_id
+    )
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, m: list_response([other_agent]))
+    transport = httpx.MockTransport(router.dispatch)
+    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
+    anthropic = AsyncAnthropic(api_key="test", http_client=http_client)
+
+    _install_agents_runtime(monkeypatch, anthropic=anthropic, sessionmaker=schema_sessionmaker)
+
+    result = CliRunner().invoke(main_mod.app, ["agents", "--tenant", str(other_tenant_id), "list"])
+    assert result.exit_code == 0, result.stdout
+    assert "other-tenant-agent" in result.stdout, "--tenant must resolve the given uuid directly"
+
+
+def test_agents_list_rejects_an_unknown_tenant_uuid(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown --tenant must fail loudly, never fall through to cli:local."""
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+
+    asyncio.run(seed())
+    _install_agents_runtime(
+        monkeypatch, anthropic=build_stub_anthropic(), sessionmaker=schema_sessionmaker
+    )
+
+    bogus = uuid.uuid4()
+    result = CliRunner().invoke(main_mod.app, ["agents", "--tenant", str(bogus), "list"])
+
+    assert result.exit_code != 0, "an unknown tenant override must not succeed"
+    combined = result.stdout + (result.stderr or "")
+    assert str(bogus) in combined, f"error must name the rejected tenant id: {combined!r}"
+    assert "tenants list" in combined, (
+        f"error must point at the tenant-listing command: {combined!r}"
+    )
+
+
+def test_agents_list_rejects_a_non_uuid_tenant_value(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-uuid --tenant value must fail with a message suggesting --guild."""
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+
+    asyncio.run(seed())
+    _install_agents_runtime(
+        monkeypatch, anthropic=build_stub_anthropic(), sessionmaker=schema_sessionmaker
+    )
+
+    result = CliRunner().invoke(main_mod.app, ["agents", "--tenant", "not-a-uuid", "list"])
+
+    assert result.exit_code != 0, "a non-uuid --tenant value must not succeed"
+    combined = result.stdout + (result.stderr or "")
+    assert "--guild" in combined, f"error must suggest --guild for a Discord guild id: {combined!r}"
+
+
+def test_agents_list_rejects_tenant_and_guild_together(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--tenant and --guild are mutually exclusive."""
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+
+    asyncio.run(seed())
+    _install_agents_runtime(
+        monkeypatch, anthropic=build_stub_anthropic(), sessionmaker=schema_sessionmaker
+    )
+
+    result = CliRunner().invoke(
+        main_mod.app,
+        ["agents", "--tenant", str(uuid.uuid4()), "--guild", "some-guild", "list"],
+    )
+
+    assert result.exit_code != 0, "combining --tenant and --guild must not succeed"
+    combined = result.stdout + (result.stderr or "")
+    assert "combined" in combined, f"error must name the mutual-exclusivity conflict: {combined!r}"
+
+
+def test_agents_archive_confirmation_names_the_resolved_tenant(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 'no' answer must abort AND the prompt must name the resolved tenant, so
+    an operator who typed the wrong guild id sees it before anything archives."""
+    guild_id = "override-guild-archive"
+    guild_tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+            await make_tenant(s, platform="discord", workspace_id=guild_id, id=guild_tenant_id)
+
+    asyncio.run(seed())
+    _install_agents_runtime(
+        monkeypatch, anthropic=build_stub_anthropic(), sessionmaker=schema_sessionmaker
+    )
+
+    result = CliRunner().invoke(
+        main_mod.app, ["agents", "--guild", guild_id, "archive", "doomed"], input="n\n"
+    )
+
+    assert result.exit_code == 1, f"a 'no' answer must abort: {result.stdout!r}"
+    assert guild_id in result.stdout, (
+        f"confirmation prompt must name the resolved tenant's external id: {result.stdout!r}"
     )

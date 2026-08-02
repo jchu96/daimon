@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from io import StringIO
 from typing import cast
 
 import pytest
 import typer
+from daimon.adapters.cli import main as main_mod
+from daimon.adapters.cli.commands import config as config_cmd
 from daimon.adapters.cli.commands.config import (
     _config_get_entry,
     _config_propagate_entry,
     _parse_scope,
 )
+from daimon.adapters.cli.runtime import CliRuntime
+from daimon.core.config import Settings
+from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import (
     ChannelScopeRef,
     DeploymentDefault,
@@ -19,8 +28,10 @@ from daimon.core.scope import (
 )
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing.factories import make_account, make_tenant
+from daimon.testing.ma import build_stub_anthropic
 from rich.console import Console
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from typer.testing import CliRunner
 
 
 def test_parse_scope_user() -> None:
@@ -305,4 +316,74 @@ async def test_get_scope_deployment(db_session: AsyncSession) -> None:
     out = cast(StringIO, console.file).getvalue()
     assert "daimon" in out, (
         "config get --scope deployment must print the injected deployment_default.agent_name"
+    )
+
+
+# ---------------------------------------------------------------------------
+# --tenant/--guild override (behavioral, via CliRunner + the real Typer app)
+# ---------------------------------------------------------------------------
+
+
+def _install_config_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    class _Cli:
+        local_user = "testuser"
+
+    class _FakeSettings:
+        cli = _Cli()
+
+    rt = object.__new__(CliRuntime)
+    object.__setattr__(rt, "settings", cast(Settings, _FakeSettings()))
+    object.__setattr__(rt, "anthropic", build_stub_anthropic())
+    object.__setattr__(rt, "sessionmaker", sessionmaker)
+    object.__setattr__(rt, "deployment_default", DeploymentDefault())
+    object.__setattr__(rt, "resolver_cache", new_resolver_cache())
+
+    @asynccontextmanager
+    async def fake_build_runtime(_settings: Settings) -> AsyncIterator[CliRuntime]:
+        yield rt
+
+    monkeypatch.setattr(config_cmd, "build_runtime", fake_build_runtime)
+    monkeypatch.setattr(config_cmd, "load_settings", lambda: cast(Settings, _FakeSettings()))
+
+
+def test_config_get_with_guild_override_resolves_that_guilds_config(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--guild reaches config's discover_tenant call too, not just agents'."""
+    guild_id = "config-override-guild"
+    guild_tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+            guild_tenant = await make_tenant(
+                s, platform="discord", workspace_id=guild_id, id=guild_tenant_id
+            )
+            await set_fields(
+                s,
+                scope=TenantScopeRef(tenant_id=guild_tenant.id),
+                tenant_id=guild_tenant.id,
+                agent_name="guild-only-agent",
+            )
+
+    asyncio.run(seed())
+    _install_config_runtime(monkeypatch, sessionmaker=schema_sessionmaker)
+
+    without_override = CliRunner().invoke(main_mod.app, ["config", "get", "--scope", "tenant"])
+    assert without_override.exit_code == 0, without_override.stdout
+    assert "guild-only-agent" not in without_override.stdout, (
+        "the local cli:local tenant must not see another guild's tenant-tier config"
+    )
+
+    with_override = CliRunner().invoke(
+        main_mod.app, ["config", "--guild", guild_id, "get", "--scope", "tenant"]
+    )
+    assert with_override.exit_code == 0, with_override.stdout
+    assert "guild-only-agent" in with_override.stdout, (
+        "--guild must resolve to that guild's tenant and read its tenant-tier config"
     )

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
 from typing import Any, cast
@@ -11,6 +14,8 @@ import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import SkillCreateResponse, SkillListResponse
 from anthropic.types.beta.skills import VersionCreateResponse
+from daimon.adapters.cli import main as main_mod
+from daimon.adapters.cli.commands import skills as skills_cmd
 from daimon.adapters.cli.commands.skills import (
     delete_skill,
     get_skill,
@@ -22,11 +27,15 @@ from daimon.core.config import Settings
 from daimon.core.defaults.metadata import tenant_scoped_display_title
 from daimon.core.errors import StoreError
 from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_resolver import new_resolver_cache
+from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.identity import get_or_create_cli_principal
 from daimon.core.stores.tenants import get_tenant
+from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, list_response
 from rich.console import Console
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from typer.testing import CliRunner
 
 # ---------------------------------------------------------------------------
 # Shared helpers (not imported — each test file is self-contained)
@@ -658,3 +667,74 @@ async def test_skills_sync_with_branch_and_path(
 
 # Keep Settings import used in type annotations
 _ = Settings
+
+
+# ---------------------------------------------------------------------------
+# --tenant/--guild override (behavioral, via CliRunner + the real Typer app)
+# ---------------------------------------------------------------------------
+
+
+def _install_skills_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    anthropic: AsyncAnthropic,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    class _Cli:
+        local_user = "testuser"
+
+    class _FakeSettings:
+        cli = _Cli()
+
+    rt = object.__new__(CliRuntime)
+    object.__setattr__(rt, "settings", cast(Settings, _FakeSettings()))
+    object.__setattr__(rt, "anthropic", anthropic)
+    object.__setattr__(rt, "sessionmaker", sessionmaker)
+    object.__setattr__(rt, "deployment_default", DeploymentDefault())
+    object.__setattr__(rt, "resolver_cache", new_resolver_cache())
+
+    @asynccontextmanager
+    async def fake_build_runtime(_settings: Settings) -> AsyncIterator[CliRuntime]:
+        yield rt
+
+    monkeypatch.setattr(skills_cmd, "build_runtime", fake_build_runtime)
+    monkeypatch.setattr(skills_cmd, "load_settings", lambda: cast(Settings, _FakeSettings()))
+
+
+def test_skills_list_with_guild_override_lists_that_guilds_skills(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--guild reaches this group's discover_tenant call too, not just agents'."""
+    guild_id = "skills-override-guild"
+    guild_tenant_id = derive_tenant_uuid(platform="discord", workspace_id=guild_id)
+
+    async def seed() -> None:
+        async with schema_sessionmaker() as s, s.begin():
+            await make_tenant(s, platform="cli", workspace_id="local")
+            await make_tenant(s, platform="discord", workspace_id=guild_id, id=guild_tenant_id)
+
+    asyncio.run(seed())
+
+    canonical = tenant_scoped_display_title(tenant_id=guild_tenant_id, name="guild-only-skill")
+    router = MARouter()
+    router.add(
+        "GET", r"/v1/skills", lambda req, m: list_response([_skill_row("sk_guild", canonical)])
+    )
+    transport = httpx.MockTransport(router.dispatch)
+    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
+    anthropic = AsyncAnthropic(api_key="test", http_client=http_client)
+
+    _install_skills_runtime(monkeypatch, anthropic=anthropic, sessionmaker=schema_sessionmaker)
+
+    without_override = CliRunner().invoke(main_mod.app, ["skills", "list"])
+    assert without_override.exit_code == 0, without_override.stdout
+    assert "guild-only-skill" not in without_override.stdout, (
+        "the local cli:local tenant must not see another guild's skills"
+    )
+
+    with_override = CliRunner().invoke(main_mod.app, ["skills", "--guild", guild_id, "list"])
+    assert with_override.exit_code == 0, with_override.stdout
+    assert "guild-only-skill" in with_override.stdout, (
+        "--guild must resolve to that guild's tenant and list its skills"
+    )
