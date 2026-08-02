@@ -13,3 +13,17 @@ from daimon.core.pricing import AGENT_MODEL_PRICING
 # contain Select components, so validation happens at submit time against this
 # tuple.
 ALLOWED_MODEL_IDS: tuple[str, ...] = tuple(AGENT_MODEL_PRICING.keys())
+
+# The per-agent skill and MCP-server limits every surface enforces. The setup
+# panel (disabling its add controls) and the chat update path (refusing a
+# merge that would exceed the cap) both read these two values, so the two
+# surfaces cannot disagree.
+#
+# These are deliberate product caps chosen to sit below the provider's own
+# per-agent limits — not a copy of them. The provider's real limit is
+# established by the re-runnable probe at
+# `packages/core/tests/contracts/test_skill_cap.py`, which reads the number
+# out of the provider's own rejection message rather than a hardcoded second
+# value here, because that number has moved before.
+AGENT_SKILL_CAP: int = 20
+AGENT_MCP_CAP: int = 20

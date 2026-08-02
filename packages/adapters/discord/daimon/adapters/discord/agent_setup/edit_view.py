@@ -28,6 +28,7 @@ from daimon.adapters.discord.agent_setup.write import (
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.stores.agent_files import list_agent_files
@@ -35,9 +36,6 @@ from daimon.core.stores.agent_files import list_agent_files
 import discord
 
 log = structlog.get_logger()
-
-_SKILL_CAP = 20
-_MCP_CAP = 20
 
 
 def _is_default_mcp(entry: BetaManagedAgentsURLMCPServerParams, public_url: str | None) -> bool:
@@ -117,7 +115,7 @@ class _SkillRemoveSelect(discord.ui.Select["EditView"]):
             return
         options = [
             discord.SelectOption(label=f"✕ {skill.skill_id}"[:100], value=str(idx))
-            for idx, skill in enumerate(skills[:_SKILL_CAP])
+            for idx, skill in enumerate(skills[:AGENT_SKILL_CAP])
         ]
         super().__init__(
             placeholder="✕ Remove a skill…",
@@ -192,7 +190,7 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
         for idx, entry in enumerate(mcps):
             if _is_default_mcp(entry, public_url):
                 continue
-            if len(options) >= _MCP_CAP:
+            if len(options) >= AGENT_MCP_CAP:
                 break
             options.append(
                 discord.SelectOption(label=f"✕ {entry.get('name', '?')}"[:100], value=str(idx))
@@ -361,7 +359,7 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         add_skill_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="+ Add skill",
             style=discord.ButtonStyle.success,
-            disabled=(skill_count >= _SKILL_CAP) or spec_controls_disabled,
+            disabled=(skill_count >= AGENT_SKILL_CAP) or spec_controls_disabled,
         )
         add_skill_btn.callback = self._on_add_skill  # type: ignore[method-assign]
         btn_row.add_item(add_skill_btn)
@@ -369,7 +367,7 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         add_mcp_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="+ Add MCP",
             style=discord.ButtonStyle.success,
-            disabled=(user_mcp_count >= _MCP_CAP) or spec_controls_disabled,
+            disabled=(user_mcp_count >= AGENT_MCP_CAP) or spec_controls_disabled,
         )
         add_mcp_btn.callback = self._on_add_mcp  # type: ignore[method-assign]
         btn_row.add_item(add_mcp_btn)
