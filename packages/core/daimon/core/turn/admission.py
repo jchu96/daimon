@@ -1,4 +1,4 @@
-"""Stage one of the two-stage turn chokepoint (D-01): `admit()`.
+"""Stage one of the two-stage turn chokepoint: `admit()`.
 
 A single core call performs identity resolution, the channel -> tenant ->
 deployment config cascade, MA resolve + SDK retrieve, the per-tenant balance
@@ -11,8 +11,8 @@ over-balance and mis-configured must see the config error (matches both
 adapters' inline sequences today).
 
 Ported verbatim from `bot.py`'s inline pre-turn sequence (the reference
-implementation); nothing calls `admit()` yet -- the adapters still run their
-own inline sequences until the cutover plans (06-04/06-05).
+implementation). Both the Discord and Slack adapters now call `admit()` as
+their pre-turn gate.
 """
 
 from __future__ import annotations
@@ -25,10 +25,11 @@ from typing import Literal
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from daimon.core.billing import is_over_cap
 from daimon.core.defaults.provisioning import reconcile_tenant_defaults
-from daimon.core.ma_resolver import resolve_agent, resolve_environment
+from daimon.core.ma_resolver import MAResolverMissError, resolve_agent, resolve_environment
 from daimon.core.scope import ResolvedConfig, ScopeContext
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.scoped_config_read import resolve as resolve_config
+from daimon.core.stores.scoped_config_write import clear_agent_references
 from daimon.core.tenant_balance import is_over_balance
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.errors import AdmissionDenied, MissingTurnConfigError
@@ -99,7 +100,10 @@ async def admit(
         )
 
     # --- Resolve agent/environment via ma_resolver (self-heals on
-    # archive/recreate); MAResolverMissError propagates unwrapped. ---
+    # archive/recreate); MAResolverMissError propagates unwrapped. This path
+    # always passes cached_id=None, so the resolver's own liveness step never
+    # runs here, and its short TTL cache can hand back an id for an agent
+    # archived since it was cached -- the retrieve below is what settles it. ---
     agent_id = await resolve_agent(
         deps.anthropic,
         tenant_id=tenant_id,
@@ -119,6 +123,17 @@ async def admit(
 
     agent = await deps.anthropic.beta.agents.retrieve(agent_id)
     environment = await deps.anthropic.beta.environments.retrieve(env_id)
+
+    # --- Liveness check on the already-retrieved agent: it was archived out of
+    # band since the resolver cached/looked up its id. Self-heal the scope
+    # rows naming it (tenant-wide) before raising, so the next mention resolves
+    # the next cascade tier instead of re-hitting this same dead binding, and
+    # raise the existing resolver-miss error so the friendly copy at the four
+    # adapter catch sites renders unchanged -- no new error taxonomy. ---
+    if agent.archived_at is not None:
+        async with deps.sessionmaker() as session, session.begin():
+            await clear_agent_references(session, tenant_id=tenant_id, agent_name=config.agent_name)
+        raise MAResolverMissError(kind="agent", tenant_id=tenant_id, daimon_tag=config.agent_name)
 
     # --- Admission gate: per-tenant balance -- independent of Stripe config ---
     if await is_over_balance(sessionmaker=deps.sessionmaker, tenant_id=tenant_id):
