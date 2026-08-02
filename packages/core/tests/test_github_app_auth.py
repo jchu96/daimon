@@ -16,6 +16,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.github_app_auth import (
+    build_app_install_url,
     build_app_jwt,
     get_installation_id_for_repo,
     mint_installation_token,
@@ -61,6 +62,28 @@ def test_build_app_jwt_claims() -> None:
     assert claims["iss"] == "12345", "iss must equal the app_id"
     assert claims["iat"] == now - 60, "iat must be now-60 (clock drift)"
     assert claims["exp"] == now + 9 * 60, "exp must be now+540 (9 minutes)"
+
+
+# ---------------------------------------------------------------------------
+# Task 1: build_app_install_url
+# ---------------------------------------------------------------------------
+
+
+def test_build_app_install_url_produces_exact_string() -> None:
+    """build_app_install_url produces the exact GitHub App install URL for a slug."""
+    url = build_app_install_url("acme-daimon")
+
+    assert url == "https://github.com/apps/acme-daimon/installations/new", (
+        "install URL must interpolate the slug into the GitHub App install-page path"
+    )
+
+
+def test_build_app_install_url_is_pure() -> None:
+    """build_app_install_url returns the same output for the same input, with no I/O."""
+    first = build_app_install_url("acme-daimon")
+    second = build_app_install_url("acme-daimon")
+
+    assert first == second, "same slug must always produce the same URL"
 
 
 # ---------------------------------------------------------------------------

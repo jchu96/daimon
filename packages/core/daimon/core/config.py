@@ -250,6 +250,8 @@ class GithubSettings(BaseModel):
     optional so deployments without GitHub App or PAT config keep working.
 
     Cloning via the GitHub App requires only app_id + app_private_key.
+    app_slug is needed only to construct the App's install link; a
+    deployment that never surfaces that link can leave it unset.
     webhook_secret is optional and required only for the skill-sync
     push-driven resync webhook.
     """
@@ -273,6 +275,15 @@ class GithubSettings(BaseModel):
     app_private_key: SecretStr | None = Field(
         default=None,
         description="Private key (PEM) for the GitHub App identified by app_id.",
+    )
+    app_slug: str | None = Field(
+        default=None,
+        description=(
+            "GitHub App's URL name, used to build the App's install link so "
+            "members can be pointed at it from chat and from the setup "
+            "panel. Cloning does not need it, so a deployment that never "
+            "surfaces the install link can leave it unset."
+        ),
     )
     webhook_secret: SecretStr | None = Field(
         default=None,
@@ -331,6 +342,35 @@ class GithubSettings(BaseModel):
         except (binascii.Error, ValueError, UnicodeDecodeError):
             return value
         return decoded if "-----BEGIN" in decoded else value
+
+    @field_validator("app_slug")
+    @classmethod
+    def _validate_app_slug(cls, value: str | None) -> str | None:
+        """Reject anything outside a GitHub App slug's real shape.
+
+        The slug is interpolated into a URL that is shown to users and
+        clicked, so a typo or a pasted URL fragment must fail at settings
+        load rather than produce a link that goes somewhere unintended.
+        This is the mitigation for this deployment's phishing-shaped
+        threat: the URL is built from configuration only, and the
+        configuration is validated here.
+        """
+        if value is None:
+            return value
+        if (
+            not value
+            or not all(char.isascii() and (char.isalnum() or char == "-") for char in value)
+            or value.startswith("-")
+            or value.endswith("-")
+            or len(value) > 100
+        ):
+            shown = value if len(value) <= 40 else f"{value[:40]}...(truncated)"
+            raise ValueError(
+                f"app_slug must be a non-empty string of ASCII letters, digits and "
+                f"hyphens, with no leading or trailing hyphen and at most 100 "
+                f"characters; got shape of: {shown!r}"
+            )
+        return value
 
 
 class CryptoSettings(BaseModel):

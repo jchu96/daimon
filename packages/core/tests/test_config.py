@@ -370,6 +370,73 @@ def test_github_app_private_key_none_stays_none() -> None:
     assert settings.app_private_key is None, "unset private key must remain None"
 
 
+# --- GithubSettings app_slug validation ---
+
+
+def test_github_app_slug_defaults_to_none() -> None:
+    """Unset app_slug remains None (deployment with no GitHub App install link)."""
+    from daimon.core.config import GithubSettings
+
+    settings = GithubSettings()
+    assert settings.app_slug is None, "unset app_slug must remain None"
+
+
+def test_github_app_slug_accepts_valid_slug() -> None:
+    """A slug of letters, digits and hyphens is accepted unchanged."""
+    from daimon.core.config import GithubSettings
+
+    settings = GithubSettings(app_slug="acme-daimon-42")
+    assert settings.app_slug == "acme-daimon-42", "valid slug must be stored unchanged"
+
+
+def test_github_app_slug_rejects_empty_string() -> None:
+    """An empty app_slug is rejected rather than silently accepted."""
+    from daimon.core.config import GithubSettings
+
+    with pytest.raises(ValidationError):
+        GithubSettings(app_slug="")
+
+
+def test_github_app_slug_rejects_slash() -> None:
+    """A slug containing '/' is rejected (a URL fragment, not a slug)."""
+    from daimon.core.config import GithubSettings
+
+    with pytest.raises(ValidationError):
+        GithubSettings(app_slug="acme/daimon")
+
+
+def test_github_app_slug_rejects_dot() -> None:
+    """A slug containing '.' is rejected."""
+    from daimon.core.config import GithubSettings
+
+    with pytest.raises(ValidationError):
+        GithubSettings(app_slug="acme.daimon")
+
+
+def test_github_app_slug_rejects_at_sign() -> None:
+    """A slug containing '@' is rejected."""
+    from daimon.core.config import GithubSettings
+
+    with pytest.raises(ValidationError):
+        GithubSettings(app_slug="acme@daimon")
+
+
+def test_github_app_slug_rejects_leading_hyphen() -> None:
+    """A slug with a leading hyphen is rejected."""
+    from daimon.core.config import GithubSettings
+
+    with pytest.raises(ValidationError):
+        GithubSettings(app_slug="-acme-daimon")
+
+
+def test_github_app_slug_rejects_over_length_cap() -> None:
+    """A slug over the length cap is rejected."""
+    from daimon.core.config import GithubSettings
+
+    with pytest.raises(ValidationError):
+        GithubSettings(app_slug="a" * 101)
+
+
 # --- SlackSettings tests ---
 
 

@@ -6,6 +6,10 @@ No DB access. No module-level singletons.
 Pure functions:
   build_app_jwt  — RS256 JWT for App-to-GitHub auth (iss/iat/exp per GitHub docs)
   verify_signature — constant-time HMAC-SHA256 check on inbound webhook bodies
+  build_app_install_url — the App's install-page URL for a configured slug;
+    the single place this URL is constructed, imported by both the chat tool
+    and the setup panel so the two surfaces cannot state different URLs. The
+    slug is validated at settings load, so this function does not re-validate.
 
 Shell functions (injected httpx):
   mint_installation_token — POST to GitHub to exchange an App JWT for an
@@ -22,6 +26,28 @@ import hmac
 
 import httpx
 import jwt
+
+_APP_INSTALL_URL_TEMPLATE = "https://github.com/apps/{slug}/installations/new"
+
+
+def build_app_install_url(slug: str) -> str:
+    """Build the GitHub App's install-page URL for a configured slug.
+
+    This is the single place the install URL is constructed. Both the chat
+    tool and the setup panel import this function rather than each
+    formatting their own copy of the URL, so the two surfaces cannot state
+    different install links. The slug is validated at settings load (see
+    GithubSettings.app_slug); this function does not re-validate it.
+
+    Args:
+        slug: The GitHub App's URL name (e.g. from GithubSettings.app_slug).
+            Nothing else is accepted — no host, no full URL, no
+            caller-supplied string — so tool input can never reach the URL.
+
+    Returns:
+        The full install-page URL for the App.
+    """
+    return _APP_INSTALL_URL_TEMPLATE.format(slug=slug)
 
 
 def build_app_jwt(private_key_pem: str, app_id: str, *, now: int) -> str:
