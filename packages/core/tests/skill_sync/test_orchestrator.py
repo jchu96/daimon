@@ -29,6 +29,8 @@ from anthropic.types.beta import (
 )
 from anthropic.types.beta.skills import VersionCreateResponse
 from cryptography.fernet import Fernet, MultiFernet
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.defaults.metadata import tenant_scoped_display_title
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.ma_identity import derive_agent_uuid
@@ -44,6 +46,7 @@ from daimon.core.stores.user_skills import (
 )
 from daimon.testing.factories import make_cli_principal
 from daimon.testing.ma import MARouter, list_response
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,20 @@ async def _seed_pat(
 
 def _make_fernet() -> MultiFernet:
     return MultiFernet([Fernet(Fernet.generate_key())])
+
+
+def _generate_rsa_keypair() -> str:
+    """Return a PEM-encoded RSA private key string for App-JWT tests.
+
+    Each test file owns its own key material inline (guideline:testing) — no
+    shared factory wrapper.
+    """
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +263,232 @@ async def test_github_fallback_pat_omitted_behaves_as_before(
     assert len(captured_requests) == 1, "fetcher should be invoked exactly once"
     assert "Authorization" not in captured_requests[0].headers, (
         "omitting github_fallback_pat must keep the pre-existing anonymous fetch behavior"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared skill-sync credential seam (daimon.core.github_repo_auth) — non-override path
+# ---------------------------------------------------------------------------
+
+
+async def test_no_per_agent_token_with_installation_lookup_reaches_app_tier(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No per-agent token + an injected lookup resolving an installation ->
+    the fetch carries the minted installation token. This is the App tier that
+    was previously unreachable from the non-override (agent-creation) path."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    # No PAT seeded.
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path == "/app/installations/777/access_tokens":
+            return httpx.Response(201, json={"token": "ghs_installation_token"})
+        return httpx.Response(404)  # tarball fetch — content doesn't matter for this test
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    lookup_calls = 0
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        assert (owner, repo) == ("o", "r")
+        return 777
+
+    report = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+    )
+
+    assert lookup_calls == 1, (
+        "the injected lookup must be consulted when no per-agent token resolves"
+    )
+    tarball_requests = [r for r in captured if "tarball" in r.url.path]
+    assert len(tarball_requests) == 1, "the fetcher must have attempted the tarball download"
+    assert tarball_requests[0].headers.get("Authorization") == "token ghs_installation_token", (
+        "the minted installation token must reach the fetch — the previously-unreachable App tier"
+    )
+    assert report.skipped_repos == [("https://github.com/o/r", "GitHubUnreachable")], (
+        "the tarball 404 must still be recorded normally; only the credential is under test"
+    )
+
+
+async def test_per_agent_token_short_circuits_before_installation_lookup(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """BOTH a per-agent token and an installation covering the repo -> the
+    per-agent token reaches the fetch and the installation lookup is invoked
+    ZERO times (the ordering short-circuit, checked behaviorally)."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    await _seed_pat(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        principal_id=cli.id,
+        plaintext="ghp_per_agent_token",
+    )
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    lookup_calls = 0
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return 999  # an installation DOES cover this repo — must not matter
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+    )
+
+    assert lookup_calls == 0, (
+        "a per-agent token must short-circuit before the installation lookup is ever invoked"
+    )
+    tarball_requests = [r for r in captured if "tarball" in r.url.path]
+    assert len(tarball_requests) == 1
+    assert tarball_requests[0].headers.get("Authorization") == "token ghp_per_agent_token", (
+        "the per-agent token must win over the covering installation"
+    )
+
+
+async def test_credential_override_wins_with_zero_installation_lookup_invocations(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An override still wins with zero installation-lookup invocations — pinned
+    with a counting async function, never a mock, per guideline:testing."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    # No PAT seeded — proves the override wins, not an internal resolution.
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    lookup_calls = 0
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return 111
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        credential_override="ghs_override_token",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+    )
+
+    assert lookup_calls == 0, "an override must win with zero installation-lookup invocations"
+    tarball_requests = [r for r in captured if "tarball" in r.url.path]
+    assert len(tarball_requests) == 1
+    assert tarball_requests[0].headers.get("Authorization") == "token ghs_override_token"
+
+
+async def test_installation_lookup_none_skips_app_tier_and_uses_fallback(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """installation_lookup=None must skip the App tier entirely — even with
+    app_id/app_private_key configured — and reach the fallback token exactly
+    as before this change, with zero App HTTP calls."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "access_tokens" in request.url.path or "installation" in request.url.path:
+            raise AssertionError(
+                f"App tier must not be consulted when installation_lookup=None; got {request.url}"
+            )
+        captured.append(request)
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        github_fallback_pat="ghp_operator_fallback",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=None,
+    )
+
+    tarball_requests = [r for r in captured if "tarball" in r.url.path]
+    assert len(tarball_requests) == 1
+    assert tarball_requests[0].headers.get("Authorization") == "token ghp_operator_fallback", (
+        "installation_lookup=None must still reach the fallback tier, unchanged"
     )
 
 

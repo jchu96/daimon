@@ -8,6 +8,7 @@ that can be unit-tested without a FastMCP Context.
 from __future__ import annotations
 
 import datetime
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any, Final, cast
@@ -53,6 +54,8 @@ from daimon.core.defaults.reconcile_agents import reconcile_agent
 from daimon.core.defaults.skills import resolve_skill_names
 from daimon.core.defaults.spec_merge import merge_mcp_servers_with_ma, merge_skills_with_ma
 from daimon.core.errors import DaimonError, DefaultsError
+from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_repo
+from daimon.core.github_repo_auth import InstallationLookup
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.memory_resource import archive_memory_store_for_agent
@@ -65,7 +68,7 @@ from daimon.core.specs import (
 from daimon.core.stores.scoped_config_write import clear_agent_references
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 
 log = structlog.get_logger()
 
@@ -385,7 +388,28 @@ async def _create_agent_impl(
                 if runtime.settings.github.fallback_pat is not None
                 else None
             )
+            github_app_id = runtime.settings.github.app_id
+            github_app_private_key = runtime.settings.github.app_private_key
             async with httpx.AsyncClient() as http_client:
+                installation_lookup: InstallationLookup | None = None
+                if github_app_id is not None and github_app_private_key is not None:
+                    # Interactive path — a live GitHub lookup is the right
+                    # freshness choice here (the webhook resync injects a
+                    # cheap cached read instead; see resync.py).
+                    resolved_app_id: str = github_app_id
+                    resolved_app_private_key: SecretStr = github_app_private_key
+
+                    async def _live_installation_lookup(owner: str, repo: str) -> int | None:
+                        jwt = build_app_jwt(
+                            resolved_app_private_key.get_secret_value(),
+                            resolved_app_id,
+                            now=int(time.time()),
+                        )
+                        return await get_installation_id_for_repo(
+                            http_client, jwt=jwt, owner=owner, repo=repo
+                        )
+
+                    installation_lookup = _live_installation_lookup
                 report = await sync_agent_skills(
                     principal_id=auth.account_id,  # NOT auth.principal_id (no such field)
                     tenant_id=auth.tenant_id,
@@ -396,6 +420,9 @@ async def _create_agent_impl(
                     http_client=http_client,
                     anthropic_client=runtime.client,  # McpRuntime field is client
                     github_fallback_pat=github_fallback_pat,
+                    app_id=github_app_id,
+                    app_private_key=github_app_private_key,
+                    installation_lookup=installation_lookup,
                 )
             warnings = sync_report_failures(report) or None
     return await _build_agent_info(

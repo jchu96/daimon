@@ -33,6 +33,7 @@ import asyncio
 import hashlib
 import io
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,8 +58,9 @@ from daimon.core.defaults.metadata import (
     strip_tenant_prefix,
     tenant_scoped_display_title,
 )
-from daimon.core.errors import DefaultsError
+from daimon.core.errors import DaimonError, DefaultsError
 from daimon.core.github_credentials import get_pat
+from daimon.core.github_repo_auth import InstallationLookup, resolve_skill_sync_token
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.skill_sync.bundler import SkillEntry, extract_and_bundle
@@ -77,7 +79,7 @@ from daimon.core.stores.user_skills import (
     load_user_skill,
     upsert_user_skill,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = structlog.get_logger(__name__)
@@ -395,27 +397,46 @@ async def sync_agent_skills(
     anthropic_client: AsyncAnthropic,
     credential_override: str | None = None,
     github_fallback_pat: str | None = None,
+    app_id: str | None = None,
+    app_private_key: SecretStr | None = None,
+    installation_lookup: InstallationLookup | None = None,
     max_tarball_bytes: int = 50 * 1024 * 1024,
 ) -> SyncReport:
     """Sync all skill_repos for one agent. Named error boundary.
 
         ``credential_override`` lets a caller (the webhook resync) pass a
-        pre-selected GitHub credential (App installation token > per-agent PAT > anon,
-        per the credential-selection priority) so this function does NOT
-        independently re-resolve a per-agent PAT.
-        When provided, it is the single authority for the fetch ``Authorization`` header
-        and the internal ``get_pat`` resolution is skipped — this is what makes the
-        App-installation-token tier actually win when both an installation and a
-        per-agent PAT exist. When None (panel / CLI / MCP paths), the per-agent PAT is
-        resolved here as before.
+        pre-selected GitHub credential. Whatever the caller supplies is the
+        single authority for every repo in this call, and this function does
+        not re-resolve — that override, not any tier ordering, is what keeps
+        a pre-selected credential (e.g. a minted App installation token) from
+        being shadowed. When provided, the internal resolution below (and the
+        ``app_id`` / ``app_private_key`` / ``installation_lookup`` parameters)
+        is skipped entirely.
+
+        When ``credential_override`` is None (panel / CLI / MCP paths), this
+        function resolves a credential per repo through the shared
+        skill-sync selector — ``daimon.core.github_repo_auth.
+        resolve_skill_sync_token`` and its pure decision table
+        ``select_skill_sync_auth`` — whose ordering is a per-agent token
+        first, then an App installation covering the repo, then the operator
+        fallback, then an unauthenticated fetch. Resolution happens per repo
+        (not once for the whole call) because App installation coverage is
+        repo-specific.
+
+        ``app_id``, ``app_private_key``, and ``installation_lookup`` feed the
+        App tier of that per-repo resolution. ``installation_lookup`` is
+        injected so the caller decides between a live GitHub installation
+        lookup (e.g. the interactive agent-creation path) and a cheap cached
+        read; when it is absent the App tier is skipped entirely, so all
+        pre-existing callers stay source-compatible without threading it.
 
         ``github_fallback_pat`` is the operator-wide service default, threaded
         by callers that already have ``settings.github.fallback_pat`` in scope
-        (panel / CLI / MCP). It is only consulted on the internal ``get_pat``
-        call — when ``credential_override`` is supplied, the caller's
-        pre-selected credential remains the single authority and the fallback
-        is not consulted. Defaults to None so all pre-existing callers stay
-        source-compatible without threading it.
+        (panel / CLI / MCP). It is only consulted by the per-repo selector
+        described above — when ``credential_override`` is supplied, the
+        caller's pre-selected credential remains the single authority and the
+        fallback is not consulted. Defaults to None so all pre-existing
+        callers stay source-compatible without threading it.
 
         ``max_tarball_bytes`` bounds the per-repo tarball download
     . Defaults to the safe 50 MiB constant so all pre-existing callers
@@ -445,16 +466,22 @@ async def sync_agent_skills(
     # WR-01: when the caller pre-selected a credential, it is the single authority —
     # do NOT re-resolve a per-agent PAT (that double-resolution is what silently
     # shadowed the App installation token).
-    if credential_override is not None:
-        pat = credential_override
-    else:
-        pat = await get_pat(
+    per_agent_credential: str | None = None
+    if credential_override is None:
+        # allow_service_default=False: the operator-fallback tier is no longer
+        # decided here. It is now the shared skill-sync selector's decision,
+        # made per repo inside the fetch loop below (resolve_skill_sync_token).
+        # Leaving the service default enabled at this call would resolve a
+        # fallback credential before the App tier is ever consulted — the same
+        # shadowing bug the credential_override contract above exists to
+        # prevent, just reached a different way.
+        per_agent_credential = await get_pat(
             principal_id=principal_id,
             agent_id=resolved_agent_id,
             sessionmaker=sessionmaker,
             fernet=fernet,
-            allow_service_default=True,
-            fallback_pat=github_fallback_pat,
+            allow_service_default=False,
+            fallback_pat=None,
         )
 
     # CR-01: user_skills is a per-AGENT ledger, not a per-user one. Both the panel
@@ -475,8 +502,28 @@ async def sync_agent_skills(
     with tempfile.TemporaryDirectory(prefix="daimon-skill-sync-") as tmp_root:
         tmp_root_path = Path(tmp_root)
         for repo in repos:
+            if credential_override is not None:
+                credential = credential_override
+            else:
+                try:
+                    credential = await resolve_skill_sync_token(
+                        http_client,
+                        repo_url=repo.url,
+                        per_agent_pat=per_agent_credential,
+                        fallback_pat=github_fallback_pat,
+                        app_id=app_id,
+                        app_private_key=app_private_key,
+                        installation_lookup=installation_lookup,
+                        now=int(time.time()),
+                    )
+                except DaimonError as err:
+                    report.skipped_repos.append((repo.url, type(err).__name__))
+                    continue
+
             try:
-                tarball = await fetcher.fetch_tarball(pat=pat, url=repo.url, branch=repo.branch)
+                tarball = await fetcher.fetch_tarball(
+                    pat=credential, url=repo.url, branch=repo.branch
+                )
             except (GitHubAuthError, GitHubUnreachable, TarballTooLarge) as err:
                 report.skipped_repos.append((repo.url, type(err).__name__))
                 continue

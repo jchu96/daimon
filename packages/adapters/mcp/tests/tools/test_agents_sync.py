@@ -25,15 +25,19 @@ import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent, SkillListResponse
 from cryptography.fernet import Fernet, MultiFernet
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, Role
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.agents import _create_agent_impl
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.scope import DeploymentDefault
-from daimon.core.specs import SkillRepo
+from daimon.core.skill_sync import SyncReport
+from daimon.core.specs import AgentSpec, SkillRepo
 from daimon.core.stores.github_credentials import upsert_credential
 from daimon.testing.factories import make_cli_principal
 from daimon.testing.ma import MARouter, list_response
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.asyncio
@@ -57,6 +61,19 @@ def _make_tarball(files: dict[str, bytes]) -> bytes:
 
 def _make_fernet() -> MultiFernet:
     return MultiFernet([Fernet(Fernet.generate_key())])
+
+
+def _generate_rsa_keypair() -> str:
+    """Return a PEM-encoded RSA private key string for App-JWT tests.
+
+    Each test file owns its own key material inline (guideline:testing).
+    """
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
 
 
 async def _seed_pat(
@@ -261,6 +278,9 @@ async def test_create_agent_impl_syncs_skill_repos(
 
     settings = MagicMock()  # type: ignore[var-annotated]
     settings.mcp.public_url = None  # no daimon-mcp merge needed in sync tests
+    settings.github.app_id = None  # no App configured in these sync tests
+    settings.github.app_private_key = None
+    settings.github.fallback_pat = None
     runtime = McpRuntime(
         session_factory=db_session_factory,
         client=anthropic_client,
@@ -422,6 +442,9 @@ async def test_create_agent_impl_returns_sync_warnings_on_partial_failure(
 
     settings = MagicMock()  # type: ignore[var-annotated]
     settings.mcp.public_url = None  # no daimon-mcp merge needed in sync tests
+    settings.github.app_id = None  # no App configured in these sync tests
+    settings.github.app_private_key = None
+    settings.github.fallback_pat = None
     runtime = McpRuntime(
         session_factory=db_session_factory,
         client=anthropic_client,
@@ -456,3 +479,176 @@ async def test_create_agent_impl_returns_sync_warnings_on_partial_failure(
     assert "https://github.com/orgB/skills" in failed_urls, (
         "failed repo URL must appear in sync_warnings"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test: installation_lookup wiring — App settings configured vs. absent
+# ---------------------------------------------------------------------------
+
+
+async def _run_create_with_mocked_sync(
+    *,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    os_user: str,
+    agent_name: str,
+    agent_id: str,
+    github_app_id: str | None,
+    github_app_private_key: SecretStr | None,
+) -> AsyncMock:
+    """Shared scaffolding for the two installation_lookup wiring tests below.
+
+    ``sync_agent_skills`` is patched entirely at the agent-creation tool's
+    import boundary — these tests assert only the wiring of the new
+    ``installation_lookup`` / ``app_id`` / ``app_private_key`` kwargs at the
+    call site, not sync behavior itself (already covered in
+    ``test_orchestrator.py``). Returns the patched mock so the caller can
+    inspect its call kwargs.
+    """
+    cli = await make_cli_principal(db_session, os_user=os_user)
+    await db_session.commit()
+    fernet = _make_fernet()
+    account_id = cli.account_id
+    tenant_id = cli.tenant_id
+
+    def on_agents_create(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=BetaManagedAgentsAgent(
+                id=agent_id,
+                type="agent",
+                version=1,
+                name=agent_name,
+                model={"id": "claude-opus-4-5"},
+                description=None,
+                system=None,
+                tools=[],
+                mcp_servers=[],
+                skills=[],
+                created_at="2026-04-24T00:00:00Z",
+                updated_at="2026-04-24T00:00:00Z",
+                metadata={
+                    "daimon_tenant": str(tenant_id),
+                    "daimon_name": agent_name,
+                    "daimon_account": str(account_id),
+                },
+            ).model_dump(mode="json"),
+        )
+
+    def on_agents_list(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        # Collision check + reconcile dedup lookup both hit this before create;
+        # sync_agent_skills itself is mocked below, so no post-create list call
+        # is needed.
+        return list_response([])
+
+    def on_agents_retrieve(_req: httpx.Request, m: re.Match[str]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=BetaManagedAgentsAgent(
+                id=m.group(1),
+                type="agent",
+                version=1,
+                name=agent_name,
+                model={"id": "claude-opus-4-5"},
+                description=None,
+                system=None,
+                tools=[],
+                mcp_servers=[],
+                skills=[],
+                created_at="2026-04-24T00:00:00Z",
+                updated_at="2026-04-24T00:00:00Z",
+                metadata={
+                    "daimon_tenant": str(tenant_id),
+                    "daimon_name": agent_name,
+                    "daimon_account": str(account_id),
+                },
+            ).model_dump(mode="json"),
+        )
+
+    router = MARouter()
+    router.add("POST", r"/v1/agents$", on_agents_create)
+    router.add("GET", r"/v1/agents$", on_agents_list)
+    router.add("GET", r"/v1/agents/([^/]+)$", on_agents_retrieve)
+
+    anthropic_client = _build_anthropic(router)
+
+    settings = MagicMock()  # type: ignore[var-annotated]
+    settings.mcp.public_url = None
+    settings.github.app_id = github_app_id
+    settings.github.app_private_key = github_app_private_key
+    settings.github.fallback_pat = None
+    runtime = McpRuntime(
+        session_factory=db_session_factory,
+        client=anthropic_client,
+        settings=settings,  # type: ignore[arg-type]
+        fernet=fernet,
+        deployment_default=DeploymentDefault(),
+    )
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    spec = AgentSpec(
+        name=agent_name,
+        model="claude-opus-4-5",
+        skill_repos=[SkillRepo(url="https://github.com/orgA/myskills", branch="main")],
+    )
+
+    with patch(
+        "daimon.adapters.mcp.tools.agents.sync_agent_skills",
+        new=AsyncMock(return_value=SyncReport()),
+    ) as mock_sync:
+        result = await _create_agent_impl(runtime, auth, spec)
+
+    assert result.name == agent_name, "agent creation must still succeed"
+    return mock_sync
+
+
+async def test_create_agent_impl_passes_live_lookup_when_app_settings_configured(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """When GitHub App settings (app_id + app_private_key) are configured, the
+    agent-creation sync call must pass a non-None installation_lookup — the
+    live-lookup wiring this plan adds, reaching the App tier from chat."""
+    mock_sync = await _run_create_with_mocked_sync(
+        db_session=db_session,
+        db_session_factory=db_session_factory,
+        os_user="dana",
+        agent_name="app-configured-agent",
+        agent_id="ag_app_configured",
+        github_app_id="123456",
+        github_app_private_key=SecretStr(_generate_rsa_keypair()),
+    )
+
+    assert mock_sync.await_args is not None, "sync_agent_skills must have been awaited"
+    call_kwargs = mock_sync.await_args.kwargs
+    assert call_kwargs["installation_lookup"] is not None, (
+        "a non-None installation_lookup must be passed when App settings are configured"
+    )
+    assert call_kwargs["app_id"] == "123456"
+    assert call_kwargs["app_private_key"] is not None
+
+
+async def test_create_agent_impl_passes_no_lookup_when_app_settings_absent(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """When GitHub App settings are absent, the agent-creation sync call must
+    pass installation_lookup=None so the App tier is skipped rather than
+    half-configured."""
+    mock_sync = await _run_create_with_mocked_sync(
+        db_session=db_session,
+        db_session_factory=db_session_factory,
+        os_user="erin",
+        agent_name="app-absent-agent",
+        agent_id="ag_app_absent",
+        github_app_id=None,
+        github_app_private_key=None,
+    )
+
+    assert mock_sync.await_args is not None, "sync_agent_skills must have been awaited"
+    call_kwargs = mock_sync.await_args.kwargs
+    assert call_kwargs["installation_lookup"] is None, (
+        "installation_lookup must be None when App settings are not configured"
+    )
+    assert call_kwargs["app_id"] is None
+    assert call_kwargs["app_private_key"] is None
