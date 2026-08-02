@@ -423,6 +423,9 @@ async def _create_agent_impl(
                     app_id=github_app_id,
                     app_private_key=github_app_private_key,
                     installation_lookup=installation_lookup,
+                    max_tarball_decompressed_bytes=(
+                        runtime.settings.github.max_tarball_decompressed_bytes
+                    ),
                 )
             warnings = sync_report_failures(report) or None
     return await _build_agent_info(

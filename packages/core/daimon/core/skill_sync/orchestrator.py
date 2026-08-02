@@ -63,7 +63,12 @@ from daimon.core.github_credentials import get_pat
 from daimon.core.github_repo_auth import InstallationLookup, resolve_skill_sync_token
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.skill_sync.bundler import SkillEntry, extract_and_bundle
+from daimon.core.skill_sync.bundler import (
+    DEFAULT_MAX_TARBALL_DECOMPRESSED_BYTES,
+    MAX_TARBALL_MEMBERS,
+    SkillEntry,
+    extract_and_bundle,
+)
 from daimon.core.skill_sync.fetcher import (
     GitHubAuthError,
     GitHubTarballFetcher,
@@ -401,6 +406,8 @@ async def sync_agent_skills(
     app_private_key: SecretStr | None = None,
     installation_lookup: InstallationLookup | None = None,
     max_tarball_bytes: int = 50 * 1024 * 1024,
+    max_tarball_decompressed_bytes: int = DEFAULT_MAX_TARBALL_DECOMPRESSED_BYTES,
+    max_tarball_members: int = MAX_TARBALL_MEMBERS,
 ) -> SyncReport:
     """Sync all skill_repos for one agent. Named error boundary.
 
@@ -442,6 +449,16 @@ async def sync_agent_skills(
     . Defaults to the safe 50 MiB constant so all pre-existing callers
         stay guarded without threading settings explicitly; the webhook resync edge
         passes ``github_settings.max_tarball_bytes`` so operator overrides take effect.
+
+        ``max_tarball_decompressed_bytes`` and ``max_tarball_members`` bound a
+        tarball's expansion (decompressed byte total and member count,
+        respectively) BEFORE extraction — closing the gap where a small
+        compressed tarball decompresses to tens of gigabytes. Both default to
+        the same safe constants the sibling ``daimon.core.skills.fetch``
+        pipeline already guards with, so all pre-existing callers stay
+        guarded without threading settings explicitly; callers that already
+        thread ``max_tarball_bytes`` from ``github_settings`` thread
+        ``max_tarball_decompressed_bytes`` the same way.
     """
     report = SyncReport()
     report_lock = asyncio.Lock()
@@ -551,6 +568,8 @@ async def sync_agent_skills(
                     extract_root=extract_root,
                     repo_name=repo_name,
                     split=repo.split,
+                    max_tarball_decompressed_bytes=max_tarball_decompressed_bytes,
+                    max_tarball_members=max_tarball_members,
                 )
             except Exception as err:  # noqa: BLE001 — boundary
                 _log.warning("skill_sync.repo_bundle_failed", url=repo.url, error=str(err))

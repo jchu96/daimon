@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from daimon.core.skill_sync.bundler import SkillEntry, extract_and_bundle
+from daimon.core.skill_sync.fetcher import TarballTooLarge
 from daimon.core.specs import SkillRepo
 
 
@@ -211,6 +212,98 @@ async def test_extract_and_bundle_uses_filter_data(tmp_path: Path) -> None:
     assert raised is None or isinstance(raised, Exception), (
         "if extract raised, it must be an Exception subclass"
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-extraction expansion caps (decompressed byte total + member count)
+# ---------------------------------------------------------------------------
+
+
+async def test_extract_and_bundle_raises_before_extraction_when_decompressed_size_exceeds_cap(
+    tmp_path: Path,
+) -> None:
+    """A tarball whose declared member sizes sum above the decompressed cap must
+    raise BEFORE any file is written — proving the check runs pre-extraction,
+    not as post-hoc cleanup."""
+    tarball = _make_tarball(
+        {
+            "repo/SKILL.md": b"x" * 200,
+            "repo/scripts/big.py": b"y" * 200,
+        }
+    )
+    with pytest.raises(TarballTooLarge, match="max_tarball_decompressed_bytes"):
+        await extract_and_bundle(
+            tarball_bytes=tarball,
+            extract_root=tmp_path,
+            repo_name="my-repo",
+            split=False,
+            max_tarball_decompressed_bytes=100,  # smaller than the real ~400-byte total
+        )
+    assert list(tmp_path.iterdir()) == [], (
+        "nothing may be written to the extraction root when the cap raises pre-extraction"
+    )
+
+
+async def test_extract_and_bundle_raises_when_member_count_exceeds_cap(tmp_path: Path) -> None:
+    """A tarball with more members than the member-count cap must raise, even
+    when every member is tiny — guards against an inode/wall-clock exhaustion
+    a byte cap alone would miss."""
+    tarball = _make_tarball(
+        {
+            "repo/a/SKILL.md": b"# a\n",
+            "repo/b/SKILL.md": b"# b\n",
+            "repo/c/SKILL.md": b"# c\n",
+            "repo/d/SKILL.md": b"# d\n",
+        }
+    )
+    with pytest.raises(TarballTooLarge, match="max_tarball_members"):
+        await extract_and_bundle(
+            tarball_bytes=tarball,
+            extract_root=tmp_path,
+            repo_name="my-repo",
+            split=True,
+            max_tarball_members=3,
+        )
+    assert list(tmp_path.iterdir()) == [], (
+        "nothing may be written to the extraction root when the member-count cap raises"
+    )
+
+
+async def test_extract_and_bundle_extracts_normally_comfortably_under_both_caps(
+    tmp_path: Path,
+) -> None:
+    """A tarball comfortably under both caps still extracts and bundles as before."""
+    tarball = _make_tarball({"repo/SKILL.md": b"# repo skill\n"})
+    entries = await extract_and_bundle(
+        tarball_bytes=tarball,
+        extract_root=tmp_path,
+        repo_name="my-repo",
+        split=False,
+        max_tarball_decompressed_bytes=1024,
+        max_tarball_members=10,
+    )
+    assert len(entries) == 1, "a tarball comfortably under both caps must still bundle"
+    assert entries[0].prebuilt_zip is not None
+
+
+async def test_extract_and_bundle_cap_of_zero_disables_both_checks(tmp_path: Path) -> None:
+    """A cap of 0 disables the check, matching max_tarball_bytes' existing convention."""
+    tarball = _make_tarball(
+        {
+            "repo/SKILL.md": b"x" * 5000,
+            "repo/a.txt": b"y" * 5000,
+            "repo/b.txt": b"z" * 5000,
+        }
+    )
+    entries = await extract_and_bundle(
+        tarball_bytes=tarball,
+        extract_root=tmp_path,
+        repo_name="my-repo",
+        split=False,
+        max_tarball_decompressed_bytes=0,
+        max_tarball_members=0,
+    )
+    assert len(entries) == 1, "cap=0 must disable both checks and extract normally"
 
 
 async def test_extract_and_bundle_runs_in_thread(

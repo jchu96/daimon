@@ -373,10 +373,11 @@ async def _resync_one_binding(
                 # sync_agent_skills does NOT re-resolve a per-agent PAT (which would
                 # shadow the App installation token). No transport wrapper / extra
                 # client is created — the credential threads cleanly through the param.
-                # Thread github_settings.max_tarball_bytes so an operator cap
-                # override (including 0-disables) reaches the fetcher on this edge.
-                # When github_settings is None, omit the kwarg so the safe
-                # sync_agent_skills default (50 MiB) applies.
+                # Thread github_settings.max_tarball_bytes / max_tarball_decompressed_bytes
+                # so an operator cap override (including 0-disables) reaches the
+                # fetcher and the pre-extraction expansion guard on this edge.
+                # When github_settings is None, omit both kwargs so the safe
+                # sync_agent_skills defaults (50 MiB / 200 MiB) apply.
                 if github_settings is not None:
                     report = await sync_agent_skills(
                         principal_id=principal_id,
@@ -389,6 +390,7 @@ async def _resync_one_binding(
                         anthropic_client=anthropic_client,
                         credential_override=credential,
                         max_tarball_bytes=github_settings.max_tarball_bytes,
+                        max_tarball_decompressed_bytes=github_settings.max_tarball_decompressed_bytes,
                     )
                 else:
                     report = await sync_agent_skills(
