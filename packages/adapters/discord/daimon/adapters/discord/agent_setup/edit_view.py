@@ -1,9 +1,11 @@
 """EditView (LayoutView) + selects + BackButton + open_edit_view launcher.
 
 EditView's container holds a header, two remove selects (skills, MCPs), and
-two button rows: ``Agent…`` / ``GitHub…`` / ``Env vars`` and
-``+ Add skill`` / ``+ Add MCP`` / ``← Back``. ``Agent…`` and ``GitHub…`` each
-open their modal directly — no intermediate view.
+two button rows: ``Agent…`` / ``GitHub…`` / ``Install App…`` / ``Env vars``
+and ``+ Add skill`` / ``+ Add MCP`` / ``← Back``. ``Agent…`` and ``GitHub…``
+each open their modal directly — no intermediate view. ``Install App…`` is a
+link button (rendered only when a GitHub App slug is configured) opening the
+App's install page on GitHub directly; it carries no callback.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
+from daimon.core.github_app_auth import build_app_install_url
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.stores.agent_files import list_agent_files
 
@@ -343,6 +346,22 @@ class EditView(ExpiringView, discord.ui.LayoutView):
         )
         github_btn.callback = self._on_github  # type: ignore[method-assign]
         field_row.add_item(github_btn)
+
+        # Rendered only when a GitHub App slug is configured — a link button
+        # with no url is not constructible, and a disabled placeholder would
+        # advertise a capability this deployment does not have.
+        app_slug = runtime.settings.github.app_slug
+        if app_slug is not None:
+            install_app_btn: discord.ui.Button[EditView] = discord.ui.Button(
+                label="🔗 Install App…",
+                style=discord.ButtonStyle.link,
+                url=build_app_install_url(app_slug),
+            )
+            # Not a spec control and no disabled logic: installing an App on
+            # GitHub is neither an agent-spec edit nor an attachment write,
+            # and GitHub enforces its own install permissions — same reason
+            # the GitHub… and Env vars doors above are exempt from the gate.
+            field_row.add_item(install_app_btn)
 
         env_vars_btn: discord.ui.Button[EditView] = discord.ui.Button(
             label="Env vars",

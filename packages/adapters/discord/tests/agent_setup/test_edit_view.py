@@ -131,6 +131,7 @@ def test_edit_view_is_layout_view(account_id: uuid.UUID) -> None:
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert isinstance(view, discord.ui.LayoutView), "EditView must be a LayoutView"
@@ -141,6 +142,7 @@ def test_edit_view_header_and_subtext(account_id: uuid.UUID) -> None:
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     text = _container_text(view)
@@ -160,6 +162,7 @@ def test_edit_view_has_only_the_two_remove_selects(account_id: uuid.UUID) -> Non
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     selects = _walk_selects(view)
@@ -178,6 +181,7 @@ def test_edit_view_button_labels_in_row_order(account_id: uuid.UUID) -> None:
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     btn_labels = [b.label for b in _walk_buttons(view)]
@@ -191,12 +195,81 @@ def test_edit_view_button_labels_in_row_order(account_id: uuid.UUID) -> None:
     ], f"button labels must be exactly the flat row order; got {btn_labels}"
 
 
+# --- Install App… link button -------------------------------------------
+
+
+def test_edit_view_renders_install_app_button_when_slug_configured(
+    account_id: uuid.UUID,
+) -> None:
+    from daimon.core.github_app_auth import build_app_install_url
+
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = "acme-daimon"
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    first_row_buttons = _walk_buttons(view)[:4]
+    assert len(first_row_buttons) == 4, "first row must hold four buttons when a slug is configured"
+    install_btn = first_row_buttons[2]
+    assert install_btn.style == discord.ButtonStyle.link, (
+        "install-app button must use the link style"
+    )
+    assert install_btn.url == build_app_install_url("acme-daimon"), (
+        "install-app button url must be the built install URL for the configured slug"
+    )
+    assert install_btn.custom_id is None, (
+        "a link button must carry no custom_id — Discord rejects url+custom_id together"
+    )
+
+
+def test_edit_view_omits_install_app_button_when_slug_unset(account_id: uuid.UUID) -> None:
+    selected = _entry("agent")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    btn_labels = [b.label for b in _walk_buttons(view)]
+    assert btn_labels == [
+        "Agent…",
+        "GitHub…",
+        "Env vars",
+        "+ Add skill",
+        "+ Add MCP",
+        "← Back",
+    ], "no link button must render when app_slug is unset"
+    first_row_buttons = _walk_buttons(view)[:3]
+    assert len(first_row_buttons) == 3, "first row must hold exactly the three pre-existing buttons"
+
+
+def test_edit_view_install_app_button_enabled_when_spec_controls_disabled(
+    account_id: uuid.UUID,
+) -> None:
+    """The install-app button is not a spec control: it must render enabled
+    even when the reachability gate disables the spec-touching controls."""
+    selected = _entry("bot")
+    state = _reachable_state(selected, account_id, is_admin=False)
+    runtime = MagicMock()
+    runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = "acme-daimon"
+
+    view = EditView(state, runtime=runtime, allowed_user_id=42)
+    install_btn = next(b for b in _walk_buttons(view) if b.style == discord.ButtonStyle.link)
+    assert install_btn.disabled is False, (
+        "install-app button must stay enabled even when spec controls are disabled"
+    )
+
+
 def test_edit_view_pat_absent_from_main_view(account_id: uuid.UUID) -> None:
     """PAT must not appear as its own control on EditView."""
     selected = _entry("agent")
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     btn_labels = [b.label for b in _walk_buttons(view) if b.label is not None]
@@ -208,6 +281,7 @@ def test_edit_view_timeout(account_id: uuid.UUID) -> None:
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert view.timeout == 300, "EditView must use timeout=300"
@@ -226,6 +300,7 @@ async def test_edit_view_agent_button_opens_agent_section_modal(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     agent_btn = _find_button(view, "Agent…")
@@ -247,6 +322,7 @@ async def test_edit_view_github_button_opens_repo_auth_modal(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     github_btn = _find_button(view, "GitHub…")
@@ -274,6 +350,7 @@ async def test_edit_view_skill_remove_select_mutates_and_reconciles_and_rerender
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     reconcile_calls: list[tuple[object, object]] = []
 
@@ -308,6 +385,7 @@ async def test_edit_view_mcp_remove_select_rollback_on_reconcile_failure(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     async def fake_reconcile(rt: object, st: object, *, tenant_id: object) -> object:
         raise RuntimeError("boom")
@@ -349,6 +427,7 @@ async def test_edit_view_mcp_remove_select_success_path(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     reconcile_calls: list[tuple[object, object]] = []
 
@@ -377,6 +456,7 @@ def test_edit_view_skills_empty_disables_skill_select(account_id: uuid.UUID) -> 
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
@@ -393,6 +473,7 @@ def test_edit_view_user_mcps_empty_disables_mcp_select(account_id: uuid.UUID) ->
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
@@ -412,6 +493,7 @@ def test_edit_view_add_skill_button_disabled_at_cap(account_id: uuid.UUID) -> No
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     add_skill = _find_button(view, "+ Add skill")
@@ -424,6 +506,7 @@ def test_edit_view_add_mcp_button_disabled_at_cap(account_id: uuid.UUID) -> None
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     add_mcp = _find_button(view, "+ Add MCP")
@@ -442,6 +525,7 @@ def test_edit_view_mcp_select_filters_default_mcp_and_preserves_original_index(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = "https://default.example/mcp"
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
@@ -457,6 +541,7 @@ async def test_edit_view_interaction_check_rejects_non_invoker(account_id: uuid.
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     interaction = MagicMock()
@@ -481,6 +566,7 @@ async def test_edit_view_remove_paths_never_mutate_main_panel(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     async def fake_reconcile(rt: object, st: object, *, tenant_id: object) -> object:
         return MagicMock()
@@ -503,6 +589,7 @@ def test_env_vars_button_label_has_no_plus(account_id: uuid.UUID) -> None:
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     labels = [b.label for b in _walk_buttons(view) if b.label is not None]
@@ -522,6 +609,7 @@ def test_edit_view_env_vars_button_always_enabled(account_id: uuid.UUID) -> None
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert _find_button(view, "Env vars").disabled is False, (
@@ -570,6 +658,7 @@ def test_edit_view_non_admin_reachable_non_system_disables_spec_controls(
     state = _reachable_state(selected, account_id, is_admin=False)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert _find_button(view, "Agent…").disabled is True, "Agent… must be disabled"
@@ -598,6 +687,7 @@ def test_edit_view_non_admin_unreachable_non_system_enables_spec_controls(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id, is_admin=False)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert _find_button(view, "Agent…").disabled is False, "Agent… must be enabled"
@@ -616,6 +706,7 @@ def test_edit_view_admin_reachable_non_system_enables_spec_controls(account_id: 
     state = _reachable_state(selected, account_id, is_admin=True)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert _find_button(view, "Agent…").disabled is False, "Agent… must be enabled for an admin"
@@ -635,6 +726,7 @@ def test_edit_view_reachable_system_agent_disables_spec_controls_for_admin_too(
     state = _reachable_state(selected, account_id, is_admin=True)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     assert _find_button(view, "Agent…").disabled is True, (
@@ -663,6 +755,7 @@ async def test_edit_view_back_edits_to_agent_setup_view(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
     runtime.settings.github.fallback_pat = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
@@ -686,6 +779,7 @@ async def test_open_edit_view_swaps_onto_the_panel_message(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     await open_edit_view(mock_interaction, state, runtime=runtime, allowed_user_id=42)
 
@@ -708,6 +802,7 @@ async def test_edit_view_timeout_replaces_the_edit_view(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     view.bind_render_interaction(mock_interaction, panel=state)
@@ -739,6 +834,7 @@ async def test_open_edit_view_binds_the_render_interaction(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     await open_edit_view(mock_interaction, state, runtime=runtime, allowed_user_id=42)
 
@@ -807,6 +903,7 @@ async def test_skill_remove_select_refuses_write_when_target_is_reachable_for_no
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
     runtime.sessionmaker = db_session_factory
     runtime.deployment_default = DeploymentDefault(agent_name="bot")
 
@@ -846,6 +943,7 @@ async def test_skill_remove_select_refuses_write_on_system_agent_even_for_admin(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     skill_select = next(s for s in _walk_selects(view) if isinstance(s, _SkillRemoveSelect))  # pyright: ignore[reportPrivateUsage]
@@ -884,6 +982,7 @@ async def test_mcp_remove_select_refuses_write_when_target_is_reachable_for_non_
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
     runtime.sessionmaker = db_session_factory
     runtime.deployment_default = DeploymentDefault(agent_name="bot")
 
@@ -933,6 +1032,7 @@ async def test_mcp_remove_select_refuses_write_on_system_agent_even_for_admin(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     mcp_select = next(s for s in _walk_selects(view) if isinstance(s, _McpRemoveSelect))  # pyright: ignore[reportPrivateUsage]
@@ -968,6 +1068,7 @@ async def test_edit_view_github_button_refuses_for_non_admin_on_reachable_agent(
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
     runtime.sessionmaker = db_session_factory
     runtime.deployment_default = DeploymentDefault(agent_name="bot")
 
@@ -1009,6 +1110,7 @@ async def test_edit_view_github_button_opens_modal_for_admin_on_system_agent(
     )
     runtime = MagicMock()
     runtime.settings.mcp.public_url = None
+    runtime.settings.github.app_slug = None
 
     view = EditView(state, runtime=runtime, allowed_user_id=42)
     github_btn = _find_button(view, "GitHub…")
@@ -1047,6 +1149,7 @@ async def test_env_vars_paste_modal_refuses_on_reachable_agent_for_non_admin(
 
     settings = MagicMock()
     settings.mcp.public_url = None
+    settings.github.app_slug = None
     runtime = DiscordRuntime(
         settings=settings,
         anthropic=MagicMock(),
