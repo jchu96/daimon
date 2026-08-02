@@ -8,6 +8,7 @@ that can be unit-tested without a FastMCP Context.
 from __future__ import annotations
 
 import datetime
+import time
 
 import httpx
 from anthropic.types.beta import SkillListResponse
@@ -21,13 +22,15 @@ from daimon.core.defaults.ma_index import find_skill_by_display_title, list_skil
 from daimon.core.defaults.metadata import strip_tenant_prefix, tenant_scoped_display_title
 from daimon.core.defaults.report import ResourceOutcome
 from daimon.core.errors import DaimonError
+from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_repo
 from daimon.core.github_credentials import get_pat
+from daimon.core.github_repo_auth import InstallationLookup, resolve_skill_sync_token
 from daimon.core.ma import delete_skill_and_versions
 from daimon.core.skills.pipeline import run_skill_sync
 from daimon.core.stores.agent_repo_binding import get_bindings_for_repo
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 
 class SkillInfo(BaseModel):
@@ -70,17 +73,28 @@ async def _resolve_sync_token(
     runtime: McpRuntime,
     auth: AuthIdentity,
     url: str,
+    http_client: httpx.AsyncClient,
 ) -> str | None:
     """Resolve a GitHub token for syncing ``url``, or None (anonymous fetch).
 
     The session JWT carries no agent_id claim (SC-4), so the credential is
     resolved from the URL instead: the caller-tenant's ``agent_repo_binding``
-    for this repo → that agent's PAT overlay, else the operator service
-    default (opt-in). Other tenants' bindings for the same repo never
-    resolve — no cross-tenant credential bleed. Because the loop returns on
-    the first `token is not None`, a fallback resolved on the first
-    tenant-matching binding short-circuits the loop — correct, since every
-    binding would resolve the same fallback.
+    for this repo → that agent's PAT overlay. Other tenants' bindings for the
+    same repo never resolve — no cross-tenant credential bleed. Because the
+    loop returns on the first non-``None`` overlay PAT, an agent whose overlay
+    resolves short-circuits the loop — correct, since only one per-agent
+    credential is needed.
+
+    The full precedence decision (per-agent token -> GitHub App installation
+    -> operator fallback -> anonymous) is delegated to
+    ``daimon.core.github_repo_auth.resolve_skill_sync_token``, so this
+    resolver and the per-agent skill-sync pipeline's credential path cannot
+    drift from each other — see that function (and its
+    ``select_skill_sync_auth`` pure decision table) for the ordering itself,
+    not restated here. This is the interactive caller, so the installation
+    lookup built below is a LIVE GitHub lookup rather than a cached read of
+    the installations table — that split is deliberate (see
+    ``resolve_skill_sync_token``'s docstring).
     """
     if runtime.fernet is None:
         return None
@@ -91,6 +105,7 @@ async def _resolve_sync_token(
     )
     async with runtime.session_factory() as session:
         bindings = await get_bindings_for_repo(session, repo_url=url)
+    per_agent_pat: str | None = None
     for binding in bindings:
         if binding.tenant_id != auth.tenant_id:
             continue
@@ -99,12 +114,45 @@ async def _resolve_sync_token(
             agent_id=binding.agent_id,
             sessionmaker=runtime.session_factory,
             fernet=runtime.fernet,
-            allow_service_default=True,
-            fallback_pat=fallback_pat,
+            allow_service_default=False,
+            fallback_pat=None,
         )
         if token is not None:
-            return token
-    return None
+            per_agent_pat = token
+            break
+
+    github_app_id = runtime.settings.github.app_id
+    github_app_private_key = runtime.settings.github.app_private_key
+    installation_lookup: InstallationLookup | None = None
+    if github_app_id is not None and github_app_private_key is not None:
+        # Interactive path — a live GitHub lookup is the right freshness
+        # choice here (an unattended batch caller would inject a cached read
+        # of the installations table instead).
+        resolved_app_id: str = github_app_id
+        resolved_app_private_key: SecretStr = github_app_private_key
+
+        async def _live_installation_lookup(owner: str, repo: str) -> int | None:
+            app_jwt = build_app_jwt(
+                resolved_app_private_key.get_secret_value(),
+                resolved_app_id,
+                now=int(time.time()),
+            )
+            return await get_installation_id_for_repo(
+                http_client, jwt=app_jwt, owner=owner, repo=repo
+            )
+
+        installation_lookup = _live_installation_lookup
+
+    return await resolve_skill_sync_token(
+        http_client,
+        repo_url=url,
+        per_agent_pat=per_agent_pat,
+        fallback_pat=fallback_pat,
+        app_id=github_app_id,
+        app_private_key=github_app_private_key,
+        installation_lookup=installation_lookup,
+        now=int(time.time()),
+    )
 
 
 async def _sync_impl(
@@ -115,8 +163,8 @@ async def _sync_impl(
     path: str,
 ) -> SkillSyncResult:
     _require_admin(auth)
-    token = await _resolve_sync_token(runtime, auth, url)
     async with httpx.AsyncClient(timeout=30.0) as http:
+        token = await _resolve_sync_token(runtime, auth, url, http)
         try:
             outcomes = await run_skill_sync(
                 runtime.client,
