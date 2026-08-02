@@ -38,6 +38,9 @@ BootstrapErrorKind = Literal[
     "no_default_environment",
     "agent_not_found",
     "environment_not_found",
+    "tenant_not_found",
+    "tenant_override_conflict",
+    "tenant_override_invalid",
 ]
 
 
