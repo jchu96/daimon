@@ -126,6 +126,43 @@ async def test_create_environment_impl_calls_ma_create() -> None:
     )
 
 
+async def test_create_environment_sends_the_pip_list_the_caller_supplied() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    created: list[dict[str, Any]] = []
+
+    def on_create(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        created.append(json_body(req))
+        return httpx.Response(200, json=_ma_env(id="env_pip", name="e").model_dump(mode="json"))
+
+    router = MARouter()
+    router.add("GET", r"/v1/environments", lambda _req, _m: list_response([]))
+    router.add("POST", r"/v1/environments", on_create)
+    client = build_fake_anthropic(router.dispatch)
+
+    spec = EnvironmentSpec(
+        name="e",
+        config={
+            "type": "cloud",
+            "packages": {"type": "packages", "pip": ["numpy", "pandas", "pymc"]},
+        },
+    )
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    await _create_environment_impl(_runtime(client), auth, spec)
+
+    assert len(created) == 1, "should call MA create exactly once"
+    packages = created[0]["config"]["packages"]
+    assert packages["pip"] == ["numpy", "pandas", "pymc"], (
+        "outbound create request should carry the caller's full pip list"
+    )
+    assert packages["apt"] == [], "replace semantics should send an explicit empty apt list"
+    assert packages["cargo"] == [], "replace semantics should send an explicit empty cargo list"
+    assert packages["gem"] == [], "replace semantics should send an explicit empty gem list"
+    assert packages["go"] == [], "replace semantics should send an explicit empty go list"
+    assert packages["npm"] == [], "replace semantics should send an explicit empty npm list"
+
+
 async def test_create_environment_impl_rejects_duplicate_name() -> None:
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()

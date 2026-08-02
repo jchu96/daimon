@@ -157,7 +157,23 @@ def register_environment_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ctx: Context,
         spec: EnvironmentSpec,
     ) -> EnvironmentInfo:
-        """Create a new environment from an EnvironmentSpec."""
+        """Create a sandbox environment an agent can later be scoped onto.
+
+        Packages are declared under ``spec.config.packages``, one list per
+        ecosystem: ``apt``, ``cargo``, ``gem``, ``go``, ``npm``, ``pip``. For
+        example, an environment with numpy, pandas, and pymc sets
+        ``config.packages.pip = ["numpy", "pandas", "pymc"]``. Pin a version
+        with the ecosystem's own syntax — for ``pip``, ``package==1.0.0``.
+
+        The package lists you send are the environment's complete package
+        set, not a delta: update_environment replaces rather than merges, so
+        an update that omits a previously-installed package removes it. Always
+        send the full intended list for every ecosystem you care about.
+
+        The new environment is inert until an admin scopes an agent onto it
+        (set_agent_default or the panel) — creating one here does not change
+        what any agent runs on yet.
+        """
         return await _create_environment_impl(runtime, await _auth(ctx), spec)
 
     @mcp.tool(tags={"admin"})
