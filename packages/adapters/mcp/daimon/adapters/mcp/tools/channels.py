@@ -157,10 +157,14 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         the user specifically requested a Discord post. Deliver output in your reply
         instead.
 
-        ``attachments=[{url, filename}]`` fetches over https (<=25 MiB each).
-        ``file_handles=[filename, ...]`` references files previously stored
-        in the media FileStore by ``generate_audio`` or ``generate_image``.
-        Combined cap of 10 attachments per message.
+        ``attachments=[{url, filename}]`` fetches over https, restricted to
+        Discord's own CDN hosts — an arbitrary external URL will be refused
+        (<=25 MiB each). ``file_handles=[handle_id, ...]`` references any
+        file already in daimon's file store — this is how you post a file
+        you produced yourself, not only output from a built-in tool. Any
+        tool that stores a file and returns a handle works here (e.g.
+        ``upload_file``, ``generate_audio``, ``generate_image``). Combined
+        cap of 10 attachments per message.
         """
         auth = await _auth(ctx)
         if auth.platform == "slack":
