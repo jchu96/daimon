@@ -18,9 +18,13 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
-from daimon.core.defaults.ma_index import find_skill_by_display_title, list_skills_lenient
+from daimon.core.defaults.ma_index import (
+    find_skill_by_display_title,
+    list_agents_by_tenant,
+    list_skills_lenient,
+)
 from daimon.core.defaults.metadata import strip_tenant_prefix, tenant_scoped_display_title
-from daimon.core.defaults.report import ResourceOutcome
+from daimon.core.defaults.report import Action, ResourceOutcome
 from daimon.core.errors import DaimonError
 from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_repo
 from daimon.core.github_credentials import get_pat
@@ -55,18 +59,35 @@ class SkillDetail(BaseModel):
 
 
 class SkillSyncResult(BaseModel):
-    """Outcome of a ``skills_sync`` call, carrying the source provenance.
+    """Outcome of a ``skills_sync`` call, carrying provenance AND attachment state.
 
     Synced skills land in the tenant-wide skill registry, so the result echoes
     where they came from (``source_url`` / ``branch`` / ``path``) — the model
     should report that back to the user rather than presenting an opaque list of
     skills with no origin.
+
+    Landing in the registry is not the same as being usable by any agent —
+    synced skills are attached to nothing until a separate attach step runs.
+    This model reports that distinction (``registry_count`` /
+    ``attached_count`` / ``summary``) rather than the caller inferring it from
+    ``outcomes``' ``action`` values, which read as "available now" but say
+    nothing about attachment.
     """
 
     source_url: str
     branch: str
     path: str
     outcomes: list[ResourceOutcome]
+    registry_count: int
+    """Number of skills created or updated in the tenant's registry by this call."""
+    attached_count: int
+    """Of ``registry_count``, how many are attached to at least one agent in
+    the tenant right now — computed from the tenant's agents at report time,
+    not asserted."""
+    summary: str
+    """One-line plain-language statement of both counts, naming the registry
+    and that attachment is a separate step (e.g. "3 skill(s) added to the
+    tenant's shared registry; 0 attached to an agent yet.")."""
 
 
 async def _resolve_sync_token(
@@ -181,7 +202,30 @@ async def _sync_impl(
             )
         except DaimonError as exc:
             raise ToolError(str(exc)) from exc
-    return SkillSyncResult(source_url=url, branch=branch, path=path, outcomes=outcomes)
+
+    registry_ids = {
+        outcome.anthropic_id
+        for outcome in outcomes
+        if outcome.anthropic_id is not None and outcome.action in (Action.CREATED, Action.UPDATED)
+    }
+    agents = await list_agents_by_tenant(runtime.client, tenant_id=auth.tenant_id)
+    attached_ids = {skill.skill_id for agent in agents for skill in agent.skills}
+    attached = registry_ids & attached_ids
+
+    summary = (
+        f"{len(registry_ids)} skill(s) added to the tenant's shared registry; "
+        f"{len(attached)} attached to an agent so far (registry membership and "
+        "agent attachment are separate steps)."
+    )
+    return SkillSyncResult(
+        source_url=url,
+        branch=branch,
+        path=path,
+        outcomes=outcomes,
+        registry_count=len(registry_ids),
+        attached_count=len(attached),
+        summary=summary,
+    )
 
 
 async def _list_impl(

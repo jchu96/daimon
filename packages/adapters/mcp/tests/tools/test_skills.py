@@ -9,7 +9,11 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import SkillListResponse
+from anthropic.types.beta import (
+    BetaManagedAgentsAgent,
+    BetaManagedAgentsCustomSkill,
+    SkillListResponse,
+)
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, Role
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.skills import (
@@ -325,8 +329,9 @@ async def test_sync_impl_returns_outcomes(tmp_path: Path) -> None:
         mock_fetch.return_value = FetchResult(path=tmp_path, cleanup_dir=cleanup_dir)
         mock_sync.return_value = [expected_outcome]
 
-        # Provide a minimal client (not used since sync_skills is mocked)
+        # No agent in the tenant attaches the synced skill.
         router = MARouter()
+        router.add("GET", r"/v1/agents", lambda _req, _m: list_response([]))
         client = build_fake_anthropic(router.dispatch)
 
         auth = AuthIdentity(
@@ -346,6 +351,8 @@ async def test_sync_impl_returns_outcomes(tmp_path: Path) -> None:
     assert len(result.outcomes) == 1, "should return one outcome"
     assert result.outcomes[0].name == "test-skill", "should return the skill name from sync"
     assert result.outcomes[0].action == Action.CREATED, "should reflect the created action"
+    assert result.registry_count == 1, "one skill landed in the tenant registry"
+    assert result.attached_count == 0, "no agent attaches the newly synced skill yet"
     assert not cleanup_dir.exists(), "should clean up the temp directory"
 
 
@@ -406,6 +413,166 @@ async def test_sync_impl_rejects_path_traversal(tmp_path: Path) -> None:
             )
 
     assert not cleanup_dir.exists(), "should clean up temp directory even on traversal attempt"
+
+
+def _agent_json(*, agent_id: str, tenant_id: uuid.UUID, skill_ids: list[str]) -> dict[str, Any]:
+    """A minimal MA agent payload tagged for ``tenant_id``, attaching ``skill_ids``."""
+    return BetaManagedAgentsAgent(
+        id=agent_id,
+        type="agent",
+        name="agent",
+        model={"id": "claude-opus-4-7"},
+        metadata={"daimon_tenant": str(tenant_id)},
+        description=None,
+        created_at="2026-04-21T00:00:00Z",
+        updated_at="2026-04-21T00:00:00Z",
+        version=1,
+        mcp_servers=[],
+        skills=[
+            BetaManagedAgentsCustomSkill(skill_id=skill_id, type="custom", version="1")
+            for skill_id in skill_ids
+        ],
+        tools=[],
+        system=None,
+    ).model_dump(mode="json")
+
+
+async def test_sync_impl_reports_zero_attached_when_no_agent_attaches_synced_skills(
+    tmp_path: Path,
+) -> None:
+    """Three skills synced into the registry; the tenant's one agent attaches
+    none of them — the observed failure case (D-11/D-21) must read
+    unmistakably: registry count 3, attached count 0, and the summary names
+    both plus the word 'registry'."""
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    outcomes = [
+        ResourceOutcome(kind="skill", name="skill-a", action=Action.CREATED, anthropic_id="sk_a"),
+        ResourceOutcome(kind="skill", name="skill-b", action=Action.CREATED, anthropic_id="sk_b"),
+        ResourceOutcome(kind="skill", name="skill-c", action=Action.UPDATED, anthropic_id="sk_c"),
+    ]
+
+    with (
+        patch("daimon.core.skills.pipeline.fetch_repo") as mock_fetch,
+        patch("daimon.core.skills.pipeline.discover_skills"),
+        patch("daimon.core.skills.pipeline.sync_skills") as mock_sync,
+    ):
+        from daimon.core.skills.fetch import FetchResult
+
+        cleanup_dir = tmp_path / "cleanup"
+        cleanup_dir.mkdir()
+        mock_fetch.return_value = FetchResult(path=tmp_path, cleanup_dir=cleanup_dir)
+        mock_sync.return_value = outcomes
+
+        agent_list_calls: list[httpx.Request] = []
+
+        def on_agents_list(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+            agent_list_calls.append(req)
+            return list_response(
+                [_agent_json(agent_id="ag_1", tenant_id=tenant_id, skill_ids=["sk_unrelated"])]
+            )
+
+        router = MARouter()
+        router.add("GET", r"/v1/agents", on_agents_list)
+        client = build_fake_anthropic(router.dispatch)
+
+        auth = AuthIdentity(
+            account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+        )
+        result = await _sync_impl(
+            _runtime(client), auth, url="https://github.com/org/repo", branch="main", path=""
+        )
+
+    assert result.registry_count == 3, "all three synced skills land in the tenant registry"
+    assert result.attached_count == 0, "none of the synced skills are attached to any agent"
+    assert "3" in result.summary and "0" in result.summary, (
+        "summary must name both the registry and attached counts"
+    )
+    assert "registry" in result.summary, "summary must name the registry explicitly"
+    assert len(agent_list_calls) == 1, "exactly one agent-listing request per sync, not per skill"
+
+
+async def test_sync_impl_reports_one_attached_when_an_existing_agent_already_has_it(
+    tmp_path: Path,
+) -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    outcomes = [
+        ResourceOutcome(kind="skill", name="skill-a", action=Action.CREATED, anthropic_id="sk_a"),
+    ]
+
+    with (
+        patch("daimon.core.skills.pipeline.fetch_repo") as mock_fetch,
+        patch("daimon.core.skills.pipeline.discover_skills"),
+        patch("daimon.core.skills.pipeline.sync_skills") as mock_sync,
+    ):
+        from daimon.core.skills.fetch import FetchResult
+
+        cleanup_dir = tmp_path / "cleanup"
+        cleanup_dir.mkdir()
+        mock_fetch.return_value = FetchResult(path=tmp_path, cleanup_dir=cleanup_dir)
+        mock_sync.return_value = outcomes
+
+        router = MARouter()
+        router.add(
+            "GET",
+            r"/v1/agents",
+            lambda _req, _m: list_response(
+                [_agent_json(agent_id="ag_1", tenant_id=tenant_id, skill_ids=["sk_a"])]
+            ),
+        )
+        client = build_fake_anthropic(router.dispatch)
+
+        auth = AuthIdentity(
+            account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+        )
+        result = await _sync_impl(
+            _runtime(client), auth, url="https://github.com/org/repo", branch="main", path=""
+        )
+
+    assert result.registry_count == 1
+    assert result.attached_count == 1, "the already-attached synced skill must be counted"
+
+
+async def test_sync_impl_excludes_failed_outcome_from_both_counts(tmp_path: Path) -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    outcomes = [
+        ResourceOutcome(kind="skill", name="skill-ok", action=Action.CREATED, anthropic_id="sk_ok"),
+        ResourceOutcome(
+            kind="skill", name="skill-bad", action=Action.FAILED, error="boom", anthropic_id=None
+        ),
+    ]
+
+    with (
+        patch("daimon.core.skills.pipeline.fetch_repo") as mock_fetch,
+        patch("daimon.core.skills.pipeline.discover_skills"),
+        patch("daimon.core.skills.pipeline.sync_skills") as mock_sync,
+    ):
+        from daimon.core.skills.fetch import FetchResult
+
+        cleanup_dir = tmp_path / "cleanup"
+        cleanup_dir.mkdir()
+        mock_fetch.return_value = FetchResult(path=tmp_path, cleanup_dir=cleanup_dir)
+        mock_sync.return_value = outcomes
+
+        router = MARouter()
+        router.add("GET", r"/v1/agents", lambda _req, _m: list_response([]))
+        client = build_fake_anthropic(router.dispatch)
+
+        auth = AuthIdentity(
+            account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+        )
+        result = await _sync_impl(
+            _runtime(client), auth, url="https://github.com/org/repo", branch="main", path=""
+        )
+
+    assert result.registry_count == 1, "the failed outcome must not inflate the registry count"
+    assert result.attached_count == 0
+    assert len(result.outcomes) == 2, "the failed outcome still appears in the raw outcomes list"
 
 
 class _SeedAuthMiddleware(Middleware):
