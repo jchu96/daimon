@@ -1,9 +1,13 @@
-"""Tests for github_repo_auth: the pure select_clone_auth decision table and
-the shell resolve_clone_token orchestrator.
+"""Tests for github_repo_auth: the pure select_clone_auth / select_skill_sync_auth
+decision tables and the shell resolve_clone_token / resolve_skill_sync_token
+orchestrators.
 
-The pure decision table is tested without I/O. The shell functions use
+The pure decision tables are tested without I/O. The shell functions use
 httpx.MockTransport (transport-level fake — guideline:testing); each test
-owns its own RSA key material inline.
+owns its own RSA key material inline. The injected installation lookup for
+resolve_skill_sync_token is a plain async function, never a mock, per
+guideline:testing's mock-at-boundaries rule — it is a first-party seam, not
+an external API.
 """
 
 from __future__ import annotations
@@ -18,7 +22,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.errors import DaimonError
 from daimon.core.github_repo_auth import (
     resolve_clone_token,
+    resolve_skill_sync_token,
     select_clone_auth,
+    select_skill_sync_auth,
 )
 from daimon.core.stores.domain import AgentRepoBindingRow, RepoProofKind
 from pydantic import SecretStr
@@ -399,6 +405,324 @@ async def test_resolve_clone_token_pat_kind_proof_never_unlocks_the_fallback_tie
             fallback_pat="ghp_operator_fallback",
             app_id=None,
             app_private_key=None,
+            now=1_000_000,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 1: select_skill_sync_auth (pure decision table)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("has_per_agent_pat", "app_installed", "has_fallback_pat", "expected"),
+    [
+        # PAT always wins, regardless of the other two inputs.
+        (True, False, False, "pat"),
+        (True, True, False, "pat"),
+        (True, False, True, "pat"),
+        (True, True, True, "pat"),
+        # No PAT, App installed -> app mode, regardless of fallback.
+        (False, True, False, "app"),
+        (False, True, True, "app"),
+        # No PAT, App absent, fallback configured -> public (anonymous-but-authed).
+        (False, False, True, "public"),
+        # No PAT, App absent, no fallback -> none (legitimate anonymous fetch).
+        (False, False, False, "none"),
+    ],
+)
+def test_select_skill_sync_auth_table(
+    has_per_agent_pat: bool,
+    app_installed: bool,
+    has_fallback_pat: bool,
+    expected: str,
+) -> None:
+    """select_skill_sync_auth follows the precedence table: pat -> app -> public -> none."""
+    mode = select_skill_sync_auth(
+        has_per_agent_pat=has_per_agent_pat,
+        app_installed=app_installed,
+        has_fallback_pat=has_fallback_pat,
+    )
+
+    assert mode == expected, (
+        f"select_skill_sync_auth(has_per_agent_pat={has_per_agent_pat}, "
+        f"app_installed={app_installed}, has_fallback_pat={has_fallback_pat}) "
+        f"should be {expected!r}, got {mode!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 1: the ordering-agreement test (D-27 mitigation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("has_per_agent_pat", "app_installed", "has_fallback_pat"),
+    [
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+        (True, True, True),
+        (False, True, False),
+        (False, True, True),
+        (False, False, True),
+        (False, False, False),
+    ],
+)
+def test_skill_sync_and_clone_selectors_agree_on_tier_ordering(
+    has_per_agent_pat: bool,
+    app_installed: bool,
+    has_fallback_pat: bool,
+) -> None:
+    """select_skill_sync_auth and select_clone_auth must never drift apart on
+    tier ORDERING again — this ordering has already drifted apart on paper
+    once in this codebase's planning history (two selectors were nearly
+    designed with reversed App/PAT precedence before implementation evidence
+    corrected it), and this test is what turns a future repeat of that drift
+    into a failing test rather than a silent divergence discovered later.
+
+    The comparison point is proof_kind="public" on the clone side: it is the
+    one proof value that unlocks EVERY tier of the clone table (pat, app,
+    and public all reachable), so comparing against it isolates ORDERING
+    from the proof gate — the one deliberate difference between the two
+    functions. Any other proof_kind (or None) would conflate a proof-gate
+    difference with an ordering difference, which is exactly the ambiguity
+    this test exists to eliminate.
+    """
+    skill_sync_mode = select_skill_sync_auth(
+        has_per_agent_pat=has_per_agent_pat,
+        app_installed=app_installed,
+        has_fallback_pat=has_fallback_pat,
+    )
+    clone_mode_with_public_proof = select_clone_auth(
+        has_per_agent_pat=has_per_agent_pat,
+        app_installed=app_installed,
+        proof_kind="public",
+        has_fallback_pat=has_fallback_pat,
+    )
+
+    assert skill_sync_mode == clone_mode_with_public_proof, (
+        "select_skill_sync_auth and select_clone_auth(proof_kind='public') must "
+        f"agree on tier ordering; got skill_sync={skill_sync_mode!r}, "
+        f"clone={clone_mode_with_public_proof!r} for has_per_agent_pat="
+        f"{has_per_agent_pat}, app_installed={app_installed}, "
+        f"has_fallback_pat={has_fallback_pat}"
+    )
+
+    # The proof-gate divergence is intentional and must be recorded as a test,
+    # not "simplified" away by widening select_clone_auth to accept a missing
+    # proof: with NO recorded proof, select_clone_auth refuses (app/public
+    # both require proof) while select_skill_sync_auth has no such gate to
+    # apply, because a skill-sync URL may have no binding row at all.
+    clone_mode_with_no_proof = select_clone_auth(
+        has_per_agent_pat=has_per_agent_pat,
+        app_installed=app_installed,
+        proof_kind=None,
+        has_fallback_pat=has_fallback_pat,
+    )
+    if not has_per_agent_pat and (app_installed or has_fallback_pat):
+        assert skill_sync_mode != clone_mode_with_no_proof, (
+            "the no-proof divergence is intentional: select_clone_auth must refuse "
+            "(proof required) where select_skill_sync_auth (no binding, no proof "
+            "concept) proceeds -- this is the gate that must never be widened away"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2: resolve_skill_sync_token (shell, MockTransport + plain async lookup)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_pat_short_circuits_with_zero_calls() -> None:
+    """A truthy per-agent token is returned with ZERO outbound HTTP requests
+    AND zero invocations of the injected installation lookup -- this pins the
+    per-agent-first short-circuit at the implementation level, not via a
+    docstring claim."""
+    outbound_requests: list[httpx.Request] = []
+    lookup_calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound_requests.append(request)
+        pytest.fail(f"GitHub transport must not be called on the PAT path; got {request.url}")
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        lookup_calls.append((owner, repo))
+        return 999
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="acme/widgets",
+        per_agent_pat="ghp_per_agent_token",
+        fallback_pat="ghp_fallback_token",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+        now=1_000_000,
+    )
+
+    assert token == "ghp_per_agent_token", "per-agent token must win"
+    assert len(outbound_requests) == 0, "zero outbound HTTP requests on the PAT short-circuit"
+    assert len(lookup_calls) == 0, "zero installation-lookup invocations on the PAT short-circuit"
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_app_installed_mints_installation_token() -> None:
+    """No PAT + injected lookup resolving an installation id -> mints and
+    returns the installation token."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/app/installations/777/access_tokens":
+            return httpx.Response(status_code=201, json={"token": "ghs_installation_token"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        assert (owner, repo) == ("acme", "widgets")
+        return 777
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="https://github.com/acme/widgets",
+        per_agent_pat=None,
+        fallback_pat=None,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+        now=1_000_000,
+    )
+
+    assert token == "ghs_installation_token"
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_no_installation_falls_back_to_public() -> None:
+    """No PAT, injected lookup returns None (App not installed), a fallback
+    PAT is configured -> fallback token."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no mint request expected: {request.method} {request.url}")
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        return None
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="acme/oss-repo",
+        per_agent_pat=None,
+        fallback_pat="ghp_operator_fallback",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+        now=1_000_000,
+    )
+
+    assert token == "ghp_operator_fallback"
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_no_credential_returns_none_anonymous() -> None:
+    """No PAT, no installation, no fallback -> None (the legitimate anonymous
+    public-fetch case), never an empty string and never a raise."""
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        return None
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="acme/public-repo",
+        per_agent_pat=None,
+        fallback_pat=None,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+        now=1_000_000,
+    )
+
+    assert token is None, "no credential resolves -> None (anonymous), not an empty string"
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_lookup_error_degrades_to_fallback() -> None:
+    """The injected lookup raising httpx.HTTPError degrades to the fallback
+    tier rather than propagating -- a transient GitHub failure must not fail
+    a sync a fallback token could still serve."""
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        raise httpx.ConnectError("connection reset")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="acme/oss-repo",
+        per_agent_pat=None,
+        fallback_pat="ghp_operator_fallback",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+        now=1_000_000,
+    )
+
+    assert token == "ghp_operator_fallback", "a lookup error must degrade to the fallback PAT"
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_none_lookup_skips_app_tier_entirely() -> None:
+    """installation_lookup=None skips the App tier entirely -- zero outbound
+    requests, no App JWT built -- and falls through to the fallback tier."""
+    outbound_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound_requests.append(request)
+        raise AssertionError(f"no request expected when installation_lookup is None: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="acme/oss-repo",
+        per_agent_pat=None,
+        fallback_pat="ghp_operator_fallback",
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=None,
+        now=1_000_000,
+    )
+
+    assert token == "ghp_operator_fallback"
+    assert len(outbound_requests) == 0, (
+        "installation_lookup=None must skip the App tier with zero requests"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_unnormalizable_repo_raises() -> None:
+    """A repo reference that does not normalize to owner/repo (no slash) must
+    raise DaimonError rather than silently falling through to an anonymous
+    fetch of a different (or no) repo."""
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        pytest.fail("lookup must not be invoked for an unnormalizable repo reference")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+
+    with pytest.raises(DaimonError):
+        await resolve_skill_sync_token(
+            client,
+            repo_url="not-a-valid-repo-reference",
+            per_agent_pat=None,
+            fallback_pat="ghp_operator_fallback",
+            app_id="12345",
+            app_private_key=SecretStr(_generate_rsa_keypair()),
+            installation_lookup=lookup,
             now=1_000_000,
         )
 
