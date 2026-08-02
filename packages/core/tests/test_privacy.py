@@ -33,6 +33,7 @@ from daimon.core.purge import PurgeReport, purge_account
 from daimon.core.stores import agent_github_binding as agent_github_binding_store
 from daimon.core.stores import credential_requests as credential_requests_store
 from daimon.core.stores import github_credentials as github_credentials_store
+from daimon.core.stores import github_oauth_states as github_oauth_states_store
 from daimon.core.stores import mcp_tokens as mcp_tokens_store
 from daimon.core.stores import message_feedback as message_feedback_store
 from daimon.core.stores import routines as routines_store
@@ -351,6 +352,68 @@ async def test_collect_purge_preview_cli_oauth_states_excludes_same_os_user_in_o
     assert preview.github_oauth_states.count == report.db.github_oauth_states, (
         "preview and purge must agree on the tenant-scoped CLI oauth-state predicate"
     )
+
+
+async def test_preview_oauth_state_count_matches_the_tenant_scoped_purge(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Preview mirrors the tenant-scoped platform-principal oauth-state predicate.
+
+    A folded rider: the same platform external_id can belong to two different
+    people in two different tenants (a Discord user id is workspace-scoped).
+    The preview must count only the account's own tenant's handshake row, not
+    the cross-tenant total — otherwise a user is told their data will be
+    deleted when it will not.
+    """
+    tenant_a = await make_tenant(db_session, workspace_id="pv-oauth-tenant-a")
+    tenant_b = await make_tenant(db_session, workspace_id="pv-oauth-tenant-b")
+    account = await make_account(db_session, tenant=tenant_a)
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="SHARED_EXTERNAL_ID",
+        tenant=tenant_a,
+        account=account,
+    )
+    # A DIFFERENT person: same external_id, other tenant (the folded rider).
+    await make_platform_principal(
+        db_session,
+        platform="discord",
+        external_id="SHARED_EXTERNAL_ID",
+        tenant=tenant_b,
+    )
+    await make_oauth_state(
+        db_session,
+        platform="discord",
+        platform_user_id="SHARED_EXTERNAL_ID",
+        scopes=("repo",),
+        tenant_id=tenant_a.id,
+    )
+    await make_oauth_state(
+        db_session,
+        platform="discord",
+        platform_user_id="SHARED_EXTERNAL_ID",
+        scopes=("repo",),
+        tenant_id=tenant_b.id,
+    )
+    await db_session.commit()
+
+    preview = await collect_purge_preview(sm=db_session_factory, account_id=account.id)
+    report = await purge_account(sm=db_session_factory, account_id=account.id)
+
+    assert preview.github_oauth_states.count == 1, (
+        "preview must count only the account's own tenant-scoped platform handshake row, "
+        "not the cross-tenant total for the colliding external_id"
+    )
+    assert preview.github_oauth_states.count == report.db.github_oauth_states, (
+        "preview and purge must agree on the tenant-scoped platform oauth-state predicate"
+    )
+
+    surviving = await github_oauth_states_store.count_states_for_platform_user(
+        db_session, platform="discord", platform_user_id="SHARED_EXTERNAL_ID", tenant_id=tenant_b.id
+    )
+    assert surviving == 1, "tenant_b's identically-external-id row must survive the purge"
 
 
 async def test_collect_purge_preview_counts_slack_user_tokens_and_turn_contexts(

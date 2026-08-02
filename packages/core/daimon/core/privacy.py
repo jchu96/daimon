@@ -200,12 +200,13 @@ async def collect_purge_preview(
         # 8. github_oauth_states — keyed by (platform, platform_user_id). Build
         # the DISTINCT set of keys to avoid double-counting when two same-account
         # CLI principals share an os_user (mirrors the principal_links dedup
-        # rationale). CLI keys carry the principal's tenant_id — mirroring the
-        # purge predicate exactly: os_user is not globally unique, so the CLI
-        # delete is tenant-scoped while platform deletes stay tenant-agnostic.
-        oauth_keys: set[tuple[str, str, uuid.UUID | None]] = set()
+        # rationale). Both CLI and platform keys carry the principal's
+        # tenant_id — mirroring the purge predicate exactly on both paths: an
+        # external id (Slack/Discord user id, or CLI os_user) is not globally
+        # unique across tenants, so both deletes are tenant-scoped.
+        oauth_keys: set[tuple[str, str, uuid.UUID]] = set()
         for pp in pp_list:
-            oauth_keys.add((pp.platform, pp.external_id, None))
+            oauth_keys.add((pp.platform, pp.external_id, pp.tenant_id))
         for cli in cli_list:
             oauth_keys.add(("cli", cli.os_user, cli.tenant_id))
         github_oauth_states_total = 0
