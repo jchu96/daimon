@@ -201,6 +201,12 @@ async def defaults_verify(
     for tenant in tenants:
         if tenant.archived_at is not None:
             continue
+        if tenant.platform == "cli":
+            # cli:local is reconciled by `defaults apply` with account_id=None;
+            # verify_tenant_defaults always derives a non-None account id from
+            # the tenant, so its fingerprint can never match. It is not a real
+            # install, just the local bootstrap row every deployment creates.
+            continue
         if tenant.provision_status != "ready":
             # Pending/failed tenants are the boot sweep's job to re-seed, not a
             # propagation bug — counting them as diverged would make an unrelated

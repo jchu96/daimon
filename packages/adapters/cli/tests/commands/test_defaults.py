@@ -272,6 +272,33 @@ def test_defaults_verify_archived_tenant_not_visited(
     assert calls == [], "an archived tenant must make zero provider requests"
 
 
+def test_defaults_verify_cli_local_tenant_not_visited(
+    schema_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `cli:local` row every deployment bootstraps via `defaults apply` is
+    reconciled with account_id=None, but `verify_tenant_defaults` always derives
+    a non-None account id — so its fingerprint can never match and it must be
+    excluded from the walk entirely, not evaluated and reported as diverged.
+    """
+
+    async def seed() -> uuid.UUID:
+        async with schema_sessionmaker() as s, s.begin():
+            t = await make_tenant(s, platform="cli", workspace_id="local")
+            return t.id
+
+    asyncio.run(seed())
+
+    _install_defaults_runtime(monkeypatch, sessionmaker=schema_sessionmaker)
+    calls: list[uuid.UUID] = []
+    _install_verify_tenant_defaults(monkeypatch, reports={}, calls=calls)
+
+    result = _invoke()
+
+    assert result.exit_code == 0, result.stdout
+    assert calls == [], "cli:local must never reach verify_tenant_defaults"
+
+
 def test_defaults_verify_provider_read_failure_exits_nonzero(
     schema_sessionmaker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
