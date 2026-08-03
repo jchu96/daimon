@@ -11,8 +11,11 @@ Pure functions:
   select_clone_auth — deterministic pat/app/public/none decision table for a
     bound repo, gated on a recorded proof of access.
   select_skill_sync_auth — the skill-sync sibling: same tier ORDERING
-    (per-agent token -> App installation -> operator fallback -> anonymous),
-    but no proof kind, because a skill-sync URL may have no binding row.
+    (per-agent token -> App installation -> operator fallback -> anonymous)
+    and the same App-tier proof gate, but the proof isn't read off a single
+    bound row — a skill-sync URL may have no binding row at all, so callers
+    resolve `proof_kind` by checking whether ANY of their own tenant's
+    bindings for that exact repo recorded proof.
   normalize_owner_repo — public `owner/repo` normalizer shared by both shell
     resolvers below (existing private copies elsewhere are untouched by this
     module; see each copy's own docstring).
@@ -24,8 +27,8 @@ Shell functions (injected httpx):
     verified-public proof) -> raise. Never returns an empty string.
   resolve_skill_sync_token — PAT short-circuit (zero GitHub I/O) -> App
     installation-token mint (only when an injected installation lookup is
-    supplied and resolves) -> operator fallback PAT -> None (anonymous
-    fetch). Never returns an empty string.
+    supplied AND the caller-resolved `proof_kind` is not None) -> operator
+    fallback PAT -> None (anonymous fetch). Never returns an empty string.
 """
 
 from __future__ import annotations
@@ -142,6 +145,7 @@ def select_skill_sync_auth(
     *,
     has_per_agent_pat: bool,
     app_installed: bool,
+    proof_kind: RepoProofKind | None,
     has_fallback_pat: bool,
 ) -> Literal["pat", "app", "public", "none"]:
     """Decide the skill-sync credential mode for a bare repo URL.
@@ -149,42 +153,55 @@ def select_skill_sync_auth(
     Scope: credential selection for a skill-repo fetch — the interactive
     ``sync_skills`` MCP tool and the per-agent webhook skill-resync path
     both select a credential for a repo URL that may have no
-    ``agent_repo_binding`` row at all (no recorded proof of access to key
-    a decision on).
+    ``agent_repo_binding`` row at all.
 
     Order, identical to ``select_clone_auth``: a per-agent token wins; else
-    an App installation covering the repo; else the operator fallback
-    token; else ``"none"``. This function shares ``select_clone_auth``'s
-    tier ORDERING deliberately — a test
+    an App installation covering the repo AND a recorded proof of access
+    for THIS caller's tenant; else the operator fallback token; else
+    ``"none"``. This function shares ``select_clone_auth``'s tier ORDERING
+    deliberately — a test
     (``test_skill_sync_and_clone_selectors_agree_on_tier_ordering``) asserts
-    the two agree on every combination of the three shared booleans, so
-    neither can silently drift from the other again.
+    the two agree on the App tier for every combination of the shared
+    inputs, so neither can silently drift from the other again.
 
-    It is a separate function rather than a parameter on ``select_clone_auth``
-    because the two decisions are keyed on different inputs, not because
-    they disagree on ordering: the clone decision is keyed on a proof of
-    access recorded at bind time, and a skill-sync URL may have no binding
-    row at all, so accepting an optional binding here would introduce an
-    implicit "no proof required" branch into a decision whose whole point is
-    that proof is required. The difference between the two functions is
-    their INPUTS, not their ordering.
+    ``proof_kind`` gates the App tier exactly like ``select_clone_auth``:
+    App installation coverage is installed by repo owners for their own
+    use, not by the tenant requesting the sync, so coverage alone cannot
+    authorize reading a repo this tenant never demonstrated access to.
+    Unlike the clone path, ``proof_kind`` here is NOT read off a single
+    bound row — a skill-sync URL may have no binding at all — callers
+    resolve it by checking whether ANY of the calling tenant's own bindings
+    for this exact repo recorded proof (see
+    ``daimon.core.stores.agent_repo_binding.get_tenant_repo_proof_kind``).
+    A repo this tenant has never bound (with proof) is never eligible for
+    the App tier, closing the cross-tenant read this function used to
+    allow: any tenant admin could otherwise name a repo the deployment's
+    App happens to cover — installed by an unrelated tenant for their own
+    use — and receive a minted installation token for it.
+
+    The operator fallback tier is intentionally NOT gated on ``proof_kind``
+    (unlike the clone path's ``proof_kind == "public"`` requirement): a
+    skill-sync URL legitimately has no binding at all, and the fallback
+    token is the deployment-wide public-read credential regardless of
+    whether this specific repo was ever bound. This is the one remaining
+    behavioral difference from ``select_clone_auth``.
 
     ``"none"`` here means the legitimate anonymous public fetch, not a
     refusal — unlike the clone path, which raises when its decision reaches
     ``"none"``. The shell counterpart, ``resolve_skill_sync_token``,
     converts ``"none"`` to ``None``, which the skill fetchers already accept
-    as "no credential" for a public repo. This is the one behavioral
-    difference from the clone path: public skill repos legitimately sync
-    with no credential on a deployment that never configured an operator
-    fallback token, so anonymous is not an error here the way it is for a
-    bound clone.
+    as "no credential" for a public repo. Public skill repos legitimately
+    sync with no credential on a deployment that never configured an
+    operator fallback token, so anonymous is not an error here the way it
+    is for a bound clone.
 
     Pure — no I/O, no clock. Callers resolve ``app_installed`` (an
-    installation lookup) and ``has_fallback_pat`` before calling this.
+    installation lookup), ``proof_kind`` (a bindings-table read), and
+    ``has_fallback_pat`` before calling this.
     """
     if has_per_agent_pat:
         return "pat"
-    if app_installed:
+    if app_installed and proof_kind is not None:
         return "app"
     if has_fallback_pat:
         return "public"
@@ -292,6 +309,7 @@ async def resolve_skill_sync_token(
     *,
     repo_url: str,
     per_agent_pat: str | None,
+    proof_kind: RepoProofKind | None,
     fallback_pat: str | None,
     app_id: str | None,
     app_private_key: SecretStr | None,
@@ -301,10 +319,11 @@ async def resolve_skill_sync_token(
     """Resolve the skill-sync token for a bare repo URL.
 
     Structurally parallel to ``resolve_clone_token`` — same ordering, same
-    short-circuit discipline — differing only in its inputs (no binding, no
-    proof kind; an injected installation lookup instead of an always-live
-    one) and in returning ``None`` for the anonymous case where the clone
-    path raises.
+    short-circuit discipline — differing only in its inputs (``proof_kind``
+    is a caller-resolved bindings-table read rather than a single bound
+    row's field, and the installation lookup is injected instead of
+    always-live) and in returning ``None`` for the anonymous case where the
+    clone path raises.
 
     Short-circuits on ``per_agent_pat`` before any GitHub HTTP call, before
     building an App JWT, and before invoking ``installation_lookup`` — the
@@ -312,19 +331,27 @@ async def resolve_skill_sync_token(
     installation lookup when a per-agent credential is already available. An
     empty string is "no token", exactly as the clone path treats it.
 
-    The App tier is only attempted when ``installation_lookup`` is not
-    ``None`` AND both App settings (``app_id``, ``app_private_key``) are
-    present — passing ``installation_lookup=None`` skips the App tier
-    entirely, including the JWT build, with zero outbound requests. This is
-    how a caller with no live-or-cached installation source opts out of the
-    App tier rather than being forced to inject a lookup that always returns
-    ``None``.
+    The App tier is only ATTEMPTED (installation lookup + mint) when
+    ``installation_lookup`` is not ``None``, ``proof_kind`` is not ``None``,
+    AND both App settings (``app_id``, ``app_private_key``) are present.
+    ``proof_kind`` gates the attempt itself (not just the final decision) so
+    a repo this tenant never demonstrated access to never triggers a live
+    GitHub installation lookup or token mint at all — closing both the
+    cross-tenant credential read AND the App-installation-existence probe
+    this endpoint would otherwise expose to any caller who can name a repo
+    URL. Passing ``installation_lookup=None`` (or ``proof_kind=None``) skips
+    the App tier entirely, including the JWT build, with zero outbound
+    requests.
 
     ``installation_lookup`` is injected precisely so an interactive caller
     can pass a live GitHub lookup (``get_installation_id_for_repo``) while an
     unattended batch caller passes a cheap read of the cached
     ``github_app_installations`` table — that freshness choice belongs to
-    the caller, not to this function.
+    the caller, not to this function. ``proof_kind`` is likewise injected
+    rather than looked up here: this function has no DB access; callers
+    resolve it (e.g. via
+    ``daimon.core.stores.agent_repo_binding.get_tenant_repo_proof_kind``)
+    before calling.
 
     The App path is best-effort: a lookup-or-mint failure raising
     ``httpx.HTTPError`` degrades to "App unavailable" (logged, repo + error
@@ -350,6 +377,10 @@ async def resolve_skill_sync_token(
         repo_url: A raw or `owner/repo` GitHub repo reference (normalized
             internally via ``normalize_owner_repo``).
         per_agent_pat: Already-resolved per-agent PAT overlay, or None.
+        proof_kind: The recorded proof THIS caller's tenant established for
+            repo_url (from any of its own bindings), or None if it has never
+            demonstrated access to this repo. Gates the App tier — see
+            ``select_skill_sync_auth``.
         fallback_pat: Operator-wide fallback PAT, or None/empty (treated the
             same — an empty string is "no token").
         app_id: GitHub App id, or None if the App is not configured.
@@ -386,9 +417,16 @@ async def resolve_skill_sync_token(
     # serve. On any HTTP error, degrade to "App unavailable" and fall through
     # to the fallback/none decision. A malformed App private key still raises
     # from build_app_jwt (operator misconfig — fail loud so it is fixed, not
-    # silently masked).
+    # silently masked). Gated on proof_kind is not None: a repo this tenant
+    # never demonstrated access to must not trigger even the lookup — see the
+    # docstring's cross-tenant-probe rationale.
     app_token: str | None = None
-    if installation_lookup is not None and app_id is not None and app_private_key is not None:
+    if (
+        installation_lookup is not None
+        and proof_kind is not None
+        and app_id is not None
+        and app_private_key is not None
+    ):
         app_jwt = build_app_jwt(app_private_key.get_secret_value(), app_id, now=now)
         try:
             installation_id = await installation_lookup(owner, repo)
@@ -406,6 +444,7 @@ async def resolve_skill_sync_token(
     mode = select_skill_sync_auth(
         has_per_agent_pat=False,
         app_installed=app_token is not None,
+        proof_kind=proof_kind,
         has_fallback_pat=has_fallback_pat,
     )
 

@@ -18,6 +18,7 @@ import json
 import re
 import tarfile
 import uuid
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -38,6 +39,8 @@ from daimon.core.skill_sync import orchestrator as orch_mod
 from daimon.core.skill_sync.orchestrator import sync_agent_skills
 from daimon.core.skill_zip import canonical_zip_bytes
 from daimon.core.specs import SkillRepo
+from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.core.stores.github_credentials import upsert_credential
 from daimon.core.stores.user_skills import (
     list_user_skills_for_agent,
@@ -271,15 +274,27 @@ async def test_github_fallback_pat_omitted_behaves_as_before(
 # ---------------------------------------------------------------------------
 
 
-async def test_no_per_agent_token_with_installation_lookup_reaches_app_tier(
+async def test_no_per_agent_token_with_recorded_proof_reaches_app_tier(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """No per-agent token + an injected lookup resolving an installation ->
-    the fetch carries the minted installation token. This is the App tier that
-    was previously unreachable from the non-override (agent-creation) path."""
+    """No per-agent token + a tenant-owned binding that recorded proof of
+    access to this repo + an injected lookup resolving an installation ->
+    the fetch carries the minted installation token. This is the App tier,
+    reachable from the non-override (agent-creation) path once this tenant
+    has demonstrated access to the repo."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=cli.tenant_id,
+            agent_id=uuid.uuid4(),
+            repo_url="o/r",
+            default_branch="main",
+            ma_secret_ref="anon:",
+            proof=RepoAccessProof(kind="pat", at=datetime.now(UTC), account_id=cli.account_id),
+        )
     fernet = _make_fernet()
     # No PAT seeded.
 
@@ -325,7 +340,84 @@ async def test_no_per_agent_token_with_installation_lookup_reaches_app_tier(
     tarball_requests = [r for r in captured if "tarball" in r.url.path]
     assert len(tarball_requests) == 1, "the fetcher must have attempted the tarball download"
     assert tarball_requests[0].headers.get("Authorization") == "token ghs_installation_token", (
-        "the minted installation token must reach the fetch — the previously-unreachable App tier"
+        "the minted installation token must reach the fetch, since this tenant recorded "
+        "proof of access to the repo"
+    )
+    assert report.skipped_repos == [("https://github.com/o/r", "GitHubUnreachable")], (
+        "the tarball 404 must still be recorded normally; only the credential is under test"
+    )
+
+
+async def test_no_recorded_proof_never_reaches_app_tier_even_when_app_covers_repo(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No per-agent token, no binding at all for this repo (so no recorded
+    proof of access) -> even though the deployment's App genuinely covers
+    the repo (the injected lookup would resolve an installation), the App
+    tier must never be attempted: zero installation-lookup invocations and
+    zero installation-token requests. A tenant admin naming an arbitrary
+    repo the App happens to cover (installed by some OTHER tenant for their
+    own use) must not receive a minted installation token for it.
+
+    This reproduces the exact failure path: before the App-tier proof gate,
+    this exact call (no binding, live installation lookup resolving an id)
+    would have returned the minted installation token and fetched the repo's
+    tarball with it. Confirmed failing prior to the proof_kind gate."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    # No PAT seeded, no agent_repo_binding row for this repo at all.
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "installation" in request.url.path or "access_tokens" in request.url.path:
+            raise AssertionError(
+                f"App tier must not be consulted without a recorded proof of access; "
+                f"got {request.url}"
+            )
+        captured.append(request)
+        return httpx.Response(404)  # tarball fetch — content doesn't matter for this test
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    lookup_calls = 0
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        # If this were ever invoked, it WOULD resolve an installation —
+        # proving the repo really is App-covered, just not by this tenant.
+        return 777
+
+    report = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+    )
+
+    assert lookup_calls == 0, (
+        "no recorded proof for this repo -> the installation lookup must never be invoked, "
+        "not just its result discarded"
+    )
+    tarball_requests = [r for r in captured if "tarball" in r.url.path]
+    assert len(tarball_requests) == 1, "the fetcher must still attempt an anonymous fetch"
+    assert "Authorization" not in tarball_requests[0].headers, (
+        "with no proof, no fallback PAT, and the App tier never attempted, the fetch must "
+        "be anonymous -- never carry a minted installation token for an unproven repo"
     )
     assert report.skipped_repos == [("https://github.com/o/r", "GitHubUnreachable")], (
         "the tarball 404 must still be recorded normally; only the credential is under test"

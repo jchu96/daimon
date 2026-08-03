@@ -32,6 +32,7 @@ from daimon.core.github_repo_auth import InstallationLookup, resolve_skill_sync_
 from daimon.core.ma import delete_skill_and_versions
 from daimon.core.skills.pipeline import run_skill_sync
 from daimon.core.stores.agent_repo_binding import get_bindings_for_repo
+from daimon.core.stores.domain import RepoProofKind
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, SecretStr
@@ -100,11 +101,13 @@ async def _resolve_sync_token(
 
     The session JWT carries no agent_id claim (SC-4), so the credential is
     resolved from the URL instead: the caller-tenant's ``agent_repo_binding``
-    for this repo → that agent's PAT overlay. Other tenants' bindings for the
-    same repo never resolve — no cross-tenant credential bleed. Because the
-    loop returns on the first non-``None`` overlay PAT, an agent whose overlay
-    resolves short-circuits the loop — correct, since only one per-agent
-    credential is needed.
+    rows for this repo → that agent's PAT overlay, and (independently) any
+    recorded proof of access this tenant established for the same repo.
+    Other tenants' bindings for the same repo never resolve a per-agent PAT
+    and never count as this tenant's proof — no cross-tenant credential
+    bleed. Because the loop returns on the first non-``None`` overlay PAT,
+    an agent whose overlay resolves short-circuits the loop — correct, since
+    only one per-agent credential is needed.
 
     The full precedence decision (per-agent token -> GitHub App installation
     -> operator fallback -> anonymous) is delegated to
@@ -112,7 +115,13 @@ async def _resolve_sync_token(
     resolver and the per-agent skill-sync pipeline's credential path cannot
     drift from each other — see that function (and its
     ``select_skill_sync_auth`` pure decision table) for the ordering itself,
-    not restated here. This is the interactive caller, so the installation
+    not restated here. Critically, the App installation tier is gated on
+    ``proof_kind``: a tenant that has never bound this repo (with proof)
+    itself is never eligible for the App tier, even when the deployment's
+    App happens to cover it for some unrelated tenant's own bound repo —
+    App coverage is installed by repo owners for their own use, not by the
+    tenant requesting this sync, so it cannot stand in for a demonstrated
+    access check. This is the interactive caller, so the installation
     lookup built below is a LIVE GitHub lookup rather than a cached read of
     the installations table — that split is deliberate (see
     ``resolve_skill_sync_token``'s docstring).
@@ -126,10 +135,13 @@ async def _resolve_sync_token(
     )
     async with runtime.session_factory() as session:
         bindings = await get_bindings_for_repo(session, repo_url=url)
+    tenant_bindings = [binding for binding in bindings if binding.tenant_id == auth.tenant_id]
+    proof_kind: RepoProofKind | None = next(
+        (binding.proof_kind for binding in tenant_bindings if binding.proof_kind is not None),
+        None,
+    )
     per_agent_pat: str | None = None
-    for binding in bindings:
-        if binding.tenant_id != auth.tenant_id:
-            continue
+    for binding in tenant_bindings:
         token = await get_pat(
             principal_id=binding.agent_id,
             agent_id=binding.agent_id,
@@ -168,6 +180,7 @@ async def _resolve_sync_token(
         http_client,
         repo_url=url,
         per_agent_pat=per_agent_pat,
+        proof_kind=proof_kind,
         fallback_pat=fallback_pat,
         app_id=github_app_id,
         app_private_key=github_app_private_key,

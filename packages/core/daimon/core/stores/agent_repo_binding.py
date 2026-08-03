@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from daimon.core._models import AgentRepoBinding
 from daimon.core.errors import StoreError
-from daimon.core.stores.domain import AgentRepoBindingRow, RepoAccessProof
+from daimon.core.stores.domain import AgentRepoBindingRow, RepoAccessProof, RepoProofKind
 from sqlalchemy import CursorResult, case, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -197,6 +197,35 @@ async def get_bindings_for_repo(
         select(AgentRepoBinding).where(AgentRepoBinding.repo_url == normalized)
     )
     return [AgentRepoBindingRow.model_validate(o) for o in result.scalars()]
+
+
+async def get_tenant_repo_proof_kind(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    repo_url: str,
+) -> RepoProofKind | None:
+    """Return a recorded proof_kind THIS tenant established for repo_url, or None.
+
+    Scans tenant_id's own bindings for repo_url (any agent) and returns the
+    first non-null proof_kind found, or None if no such binding exists or
+    none of them recorded proof. This is the evidence a skill-sync caller
+    needs before treating GitHub App installation coverage as authorization
+    to read a repo on this tenant's behalf: App coverage is installed by
+    repo owners for their own use, not by the tenant syncing the repo, so it
+    cannot stand in for a demonstrated access check (mirrors the reasoning
+    in ``select_clone_auth``'s docstring).
+
+    Used by ``select_skill_sync_auth``'s callers, which have no single
+    binding row to key off of (a skill-sync URL may name a repo this tenant
+    never bound at all) — they still need to know whether ANY of this
+    tenant's own bindings already proved access to that specific repo.
+    """
+    bindings = await get_bindings_for_repo(session, repo_url=repo_url)
+    for binding in bindings:
+        if binding.tenant_id == tenant_id and binding.proof_kind is not None:
+            return binding.proof_kind
+    return None
 
 
 async def update_repo_and_branch_keep_secret(

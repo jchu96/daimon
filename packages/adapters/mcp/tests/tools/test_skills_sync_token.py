@@ -13,6 +13,7 @@ sesn_01S1PW8nFn9tZongAokvVpzd).
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import httpx
@@ -28,6 +29,7 @@ from daimon.core.github_credentials import build_multifernet, upsert_credential_
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.testing.factories import make_tenant
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -240,10 +242,54 @@ async def test_resolve_sync_token_returns_fallback_for_tenant_binding_with_no_ov
 async def test_resolve_sync_token_app_covered_repo_resolves_installation_token(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The direct regression test for the reported defect: a repo covered by
-    an installed GitHub App, with no per-agent credential bound, must resolve
-    to a minted installation token from the interactive sync tool — the
-    missing tier, now reachable via the shared seam."""
+    """A repo covered by an installed GitHub App, with no per-agent credential
+    bound but a recorded proof this tenant already demonstrated access to
+    the repo, must resolve to a minted installation token from the
+    interactive sync tool."""
+    async with sessionmaker.begin() as session:
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(uuid.uuid4()))
+    agent_id = uuid.uuid4()
+    url = "https://github.com/example-org/example-agent"
+    async with sessionmaker.begin() as session:
+        await set_binding(
+            session,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            repo_url=url,
+            default_branch="main",
+            ma_secret_ref="anon:",
+            proof=RepoAccessProof(kind="pat", at=datetime.now(UTC), account_id=None),
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/example-org/example-agent/installation":
+            return httpx.Response(200, json={"id": 555})
+        if request.url.path == "/app/installations/555/access_tokens":
+            return httpx.Response(201, json={"token": "ghs_installation_token"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    settings = _minimal_settings(app_id="12345", app_private_key=SecretStr(_generate_rsa_keypair()))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        token = await _resolve_sync_token(
+            _make_runtime(sessionmaker, settings=settings), _identity(tenant.id), url, client
+        )
+    assert token == "ghs_installation_token", (
+        "an App-covered repo, with a recorded proof this tenant already demonstrated "
+        "access to it, must resolve to the minted installation token"
+    )
+
+
+async def test_resolve_sync_token_app_covered_repo_without_proof_is_never_resolved(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The regression test for the cross-tenant read: a repo covered by an
+    installed GitHub App, with no per-agent credential AND no recorded proof
+    this tenant ever demonstrated access to it, must NOT resolve an
+    installation token — the live installation lookup must never even be
+    invoked. Before the proof gate, this exact call (a repo the App covers,
+    no per-agent credential, no fallback) minted and returned an installation
+    token regardless of whether this tenant had ever proven it could read the
+    repo; confirmed failing prior to the proof_kind gate."""
     async with sessionmaker.begin() as session:
         tenant = await make_tenant(session, platform="discord", workspace_id=str(uuid.uuid4()))
     agent_id = uuid.uuid4()
@@ -260,20 +306,19 @@ async def test_resolve_sync_token_app_covered_repo_resolves_installation_token(
         )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/repos/example-org/example-agent/installation":
-            return httpx.Response(200, json={"id": 555})
-        if request.url.path == "/app/installations/555/access_tokens":
-            return httpx.Response(201, json={"token": "ghs_installation_token"})
-        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+        raise AssertionError(
+            f"no GitHub App request expected without a recorded proof; got {request.url}"
+        )
 
     settings = _minimal_settings(app_id="12345", app_private_key=SecretStr(_generate_rsa_keypair()))
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         token = await _resolve_sync_token(
             _make_runtime(sessionmaker, settings=settings), _identity(tenant.id), url, client
         )
-    assert token == "ghs_installation_token", (
-        "an App-covered repo with no per-agent credential must resolve to the minted "
-        "installation token"
+    assert token is None, (
+        "an App-covered repo this tenant never demonstrated access to must resolve to "
+        "an anonymous fetch, not a minted installation token — App installation coverage "
+        "belongs to whoever installed the App for their own repo, not to this tenant"
     )
 
 

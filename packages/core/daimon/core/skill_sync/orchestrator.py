@@ -78,6 +78,8 @@ from daimon.core.skill_sync.fetcher import (
 )
 from daimon.core.skill_zip import canonical_zip_bytes
 from daimon.core.specs import SkillRepo, merge_default_agent_toolset
+from daimon.core.stores.agent_repo_binding import get_tenant_repo_proof_kind
+from daimon.core.stores.domain import RepoProofKind
 from daimon.core.stores.user_skills import (
     delete_user_skill,
     list_user_skills_for_agent,
@@ -425,17 +427,26 @@ async def sync_agent_skills(
         skill-sync selector — ``daimon.core.github_repo_auth.
         resolve_skill_sync_token`` and its pure decision table
         ``select_skill_sync_auth`` — whose ordering is a per-agent token
-        first, then an App installation covering the repo, then the operator
+        first, then an App installation covering the repo (gated on this
+        tenant having recorded proof of access to it), then the operator
         fallback, then an unauthenticated fetch. Resolution happens per repo
-        (not once for the whole call) because App installation coverage is
-        repo-specific.
+        (not once for the whole call) because App installation coverage AND
+        the tenant's recorded proof are both repo-specific: before each
+        ``resolve_skill_sync_token`` call this function reads
+        ``daimon.core.stores.agent_repo_binding.get_tenant_repo_proof_kind``
+        for ``tenant_id``/``repo.url`` — ANY of this tenant's own bindings
+        recording proof for that exact repo is sufficient; a repo this
+        tenant has never bound (with proof) is never eligible for the App
+        tier, even when the deployment's App happens to cover it because
+        some unrelated tenant installed it for their own use.
 
         ``app_id``, ``app_private_key``, and ``installation_lookup`` feed the
         App tier of that per-repo resolution. ``installation_lookup`` is
         injected so the caller decides between a live GitHub installation
         lookup (e.g. the interactive agent-creation path) and a cheap cached
-        read; when it is absent the App tier is skipped entirely, so all
-        pre-existing callers stay source-compatible without threading it.
+        read; when it is absent (or the tenant has no recorded proof for the
+        repo) the App tier is skipped entirely, so all pre-existing callers
+        stay source-compatible without threading it.
 
         ``github_fallback_pat`` is the operator-wide service default, threaded
         by callers that already have ``settings.github.fallback_pat`` in scope
@@ -522,11 +533,23 @@ async def sync_agent_skills(
             if credential_override is not None:
                 credential = credential_override
             else:
+                # A per-agent credential already resolved wins regardless of
+                # proof (select_skill_sync_auth's "pat" tier), so the proof
+                # lookup below is only needed when it did not — this both
+                # saves a DB round-trip and keeps the pat-short-circuit zero-
+                # extra-I/O on the resolution path, not just the App tier.
+                proof_kind: RepoProofKind | None = None
+                if per_agent_credential is None:
+                    async with sessionmaker() as session:
+                        proof_kind = await get_tenant_repo_proof_kind(
+                            session, tenant_id=tenant_id, repo_url=repo.url
+                        )
                 try:
                     credential = await resolve_skill_sync_token(
                         http_client,
                         repo_url=repo.url,
                         per_agent_pat=per_agent_credential,
+                        proof_kind=proof_kind,
                         fallback_pat=github_fallback_pat,
                         app_id=app_id,
                         app_private_key=app_private_key,

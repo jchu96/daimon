@@ -415,39 +415,58 @@ async def test_resolve_clone_token_pat_kind_proof_never_unlocks_the_fallback_tie
 
 
 @pytest.mark.parametrize(
-    ("has_per_agent_pat", "app_installed", "has_fallback_pat", "expected"),
+    ("has_per_agent_pat", "app_installed", "proof_kind", "has_fallback_pat", "expected"),
     [
-        # PAT always wins, regardless of the other two inputs.
-        (True, False, False, "pat"),
-        (True, True, False, "pat"),
-        (True, False, True, "pat"),
-        (True, True, True, "pat"),
-        # No PAT, App installed -> app mode, regardless of fallback.
-        (False, True, False, "app"),
-        (False, True, True, "app"),
-        # No PAT, App absent, fallback configured -> public (anonymous-but-authed).
-        (False, False, True, "public"),
+        # PAT always wins, regardless of the other inputs -- proof is irrelevant.
+        (True, False, None, False, "pat"),
+        (True, True, "public", True, "pat"),
+        (True, False, "pat", True, "pat"),
+        # No PAT, App installed, a recorded proof (either kind) -> app mode,
+        # regardless of fallback -- matches select_clone_auth's app-tier gate.
+        (False, True, "pat", False, "app"),
+        (False, True, "public", True, "app"),
+        # No PAT, App installed, NO recorded proof -> the app tier is refused
+        # even though the App genuinely covers the repo: App installation
+        # coverage belongs to whoever installed the App for their own repo,
+        # not to the tenant requesting this sync, so it cannot authorize a
+        # read on its own. Falls through to fallback.
+        (False, True, None, False, "none"),
+        (False, True, None, True, "public"),
+        # No PAT, App absent, no recorded proof, fallback configured ->
+        # public (anonymous-but-authed) -- unlike the clone path, the
+        # fallback tier here does NOT require proof_kind == "public": a
+        # skill-sync URL may have no binding at all.
+        (False, False, None, True, "public"),
+        (False, False, "pat", True, "public"),
+        (False, False, "public", True, "public"),
         # No PAT, App absent, no fallback -> none (legitimate anonymous fetch).
-        (False, False, False, "none"),
+        (False, False, None, False, "none"),
     ],
 )
 def test_select_skill_sync_auth_table(
     has_per_agent_pat: bool,
     app_installed: bool,
+    proof_kind: RepoProofKind | None,
     has_fallback_pat: bool,
     expected: str,
 ) -> None:
-    """select_skill_sync_auth follows the precedence table: pat -> app -> public -> none."""
+    """select_skill_sync_auth follows the precedence table: pat -> app -> public -> none.
+
+    The app tier additionally requires proof_kind is not None: App
+    installation coverage alone must never authorize a read of a repo this
+    tenant never demonstrated access to.
+    """
     mode = select_skill_sync_auth(
         has_per_agent_pat=has_per_agent_pat,
         app_installed=app_installed,
+        proof_kind=proof_kind,
         has_fallback_pat=has_fallback_pat,
     )
 
     assert mode == expected, (
         f"select_skill_sync_auth(has_per_agent_pat={has_per_agent_pat}, "
-        f"app_installed={app_installed}, has_fallback_pat={has_fallback_pat}) "
-        f"should be {expected!r}, got {mode!r}"
+        f"app_installed={app_installed}, proof_kind={proof_kind!r}, "
+        f"has_fallback_pat={has_fallback_pat}) should be {expected!r}, got {mode!r}"
     )
 
 
@@ -457,74 +476,92 @@ def test_select_skill_sync_auth_table(
 
 
 @pytest.mark.parametrize(
-    ("has_per_agent_pat", "app_installed", "has_fallback_pat"),
+    ("has_per_agent_pat", "app_installed", "proof_kind", "has_fallback_pat"),
     [
-        (True, False, False),
-        (True, True, False),
-        (True, False, True),
-        (True, True, True),
-        (False, True, False),
-        (False, True, True),
-        (False, False, True),
-        (False, False, False),
+        (True, False, None, False),
+        (True, True, "pat", False),
+        (True, False, "public", True),
+        (True, True, None, True),
+        (False, True, None, False),
+        (False, True, "pat", True),
+        (False, True, "public", True),
+        (False, False, "public", True),
+        (False, False, "pat", True),
+        (False, False, None, True),
+        (False, False, None, False),
     ],
 )
 def test_skill_sync_and_clone_selectors_agree_on_tier_ordering(
     has_per_agent_pat: bool,
     app_installed: bool,
+    proof_kind: RepoProofKind | None,
     has_fallback_pat: bool,
 ) -> None:
     """select_skill_sync_auth and select_clone_auth must never drift apart on
-    tier ORDERING again — this ordering has already drifted apart on paper
-    once in this codebase's planning history (two selectors were nearly
-    designed with reversed App/PAT precedence before implementation evidence
-    corrected it), and this test is what turns a future repeat of that drift
-    into a failing test rather than a silent divergence discovered later.
+    the pat/app tier ORDERING again — this ordering has already drifted
+    apart on paper once in this codebase's planning history (two selectors
+    were nearly designed with reversed App/PAT precedence before
+    implementation evidence corrected it), and this test is what turns a
+    future repeat of that drift into a failing test rather than a silent
+    divergence discovered later.
 
-    The comparison point is proof_kind="public" on the clone side: it is the
-    one proof value that unlocks EVERY tier of the clone table (pat, app,
-    and public all reachable), so comparing against it isolates ORDERING
-    from the proof gate — the one deliberate difference between the two
-    functions. Any other proof_kind (or None) would conflate a proof-gate
-    difference with an ordering difference, which is exactly the ambiguity
-    this test exists to eliminate.
+    Both selectors now gate the App tier identically on ``proof_kind is not
+    None`` — passing the SAME proof_kind to both functions must therefore
+    produce the SAME pat/app decision. This is a strictly stronger check
+    than before this gate existed (previously select_skill_sync_auth had no
+    proof concept at all and reached "app" unconditionally on
+    app_installed, which allowed a tenant to receive a minted installation
+    token for a repo it never demonstrated access to, as long as the
+    deployment's App happened to cover it for some unrelated tenant).
+
+    The one REMAINING deliberate difference is the public (operator
+    fallback) tier: select_clone_auth requires proof_kind == "public"
+    specifically, while select_skill_sync_auth only requires
+    has_fallback_pat, because a skill-sync URL may have no binding row at
+    all to carry a proof_kind in the first place.
     """
     skill_sync_mode = select_skill_sync_auth(
         has_per_agent_pat=has_per_agent_pat,
         app_installed=app_installed,
+        proof_kind=proof_kind,
         has_fallback_pat=has_fallback_pat,
     )
-    clone_mode_with_public_proof = select_clone_auth(
+    clone_mode = select_clone_auth(
         has_per_agent_pat=has_per_agent_pat,
         app_installed=app_installed,
-        proof_kind="public",
+        proof_kind=proof_kind,
         has_fallback_pat=has_fallback_pat,
     )
 
-    assert skill_sync_mode == clone_mode_with_public_proof, (
-        "select_skill_sync_auth and select_clone_auth(proof_kind='public') must "
-        f"agree on tier ordering; got skill_sync={skill_sync_mode!r}, "
-        f"clone={clone_mode_with_public_proof!r} for has_per_agent_pat="
-        f"{has_per_agent_pat}, app_installed={app_installed}, "
-        f"has_fallback_pat={has_fallback_pat}"
-    )
+    if has_per_agent_pat:
+        assert skill_sync_mode == "pat" and clone_mode == "pat", (
+            "a per-agent PAT must win identically on both selectors"
+        )
+        return
 
-    # The proof-gate divergence is intentional and must be recorded as a test,
-    # not "simplified" away by widening select_clone_auth to accept a missing
-    # proof: with NO recorded proof, select_clone_auth refuses (app/public
-    # both require proof) while select_skill_sync_auth has no such gate to
-    # apply, because a skill-sync URL may have no binding row at all.
-    clone_mode_with_no_proof = select_clone_auth(
-        has_per_agent_pat=has_per_agent_pat,
-        app_installed=app_installed,
-        proof_kind=None,
-        has_fallback_pat=has_fallback_pat,
-    )
-    if not has_per_agent_pat and (app_installed or has_fallback_pat):
-        assert skill_sync_mode != clone_mode_with_no_proof, (
-            "the no-proof divergence is intentional: select_clone_auth must refuse "
-            "(proof required) where select_skill_sync_auth (no binding, no proof "
-            "concept) proceeds -- this is the gate that must never be widened away"
+    if app_installed and proof_kind is not None:
+        assert skill_sync_mode == "app" and clone_mode == "app", (
+            "with a recorded proof, an installed App must win identically on both "
+            f"selectors; got skill_sync={skill_sync_mode!r}, clone={clone_mode!r}"
+        )
+        return
+
+    # App tier is refused on both (no proof, or App not installed). Only the
+    # public/fallback tier may now diverge: select_clone_auth additionally
+    # requires proof_kind == "public"; select_skill_sync_auth does not.
+    assert clone_mode in ("public", "none"), clone_mode
+    assert skill_sync_mode in ("public", "none"), skill_sync_mode
+    if proof_kind == "public":
+        assert skill_sync_mode == clone_mode, (
+            "with a verified-public proof, both selectors' fallback tiers must agree; "
+            f"got skill_sync={skill_sync_mode!r}, clone={clone_mode!r}"
+        )
+    elif has_fallback_pat:
+        assert skill_sync_mode == "public" and clone_mode == "none", (
+            "the remaining intentional divergence: select_skill_sync_auth's fallback "
+            "tier does not require proof_kind == 'public' (no binding may exist at "
+            "all), while select_clone_auth refuses without it -- "
+            f"got skill_sync={skill_sync_mode!r}, clone={clone_mode!r}"
         )
 
 
@@ -556,6 +593,7 @@ async def test_resolve_skill_sync_token_pat_short_circuits_with_zero_calls() -> 
         client,
         repo_url="acme/widgets",
         per_agent_pat="ghp_per_agent_token",
+        proof_kind=None,
         fallback_pat="ghp_fallback_token",
         app_id="12345",
         app_private_key=SecretStr(_generate_rsa_keypair()),
@@ -570,8 +608,9 @@ async def test_resolve_skill_sync_token_pat_short_circuits_with_zero_calls() -> 
 
 @pytest.mark.asyncio
 async def test_resolve_skill_sync_token_app_installed_mints_installation_token() -> None:
-    """No PAT + injected lookup resolving an installation id -> mints and
-    returns the installation token."""
+    """No PAT, a recorded proof of access for this repo, and an injected
+    lookup resolving an installation id -> mints and returns the
+    installation token."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/app/installations/777/access_tokens":
@@ -588,6 +627,7 @@ async def test_resolve_skill_sync_token_app_installed_mints_installation_token()
         client,
         repo_url="https://github.com/acme/widgets",
         per_agent_pat=None,
+        proof_kind="pat",
         fallback_pat=None,
         app_id="12345",
         app_private_key=SecretStr(_generate_rsa_keypair()),
@@ -596,6 +636,55 @@ async def test_resolve_skill_sync_token_app_installed_mints_installation_token()
     )
 
     assert token == "ghs_installation_token"
+
+
+@pytest.mark.asyncio
+async def test_resolve_skill_sync_token_no_recorded_proof_never_invokes_installation_lookup() -> (
+    None
+):
+    """The regression test for the cross-tenant read: no PAT, NO recorded
+    proof of access for this repo, but the deployment's App genuinely covers
+    it (the injected lookup WOULD resolve an installation, proven by a
+    counting wrapper) -- the installation lookup must be invoked ZERO times,
+    not just have its result discarded. Before the proof_kind gate, this
+    exact call resolved and returned the minted installation token
+    regardless of whether the caller's tenant had ever demonstrated it could
+    read the repo; confirmed failing prior to the proof_kind gate."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(
+            f"no GitHub App request expected without a recorded proof; got {request.url}"
+        )
+
+    lookup_calls = 0
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return 777  # would resolve if ever invoked -- proves the App really covers the repo
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    token = await resolve_skill_sync_token(
+        client,
+        repo_url="acme/widgets",
+        per_agent_pat=None,
+        proof_kind=None,
+        fallback_pat=None,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+        now=1_000_000,
+    )
+
+    assert lookup_calls == 0, (
+        "no recorded proof -> the installation lookup must never be invoked, "
+        "not merely have its result discarded"
+    )
+    assert token is None, (
+        "with no proof and no fallback PAT, the result must be the legitimate anonymous "
+        "fetch, never a minted installation token for an unproven repo"
+    )
 
 
 @pytest.mark.asyncio
@@ -615,6 +704,7 @@ async def test_resolve_skill_sync_token_no_installation_falls_back_to_public() -
         client,
         repo_url="acme/oss-repo",
         per_agent_pat=None,
+        proof_kind="pat",
         fallback_pat="ghp_operator_fallback",
         app_id="12345",
         app_private_key=SecretStr(_generate_rsa_keypair()),
@@ -639,6 +729,7 @@ async def test_resolve_skill_sync_token_no_credential_returns_none_anonymous() -
         client,
         repo_url="acme/public-repo",
         per_agent_pat=None,
+        proof_kind="pat",
         fallback_pat=None,
         app_id="12345",
         app_private_key=SecretStr(_generate_rsa_keypair()),
@@ -664,6 +755,7 @@ async def test_resolve_skill_sync_token_lookup_error_degrades_to_fallback() -> N
         client,
         repo_url="acme/oss-repo",
         per_agent_pat=None,
+        proof_kind="pat",
         fallback_pat="ghp_operator_fallback",
         app_id="12345",
         app_private_key=SecretStr(_generate_rsa_keypair()),
@@ -690,6 +782,7 @@ async def test_resolve_skill_sync_token_none_lookup_skips_app_tier_entirely() ->
         client,
         repo_url="acme/oss-repo",
         per_agent_pat=None,
+        proof_kind="pat",
         fallback_pat="ghp_operator_fallback",
         app_id="12345",
         app_private_key=SecretStr(_generate_rsa_keypair()),
@@ -719,6 +812,7 @@ async def test_resolve_skill_sync_token_unnormalizable_repo_raises() -> None:
             client,
             repo_url="not-a-valid-repo-reference",
             per_agent_pat=None,
+            proof_kind="pat",
             fallback_pat="ghp_operator_fallback",
             app_id="12345",
             app_private_key=SecretStr(_generate_rsa_keypair()),
