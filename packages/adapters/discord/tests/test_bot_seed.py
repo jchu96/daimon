@@ -14,6 +14,7 @@ import uuid
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anthropic as _anthropic
 import discord
 import httpx
 import structlog.testing
@@ -259,6 +260,80 @@ async def test_seed_skips_roster_check_when_deployment_default_has_no_agent_name
     assert len(skipped_events) >= 1, (
         "skipping the roster check because no default agent name is configured must be logged"
     )
+
+
+async def test_seed_keeps_ready_tenant_ready_when_reconcile_report_fails(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A tenant that was already `ready` before a boot-sweep reconcile must not be
+    demoted to `failed` by a transient FAILED resource outcome -- only the reason
+    is recorded so an operator can still see it happened."""
+    tenant_id = await _provision(db_session_factory, workspace_id="seed-ready-transient-1")
+    await set_provision_status(db_session_factory, tenant_id=tenant_id, status="ready")
+    router = MARouter()  # no routes registered — roster check must not even run
+    client = build_fake_anthropic(router.dispatch)
+    runtime = _make_runtime(db_session_factory, anthropic_client=client, agent_name="daimon")
+    bot = _make_bot(runtime)
+    guild = _make_guild(guild_id=6)
+
+    failing_report = ApplyReport()
+    failing_report.add(
+        ResourceOutcome(kind="skill", name="boom", action=Action.FAILED, error="429 rate limited")
+    )
+
+    with (
+        structlog.testing.capture_logs() as logs,
+        patch(
+            "daimon.adapters.discord.bot.reconcile_tenant_defaults",
+            new_callable=AsyncMock,
+            return_value=failing_report,
+        ),
+    ):
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=True
+        )
+
+    tr = await get_tenant_liveness(db_session_factory, tenant_id)
+    assert tr is not None and tr.provision_status == "ready", (
+        "a previously-ready tenant must stay ready on a transient reconcile failure -- "
+        "demoting it would take a working guild's turns offline"
+    )
+    assert tr.last_reconcile_error is not None and "boom" in tr.last_reconcile_error, (
+        "the failure reason must still be persisted even though status is unchanged"
+    )
+    guild.system_channel.send.assert_not_awaited()
+    warn_events = [e for e in logs if e["event"] == "guild_reconcile_failed_ready_tenant"]
+    assert len(warn_events) >= 1, "a swallowed failure on an already-ready tenant must be logged"
+    assert warn_events[0]["tenant_id"] == str(tenant_id)
+
+
+async def test_seed_keeps_ready_tenant_ready_when_reconcile_raises_api_error(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The exception-path status flip (`_flip_failed_best_effort`) must honor the
+    same was_ready guard as the FAILED-outcome branch: a previously-ready tenant
+    whose reconcile call itself raises must stay ready, reason recorded."""
+    tenant_id = await _provision(db_session_factory, workspace_id="seed-ready-transient-2")
+    await set_provision_status(db_session_factory, tenant_id=tenant_id, status="ready")
+    runtime = _make_runtime(db_session_factory, anthropic_client=MagicMock(), agent_name="daimon")
+    bot = _make_bot(runtime)
+    guild = _make_guild(guild_id=7)
+
+    with patch(
+        "daimon.adapters.discord.bot.reconcile_tenant_defaults",
+        new_callable=AsyncMock,
+        side_effect=_anthropic.APIConnectionError(request=MagicMock()),
+    ):
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=tenant_id, guild=guild, was_ready=True
+        )
+
+    tr = await get_tenant_liveness(db_session_factory, tenant_id)
+    assert tr is not None and tr.provision_status == "ready", (
+        "a previously-ready tenant must stay ready even when the reconcile call "
+        "itself raises -- the exception-path flip must honor was_ready too"
+    )
+    assert tr.last_reconcile_error is not None, "the failure reason must still be persisted"
 
 
 async def test_seed_ma_error_during_roster_check_flips_failed_via_existing_boundary(

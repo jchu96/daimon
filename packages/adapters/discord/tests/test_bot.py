@@ -1040,13 +1040,15 @@ class TestReadyEmbedSuppression:
 
     @patch("daimon.adapters.discord.bot.set_provision_status", new_callable=AsyncMock)
     @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
-    async def test_a_failed_reconcile_still_posts_the_snag_embed(
+    async def test_a_failed_reconcile_posts_no_embed_when_the_tenant_was_already_ready(
         self,
         mock_reconcile: AsyncMock,
         mock_set_provision_status: AsyncMock,
         db_session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        """A failed reconcile always posts the snag embed, regardless of was_ready."""
+        """was_ready=True: a failed reconcile must NOT post the snag embed or demote
+        the tenant -- a transient failure on an already-serving install stays quiet
+        so a working guild's turns are never taken offline."""
         from daimon.core.defaults.report import Action, ApplyReport, ResourceOutcome
 
         report = ApplyReport()
@@ -1063,9 +1065,39 @@ class TestReadyEmbedSuppression:
             tenant_id=uuid.uuid4(), guild=guild, was_ready=True
         )
 
+        guild.system_channel.send.assert_not_awaited()  # pyright: ignore[reportUnknownMemberType]
+
+    @patch("daimon.adapters.discord.bot.set_provision_status", new_callable=AsyncMock)
+    @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
+    async def test_a_failed_reconcile_still_posts_the_snag_embed_when_not_previously_ready(
+        self,
+        mock_reconcile: AsyncMock,
+        mock_set_provision_status: AsyncMock,
+        db_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """was_ready=False (first-run/recovery): a failed reconcile still announces
+        itself with the snag embed, unchanged from prior behavior."""
+        from daimon.core.defaults.report import Action, ApplyReport, ResourceOutcome
+
+        report = ApplyReport()
+        report.add(
+            ResourceOutcome(kind="skill", name="broken-skill", action=Action.FAILED, error="boom")
+        )
+        mock_reconcile.return_value = report
+
+        runtime = _make_runtime(db_session_factory)
+        bot = _make_bot(runtime)
+        guild = _make_sweep_guild(900000024)
+
+        await bot._seed_tenant_defaults(  # pyright: ignore[reportPrivateUsage]
+            tenant_id=uuid.uuid4(), guild=guild, was_ready=False
+        )
+
         guild.system_channel.send.assert_awaited_once()  # pyright: ignore[reportUnknownMemberType]
         embed = guild.system_channel.send.await_args.kwargs["embed"]  # pyright: ignore[reportUnknownMemberType]
-        assert "snag" in (embed.title or "").lower(), "every failure must still announce itself"
+        assert "snag" in (embed.title or "").lower(), (
+            "a not-previously-ready failure must announce itself"
+        )
 
 
 class TestReconcileFailureReasonPersistence:
@@ -1073,14 +1105,16 @@ class TestReconcileFailureReasonPersistence:
     success clears it (D-08)."""
 
     @patch("daimon.adapters.discord.bot.reconcile_tenant_defaults", new_callable=AsyncMock)
-    async def test_a_failed_reconcile_records_the_reason_on_the_tenant_row(
+    async def test_a_failed_reconcile_records_the_reason_without_demoting_a_ready_tenant(
         self,
         mock_reconcile: AsyncMock,
         db_session: AsyncSession,
         db_session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
         """A resource-level failure in the report is composed into a reason
-        naming the failing resource's kind and name, and persisted."""
+        naming the failing resource's kind and name, and persisted -- but a
+        tenant that was already ready (was_ready=True, the boot-sweep case)
+        must stay ready rather than being demoted to failed."""
         from daimon.core.defaults.provisioning import provision_tenant
         from daimon.core.defaults.report import Action, ApplyReport, ResourceOutcome
         from daimon.core.stores.tenants import get_tenant_liveness
@@ -1109,7 +1143,9 @@ class TestReconcileFailureReasonPersistence:
 
         tr = await get_tenant_liveness(db_session_factory, tenant_id)
         assert tr is not None
-        assert tr.provision_status == "failed"
+        assert tr.provision_status == "ready", (
+            "a previously-ready tenant must not be demoted by a transient reconcile failure"
+        )
         assert tr.last_reconcile_error is not None
         assert "skill" in tr.last_reconcile_error, "reason must name the failing resource kind"
         assert "broken-skill" in tr.last_reconcile_error, "reason must name the failing resource"

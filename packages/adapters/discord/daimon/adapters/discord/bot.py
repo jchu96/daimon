@@ -332,21 +332,34 @@ class DaimonBot(commands.Bot):
                 log.warning("guild_post_dm_failed", guild_id=str(guild.id), error=str(exc))
         log.warning("guild_post_skipped", guild_id=str(guild.id))
 
-    async def _flip_failed_best_effort(self, tenant_id: uuid.UUID, *, reason: str | None) -> None:
-        """Best-effort pending→failed flip. A DB hiccup can make the flip itself
-        raise; swallowing it here keeps the snag embed posting and the seed handler
-        alive. The on_ready sweep is the designed backstop if the flip is lost."""
+    async def _flip_failed_best_effort(
+        self, tenant_id: uuid.UUID, *, reason: str | None, was_ready: bool
+    ) -> None:
+        """Best-effort pending/failed→failed flip. A DB hiccup can make the flip
+        itself raise; swallowing it here keeps the snag embed posting and the
+        seed handler alive. The on_ready sweep is the designed backstop if the
+        flip is lost.
+
+        A tenant that was already `ready` keeps that status -- an exception
+        raised out of the reconcile is the same "transient failure" case
+        `_seed_tenant_defaults`'s FAILED-outcome branch guards, just reached via
+        the exception path instead. Only the failure reason is recorded."""
         try:
-            await set_provision_status(
-                self.runtime.sessionmaker, tenant_id=tenant_id, status="failed", reason=reason
-            )
+            if was_ready:
+                await set_provision_status(
+                    self.runtime.sessionmaker, tenant_id=tenant_id, reason=reason
+                )
+            else:
+                await set_provision_status(
+                    self.runtime.sessionmaker, tenant_id=tenant_id, status="failed", reason=reason
+                )
         except SQLAlchemyError:
             log.exception("guild_seed_status_flip_failed", tenant_id=str(tenant_id))
 
     async def _seed_tenant_defaults(
         self, *, tenant_id: uuid.UUID, guild: discord.Guild, was_ready: bool
     ) -> None:
-        """Background MA seed. Owns the pending→ready/failed status flip.
+        """Background MA seed. Owns the pending/failed→ready/failed status flip.
         Posts the ✅/⚠️ follow-up on terminal state, EXCEPT the ready embed is
         suppressed when the tenant was already ready before this reconcile and
         the reconcile changed nothing -- a quiet boot sweep stays quiet (D-23).
@@ -356,6 +369,10 @@ class DaimonBot(commands.Bot):
         passed explicitly by the caller (which already has the row) rather than
         re-read here -- a first-run or recovering install (was_ready=False)
         always gets its confirmation regardless of what the reconcile reports.
+        A tenant that WAS ready is never demoted by a failed reconcile here: a
+        transient provider failure during the boot sweep must not take a
+        working guild's turns offline, so only the failure reason is recorded
+        and the tenant stays `ready`.
         """
         if tenant_id in self._seeding:
             return
@@ -406,19 +423,35 @@ class DaimonBot(commands.Bot):
                     await self._post_to_guild(guild, _build_ready_embed())
             else:
                 reason = roster_failure_reason or _compose_failure_reason(report)
-                await set_provision_status(
-                    self.runtime.sessionmaker,
-                    tenant_id=tenant_id,
-                    status="failed",
-                    reason=reason,
-                )
-                await self._post_to_guild(guild, _build_snag_embed())
+                if was_ready:
+                    # A previously-ready install stays ready: a transient reconcile
+                    # failure must not take a working guild's turns offline. Record
+                    # the reason so it's visible to an operator, but don't flip the
+                    # gate `on_message` checks.
+                    await set_provision_status(
+                        self.runtime.sessionmaker, tenant_id=tenant_id, reason=reason
+                    )
+                    log.warning(
+                        "guild_reconcile_failed_ready_tenant",
+                        tenant_id=str(tenant_id),
+                        reason=reason,
+                    )
+                else:
+                    await set_provision_status(
+                        self.runtime.sessionmaker,
+                        tenant_id=tenant_id,
+                        status="failed",
+                        reason=reason,
+                    )
+                    await self._post_to_guild(guild, _build_snag_embed())
         except (DaimonError, _anthropic.APIError, discord.HTTPException) as exc:
             log.warning("guild_seed_failed", tenant_id=str(tenant_id), error=str(exc))
             # Best-effort flip before posting so the tenant is never left wedged in
             # 'pending' — a raise inside this handler would NOT be caught by the
             # sibling except clause below and would skip the snag embed entirely.
-            await self._flip_failed_best_effort(tenant_id, reason=f"{type(exc).__name__}: {exc}")
+            await self._flip_failed_best_effort(
+                tenant_id, reason=f"{type(exc).__name__}: {exc}", was_ready=was_ready
+            )
             await self._post_to_guild(guild, _build_snag_embed())
         except Exception as exc:  # noqa: BLE001 — background-task supervisor boundary
             log.exception("guild_seed_unexpected", tenant_id=str(tenant_id))
@@ -428,7 +461,7 @@ class DaimonBot(commands.Bot):
             # the message, so an unexpected exception can't smuggle request/response
             # content into the persisted reason.
             await self._flip_failed_best_effort(
-                tenant_id, reason=f"unexpected error: {type(exc).__name__}"
+                tenant_id, reason=f"unexpected error: {type(exc).__name__}", was_ready=was_ready
             )
             await self._post_to_guild(guild, _build_snag_embed())
         finally:
