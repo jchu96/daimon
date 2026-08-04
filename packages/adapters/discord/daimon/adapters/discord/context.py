@@ -31,17 +31,22 @@ def _strip_bot_mention(
 
 
 def _render_location(thread: discord.Thread) -> list[str]:
-    """Render the parent-channel and current-thread elements for a thread turn.
+    """Render the parent-channel and current-thread elements for a turn.
 
     Both ids are exposed and differentiated by ``role`` so the agent can target
-    the thread (not the parent channel) when asked to post "here".
+    the thread (not the parent channel) when asked to post "here". Names ride
+    alongside the ids so the agent can say where it is, not just post there;
+    ``thread.parent`` is None when the parent is not in the client cache, so the
+    channel name is emitted only when it resolves.
     """
     thread_hint = "to post in this thread, pass this id as channel_id"
+    channel_name = "" if thread.parent is None else f" name={quoteattr(thread.parent.name)}"
     return [
         f"<channel platform={quoteattr('discord')} id={quoteattr(str(thread.parent_id))}"
-        f" role={quoteattr('parent_channel')}/>",
+        f" role={quoteattr('parent_channel')}{channel_name}/>",
         f"<thread platform={quoteattr('discord')} id={quoteattr(str(thread.id))}"
-        f" role={quoteattr('current_thread')} hint={quoteattr(thread_hint)}/>",
+        f" role={quoteattr('current_thread')} hint={quoteattr(thread_hint)}"
+        f" name={quoteattr(thread.name)}/>",
     ]
 
 
@@ -225,6 +230,7 @@ async def build_channel_context_xml(
     channel: discord.TextChannel,
     trigger: discord.Message,
     *,
+    thread: discord.Thread,
     limit: int = CHANNEL_BACKFILL_LIMIT,
     bot_user_id: int | None = None,
     bot_display_name: str = "daimon",
@@ -232,7 +238,12 @@ async def build_channel_context_xml(
     """Build XML context from parent channel history for a channel-mention turn.
 
     Called when the bot is @-mentioned directly in a channel (not in a thread).
-    Returns ``(xml, image_attachments)`` where ``xml`` is a
+    ``thread`` is the thread this turn answers in — the caller has already
+    created it — and supplies the location elements the agent needs to post
+    "here"; without them the agent has no channel id at all and asks the user
+    to paste a channel link.
+    Returns ``(xml, image_attachments)`` where ``xml`` is a location block
+    followed by a
     ``<channel_context count="N">`` block containing the last ``limit`` messages
     (trigger excluded, bot replies INCLUDED) followed by a ``<user_query>`` element
     identical to the one ``build_context_xml`` emits.  ``image_attachments`` is the
@@ -249,7 +260,7 @@ async def build_channel_context_xml(
         att for msg in messages for att in msg.attachments if is_vision_image_attachment(att)
     ]
 
-    lines: list[str] = [f'<channel_context count="{len(messages)}">']
+    lines: list[str] = [*_render_location(thread), f'<channel_context count="{len(messages)}">']
     for msg in messages:
         lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
     lines.append("</channel_context>")

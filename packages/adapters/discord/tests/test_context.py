@@ -84,6 +84,7 @@ def _make_thread(
     thread.history = MagicMock(return_value=_AsyncIter(messages))
     thread.id = thread_id
     thread.parent_id = parent_id
+    thread.name = "Chat with daimon"
     # Default: no starter message and no parent — build_context_xml skips starter prepend.
     thread.starter_message = None
     thread.parent = None
@@ -713,6 +714,39 @@ class TestBuildChannelContextXml:
     """Tests for build_channel_context_xml() — channel-mention backfill builder."""
 
     @pytest.mark.asyncio
+    async def test_channel_context_carries_thread_and_parent_channel_ids(self) -> None:
+        """A channel mention must name where to post — the turn answers in a thread."""
+        trigger = _make_message(msg_id=10, content="<@999> plot this and post it here")
+        channel = _make_text_channel([trigger])
+        thread = _make_thread([trigger], thread_id=900, parent_id=42)
+
+        result, _ = await build_channel_context_xml(channel, trigger, thread=thread)
+
+        assert 'id="900" role="current_thread"' in result, (
+            "channel-mention context must name the thread the answer lands in, "
+            "so the agent can post there"
+        )
+        assert 'id="42" role="parent_channel"' in result, (
+            "channel-mention context must name the parent channel id"
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_context_carries_channel_and_thread_names(self) -> None:
+        """Ids alone leave the agent unable to say where it is."""
+        trigger = _make_message(msg_id=10, content="<@999> where am I?")
+        channel = _make_text_channel([trigger])
+        parent = MagicMock(spec=discord.TextChannel)
+        parent.name = "general"
+        thread = _make_thread([trigger], thread_id=900, parent_id=42)
+        thread.name = "Chat with daimon"
+        thread.parent = parent
+
+        result, _ = await build_channel_context_xml(channel, trigger, thread=thread)
+
+        assert 'name="general"' in result, "parent channel element should carry its name"
+        assert 'name="Chat with daimon"' in result, "thread element should carry its name"
+
+    @pytest.mark.asyncio
     async def test_channel_context_count_equals_backfilled_message_count(self) -> None:
         """count attribute equals number of non-trigger messages backfilled."""
         m1 = _make_message(
@@ -726,7 +760,9 @@ class TestBuildChannelContextXml:
         )
         channel = _make_text_channel([m1, m2, trigger])
 
-        result, _ = await build_channel_context_xml(channel, trigger)
+        result, _ = await build_channel_context_xml(
+            channel, trigger, thread=_make_thread([trigger])
+        )
 
         assert 'count="2"' in result, "count attribute should equal number of backfilled messages"
 
@@ -737,7 +773,9 @@ class TestBuildChannelContextXml:
         trigger = _make_message(msg_id=10, content="trigger-content")
         channel = _make_text_channel([m1, trigger])
 
-        result, _ = await build_channel_context_xml(channel, trigger)
+        result, _ = await build_channel_context_xml(
+            channel, trigger, thread=_make_thread([trigger])
+        )
 
         ctx_start = result.index("<channel_context")
         ctx_end = result.index("</channel_context>")
@@ -765,7 +803,9 @@ class TestBuildChannelContextXml:
         )
         channel = _make_text_channel([bot_msg, trigger])
 
-        result, _ = await build_channel_context_xml(channel, trigger)
+        result, _ = await build_channel_context_xml(
+            channel, trigger, thread=_make_thread([trigger])
+        )
 
         assert "bot prior reply" in result, "bot replies must be included in channel_context"
         assert 'is_bot="true"' in result, "bot message should have is_bot=true attribute"
@@ -785,7 +825,9 @@ class TestBuildChannelContextXml:
         )
         channel = _make_text_channel([m_late, m_early, trigger])
 
-        result, _ = await build_channel_context_xml(channel, trigger)
+        result, _ = await build_channel_context_xml(
+            channel, trigger, thread=_make_thread([trigger])
+        )
 
         early_pos = result.index("early")
         late_pos = result.index("late")
@@ -798,7 +840,9 @@ class TestBuildChannelContextXml:
         trigger = _make_message(msg_id=10, content="<@999> hello there")
         channel = _make_text_channel([m1, trigger])
 
-        result, _ = await build_channel_context_xml(channel, trigger, bot_user_id=999)
+        result, _ = await build_channel_context_xml(
+            channel, trigger, bot_user_id=999, thread=_make_thread([trigger])
+        )
 
         assert "<user_query" in result, "user_query element must be present"
         # user_query must come after </channel_context>
@@ -827,7 +871,9 @@ class TestBuildChannelContextXml:
         trigger = _make_message(msg_id=10, content="got it")
         channel = _make_text_channel([m1, trigger])
 
-        _, image_atts = await build_channel_context_xml(channel, trigger)
+        _, image_atts = await build_channel_context_xml(
+            channel, trigger, thread=_make_thread([trigger])
+        )
 
         assert len(image_atts) == 1, "only the image/png attachment should be collected"
         assert image_atts[0] is img, "collected attachment should be the image object"
@@ -838,7 +884,9 @@ class TestBuildChannelContextXml:
         trigger = _make_message(msg_id=10, content="hello")
         channel = _make_text_channel([trigger])
 
-        result, image_atts = await build_channel_context_xml(channel, trigger)
+        result, image_atts = await build_channel_context_xml(
+            channel, trigger, thread=_make_thread([trigger])
+        )
 
         assert 'count="0"' in result, "empty channel should produce count=0"
         assert "<message" not in result.split("</channel_context>")[0], (

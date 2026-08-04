@@ -1183,6 +1183,7 @@ class DaimonBot(commands.Bot):
                 user_message, _ = await build_channel_context_xml(
                     message.channel,
                     trigger=message,
+                    thread=thread,
                     bot_user_id=self.user.id if self.user else None,
                     bot_display_name=discord_settings.bot_display_name,
                 )
