@@ -46,3 +46,30 @@ def build_clear_default_note(*, scope_label: str, cleared: bool) -> str:
         f"only by @mentioning the bot in that channel — there is one bot for "
         f"the whole workspace, not one bot per agent."
     )
+
+
+def build_resolution_note(*, agent_name: str | None, tier: str | None, channel_id: str) -> str:
+    """Explain which agent answers in ``channel_id`` and which tier decided it.
+
+    The tier is the whole point: "daimon answers here" is not actionable, but
+    "daimon answers here because the workspace default says so, and this channel
+    has no setting of its own" tells the caller exactly where to change it.
+    """
+    if agent_name is None:
+        return (
+            f"No agent resolves for channel {channel_id} — the channel, the "
+            f"workspace, and the deployment default are all unset, so a mention "
+            f"there has nothing to answer it."
+        )
+    where = {
+        "channel": f"this channel's own default (channel {channel_id})",
+        "tenant": "the workspace default, since this channel has none of its own",
+        "deployment": (
+            "the deployment default, since neither this channel nor the workspace sets one"
+        ),
+    }.get(tier or "", "an unrecognised tier")
+    return (
+        f"{agent_name} answers in channel {channel_id}, from {where}. Members "
+        f"reach it only by @mentioning the bot there — there is one bot for the "
+        f"whole workspace, not one bot per agent."
+    )

@@ -1216,6 +1216,35 @@
         'type': 'object',
       }),
     }),
+    'explain_agent_resolution': dict({
+      'description': '''
+        Report which agent answers in a channel, and which tier decided it.
+        
+        Resolution is a cascade: the channel's own default wins, else the
+        workspace default, else the deployment default. This reports the winner
+        AND every tier's setting, so "why that agent" is answerable without
+        starting a turn and reading its footer.
+        
+        Use it when someone asks which agent is configured here, when an agent
+        answers that seems wrong for the channel, or before changing a default —
+        the tier that currently wins is the tier worth changing.
+        
+        Not admin-gated: this is a read of routing any member can already infer
+        from a reply's footer.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'channel_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'fetch_youtube_transcript': dict({
       'description': '''
         Fetch the transcript of a public YouTube video for summarization or Q&A.

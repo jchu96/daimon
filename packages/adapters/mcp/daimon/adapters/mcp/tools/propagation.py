@@ -21,8 +21,18 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
-from daimon.core.routing_facts import build_clear_default_note, build_set_default_note
-from daimon.core.scope import ChannelScopeRef, TenantScopeRef
+from daimon.core.routing_facts import (
+    build_clear_default_note,
+    build_resolution_note,
+    build_set_default_note,
+)
+from daimon.core.scope import (
+    ChannelConfigRow,
+    ChannelScopeRef,
+    TenantConfigRow,
+    TenantScopeRef,
+    merge,
+)
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields, unset_fields
 from fastmcp import Context, FastMCP
@@ -131,6 +141,72 @@ async def _clear_agent_default_impl(
     )
 
 
+@dataclass(frozen=True)
+class AgentResolutionExplanation:
+    """Result returned from explain_agent_resolution."""
+
+    channel_id: str
+    """The channel the question was asked about."""
+    effective_agent_name: str | None
+    """The agent that would actually answer a mention in that channel."""
+    winning_tier: str | None
+    """Which tier supplied it: 'channel', 'tenant', or 'deployment'."""
+    channel_default: str | None
+    """The channel tier's own setting, or None if it has none."""
+    tenant_default: str | None
+    """The workspace tier's own setting, or None if it has none."""
+    deployment_default: str | None
+    """The deployment fallback from defaults/config.yaml."""
+    effective_environment_name: str | None
+    """The environment that would be used, resolved over the same cascade."""
+    environment_winning_tier: str | None
+    """Which tier supplied the environment."""
+    explanation: str
+    """One sentence naming the winner and the tier it came from, so the caller
+    can answer 'why that one' without re-deriving the cascade."""
+
+
+async def _explain_agent_resolution_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    channel_id: str,
+) -> AgentResolutionExplanation:
+    """Resolve the cascade for one channel and report every tier's contribution.
+
+    Deliberately NOT admin-gated. This is a read of routing that any member can
+    already infer from a turn's footer, and the people most often confused about
+    which agent answers are ordinary members. Gating it would leave the question
+    unanswerable by exactly the callers who ask it.
+    """
+    tenant_id: uuid.UUID = auth.tenant_id
+
+    async with runtime.session_factory() as session:
+        channel_row = await get_scope(
+            session, scope=ChannelScopeRef(tenant_id=tenant_id, channel_id=channel_id)
+        )
+        tenant_row = await get_scope(session, scope=TenantScopeRef(tenant_id=tenant_id))
+
+    channel_cfg = channel_row if isinstance(channel_row, ChannelConfigRow) else None
+    tenant_cfg = tenant_row if isinstance(tenant_row, TenantConfigRow) else None
+    resolved = merge(channel=channel_cfg, tenant=tenant_cfg, default=runtime.deployment_default)
+
+    return AgentResolutionExplanation(
+        channel_id=channel_id,
+        effective_agent_name=resolved.agent_name,
+        winning_tier=resolved.agent_name_tier,
+        channel_default=channel_cfg.agent_name if channel_cfg is not None else None,
+        tenant_default=tenant_cfg.agent_name if tenant_cfg is not None else None,
+        deployment_default=runtime.deployment_default.agent_name,
+        effective_environment_name=resolved.environment_name,
+        environment_winning_tier=resolved.environment_name_tier,
+        explanation=build_resolution_note(
+            agent_name=resolved.agent_name,
+            tier=resolved.agent_name_tier,
+            channel_id=channel_id,
+        ),
+    )
+
+
 def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     @mcp.tool(tags={"admin"})
     async def set_agent_default(  # pyright: ignore[reportUnusedFunction]
@@ -159,3 +235,24 @@ def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         default the call is a no-op (idempotent).  Requires Manage Server (admin).
         """
         return await _clear_agent_default_impl(runtime, await _auth(ctx), channel_id)
+
+    @mcp.tool
+    async def explain_agent_resolution(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        channel_id: str,
+    ) -> AgentResolutionExplanation:
+        """Report which agent answers in a channel, and which tier decided it.
+
+        Resolution is a cascade: the channel's own default wins, else the
+        workspace default, else the deployment default. This reports the winner
+        AND every tier's setting, so "why that agent" is answerable without
+        starting a turn and reading its footer.
+
+        Use it when someone asks which agent is configured here, when an agent
+        answers that seems wrong for the channel, or before changing a default —
+        the tier that currently wins is the tier worth changing.
+
+        Not admin-gated: this is a read of routing any member can already infer
+        from a reply's footer.
+        """
+        return await _explain_agent_resolution_impl(runtime, await _auth(ctx), channel_id)
