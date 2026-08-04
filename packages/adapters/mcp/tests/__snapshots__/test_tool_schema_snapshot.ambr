@@ -993,6 +993,45 @@
         'type': 'object',
       }),
     }),
+    'create_file_upload_url': dict({
+      'description': '''
+        Get a one-time URL for uploading a file you produced — a chart, a
+        table, a data file — so it can be posted as a Discord attachment.
+        
+        Call this FIRST, then send the bytes from your sandbox with curl:
+        
+            curl -sS -X PUT --data-binary @chart.png "<upload_url>"
+        
+        Do NOT base64 the file into a tool argument. The bytes go straight from
+        your sandbox over HTTP; they never pass through your context, so a large
+        file costs you nothing and cannot be truncated in transit.
+        
+        ``mime_type`` is required (e.g. "image/png", "text/csv") — it is not
+        guessed, since a wrong one produces a wrong file extension.
+        
+        Returns an ``upload_url`` and a ``handle_id``. After the PUT succeeds,
+        pass the handle id to ``send_message``'s ``file_handles`` argument to
+        post it, in the same channel/thread where the user asked — do not post
+        to a different channel unless the user explicitly names one. The URL is
+        single-use and expires; mint a new one per file.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'mime_type': dict({
+            'type': 'string',
+          }),
+          'title': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'title',
+          'mime_type',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'create_notebook_upload_url': dict({
       'description': '''
         Mint a one-time upload URL for an ephemeral marimo notebook.
@@ -2411,10 +2450,13 @@
         ``attachments=[{url, filename}]`` fetches over https, restricted to
         Discord's own CDN hosts — an arbitrary external URL will be refused
         (<=25 MiB each). ``file_handles=[handle_id, ...]`` references any
-        file already in daimon's file store — this is how you post a file
+        file daimon is already holding — this is how you post a file
         you produced yourself, not only output from a built-in tool. Any
         tool that stores a file and returns a handle works here (e.g.
-        ``upload_file``, ``generate_audio``, ``generate_image``). Combined
+        ``create_file_upload_url``, ``generate_audio``, ``generate_image``).
+        To post a file you made in your sandbox, call
+        ``create_file_upload_url`` first and PUT the bytes to the URL it
+        returns — never base64 a file into a tool argument. Combined
         cap of 10 attachments per message.
       ''',
       'parameters': dict({
@@ -3475,45 +3517,6 @@
         }),
         'required': list([
           'routine_id',
-        ]),
-        'type': 'object',
-      }),
-    }),
-    'upload_file': dict({
-      'description': '''
-        Hand daimon a file you produced — a chart, a table, a small data
-        file — so it can be posted as a Discord attachment.
-        
-        ``data`` is base64-encoded bytes, capped at 3 MB decoded (a base64
-        tool argument cannot carry much more than that). For larger files,
-        use ``create_attachment_upload_url`` instead — the sandbox PUTs the
-        bytes directly, bypassing this argument-size ceiling.
-        
-        ``mime_type`` is required (e.g. "image/png", "text/csv") — it is not
-        guessed, since a wrong one produces a wrong file extension.
-        
-        Returns the stored size and a handle id. Pass the handle id to
-        ``send_message``'s ``file_handles`` argument to post it, in the same
-        channel/thread where the user asked — do not post to a different
-        channel unless the user explicitly names one.
-      ''',
-      'parameters': dict({
-        'additionalProperties': False,
-        'properties': dict({
-          'data': dict({
-            'type': 'string',
-          }),
-          'mime_type': dict({
-            'type': 'string',
-          }),
-          'title': dict({
-            'type': 'string',
-          }),
-        }),
-        'required': list([
-          'data',
-          'title',
-          'mime_type',
         ]),
         'type': 'object',
       }),

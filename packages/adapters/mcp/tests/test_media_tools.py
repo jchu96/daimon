@@ -11,7 +11,6 @@ neither regardless of outcome; a depleted ledger denies with a
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import uuid
@@ -23,11 +22,13 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from anthropic import AsyncAnthropic
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
     BetaManagedAgentsSpanModelUsage,
 )
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.file_store import FileStore
+from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.adapters.mcp.services.audio import TTS_MODEL
 from daimon.adapters.mcp.services.image import IMAGE_MODEL
@@ -40,6 +41,7 @@ from daimon.core.config import (
     Settings,
 )
 from daimon.core.pricing import MODEL_PRICING, cost_of
+from daimon.core.scope import DeploymentDefault
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import Role
 from daimon.core.tenant_balance import debit_amount
@@ -151,63 +153,92 @@ async def test_generate_audio_rejects_empty_script(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# upload_file: round trip, malformed input, over-ceiling, no-gemini-key wiring
+# create_file_upload_url: mints a URL + handle, no bytes in the tool argument
 # ---------------------------------------------------------------------------
 
 
-def _register_upload(mcp: FastMCP, tmp_path: Path) -> None:
-    mcp.add_middleware(_SeedAuthMiddleware(_trusted_auth()))
-    register_upload_tool(mcp, file_store=FileStore(base_dir=tmp_path))
+async def test_create_file_upload_url_returns_a_put_url_and_a_handle(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """The tool hands back a URL to curl to — it never accepts the bytes itself."""
+    async with sessionmaker() as session:
+        tenant_id, account_id = await seed_tenant_and_account(session)
+        await session.commit()
 
-
-@pytest.mark.asyncio
-async def test_upload_file_round_trips_the_exact_bytes_and_mime_type(tmp_path: Path) -> None:
     mcp = FastMCP(name="t")
-    _register_upload(mcp, tmp_path)
-    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
-    encoded = base64.b64encode(png_bytes).decode()
+    mcp.add_middleware(
+        _SeedAuthMiddleware(
+            AuthIdentity(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                role=Role.ADMIN,
+                platform_user_id=None,
+            )
+        )
+    )
+    settings = Settings(
+        database=DatabaseSettings(url=PostgresDsn("postgresql+asyncpg://u:p@h/d")),
+        anthropic=AnthropicSettings(api_key=SecretStr("sk-test")),
+        mcp=McpSettings(
+            public_url=HttpUrl("https://t.example.com/mcp"),
+            file_store_dir=tmp_path,
+        ),
+    )
+    register_upload_tool(
+        mcp,
+        runtime=McpRuntime(
+            session_factory=sessionmaker,
+            client=AsyncAnthropic(api_key="k"),
+            settings=settings,
+            deployment_default=DeploymentDefault(),
+            file_store=FileStore(base_dir=tmp_path),
+        ),
+    )
 
     async with Client(mcp) as client:
         result = await client.call_tool(
-            "upload_file",
-            {"data": encoded, "title": "chart", "mime_type": "image/png"},
+            "create_file_upload_url",
+            {"title": "chart", "mime_type": "image/png"},
         )
-    assert not result.is_error, f"round trip should succeed: {result!r}"
+
+    assert not result.is_error, f"minting an upload url should succeed: {result!r}"
     text = " ".join(part.text for part in result.content if hasattr(part, "text"))
-    handle_id = text.split("handle id ")[1].split("'")[1]
-
-    store = FileStore(base_dir=tmp_path)
-    handle = store.get(handle_id)
-    assert handle.data == png_bytes, "stored bytes should exactly match the uploaded payload"
-    assert handle.content_type == "image/png", "stored mime type should match the declared one"
+    assert "/uploads/" in text, "result should carry the PUT url the sandbox curls to"
+    assert "--data-binary" in text, "result should show the curl invocation to use"
+    assert "handle id" in text, "result should name the handle to pass to send_message"
 
 
-@pytest.mark.asyncio
-async def test_upload_file_rejects_malformed_base64(tmp_path: Path) -> None:
-    mcp = FastMCP(name="t")
-    _register_upload(mcp, tmp_path)
-    async with Client(mcp) as client:
-        with pytest.raises(ToolError, match="not valid base64"):
-            await client.call_tool(
-                "upload_file",
-                {"data": "not-valid-base64!!!", "title": "bad", "mime_type": "text/plain"},
-            )
+async def test_create_file_upload_url_takes_no_data_argument(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the truncation bug: bytes must not be expressible
+    as a tool argument, so there is nowhere for the model to put them."""
+    settings = Settings(
+        database=DatabaseSettings(url=PostgresDsn("postgresql+asyncpg://u:p@h/d")),
+        anthropic=AnthropicSettings(api_key=SecretStr("sk-test")),
+        mcp=McpSettings(
+            public_url=HttpUrl("https://t.example.com/mcp"),
+            file_store_dir=tmp_path,
+        ),
+    )
+    app = create_mcp_app(
+        settings=settings,
+        sessionmaker=sessionmaker,
+        auth=StaticTokenVerifier(tokens={}),
+    )
+    tools = {t.name: t for t in await app.state.mcp.local_provider.list_tools()}
+
+    assert "upload_file" not in tools, (
+        "the base64 upload tool must be gone — it is the truncation path"
+    )
+    params = tools["create_file_upload_url"].parameters.get("properties", {})
+    assert "data" not in params, "no argument may carry file bytes"
+    assert {"title", "mime_type"} <= set(params), "mint takes only a title and a mime type"
 
 
-@pytest.mark.asyncio
-async def test_upload_file_rejects_payload_over_the_ceiling(tmp_path: Path) -> None:
-    mcp = FastMCP(name="t")
-    _register_upload(mcp, tmp_path)
-    oversized = base64.b64encode(b"\x00" * 3_500_000).decode()
-    async with Client(mcp) as client:
-        with pytest.raises(ToolError, match="create_attachment_upload_url"):
-            await client.call_tool(
-                "upload_file",
-                {"data": oversized, "title": "big", "mime_type": "application/octet-stream"},
-            )
-
-
-async def test_upload_file_registers_without_an_image_generation_key(
+async def test_upload_tool_registers_without_an_image_generation_key(
     sessionmaker: async_sessionmaker[AsyncSession],
     tmp_path: Path,
 ) -> None:
@@ -227,7 +258,9 @@ async def test_upload_file_registers_without_an_image_generation_key(
     )
     mcp = app.state.mcp
     registered = {t.name for t in await mcp.local_provider.list_tools()}
-    assert "upload_file" in registered, "upload_file should register with no gemini key configured"
+    assert "create_file_upload_url" in registered, (
+        "the upload tool should register with no gemini key configured"
+    )
     generation_tools = {"generate_image", "generate_audio", "fetch_youtube_transcript"}
     assert not (registered & generation_tools), (
         "generation tools should NOT register with no gemini key configured"

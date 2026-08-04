@@ -55,6 +55,7 @@ from daimon.adapters.mcp.tools.media import register_media_tools, register_uploa
 from daimon.adapters.mcp.tools.notebook import register_notebook_tools
 from daimon.adapters.mcp.tools.propagation import register_propagation_tools
 from daimon.adapters.mcp.tools.wizard import register_wizard_tools
+from daimon.adapters.mcp.uploads import build_upload_route
 from daimon.adapters.mcp.webhooks import build_github_webhook, build_stripe_webhook
 from daimon.core.billing import BillingConfig, load_billing_config
 from daimon.core.config import Settings, load_settings
@@ -278,7 +279,7 @@ def create_mcp_app(
     register_notebook_tools(mcp, runtime)  # notebook publish (raises when unconfigured)
     register_propagation_tools(mcp, runtime)  # set/clear agent default
 
-    register_upload_tool(mcp, file_store=file_store)
+    register_upload_tool(mcp, runtime=runtime)
     log.info("mcp.file_store_ready", store_dir=str(file_store_dir))
 
     if gemini_client is not None:
@@ -296,6 +297,11 @@ def create_mcp_app(
 
     app = mcp.http_app()
     app.state.mcp = mcp
+    app.add_route(
+        "/uploads/{token}",
+        build_upload_route(effective_sessionmaker),
+        methods=["PUT"],
+    )
     app.add_route("/healthz", _healthz, methods=["GET"])
     app.add_route("/readyz", _build_readyz(effective_sessionmaker), methods=["GET"])
     if effective_billing_config is not None:

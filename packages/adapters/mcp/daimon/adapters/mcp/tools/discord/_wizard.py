@@ -198,7 +198,12 @@ async def _post_wizard_impl(  # pyright: ignore[reportUnusedFunction]
                 "file_handles requires the media file store to be configured "
                 "(set DAIMON_GEMINI__API_KEY on the mcp process)"
             )
-        files = await _build_files_from_handles(handles, store=file_store)
+        files = await _build_files_from_handles(
+            handles,
+            store=file_store,
+            session_factory=runtime.session_factory,
+            tenant_id=auth.tenant_id,
+        )
     files_by_handle = dict(zip(handles, files, strict=True))
 
     rendered_screen = to_screen(spec, WizardState(short_id=short_id))

@@ -3,24 +3,27 @@
 The three Gemini-backed tools (audio/image/YouTube) are registered
 conditionally — only when ``settings.gemini.api_key`` is set and the server
 has built a ``genai.Client``. ``register_upload_tool`` has no such
-dependency: it only needs the shared ``FileStore``, which ``server.py``
-constructs unconditionally. See ``server.py`` for the wiring.
+dependency. See ``server.py`` for the wiring.
 
-Generated and uploaded bytes land in the shared on-disk ``FileStore``; the
-Discord ``send_message`` tool resolves them via the ``file_handles``
-parameter.
+Two different paths produce bytes, and they have different constraints.
+Gemini-generated audio/image bytes are produced server-side and never touch
+the model's context, so they land in the in-process ``FileStore``.
+Agent-produced files cannot use a tool argument at all — the model would have
+to emit the whole file as base64 — so ``create_file_upload_url`` mints a
+one-time URL the sandbox PUTs to, and the bytes land in Postgres. Both are
+resolved by Discord ``send_message`` via the ``file_handles`` parameter.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
 
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
-from daimon.adapters.mcp.file_store import FileStore
+from daimon.adapters.mcp.file_store import FileStore, display_filename_for
+from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.services._usage import MediaUsage
 from daimon.adapters.mcp.services.audio import DISCORD_FILE_SIZE_LIMIT, TTS_MODEL, AudioService
 from daimon.adapters.mcp.services.image import (
@@ -40,6 +43,7 @@ from daimon.core.billing import BillingConfig
 from daimon.core.media.audio_script import DEFAULT_VOICE_MAP, parse_script, validate_script
 from daimon.core.media.youtube_url import extract_video_id
 from daimon.core.pricing import MODEL_PRICING
+from daimon.core.stores.file_uploads import MAX_UPLOAD_BYTES, create_upload
 from daimon.core.usage_recording import record_media_usage
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -403,60 +407,65 @@ def _register_youtube(
         return result.text
 
 
-def register_upload_tool(mcp: FastMCP, *, file_store: FileStore) -> None:
-    """Register ``upload_file``, independent of any Gemini configuration.
+def register_upload_tool(mcp: FastMCP, *, runtime: McpRuntime) -> None:
+    """Register ``create_file_upload_url``, independent of any Gemini configuration.
 
     Unlike the three tools above, this needs no paid external call — no
     admission/billing gate, just the ordinary auth check every tool has.
     """
 
     @mcp.tool
-    async def upload_file(  # pyright: ignore[reportUnusedFunction]
+    async def create_file_upload_url(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
-        data: str,
         title: str,
         mime_type: str,
     ) -> str:
-        """Hand daimon a file you produced — a chart, a table, a small data
-        file — so it can be posted as a Discord attachment.
+        """Get a one-time URL for uploading a file you produced — a chart, a
+        table, a data file — so it can be posted as a Discord attachment.
 
-        ``data`` is base64-encoded bytes, capped at 3 MB decoded (a base64
-        tool argument cannot carry much more than that). For larger files,
-        use ``create_attachment_upload_url`` instead — the sandbox PUTs the
-        bytes directly, bypassing this argument-size ceiling.
+        Call this FIRST, then send the bytes from your sandbox with curl:
+
+            curl -sS -X PUT --data-binary @chart.png "<upload_url>"
+
+        Do NOT base64 the file into a tool argument. The bytes go straight from
+        your sandbox over HTTP; they never pass through your context, so a large
+        file costs you nothing and cannot be truncated in transit.
 
         ``mime_type`` is required (e.g. "image/png", "text/csv") — it is not
         guessed, since a wrong one produces a wrong file extension.
 
-        Returns the stored size and a handle id. Pass the handle id to
-        ``send_message``'s ``file_handles`` argument to post it, in the same
-        channel/thread where the user asked — do not post to a different
-        channel unless the user explicitly names one.
+        Returns an ``upload_url`` and a ``handle_id``. After the PUT succeeds,
+        pass the handle id to ``send_message``'s ``file_handles`` argument to
+        post it, in the same channel/thread where the user asked — do not post
+        to a different channel unless the user explicitly names one. The URL is
+        single-use and expires; mint a new one per file.
         """
-        await _auth(ctx)
+        auth = await _auth(ctx)
 
-        try:
-            decoded = base64.b64decode(data, validate=True)
-        except binascii.Error as e:
-            raise ToolError(f"TERMINAL ERROR: {data!r} is not valid base64: {e}") from e
-
-        if len(decoded) > _UPLOAD_MAX_DECODED_BYTES:
+        public_url = runtime.settings.mcp.public_url
+        if public_url is None:
             raise ToolError(
-                f"TERMINAL ERROR: Decoded file is "
-                f"{len(decoded) / 1_000_000:.1f} MB, exceeding the "
-                f"{_UPLOAD_MAX_DECODED_BYTES / 1_000_000:.0f} MB limit for this tool. "
-                f"Use create_attachment_upload_url for larger files."
+                "TERMINAL ERROR: file upload is unavailable — this deployment has no "
+                "configured public URL, so an upload URL cannot be minted."
             )
 
-        try:
-            handle = file_store.put(data=decoded, mime_type=mime_type, title=title)
-        except ValueError as e:
-            raise ToolError(f"TERMINAL ERROR: {e}") from e
+        async with runtime.session_factory() as session:
+            row, upload_token = await create_upload(
+                session,
+                tenant_id=auth.tenant_id,
+                title=title,
+                display_filename=display_filename_for(title, mime_type),
+                content_type=mime_type,
+                now=datetime.now(UTC),
+            )
+            await session.commit()
 
-        size_mb = len(decoded) / 1_000_000
+        upload_url = f"{str(public_url).rstrip('/')}/uploads/{upload_token}"
         return (
-            f"Uploaded {title!r} ({size_mb:.1f} MB). "
-            f"Post it by passing handle id {handle.id!r} to `send_message`'s "
+            f"Upload {row.display_filename!r} with:\n"
+            f'  curl -sS -X PUT --data-binary @<your-file> "{upload_url}"\n'
+            f"Then post it by passing handle id {row.id!r} to `send_message`'s "
             f"`file_handles` argument. Use the same channel/thread where the user "
-            f"asked — do not post to a different channel."
+            f"asked — do not post to a different channel. Max "
+            f"{MAX_UPLOAD_BYTES // 1_000_000} MB; the URL is single-use."
         )

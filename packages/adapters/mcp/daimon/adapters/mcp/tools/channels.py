@@ -160,10 +160,13 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ``attachments=[{url, filename}]`` fetches over https, restricted to
         Discord's own CDN hosts — an arbitrary external URL will be refused
         (<=25 MiB each). ``file_handles=[handle_id, ...]`` references any
-        file already in daimon's file store — this is how you post a file
+        file daimon is already holding — this is how you post a file
         you produced yourself, not only output from a built-in tool. Any
         tool that stores a file and returns a handle works here (e.g.
-        ``upload_file``, ``generate_audio``, ``generate_image``). Combined
+        ``create_file_upload_url``, ``generate_audio``, ``generate_image``).
+        To post a file you made in your sandbox, call
+        ``create_file_upload_url`` first and PUT the bytes to the URL it
+        returns — never base64 a file into a tool argument. Combined
         cap of 10 attachments per message.
         """
         auth = await _auth(ctx)

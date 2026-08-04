@@ -77,6 +77,19 @@ def _sanitize_title(title: str) -> str:
     return cleaned or "file"
 
 
+def display_filename_for(title: str, mime_type: str) -> str:
+    """Build the user-visible filename for an agent-supplied title.
+
+    The extension is appended only when the title does not already end in it —
+    an agent that helpfully passes "chart.jpg" should not get "chart.jpg.jpg".
+    """
+    cleaned = _sanitize_title(title)
+    ext = _extension_for_mime(mime_type)
+    if cleaned.lower().endswith(ext.lower()):
+        return cleaned
+    return f"{cleaned}{ext}"
+
+
 def _mint_id(mime_type: str) -> str:
     return f"{secrets.token_urlsafe(8)}{_extension_for_mime(mime_type)}"
 
@@ -218,8 +231,7 @@ class FileStore:
         while self._data_path(handle_id).exists():
             handle_id = _mint_id(mime_type)
 
-        ext = _extension_for_mime(mime_type)
-        display_filename = f"{_sanitize_title(title)}{ext}"
+        display_filename = display_filename_for(title, mime_type)
         created_at = self._now()
 
         tmp_path = self._tmp_path(handle_id)

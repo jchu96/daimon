@@ -66,19 +66,51 @@ def _payload_from_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     raise AssertionError(f"no payload_json part in multipart form: {kwargs!r}")
 
 
-def _runtime_with_discord_token(*, file_store: FileStore | None) -> McpRuntime:
+class _ReusingFactory:
+    """A session_factory that yields the test's own session.
+
+    Rows written by a test live in an uncommitted, schema-isolated
+    transaction, so a second connection could not see them.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def __call__(self) -> _ReusingFactory:
+        return self
+
+    async def __aenter__(self) -> AsyncSession:
+        return self._session
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
+def _reusing_factory(session: AsyncSession) -> async_sessionmaker[AsyncSession]:
+    return _ReusingFactory(session)  # pyright: ignore[reportReturnType]
+
+
+def _runtime_with_discord_token(
+    *,
+    file_store: FileStore | None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> McpRuntime:
     """Build an McpRuntime with a Settings carrying a discord.bot_token.
 
-    `session_factory` and `client` are real (unbound/unrouted) SDK objects
-    the impl never touches in these tests -- `rest_client` opens its own
-    per-call Discord HTTP client instead of reusing either.
+    `client` is a real (unrouted) SDK object the impl never touches --
+    `rest_client` opens its own per-call Discord HTTP client instead.
+    `session_factory` defaults to an unbound one, which is fine for every
+    path that resolves its handles out of the file store; a test that
+    exercises a handle the store does not hold must pass a bound one, since
+    an unrecognised handle now falls through to a Postgres lookup.
     """
     settings = Settings(
         database=DatabaseSettings(url="postgresql+asyncpg://x/y"),  # pyright: ignore[reportArgumentType]
         anthropic=AnthropicSettings(api_key=SecretStr("k")),
         discord=DiscordSettings(bot_token=SecretStr("test-bot-token")),
     )
-    session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker()  # type: ignore[call-arg]
+    if session_factory is None:
+        session_factory = async_sessionmaker()  # type: ignore[call-arg]
     return McpRuntime(
         session_factory=session_factory,
         client=AsyncAnthropic(api_key="k"),
@@ -483,7 +515,7 @@ async def test_post_wizard_maps_same_named_attachments_to_distinct_handles(
 
 
 async def test_post_wizard_rejects_a_missing_file_handle(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_session: AsyncSession
 ) -> None:
     store = FileStore(base_dir=tmp_path)
     spec = WizardSpec(
@@ -505,7 +537,9 @@ async def test_post_wizard_rejects_a_missing_file_handle(
     patch_discord_http(monkeypatch, handler)
     with pytest.raises(ToolError, match="nope.png"):
         await _post_wizard_impl(
-            _runtime_with_discord_token(file_store=store),
+            _runtime_with_discord_token(
+                file_store=store, session_factory=_reusing_factory(db_session)
+            ),
             _auth(),
             channel_id="222",
             spec=spec,
