@@ -19,7 +19,6 @@ def test_mcp_runtime_is_frozen_dataclass_with_required_fields() -> None:
         "settings",
         "deployment_default",
         "gemini_client",
-        "file_store",
         "notebook_rate_limiter",
         "fernet",
     }, (
@@ -44,8 +43,8 @@ def test_mcp_runtime_is_frozen_dataclass_with_required_fields() -> None:
         raise AssertionError("McpRuntime should be frozen")
 
 
-def test_mcp_runtime_media_fields_default_to_none() -> None:
-    """gemini_client and file_store are optional, default to None
+def test_mcp_runtime_optional_fields_default_to_none() -> None:
+    """gemini_client is optional and defaults to None
     so non-Gemini deployments don't have to construct them."""
     sf: async_sessionmaker[AsyncSession] = async_sessionmaker()  # type: ignore[call-arg]
     rt = McpRuntime(
@@ -58,4 +57,3 @@ def test_mcp_runtime_media_fields_default_to_none() -> None:
         deployment_default=DeploymentDefault(),
     )
     assert rt.gemini_client is None
-    assert rt.file_store is None

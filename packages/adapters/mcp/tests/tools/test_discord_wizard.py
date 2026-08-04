@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,15 +27,17 @@ import discord.http
 import pytest
 from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
-from daimon.adapters.mcp.file_store import FileStore
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.discord import (
     _post_wizard_impl,  # pyright: ignore[reportPrivateUsage]
 )
 from daimon.core.config import AnthropicSettings, DatabaseSettings, DiscordSettings, Settings
+from daimon.core.media.filenames import display_filename_for
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.domain import Role
+from daimon.core.stores.file_uploads import create_upload, store_upload_content
 from daimon.core.wizard.spec import Option, Step, StepKind, WizardSpec
+from daimon.testing.factories import make_tenant
 from fastmcp.exceptions import ToolError
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -90,9 +93,25 @@ def _reusing_factory(session: AsyncSession) -> async_sessionmaker[AsyncSession]:
     return _ReusingFactory(session)  # pyright: ignore[reportReturnType]
 
 
+async def _stage_image(
+    session: AsyncSession, tenant_id: uuid.UUID, *, data: bytes, title: str
+) -> str:
+    """Stage an image the way create_file_upload_url + a sandbox PUT would."""
+    now = datetime.now(UTC)
+    row, token = await create_upload(
+        session,
+        tenant_id=tenant_id,
+        title=title,
+        display_filename=display_filename_for(title, "image/png"),
+        content_type="image/png",
+        now=now,
+    )
+    await store_upload_content(session, upload_token=token, data=data, now=now)
+    return row.id
+
+
 def _runtime_with_discord_token(
     *,
-    file_store: FileStore | None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> McpRuntime:
     """Build an McpRuntime with a Settings carrying a discord.bot_token.
@@ -116,14 +135,18 @@ def _runtime_with_discord_token(
         client=AsyncAnthropic(api_key="k"),
         settings=settings,
         deployment_default=DeploymentDefault(),
-        file_store=file_store,
     )
 
 
-def _auth(*, external_id: str = "111", platform_user_id: str = "42") -> AuthIdentity:
+def _auth(
+    *,
+    external_id: str = "111",
+    platform_user_id: str = "42",
+    tenant_id: uuid.UUID | None = None,
+) -> AuthIdentity:
     return AuthIdentity(
         account_id=uuid.uuid4(),
-        tenant_id=uuid.uuid4(),
+        tenant_id=tenant_id or uuid.uuid4(),
         role=Role.USER,
         platform="discord",
         external_id=external_id,
@@ -281,7 +304,7 @@ def _happy_path_handler(
 
 
 async def test_post_wizard_sets_the_components_v2_flag_from_the_view(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     posted: dict[str, Any] = {}
     patch_discord_http(monkeypatch, _happy_path_handler(posted))
@@ -294,7 +317,7 @@ async def test_post_wizard_sets_the_components_v2_flag_from_the_view(
         ],
     )
     await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=None),
+        _runtime_with_discord_token(),
         _auth(),
         channel_id="222",
         spec=spec,
@@ -306,9 +329,7 @@ async def test_post_wizard_sets_the_components_v2_flag_from_the_view(
     )
 
 
-async def test_post_wizard_sends_no_message_content(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_post_wizard_sends_no_message_content(monkeypatch: pytest.MonkeyPatch) -> None:
     posted: dict[str, Any] = {}
     patch_discord_http(monkeypatch, _happy_path_handler(posted))
     spec = WizardSpec(
@@ -320,7 +341,7 @@ async def test_post_wizard_sends_no_message_content(
         ],
     )
     await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=None),
+        _runtime_with_discord_token(),
         _auth(),
         channel_id="222",
         spec=spec,
@@ -333,9 +354,7 @@ async def test_post_wizard_sends_no_message_content(
     )
 
 
-async def test_post_wizard_suppresses_every_mention(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_post_wizard_suppresses_every_mention(monkeypatch: pytest.MonkeyPatch) -> None:
     """The head text carries the agent-authored prompt and question verbatim,
     so an injected mass mention would ping the whole channel."""
     posted: dict[str, Any] = {}
@@ -352,7 +371,7 @@ async def test_post_wizard_suppresses_every_mention(
         ],
     )
     await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=None),
+        _runtime_with_discord_token(),
         _auth(),
         channel_id="222",
         spec=spec,
@@ -365,17 +384,17 @@ async def test_post_wizard_suppresses_every_mention(
 
 
 async def test_post_wizard_uploads_every_step_image_but_references_only_the_first(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession
 ) -> None:
-    store = FileStore(base_dir=tmp_path)
-    handle1 = store.put(data=b"PNGDATA1", mime_type="image/png", title="step1")
-    handle2 = store.put(data=b"PNGDATA2", mime_type="image/png", title="step2")
-    spec = _two_image_spec_for(handle1.id, handle2.id)
+    tenant = await make_tenant(db_session)
+    h1 = await _stage_image(db_session, tenant.id, data=b"PNGDATA1", title="step1")
+    h2 = await _stage_image(db_session, tenant.id, data=b"PNGDATA2", title="step2")
+    spec = _two_image_spec_for(h1, h2)
     posted: dict[str, Any] = {}
     patch_discord_http(monkeypatch, _happy_path_handler(posted))
     await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=store),
-        _auth(),
+        _runtime_with_discord_token(session_factory=_reusing_factory(db_session)),
+        _auth(tenant_id=tenant.id),
         channel_id="222",
         spec=spec,
         short_id="abcd1234",
@@ -393,12 +412,12 @@ async def test_post_wizard_uploads_every_step_image_but_references_only_the_firs
 
 
 async def test_post_wizard_returns_a_url_for_every_uploaded_handle(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession
 ) -> None:
-    store = FileStore(base_dir=tmp_path)
-    handle1 = store.put(data=b"PNGDATA1", mime_type="image/png", title="step1")
-    handle2 = store.put(data=b"PNGDATA2", mime_type="image/png", title="step2")
-    spec = _two_image_spec_for(handle1.id, handle2.id)
+    tenant = await make_tenant(db_session)
+    h1 = await _stage_image(db_session, tenant.id, data=b"PNGDATA1", title="step1")
+    h2 = await _stage_image(db_session, tenant.id, data=b"PNGDATA2", title="step2")
+    spec = _two_image_spec_for(h1, h2)
     posted: dict[str, Any] = {}
 
     def handler_factory() -> Any:
@@ -438,33 +457,31 @@ async def test_post_wizard_returns_a_url_for_every_uploaded_handle(
 
     patch_discord_http(monkeypatch, handler_factory())
     posted_wizard = await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=store),
-        _auth(),
+        _runtime_with_discord_token(session_factory=_reusing_factory(db_session)),
+        _auth(tenant_id=tenant.id),
         channel_id="222",
         spec=spec,
         short_id="abcd1234",
     )
-    assert posted_wizard.image_urls[handle1.id] == (
+    assert posted_wizard.image_urls[h1] == (
         "https://cdn.discordapp.com/attachments/1/2/step1.png?ex=abc123"
     ), "each handle must map to the durable url the platform minted for it"
-    assert posted_wizard.image_urls[handle2.id] == (
+    assert posted_wizard.image_urls[h2] == (
         "https://cdn.discordapp.com/attachments/1/2/step2.png?ex=def456"
     ), "the later step's handle must also resolve, even though it isn't displayed"
 
 
 async def test_post_wizard_maps_same_named_attachments_to_distinct_handles(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession
 ) -> None:
     """A file's display name is slugged from the agent-supplied title, so two
     steps whose images share a title upload under one filename -- each handle
     must still resolve to its own attachment."""
-    store = FileStore(base_dir=tmp_path)
-    handle1 = store.put(data=b"PNGDATA1", mime_type="image/png", title="chart")
-    handle2 = store.put(data=b"PNGDATA2", mime_type="image/png", title="chart")
-    assert store.get(handle1.id).display_filename == store.get(handle2.id).display_filename, (
-        "the two handles must genuinely collide on filename for this test to mean anything"
-    )
-    spec = _two_image_spec_for(handle1.id, handle2.id)
+    tenant = await make_tenant(db_session)
+    h1 = await _stage_image(db_session, tenant.id, data=b"PNGDATA1", title="chart")
+    h2 = await _stage_image(db_session, tenant.id, data=b"PNGDATA2", title="chart")
+    assert h1 != h2, "distinct uploads must mint distinct handles"
+    spec = _two_image_spec_for(h1, h2)
 
     async def handler(route: discord.http.Route, kwargs: dict[str, Any]) -> Any:
         if route.path == "/guilds/{guild_id}":
@@ -499,17 +516,17 @@ async def test_post_wizard_maps_same_named_attachments_to_distinct_handles(
 
     patch_discord_http(monkeypatch, handler)
     posted_wizard = await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=store),
-        _auth(),
+        _runtime_with_discord_token(session_factory=_reusing_factory(db_session)),
+        _auth(tenant_id=tenant.id),
         channel_id="222",
         spec=spec,
         short_id="abcd1234",
     )
 
-    assert posted_wizard.image_urls[handle1.id] == (
+    assert posted_wizard.image_urls[h1] == (
         "https://cdn.discordapp.com/attachments/1/2/chart.png?ex=first"
     ), "the first step's handle must resolve to the first uploaded attachment"
-    assert posted_wizard.image_urls[handle2.id] == (
+    assert posted_wizard.image_urls[h2] == (
         "https://cdn.discordapp.com/attachments/1/3/chart.png?ex=second"
     ), "the second step must not inherit the first step's image"
 
@@ -517,7 +534,6 @@ async def test_post_wizard_maps_same_named_attachments_to_distinct_handles(
 async def test_post_wizard_rejects_a_missing_file_handle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_session: AsyncSession
 ) -> None:
-    store = FileStore(base_dir=tmp_path)
     spec = WizardSpec(
         prompt="p",
         steps=[
@@ -537,9 +553,7 @@ async def test_post_wizard_rejects_a_missing_file_handle(
     patch_discord_http(monkeypatch, handler)
     with pytest.raises(ToolError, match="nope.png"):
         await _post_wizard_impl(
-            _runtime_with_discord_token(
-                file_store=store, session_factory=_reusing_factory(db_session)
-            ),
+            _runtime_with_discord_token(session_factory=_reusing_factory(db_session)),
             _auth(),
             channel_id="222",
             spec=spec,
@@ -575,7 +589,7 @@ async def test_post_wizard_refuses_a_channel_the_requester_cannot_see(
     patch_discord_http(monkeypatch, handler)
     with pytest.raises(ToolError, match="send_messages"):
         await _post_wizard_impl(
-            _runtime_with_discord_token(file_store=None),
+            _runtime_with_discord_token(),
             _auth(),
             channel_id="222",
             spec=spec,
@@ -583,9 +597,7 @@ async def test_post_wizard_refuses_a_channel_the_requester_cannot_see(
         )
 
 
-async def test_post_wizard_posts_a_form_with_no_images(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_post_wizard_posts_a_form_with_no_images(monkeypatch: pytest.MonkeyPatch) -> None:
     posted: dict[str, Any] = {}
     patch_discord_http(monkeypatch, _happy_path_handler(posted))
     spec = WizardSpec(
@@ -597,7 +609,7 @@ async def test_post_wizard_posts_a_form_with_no_images(
         ],
     )
     posted_wizard = await _post_wizard_impl(
-        _runtime_with_discord_token(file_store=None),
+        _runtime_with_discord_token(),
         _auth(),
         channel_id="222",
         spec=spec,

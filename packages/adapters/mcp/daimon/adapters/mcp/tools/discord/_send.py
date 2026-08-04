@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 import aiohttp
 import discord
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
-from daimon.adapters.mcp.file_store import FileStore
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.discord._client import (
     _require_bot_token,  # pyright: ignore[reportPrivateUsage]
@@ -85,42 +84,29 @@ async def _build_files(
 async def _build_files_from_handles(
     filenames: list[str],
     *,
-    store: FileStore,
     session_factory: async_sessionmaker[AsyncSession],
     tenant_id: uuid.UUID,
 ) -> list[discord.File]:
     """Resolve file handles into discord.File attachments.
 
-    Two producers mint handles and they live in different places. Bytes
-    generated server-side by ``generate_audio`` / ``generate_image`` land in
-    the in-process ``FileStore``; files the agent uploaded via
-    ``create_file_upload_url`` are staged in Postgres, so they survive the PUT
-    and the read landing on different mcp instances.
+    Handles name rows staged in Postgres by ``create_file_upload_url``, which
+    the agent's sandbox filled with a direct PUT. Postgres rather than instance
+    storage because the PUT and this read are separate HTTP requests and mcp
+    runs several instances with no session affinity.
 
-    The store is checked first because it is in-process — a generated handle
-    resolves without a DB round trip, and only an unrecognised handle pays for
-    the Postgres lookup.
-
-    The error string must surface the rejected filename so an agent can fix
-    the call without inspecting structured tool output.
+    The error string must surface the rejected handle so an agent can fix the
+    call without inspecting structured tool output.
     """
     if len(filenames) > _MAX_ATTACHMENTS_PER_MESSAGE:
         raise ToolError("max 10 attachments per message")
     files: list[discord.File] = []
     for name in filenames:
-        try:
-            handle = store.get(name)
-        except KeyError:
-            pass
-        else:
-            files.append(discord.File(fp=io.BytesIO(handle.data), filename=handle.display_filename))
-            continue
-
         async with session_factory() as session:
             upload = await get_upload(session, tenant_id=tenant_id, handle_id=name)
         if upload is None:
             raise ToolError(
-                f"file handle {name!r} not found — generate it first, or check the handle id"
+                f"file handle {name!r} not found — mint one with create_file_upload_url, "
+                f"or check the handle id"
             )
         if upload.content is None:
             raise ToolError(
@@ -159,15 +145,9 @@ async def _send_message_impl(  # pyright: ignore[reportUnusedFunction]
             async with aiohttp.ClientSession() as http_session:
                 files.extend(await _build_files(attachments, session=http_session))
     if file_handles:
-        if runtime.file_store is None:
-            # The mcp server always constructs a file store today (see
-            # server.py); this branch only guards a runtime that skipped
-            # that wiring (e.g. a test-built McpRuntime), not a missing key.
-            raise ToolError("file_handles requires the mcp process's file store to be available")
         files.extend(
             await _build_files_from_handles(
                 file_handles,
-                store=runtime.file_store,
                 session_factory=runtime.session_factory,
                 tenant_id=auth.tenant_id,
             )

@@ -18,7 +18,6 @@ dependencies = [
     "discord.py>=2.7,<3",
     "aiohttp>=3.10",
     "google-genai>=2.5,<3",
-    "pydub>=0.25.1",
     "imageio-ffmpeg>=0.6",
     "slack-sdk>=3.42,<4",
 ]

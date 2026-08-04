@@ -10,9 +10,7 @@ any collaborator the caller supplied.
 
 from __future__ import annotations
 
-import tempfile
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -20,7 +18,6 @@ import structlog
 from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.auth.verifier import DaimonJWTVerifier
 from daimon.adapters.mcp.checkout import billing_cancel, billing_success, build_checkout_route
-from daimon.adapters.mcp.file_store import FileStore
 from daimon.adapters.mcp.middleware.ma_errors import MaErrorMiddleware
 from daimon.adapters.mcp.middleware.mcp_identity import (
     ClaimResolver,
@@ -229,10 +226,6 @@ def create_mcp_app(
     # it, the three generation tools skip registration and the rest of the mcp
     # surface (including file storage) boots normally.
     gemini_client: genai.Client | None = None
-    file_store_dir: Path = effective_settings.mcp.file_store_dir or (
-        Path(tempfile.gettempdir()) / "daimon-mcp-files"
-    )
-    file_store: FileStore = FileStore(base_dir=file_store_dir)
     if effective_settings.gemini.api_key is not None:
         gemini_client = genai.Client(api_key=effective_settings.gemini.api_key.get_secret_value())
 
@@ -254,7 +247,6 @@ def create_mcp_app(
         settings=effective_settings,
         deployment_default=deployment_default,
         gemini_client=gemini_client,
-        file_store=file_store,
         notebook_rate_limiter=notebook_rate_limiter,
         fernet=fernet,
     )
@@ -280,13 +272,11 @@ def create_mcp_app(
     register_propagation_tools(mcp, runtime)  # set/clear agent default
 
     register_upload_tool(mcp, runtime=runtime)
-    log.info("mcp.file_store_ready", store_dir=str(file_store_dir))
 
     if gemini_client is not None:
         register_media_tools(
             mcp,
             gemini_client=gemini_client,
-            file_store=file_store,
             sessionmaker=effective_sessionmaker,
             billing_config=effective_billing_config,
             markup=effective_settings.billing.markup,

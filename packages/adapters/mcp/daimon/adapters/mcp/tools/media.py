@@ -1,36 +1,23 @@
-"""Media MCP tools: audio, image, YouTube transcript, and file upload.
+"""Media MCP tools: YouTube transcript and file upload.
 
-The three Gemini-backed tools (audio/image/YouTube) are registered
-conditionally — only when ``settings.gemini.api_key`` is set and the server
-has built a ``genai.Client``. ``register_upload_tool`` has no such
-dependency. See ``server.py`` for the wiring.
+``fetch_youtube_transcript`` is Gemini-backed and registers only when
+``settings.gemini.api_key`` is set and the server has built a ``genai.Client``.
+``register_upload_tool`` has no such dependency. See ``server.py`` for wiring.
 
-Two different paths produce bytes, and they have different constraints.
-Gemini-generated audio/image bytes are produced server-side and never touch
-the model's context, so they land in the in-process ``FileStore``.
-Agent-produced files cannot use a tool argument at all — the model would have
-to emit the whole file as base64 — so ``create_file_upload_url`` mints a
-one-time URL the sandbox PUTs to, and the bytes land in Postgres. Both are
-resolved by Discord ``send_message`` via the ``file_handles`` parameter.
+Agent-produced files cannot travel as a tool argument — the model would have to
+emit the whole file as base64 — so ``create_file_upload_url`` mints a one-time
+URL the sandbox PUTs to, and the bytes land in Postgres. Discord
+``send_message`` resolves them via the ``file_handles`` parameter.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from enum import StrEnum
-from typing import Annotated, Literal
 
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
-from daimon.adapters.mcp.file_store import FileStore, display_filename_for
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.services._usage import MediaUsage
-from daimon.adapters.mcp.services.audio import DISCORD_FILE_SIZE_LIMIT, TTS_MODEL, AudioService
-from daimon.adapters.mcp.services.image import (
-    IMAGE_MODEL,
-    ImageGenerationRefused,
-    ImageService,
-)
 from daimon.adapters.mcp.services.youtube import (
     _MODEL as YOUTUBE_MODEL,  # pyright: ignore[reportPrivateUsage]
 )
@@ -40,7 +27,7 @@ from daimon.adapters.mcp.tools._ctx import (
     _check_admission,  # pyright: ignore[reportPrivateUsage]
 )
 from daimon.core.billing import BillingConfig
-from daimon.core.media.audio_script import DEFAULT_VOICE_MAP, parse_script, validate_script
+from daimon.core.media.filenames import display_filename_for
 from daimon.core.media.youtube_url import extract_video_id
 from daimon.core.pricing import MODEL_PRICING
 from daimon.core.stores.file_uploads import MAX_UPLOAD_BYTES, create_upload
@@ -48,44 +35,7 @@ from daimon.core.usage_recording import record_media_usage
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from google import genai
-from google.genai import errors
-from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-# A base64 tool argument cannot carry large payloads (the codebase's own
-# recorded experience — see notebook.py's upload-URL tools). This ceiling
-# sits far below FileStore.MAX_FILE_SIZE (24 MB, a Discord upload limit) so
-# an over-limit caller is rejected here, cheaply, before ever reaching the
-# store's own check.
-_UPLOAD_MAX_DECODED_BYTES = 3_000_000  # 3 MB decoded
-
-GeminiVoice = Literal[
-    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
-    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
-    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
-    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
-    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
-]  # fmt: skip
-
-
-class AspectRatio(StrEnum):
-    SQUARE = "1:1"
-    ULTRA_TALL = "1:4"
-    EXTREME_TALL = "1:8"
-    PORTRAIT_2_3 = "2:3"
-    LANDSCAPE_3_2 = "3:2"
-    PORTRAIT_3_4 = "3:4"
-    ULTRA_WIDE_4_1 = "4:1"
-    LANDSCAPE_4_3 = "4:3"
-    PORTRAIT_4_5 = "4:5"
-    LANDSCAPE_5_4 = "5:4"
-    ULTRA_WIDE_8_1 = "8:1"
-    PORTRAIT_9_16 = "9:16"
-    LANDSCAPE_16_9 = "16:9"
-    CINEMATIC = "21:9"
-
-
-_VALID_ASPECT_RATIOS = ", ".join(r.value for r in AspectRatio)
 
 
 async def _meter_billed_call(
@@ -121,222 +71,18 @@ def register_media_tools(
     mcp: FastMCP,
     *,
     gemini_client: genai.Client,
-    file_store: FileStore,
     sessionmaker: async_sessionmaker[AsyncSession],
     billing_config: BillingConfig | None,
     markup: Decimal,
 ) -> None:
-    """Register the three Gemini-backed media tools on ``mcp``."""
-
-    audio_service = AudioService(client=gemini_client)
-    image_service = ImageService(client=gemini_client)
-    youtube_service = YouTubeService(client=gemini_client)
-    _register_audio(
-        mcp,
-        audio_service=audio_service,
-        file_store=file_store,
-        sessionmaker=sessionmaker,
-        billing_config=billing_config,
-        markup=markup,
-    )
-    _register_image(
-        mcp,
-        image_service=image_service,
-        file_store=file_store,
-        sessionmaker=sessionmaker,
-        billing_config=billing_config,
-        markup=markup,
-    )
+    """Register the Gemini-backed media tools on ``mcp``."""
     _register_youtube(
         mcp,
-        youtube_service=youtube_service,
+        youtube_service=YouTubeService(client=gemini_client),
         sessionmaker=sessionmaker,
         billing_config=billing_config,
         markup=markup,
     )
-
-
-def _register_audio(
-    mcp: FastMCP,
-    *,
-    audio_service: AudioService,
-    file_store: FileStore,
-    sessionmaker: async_sessionmaker[AsyncSession],
-    billing_config: BillingConfig | None,
-    markup: Decimal,
-) -> None:
-    @mcp.tool
-    async def generate_audio(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context,
-        script: str,
-        title: str,
-        voices: Annotated[
-            dict[str, GeminiVoice] | None,
-            Field(
-                description=(
-                    "Map speaker tag -> Gemini voice. Default is Charon for all "
-                    "speakers — only override if the user explicitly requests "
-                    "different voices. Example: {'HOST_A': 'Fenrir', 'HOST_B': 'Charon'}."
-                ),
-            ),
-        ] = None,
-    ) -> str:
-        """Generate audio from a speaker-tagged script and store it for later posting.
-
-        Scripts use uppercase [TAG] prefixes to mark speaker turns:
-
-            [NARRATOR] This is the brief.
-            [HOST_A] Welcome to the show.
-            [HOST_B] Let me break this down...
-
-        SCRIPT TONE — follow these strictly:
-        - Be direct and informative. State what happened, what it means, and
-          what's next. No hype, no cheerleading, no "incredible", "amazing",
-          "groundbreaking", "game-changing", or "exciting".
-        - Don't praise the community, the team, or the work. Report on it.
-        - Don't editorialize with superlatives. "The team shipped X" not
-          "The team shipped an absolutely stellar X".
-        - Conversational is fine. Enthusiasm about genuinely surprising things
-          is fine. But the default register is a calm, smart briefing — not a
-          hype reel.
-        - Never end with a generic motivational sign-off ("keep up the amazing
-          work!", "the future is bright!", "can't wait to see what's next!").
-          End with substance or just stop.
-
-        The MP3 is stored under "{title}.mp3". Post it back to the SAME
-        channel or thread where the user asked — pass the filename via
-        ``send_message``'s ``file_handles`` parameter. Never post to a
-        different channel unless the user explicitly names one.
-        """
-        auth = await _check_admission(
-            ctx,
-            sessionmaker=sessionmaker,
-            billing_config=billing_config,
-            tool_name="generate_audio",
-        )
-
-        voice_map: dict[str, str] = DEFAULT_VOICE_MAP | dict(voices or {})
-
-        try:
-            segments = parse_script(script)
-            validate_script(segments, voice_map)
-        except ValueError as e:
-            raise ToolError(f"TERMINAL ERROR: Invalid script: {e}") from e
-
-        try:
-            audio_result = await audio_service.generate(segments, voice_map)
-        except errors.ClientError as e:
-            if e.code == 429:
-                raise ToolError(f"Gemini rate limit hit. Wait a moment and retry: {e}") from e
-            raise ToolError(f"TERMINAL ERROR: Gemini rejected the request: {e}") from e
-        except errors.ServerError as e:
-            raise ToolError(f"Gemini API server error (retryable): {e}") from e
-
-        await _meter_billed_call(
-            auth,
-            sessionmaker=sessionmaker,
-            markup=markup,
-            model_id=TTS_MODEL,
-            usage=audio_result.usage,
-        )
-
-        mp3_bytes = audio_result.mp3
-        if len(mp3_bytes) > DISCORD_FILE_SIZE_LIMIT:
-            raise ToolError(
-                f"TERMINAL ERROR: Generated audio is {len(mp3_bytes) / 1_000_000:.1f} MB, "
-                f"exceeding Discord's 24 MB limit. Shorten the script and retry."
-            )
-
-        try:
-            handle = file_store.put(data=mp3_bytes, mime_type="audio/mpeg", title=title)
-        except ValueError as e:
-            raise ToolError(f"TERMINAL ERROR: {e}") from e
-
-        size_mb = len(mp3_bytes) / 1_000_000
-        return (
-            f"Generated audio for {title!r} ({size_mb:.1f} MB, {len(segments)} segments). "
-            f"Post it by passing handle id {handle.id!r} to `send_message`'s "
-            f"`file_handles` argument. Use the same channel/thread where the user "
-            f"asked — do not post to a different channel."
-        )
-
-
-def _register_image(
-    mcp: FastMCP,
-    *,
-    image_service: ImageService,
-    file_store: FileStore,
-    sessionmaker: async_sessionmaker[AsyncSession],
-    billing_config: BillingConfig | None,
-    markup: Decimal,
-) -> None:
-    @mcp.tool
-    async def generate_image(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context,
-        prompt: str,
-        title: str,
-        aspect_ratio: str = "1:1",
-    ) -> str:
-        """Generate an image from a text prompt using Gemini.
-
-        Returns the filename. Post it back to the SAME channel or thread
-        where the user asked — pass it via ``send_message``'s
-        ``file_handles`` parameter. Never post to a different channel
-        unless the user explicitly names one.
-
-        ``aspect_ratio`` must be one of: 1:1, 1:4, 1:8, 2:3, 3:2, 3:4,
-        4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9. Defaults to 1:1.
-
-        ``title`` is used as the filename (without extension). Use lowercase
-        kebab-case, e.g. "sunset-landscape" -> "sunset-landscape.jpg".
-        """
-        auth = await _check_admission(
-            ctx,
-            sessionmaker=sessionmaker,
-            billing_config=billing_config,
-            tool_name="generate_image",
-        )
-
-        if aspect_ratio not in {r.value for r in AspectRatio}:
-            raise ToolError(
-                f"TERMINAL ERROR: Invalid aspect_ratio '{aspect_ratio}'. "
-                f"Must be one of: {_VALID_ASPECT_RATIOS}"
-            )
-
-        try:
-            result = await image_service.generate(prompt=prompt, aspect_ratio=aspect_ratio)
-        except ImageGenerationRefused as e:
-            raise ToolError(
-                "TERMINAL ERROR: Image generation was refused by safety filters. "
-                "Try rephrasing the prompt. Do not retry the same prompt."
-            ) from e
-        except errors.ClientError as e:
-            if e.code == 429:
-                raise ToolError(f"Rate limited by Gemini. Wait a moment and retry: {e}") from e
-            raise ToolError(f"TERMINAL ERROR: Gemini rejected the request: {e}") from e
-        except errors.ServerError as e:
-            raise ToolError(f"Gemini API server error (retryable): {e}") from e
-
-        await _meter_billed_call(
-            auth,
-            sessionmaker=sessionmaker,
-            markup=markup,
-            model_id=IMAGE_MODEL,
-            usage=result.usage,
-        )
-
-        try:
-            handle = file_store.put(data=result.data, mime_type=result.mime_type, title=title)
-        except ValueError as e:
-            raise ToolError(f"TERMINAL ERROR: {e}") from e
-
-        size_mb = len(result.data) / 1_000_000
-        return (
-            f"Image stored for {title!r} ({size_mb:.1f} MB). "
-            f"Post it by passing handle id {handle.id!r} to `send_message`'s "
-            f"`file_handles` argument. Use the same channel/thread where the user "
-            f"asked — do not post to a different channel."
-        )
 
 
 def _register_youtube(

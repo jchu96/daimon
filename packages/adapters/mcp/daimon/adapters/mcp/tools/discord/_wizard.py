@@ -192,15 +192,8 @@ async def _post_wizard_impl(  # pyright: ignore[reportUnusedFunction]
     handles = [step.image_handle for step in spec.steps if step.image_handle is not None]
     files: list[discord.File] = []
     if handles:
-        file_store = runtime.file_store
-        if file_store is None:
-            raise ToolError(
-                "file_handles requires the media file store to be configured "
-                "(set DAIMON_GEMINI__API_KEY on the mcp process)"
-            )
         files = await _build_files_from_handles(
             handles,
-            store=file_store,
             session_factory=runtime.session_factory,
             tenant_id=auth.tenant_id,
         )

@@ -3,7 +3,7 @@
 Drives `_post_wizard_impl` (the tool-level one in `tools/wizard.py`, which
 delegates to the Discord-side `_post_wizard_impl` from `tools/discord/`) with
 a real `committing_sessionmaker` (real Postgres, per guideline:testing), a
-real `FileStore`, and a transport-level patched Discord `HTTPClient`
+staged uploads, and a transport-level patched Discord `HTTPClient`
 (`patch_discord_http`, loaded from the sibling conftest.py by file path —
 same trick `test_discord_wizard.py`/`test_credential_requests.py` use).
 
@@ -28,12 +28,13 @@ import discord.http
 import pytest
 from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
-from daimon.adapters.mcp.file_store import FileStore
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.wizard import _STOP_SIGNAL, _post_wizard_impl
 from daimon.core.config import AnthropicSettings, DatabaseSettings, DiscordSettings, Settings
+from daimon.core.media.filenames import display_filename_for
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.domain import Role
+from daimon.core.stores.file_uploads import create_upload, store_upload_content
 from daimon.core.stores.wizard_session import (
     count_wizard_sessions_for_platform_user,
     get_wizard_session,
@@ -66,7 +67,6 @@ _SHORT_ID_RE = re.compile(r"wz:([A-Za-z0-9]{8}):")
 def _runtime(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
-    file_store: FileStore | None = None,
     with_discord: bool = True,
 ) -> McpRuntime:
     settings = Settings(
@@ -79,7 +79,6 @@ def _runtime(
         client=AsyncAnthropic(api_key="k"),
         settings=settings,
         deployment_default=DeploymentDefault(),
-        file_store=file_store,
     )
 
 
@@ -321,6 +320,23 @@ async def test_post_wizard_stores_the_form_with_its_message_id(
     assert row.channel_id == "222"
 
 
+async def _stage_image(
+    session: AsyncSession, tenant_id: uuid.UUID, *, data: bytes, title: str
+) -> str:
+    """Stage an image the way create_file_upload_url + a sandbox PUT would."""
+    now = datetime.now(UTC)
+    row, token = await create_upload(
+        session,
+        tenant_id=tenant_id,
+        title=title,
+        display_filename=display_filename_for(title, "image/png"),
+        content_type="image/png",
+        now=now,
+    )
+    await store_upload_content(session, upload_token=token, data=data, now=now)
+    return row.id
+
+
 # ---------------------------------------------------------------------------
 # 3. Per-step content-delivery addresses persist
 # ---------------------------------------------------------------------------
@@ -334,10 +350,9 @@ async def test_post_wizard_persists_a_content_address_for_every_step_image(
 ) -> None:
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
+    handle1_id = await _stage_image(db_session, tenant.id, data=b"PNGDATA1", title="step1")
+    handle2_id = await _stage_image(db_session, tenant.id, data=b"PNGDATA2", title="step2")
     await db_session.commit()
-    store = FileStore(base_dir=tmp_path)
-    handle1 = store.put(data=b"PNGDATA1", mime_type="image/png", title="step1")
-    handle2 = store.put(data=b"PNGDATA2", mime_type="image/png", title="step2")
     posted: dict[str, Any] = {}
     patch_discord_http(
         monkeypatch,
@@ -347,14 +362,14 @@ async def test_post_wizard_persists_a_content_address_for_every_step_image(
             attachments=[
                 {
                     "id": "8001",
-                    "filename": "step1.png",  # matches store.put(title="step1") below
+                    "filename": "step1.png",  # matches the staged title ("step1") below
                     "url": "https://cdn.discordapp.com/attachments/1/2/step1.png?ex=abc123",
                     "proxy_url": "https://media.discordapp.net/attachments/1/2/step1.png?ex=abc123",
                     "size": 8,
                 },
                 {
                     "id": "8002",
-                    "filename": "step2.png",  # matches store.put(title="step2") below
+                    "filename": "step2.png",  # matches the staged title ("step2") below
                     "url": "https://cdn.discordapp.com/attachments/1/2/step2.png?ex=def456",
                     "proxy_url": "https://media.discordapp.net/attachments/1/2/step2.png?ex=def456",
                     "size": 8,
@@ -364,12 +379,12 @@ async def test_post_wizard_persists_a_content_address_for_every_step_image(
     )
 
     await _post_wizard_impl(
-        _runtime(committing_sessionmaker, file_store=store),
+        _runtime(committing_sessionmaker),
         _auth_identity(tenant_id=tenant.id, account_id=account.id),
         prompt="Configure the pipeline",
         steps=[
-            _one_choice_step(key="stage", image_handle=handle1.id),
-            _one_choice_step(key="region", image_handle=handle2.id),
+            _one_choice_step(key="stage", image_handle=handle1_id),
+            _one_choice_step(key="region", image_handle=handle2_id),
         ],
         channel_id="222",
     )
@@ -399,9 +414,8 @@ async def test_post_wizard_expiry_follows_the_image_signature(
 ) -> None:
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
+    handle_id = await _stage_image(db_session, tenant.id, data=b"PNGDATA", title="x")
     await db_session.commit()
-    store = FileStore(base_dir=tmp_path)
-    handle = store.put(data=b"PNGDATA", mime_type="image/png", title="x")
     an_hour_out = int((datetime.now(UTC) + timedelta(hours=1)).timestamp())
     posted: dict[str, Any] = {}
     patch_discord_http(
@@ -412,7 +426,7 @@ async def test_post_wizard_expiry_follows_the_image_signature(
             attachments=[
                 {
                     "id": "8001",
-                    "filename": "x.png",  # matches store.put(title="x") above
+                    "filename": "x.png",  # matches the staged title ("x") above
                     "url": f"https://cdn.discordapp.com/attachments/1/2/x.png?ex={an_hour_out:x}",
                     "proxy_url": f"https://media.discordapp.net/attachments/1/2/x.png?ex={an_hour_out:x}",
                     "size": 7,
@@ -423,10 +437,10 @@ async def test_post_wizard_expiry_follows_the_image_signature(
     before = datetime.now(UTC)
 
     await _post_wizard_impl(
-        _runtime(committing_sessionmaker, file_store=store),
+        _runtime(committing_sessionmaker),
         _auth_identity(tenant_id=tenant.id, account_id=account.id),
         prompt="Configure the pipeline",
-        steps=[_one_choice_step(image_handle=handle.id)],
+        steps=[_one_choice_step(image_handle=handle_id)],
         channel_id="222",
     )
 
