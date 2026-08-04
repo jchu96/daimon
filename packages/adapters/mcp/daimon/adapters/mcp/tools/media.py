@@ -188,8 +188,11 @@ def register_upload_tool(mcp: FastMCP, *, runtime: McpRuntime) -> None:
         """
         auth = await _auth(ctx)
 
-        public_url = runtime.settings.mcp.public_url
-        if public_url is None:
+        # app_root_url, not public_url: the PUT route is add_route'd at the app
+        # root beside /healthz, while public_url carries the /mcp streamable
+        # suffix. Minting from public_url yields /mcp/uploads/<token>, which 404s.
+        app_root = runtime.settings.mcp.app_root_url
+        if app_root is None:
             raise ToolError(
                 "TERMINAL ERROR: file upload is unavailable — this deployment has no "
                 "configured public URL, so an upload URL cannot be minted."
@@ -206,7 +209,7 @@ def register_upload_tool(mcp: FastMCP, *, runtime: McpRuntime) -> None:
             )
             await session.commit()
 
-        upload_url = f"{str(public_url).rstrip('/')}/uploads/{upload_token}"
+        upload_url = f"{app_root}/uploads/{upload_token}"
         return (
             f"Upload {row.display_filename!r} with:\n"
             f'  curl -sS -X PUT --data-binary @<your-file> "{upload_url}"\n'

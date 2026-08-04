@@ -160,6 +160,13 @@ async def test_create_file_upload_url_returns_a_put_url_and_a_handle(
     assert "/uploads/" in text, "result should carry the PUT url the sandbox curls to"
     assert "--data-binary" in text, "result should show the curl invocation to use"
     assert "handle id" in text, "result should name the handle to pass to send_message"
+    assert "/mcp/uploads/" not in text, (
+        "the PUT route is add_route'd at the app root, so the minted url must not "
+        "carry public_url's /mcp streamable suffix — that path 404s"
+    )
+    assert "https://t.example.com/uploads/" in text, (
+        "url should be built from app_root_url, beside /healthz"
+    )
 
 
 async def test_create_file_upload_url_takes_no_data_argument(
