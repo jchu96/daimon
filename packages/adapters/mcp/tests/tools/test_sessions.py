@@ -172,7 +172,11 @@ def _sessions_mcp_app(client: AsyncAnthropic, token: str, claims: dict[str, str]
 
 
 def _make_session_payload(
-    *, session_id: str = "ses_1", agent_id: str = "ag_a", status: str = "idle"
+    *,
+    session_id: str = "ses_1",
+    agent_id: str = "ag_a",
+    status: str = "idle",
+    account_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a BetaManagedAgentsSession payload via the real SDK constructor,
     then override ``status`` — the SDK's Literal cannot carry a novel value
@@ -198,7 +202,7 @@ def _make_session_payload(
             "updated_at": "2026-05-08T10:00:00Z",
             "outcome_evaluations": [],
             "environment_id": "env_1",
-            "metadata": {},
+            "metadata": {"daimon_account": str(account_id)},
             "resources": [],
             "stats": {},
             "status": "idle",
@@ -208,6 +212,9 @@ def _make_session_payload(
         }
     ).model_dump(mode="json")
     payload["status"] = status
+    # Session reads are scoped to the account that opened the session, so a
+    # payload with no daimon_account is unreadable by design.
+    payload["metadata"] = {"daimon_account": account_id} if account_id else {}
     return payload
 
 
@@ -243,9 +250,11 @@ async def test_get_session_admits_novel_status_string_through_fastmcp() -> None:
     bypasses the schema check entirely.
     """
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    account_id = uuid.uuid4()
     token = "get-session-novel-status"
     claims = {
-        "sub": str(uuid.uuid4()),
+        "sub": str(account_id),
         "tenant_id": str(tenant_id),
         "role": "user",
         "client_id": "test",
@@ -269,7 +278,10 @@ async def test_get_session_admits_novel_status_string_through_fastmcp() -> None:
         "GET",
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
-            200, json=_make_session_payload(session_id="ses_1", agent_id="ag_a", status="paused")
+            200,
+            json=_make_session_payload(
+                session_id="ses_1", agent_id="ag_a", status="paused", account_id=str(account_id)
+            ),
         ),
     )
     client = build_fake_anthropic(router.dispatch)
@@ -298,9 +310,10 @@ async def test_list_session_events_admits_thread_status_events_through_fastmcp()
     (the #214 failure mode, on the tenant tool surface).
     """
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
     token = "list-events-novel-type"
     claims = {
-        "sub": str(uuid.uuid4()),
+        "sub": str(account_id),
         "tenant_id": str(tenant_id),
         "role": "user",
         "client_id": "test",
@@ -324,7 +337,10 @@ async def test_list_session_events_admits_thread_status_events_through_fastmcp()
         "GET",
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
-            200, json=_make_session_payload(session_id="ses_1", agent_id="ag_a")
+            200,
+            json=_make_session_payload(
+                session_id="ses_1", agent_id="ag_a", account_id=str(account_id)
+            ),
         ),
     )
     router.add(
@@ -355,6 +371,7 @@ async def test_list_session_events_admits_thread_status_events_through_fastmcp()
 
 async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
 
     router = MARouter()
     router.add(
@@ -394,7 +411,7 @@ async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
                         "updated_at": "2026-05-08T10:00:00Z",
                         "outcome_evaluations": [],
                         "environment_id": "env_1",
-                        "metadata": {},
+                        "metadata": {"daimon_account": str(account_id)},
                         "resources": [],
                         "stats": {},
                         "status": "idle",
@@ -408,7 +425,7 @@ async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
     )
     client = build_fake_anthropic(router.dispatch)
 
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN)
     result = await _list_sessions_impl(_runtime(client), auth, page=None, agent_name=None)
 
     assert len(result) == 1, "should drain one session for the tenant's only agent"
@@ -419,19 +436,21 @@ async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
 
 async def test_list_sessions_with_unknown_agent_name_raises() -> None:
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
 
     router = MARouter()
     # No agents in the tenant -> find_agent_by_daimon_tag returns None.
     router.add("GET", r"/v1/agents", lambda _r, _m: list_response([]))
     client = build_fake_anthropic(router.dispatch)
 
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN)
     with pytest.raises(ToolError, match="not found"):
         await _list_sessions_impl(_runtime(client), auth, page=None, agent_name="nope")
 
 
 async def test_get_session_raises_when_session_belongs_to_other_tenant() -> None:
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
 
     router = MARouter()
     # Tenant has agent ag_a; the requested session is owned by ag_other.
@@ -472,7 +491,7 @@ async def test_get_session_raises_when_session_belongs_to_other_tenant() -> None
                     "updated_at": "2026-05-08T10:00:00Z",
                     "outcome_evaluations": [],
                     "environment_id": "env_1",
-                    "metadata": {},
+                    "metadata": {"daimon_account": str(account_id)},
                     "resources": [],
                     "stats": {},
                     "status": "idle",
@@ -485,13 +504,14 @@ async def test_get_session_raises_when_session_belongs_to_other_tenant() -> None
     )
     client = build_fake_anthropic(router.dispatch)
 
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN)
     with pytest.raises(ToolError, match="session not found"):
         await _get_session_impl(_runtime(client), auth, "ses_x")
 
 
 async def test_get_session_returns_session_info_when_owned() -> None:
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
 
     router = MARouter()
     router.add(
@@ -531,7 +551,7 @@ async def test_get_session_returns_session_info_when_owned() -> None:
                     "updated_at": "2026-05-08T10:00:00Z",
                     "outcome_evaluations": [],
                     "environment_id": "env_1",
-                    "metadata": {},
+                    "metadata": {"daimon_account": str(account_id)},
                     "resources": [],
                     "stats": {},
                     "status": "idle",
@@ -544,7 +564,7 @@ async def test_get_session_returns_session_info_when_owned() -> None:
     )
     client = build_fake_anthropic(router.dispatch)
 
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN)
     result = await _get_session_impl(_runtime(client), auth, "ses_1")
 
     assert isinstance(result, SessionInfo), "should return a SessionInfo"
@@ -554,6 +574,7 @@ async def test_get_session_returns_session_info_when_owned() -> None:
 
 async def test_list_session_events_returns_page_envelope() -> None:
     tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
 
     user_event = BetaManagedAgentsUserMessageEvent.model_validate(
         {
@@ -601,7 +622,7 @@ async def test_list_session_events_returns_page_envelope() -> None:
                     "updated_at": "2026-05-08T10:00:00Z",
                     "outcome_evaluations": [],
                     "environment_id": "env_1",
-                    "metadata": {},
+                    "metadata": {"daimon_account": str(account_id)},
                     "resources": [],
                     "stats": {},
                     "status": "idle",
@@ -619,7 +640,7 @@ async def test_list_session_events_returns_page_envelope() -> None:
     )
     client = build_fake_anthropic(router.dispatch)
 
-    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN)
     result = await _list_session_events_impl(
         _runtime(client), auth, "ses_1", page=None, limit=None, order=None
     )
@@ -628,3 +649,120 @@ async def test_list_session_events_returns_page_envelope() -> None:
     assert result.next_page == "p2", "should forward SDK next_page cursor unchanged"
     item: SessionEventOut = result.items[0]
     assert item.id == "sevt_1", "event id should round-trip through SDK parse"
+
+
+# ---------------------------------------------------------------------------
+# Session reads are scoped to the account that opened the session, not the
+# tenant. Everyone in an install shares a tenant, so a tenant-only check let
+# any member read any other member's transcript.
+# ---------------------------------------------------------------------------
+
+
+def _agents_router(tenant_id: uuid.UUID) -> MARouter:
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _r, _m: list_response(
+            [
+                make_ma_agent(
+                    id="ag_a",
+                    name="demo",
+                    metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    return router
+
+
+async def test_get_session_refuses_a_session_opened_by_another_member() -> None:
+    """The same tenant is not the same person — a DM transcript is not shared."""
+    tenant_id = uuid.uuid4()
+    owner_account = uuid.uuid4()
+    other_account = uuid.uuid4()
+
+    router = _agents_router(tenant_id)
+    router.add(
+        "GET",
+        r"/v1/sessions/([^/]+)",
+        lambda _r, _m: httpx.Response(
+            200, json=_make_session_payload(account_id=str(owner_account))
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+
+    auth = AuthIdentity(account_id=other_account, tenant_id=tenant_id, role=Role.USER)
+
+    with pytest.raises(ToolError, match="session not found"):
+        await _get_session_impl(_runtime(client), auth, "ses_1")
+
+
+async def test_get_session_refuses_another_members_session_even_for_an_admin() -> None:
+    """Manage Server governs the server's configuration, not other people's chats."""
+    tenant_id = uuid.uuid4()
+    owner_account = uuid.uuid4()
+
+    router = _agents_router(tenant_id)
+    router.add(
+        "GET",
+        r"/v1/sessions/([^/]+)",
+        lambda _r, _m: httpx.Response(
+            200, json=_make_session_payload(account_id=str(owner_account))
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+
+    admin = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+    )
+
+    with pytest.raises(ToolError, match="session not found"):
+        await _get_session_impl(_runtime(client), admin, "ses_1")
+
+
+async def test_get_session_refuses_an_unattributable_session() -> None:
+    """Fail closed: a session with no account stamp cannot be shown to anyone."""
+    tenant_id = uuid.uuid4()
+
+    router = _agents_router(tenant_id)
+    router.add(
+        "GET",
+        r"/v1/sessions/([^/]+)",
+        lambda _r, _m: httpx.Response(200, json=_make_session_payload(account_id=None)),
+    )
+    client = build_fake_anthropic(router.dispatch)
+
+    auth = AuthIdentity(account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER)
+
+    with pytest.raises(ToolError, match="session not found"):
+        await _get_session_impl(_runtime(client), auth, "ses_1")
+
+
+async def test_list_sessions_hides_other_members_sessions() -> None:
+    """Enumeration is the same leak as retrieval, so it gets the same filter."""
+    tenant_id = uuid.uuid4()
+    mine = uuid.uuid4()
+    theirs = uuid.uuid4()
+
+    router = _agents_router(tenant_id)
+    router.add(
+        "GET",
+        r"/v1/sessions",
+        lambda _r, _m: list_response(
+            [
+                _make_session_payload(session_id="ses_mine", account_id=str(mine)),
+                _make_session_payload(session_id="ses_theirs", account_id=str(theirs)),
+                _make_session_payload(session_id="ses_unstamped", account_id=None),
+            ]
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+
+    auth = AuthIdentity(account_id=mine, tenant_id=tenant_id, role=Role.ADMIN)
+    results = await _list_sessions_impl(_runtime(client), auth, None, None)
+
+    assert [r.id for r in results] == ["ses_mine"], (
+        "listing must return only sessions this caller opened — not a "
+        "co-member's, and not one that cannot be attributed"
+    )

@@ -21,6 +21,7 @@ from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
 from daimon.adapters.mcp.tools._pagination import Page
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag, list_agents_by_tenant
+from daimon.core.defaults.metadata import MA_METADATA_KEY_ACCOUNT
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict
@@ -80,20 +81,44 @@ class SessionEventOut(BaseModel):
     content: list[dict[str, Any]] | None = None
 
 
-async def _verify_tenant_owns_session(
+def _session_belongs_to_caller(session: BetaManagedAgentsSession, auth: AuthIdentity) -> bool:
+    """True when the session was opened by this caller's account.
+
+    ``create_session`` stamps ``daimon_account`` on every session it opens
+    (``core/sessions.py``), and the privacy deletion path already keys on it.
+    Fail closed when the stamp is absent: an unstamped session predates the
+    metadata and cannot be attributed, and a transcript is not something to
+    hand over on a maybe.
+    """
+    stamped = session.metadata.get(MA_METADATA_KEY_ACCOUNT) if session.metadata else None
+    return stamped is not None and stamped == str(auth.account_id)
+
+
+async def _verify_caller_owns_session(
     runtime: McpRuntime, auth: AuthIdentity, session_id: str
 ) -> BetaManagedAgentsSession:
-    """Retrieve a session and assert the caller's tenant owns its agent.
+    """Retrieve a session and assert this caller opened it.
 
-    Raises ``ToolError("session not found")`` for cross-tenant access — the
-    same message used for genuinely missing sessions, so existence isn't
-    leaked across tenants.
+    Tenant ownership is necessary but nowhere near sufficient: a session
+    transcript can come from a private channel or a DM, so "same guild" is the
+    wrong grain. Everyone in an install shares a tenant, so a tenant-only check
+    let any member read any other member's transcript — bypassing the
+    per-channel visibility the Discord read tools enforce.
+
+    Deliberately not relaxed for admins. Manage Server is a permission over the
+    server's configuration, not over other people's conversations.
+
+    Raises ``ToolError("session not found")`` for every rejection — the same
+    message used for a genuinely missing session, so neither existence nor
+    ownership is leaked.
     """
     s = await runtime.client.beta.sessions.retrieve(session_id)
     tenant_agent_ids = {
         a.id for a in await list_agents_by_tenant(runtime.client, tenant_id=auth.tenant_id)
     }
     if s.agent.id not in tenant_agent_ids:
+        raise ToolError("session not found")
+    if not _session_belongs_to_caller(s, auth):
         raise ToolError("session not found")
     return s
 
@@ -115,7 +140,8 @@ async def _list_sessions_impl(
             list_kwargs["page"] = page
         results: list[SessionInfo] = []
         async for s in runtime.client.beta.sessions.list(**list_kwargs):
-            results.append(SessionInfo.from_ma(s))
+            if _session_belongs_to_caller(s, auth):
+                results.append(SessionInfo.from_ma(s))
         return results
 
     # Unfiltered: drain across every tenant agent. Cross-agent cursors are
@@ -125,7 +151,8 @@ async def _list_sessions_impl(
     drained: list[SessionInfo] = []
     for agent in agents:
         async for s in runtime.client.beta.sessions.list(agent_id=agent.id):
-            drained.append(SessionInfo.from_ma(s))
+            if _session_belongs_to_caller(s, auth):
+                drained.append(SessionInfo.from_ma(s))
     drained.sort(key=lambda r: r.created_at, reverse=True)
     return drained
 
@@ -133,7 +160,7 @@ async def _list_sessions_impl(
 async def _get_session_impl(
     runtime: McpRuntime, auth: AuthIdentity, session_id: str
 ) -> SessionInfo:
-    s = await _verify_tenant_owns_session(runtime, auth, session_id)
+    s = await _verify_caller_owns_session(runtime, auth, session_id)
     return SessionInfo.from_ma(s)
 
 
@@ -145,7 +172,7 @@ async def _list_session_events_impl(
     limit: int | None,
     order: Literal["asc", "desc"] | None,
 ) -> Page[SessionEventOut]:
-    await _verify_tenant_owns_session(runtime, auth, session_id)
+    await _verify_caller_owns_session(runtime, auth, session_id)
     list_kwargs: dict[str, Any] = {}
     if page is not None:
         list_kwargs["page"] = page
