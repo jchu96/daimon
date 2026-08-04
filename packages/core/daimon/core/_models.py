@@ -1014,3 +1014,38 @@ class SlackEventDedup(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class FileUpload(Base):
+    """A file the agent produced, staged for delivery as a chat attachment.
+
+    Rows are created empty by the mint step and filled by a single PUT from the
+    agent's sandbox, so the bytes never transit the model's token stream. The
+    row lives in Postgres rather than on an instance's disk because ``mcp``
+    runs multiple Cloud Run instances with no session affinity: the PUT and the
+    later read are separate requests and routinely land on different instances.
+
+    ``upload_token`` is the single-use capability that authorizes the PUT and is
+    cleared once the bytes land; ``content`` is NULL until then.
+
+    Private to `daimon.core.stores.**` per the import-linter ORM contract.
+    """
+
+    __tablename__ = "file_uploads"
+    __table_args__ = (
+        Index("ix_file_uploads_upload_token", "upload_token", unique=True),
+        Index("ix_file_uploads_created_at", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    upload_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    display_filename: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

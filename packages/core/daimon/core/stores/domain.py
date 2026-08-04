@@ -512,3 +512,22 @@ class McpTokenRow(BaseModel):
     label: str | None
     created_at: datetime
     revoked_at: datetime | None
+
+
+class FileUploadRow(BaseModel):
+    """Pydantic row for FileUpload — a staged chat attachment.
+
+    `content` is None between the mint and the sandbox's PUT; a consumer that
+    reads a row with no content is looking at an upload that never landed, not
+    at an empty file.
+    """
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: str
+    tenant_id: uuid.UUID
+    title: str
+    display_filename: str
+    content_type: str
+    content: bytes | None
+    created_at: datetime
