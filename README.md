@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/daimon.png" alt="daimon, a small blue clay creature, waving" width="300">
+  <img src="assets/daimon-data-scientist.jpg" alt="daimon, a small blue clay creature in a lab coat, presenting charts at a whiteboard" width="440">
 
 # daimon
 
@@ -24,27 +24,28 @@ Most chat bots are one agent shared across a workspace. daimon is
 many-to-many: you deploy it once, on your own Anthropic API key, and any
 number of Discord servers install it from that single deployment. Every
 server is isolated: one tenant, its own data, scoped to that server. Adding
-a server takes about two minutes: invite the bot, run `/agent-setup`, and
-everyone in it can `@mention` a working agent.
+a server takes about two minutes: invite the bot, `@mention` it, and it sets
+itself up. From there, everyone in the server can just ask it for things.
 
 Built on [Anthropic Managed Agents](https://platform.claude.com/docs/en/managed-agents/quickstart)
 by [PyMC Labs](https://www.pymc-labs.com), the team behind the PyMC project.
 
-> **Status:** early. The code is public and you can run it yourself (see
-> below), but self-hosting is not a supported path yet. Expect rough edges
-> and breaking changes. The hosted version at
-> [daimon.decision.ai](https://daimon.decision.ai/) is the easy path.
+> **Status:** early. Self-hosting works and is documented below — expect
+> rough edges and breaking changes while things settle. The hosted version at
+> [daimon.decision.ai](https://daimon.decision.ai/) is the zero-setup path.
 
 ## It doesn't chat. It does the work.
 
 - `@daimon` in a channel starts (or continues) a threaded conversation with
   session continuity
-- Slash-command admin surface: `/agent-setup`, `/routines`, `/billing`,
-  `/privacy`, `/help`. Setup and routines require Discord's `Manage Server`
-  permission; the rest are open to everyone
+- Everything happens in conversation — setup, scheduling, billing: `@mention`
+  the bot and ask. Slash commands (`/agent-setup`, `/routines`, `/billing`,
+  `/privacy`, `/help`) still exist if you prefer them; setup and routines
+  require Discord's `Manage Server` permission
 - Scheduled routines: recurring agent runs dispatched headlessly
-- Slack adapter (optional) with full Discord parity, per-workspace OAuth
-  install, and opt-in per-user access ([`docs/slack.md`](docs/slack.md))
+- Slack adapter (early, not yet as battle-tested as Discord) with
+  per-workspace OAuth install and opt-in per-user access
+  ([`docs/slack.md`](docs/slack.md))
 - CLI and MCP adapters sharing the same core turn pipeline
 - Tenant isolation enforced at the database `tenant_id` layer, so one shared
   Anthropic key can safely power every guild
@@ -99,11 +100,9 @@ deltas into the thread until the session goes idle.
 
 ## Run it yourself
 
-Unsupported, but it works. You need an Anthropic API key **with Managed
-Agents beta access** (a closed beta: request access first, or session
-creation will fail) **in a workspace dedicated to this deployment** (daimon
-manages the workspace's Managed Agents resources as its own, so sharing the
-workspace with anything else causes collisions),
+You need an Anthropic API key **in a workspace dedicated to this deployment**
+(daimon manages the workspace's Managed Agents resources as its own, so
+sharing the workspace with anything else causes collisions),
 [Docker](https://docs.docker.com/get-docker/), and
 [`uv`](https://docs.astral.sh/uv/).
 
@@ -115,7 +114,7 @@ cp .env.example .env
 
 Open `.env`, then uncomment and fill in:
 
-- `DAIMON_ANTHROPIC__API_KEY`: your beta-enabled Anthropic key
+- `DAIMON_ANTHROPIC__API_KEY`: your Anthropic API key
 - `DAIMON_MCP__JWT_SECRET`: any random string (e.g. `openssl rand -hex 32`)
 - `DAIMON_MCP__PUBLIC_URL`: `http://localhost:8765/mcp` is fine for local use
 - `POSTGRES_PASSWORD`: a strong, URL-safe value (avoid `@ : / % #`)
