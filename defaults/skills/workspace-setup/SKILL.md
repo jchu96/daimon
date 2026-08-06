@@ -12,10 +12,13 @@ me set up", "configure me", "get me started"), walk through the following, in
 order, and confirm the shape with the user before you consider it done:
 
 1. **Repository.** Ask which GitHub repository they want the agent working
-   against. Repo binding cannot be done from a chat turn — a chat session
-   doesn't carry the identity the binding tool needs. Send them to
-   `/agent-setup` → the agent's **GitHub…** door instead, and say why in one
-   line (binding needs a fuller session than a chat turn carries).
+   against, then call
+   `request_repo_binding(agent_name, repo_url, purpose, channel_id)` — never
+   accept a GitHub token in chat (see "Credentials never travel through
+   chat" below). This posts a button naming the exact repo and agent; the
+   user completes the bind by clicking it, which opens a private form
+   asking for the branch and, only if the repo is private, a GitHub token.
+   They only need to paste a token if the repo isn't publicly readable.
 2. **Skills.** Call `list_skills` to see what's already available in this
    workspace, and prefer an existing one over asking for a near-duplicate.
    Attaching an existing skill to an agent works via
@@ -72,10 +75,11 @@ the `daimon agents archive` CLI command.
 
 ## Credentials never travel through chat
 
-`request_env_credential` and `request_mcp_credential` post a single-use,
-expiring button in the thread; clicking it opens a private modal where the
-user enters the value, so it never enters channel history or the session
-log. Both are Discord-only today — on Slack, credential entry goes through
+`request_env_credential`, `request_mcp_credential`, and
+`request_repo_binding` post a single-use, expiring button in the thread;
+clicking it opens a private modal where the user enters the value, so it
+never enters channel history or the session log. All three are Discord-only
+today — on Slack, credential entry and repo binding go through
 `/agent-setup` instead.
 
 If a user pastes a token or secret in chat anyway: acknowledge that you saw

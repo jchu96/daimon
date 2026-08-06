@@ -43,6 +43,7 @@ from fastmcp.exceptions import ToolError
 _KIND_NOUN: dict[CredentialRequestKind, str] = {
     "env": "an environment secret",
     "mcp": "an MCP server credential",
+    "repo": "a repo binding",
 }
 
 
@@ -54,6 +55,14 @@ def _build_message_body(
     target: str,
     purpose: str,
 ) -> str:
+    if kind == "repo":
+        return (
+            f"<@{requester_platform_user_id}> wants to bind a repo to **{agent_name}** "
+            f"(`{target}`) — {purpose}\n"
+            "Click the button below to open a private form confirming the branch, "
+            "and — only if the repo isn't publicly readable — a GitHub token that "
+            "never appears in this channel."
+        )
     return (
         f"<@{requester_platform_user_id}> **{agent_name}** needs {_KIND_NOUN[kind]} "
         f"(`{target}`) — {purpose}\n"

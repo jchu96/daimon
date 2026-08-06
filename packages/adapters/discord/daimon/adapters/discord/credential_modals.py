@@ -1,44 +1,68 @@
-"""EnvCredentialModal / McpCredentialModal — the two credential-button modals.
+"""EnvCredentialModal / McpCredentialModal / RepoBindModal — the three
+credential-button modals.
 
-Two separate modals, not one type-dispatching modal: an env secret and an MCP
-auth token are different resources with different write paths
-(`put_agent_file` vs `add_external_mcp_credential`), mirroring the two modals
-that already exist for the same writes (`agent_setup/credentials.py`'s
-`PasteSecretModal`, `agent_setup/modals_mcp.py`'s `AddMcpModal`). Each modal
-here collects exactly ONE field — the secret value itself — because every
-routing field (agent, key/server name) is already fixed by the consumed
-`credential_requests` row; the user never retypes it.
+Three separate modals, not one type-dispatching modal: an env secret, an MCP
+auth token, and a repo binding are different resources with different write
+paths (`put_agent_file` vs `add_external_mcp_credential` vs
+`agent_repo_binding.set_binding`), mirroring the modals that already exist
+for the same writes on the setup panel (`agent_setup/credentials.py`'s
+`PasteSecretModal`, `agent_setup/modals_mcp.py`'s `AddMcpModal`,
+`agent_setup/modals.py`'s `RepoAuthModal`). `EnvCredentialModal` and
+`McpCredentialModal` each collect exactly ONE field — the secret value
+itself — because every routing field (agent, key/server name) is already
+fixed by the consumed `credential_requests` row; the user never retypes it.
+`RepoBindModal` collects two fields (branch, optional token) because a repo
+binding has two writable parts and only one of them is a secret; the repo
+itself is likewise fixed by the row, never retyped.
 
 Secret hygiene, matching the structural guarantees `PasteSecretModal` already
 documents:
-- the value never reaches a log record (env logs the key name only; MCP logs
-  a masked tail only),
+- the value never reaches a log record (env logs the key name only; MCP and
+  repo log a masked tail only),
 - the value never reaches a `custom_id` (the button's custom_id carries only
-  the opaque request token, minted before either modal exists),
+  the opaque request token, minted before any modal exists),
 - the value never reaches a container/embed (a Modal TextInput has no
   render surface other than the ephemeral confirmation, which never echoes
   the value back),
 - there is no URL-fetch path and no attachment path.
 
-The atomic single-use consume runs BEFORE either write, so a request can
+The atomic single-use consume runs BEFORE every write, so a request can
 only ever produce one write no matter how many times its modal is
 (re)submitted — the loser of a race, or any resubmission, gets `None` back
 and writes nothing.
+
+`RepoBindModal`'s write is additionally admin-gated on a shared agent: token
+consumption alone is sufficient authorization for an env secret or an MCP
+token (the requester supplies a value only they hold, scoped to one key on
+one agent), but a repo binding changes what code the agent clones and runs
+and, on a shared agent, reaches every member of the install. So its
+`on_submit` also runs
+`credential_repo_bind.refuse_if_shared_and_not_admin_for_request` — once
+here, right after `defer` and before the consume, and once more as a
+pre-filter in `credential_button.py`'s `callback`, before the modal is even
+opened.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import httpx
 import structlog
 from daimon.adapters.discord.agent_setup.credentials import (
     _MAX_SECRET_VALUE_BYTES,  # pyright: ignore[reportPrivateUsage]  # reusing PasteSecretModal's byte cap rather than inventing a second number
 )
 from daimon.adapters.discord.agent_setup.write import mask_tail
+from daimon.adapters.discord.credential_repo_bind import (
+    refuse_if_shared_and_not_admin_for_request,
+    resolve_repo_binding_credential,
+)
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.errors import DaimonError
 from daimon.core.mcp_vault import add_external_mcp_credential
 from daimon.core.stores import credential_requests
 from daimon.core.stores.agent_files import put_agent_file
+from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.core.stores.domain import CredentialRequestRow
 
 import discord
@@ -200,5 +224,122 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP credential"):
         await interaction.followup.send(
             f"MCP credential added for `{mcp_server_url}`. Anyone who talks to "
             "this agent can use it.",
+            ephemeral=True,
+        )
+
+
+class RepoBindModal(discord.ui.Modal, title="Bind repo"):
+    """Bind repo modal: branch + optional token, gate, atomic consume, then
+    the shared credential resolution and the binding write.
+
+    The repo itself is never retyped here — it is fixed by the consumed
+    row's `target`, exactly as the env key and MCP server name are for the
+    two sibling modals. Unlike them, submitting this one is additionally
+    gated on `credential_repo_bind.refuse_if_shared_and_not_admin_for_request`
+    (see the module docstring): a member who was an admin, or whose target
+    was private, when the button was clicked may have lost either between
+    click and submit, so the gate runs again here, immediately after
+    `defer` and before the consume, rather than being trusted from the
+    pre-filter alone.
+    """
+
+    def __init__(self, *, runtime: DiscordRuntime, request_row: CredentialRequestRow) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._row = request_row
+        self.branch_in: discord.ui.TextInput[RepoBindModal] = discord.ui.TextInput(
+            label="Branch",
+            default="main",
+            max_length=255,
+        )
+        self.pat_in: discord.ui.TextInput[RepoBindModal] = discord.ui.TextInput(
+            label="GitHub token (optional)",
+            required=False,
+            max_length=255,
+            placeholder="Leave blank for a public repo",
+        )
+        self.add_item(self.branch_in)
+        self.add_item(self.pat_in)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if await refuse_if_shared_and_not_admin_for_request(
+            interaction,
+            runtime=self._runtime,
+            tenant_id=self._row.tenant_id,
+            agent_id=self._row.agent_id,
+        ):
+            return
+
+        branch = str(self.branch_in.value or "").strip() or "main"
+        pat = str(self.pat_in.value or "").strip()
+
+        now = datetime.now(UTC)
+        async with self._runtime.sessionmaker() as session, session.begin():
+            consumed_row = await credential_requests.consume_credential_request(
+                session, token=self._row.token, now=now
+            )
+        if consumed_row is None:
+            await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
+            return
+
+        # Log the repo and branch, and the token ONLY as a masked tail when
+        # present — never the plain value, never the (now-consumed) request
+        # token.
+        _log.info(
+            "credential_modal.repo.submit",
+            repo_url=consumed_row.target,
+            branch=branch,
+            pat_masked=mask_tail(pat) if pat else None,
+        )
+
+        try:
+            async with httpx.AsyncClient() as http_client:
+                ma_secret_ref, proof = await resolve_repo_binding_credential(
+                    self._runtime,
+                    http_client,
+                    agent_id=consumed_row.agent_id,
+                    account_id=consumed_row.account_id,
+                    repo_url=consumed_row.target,
+                    pasted_pat=pat or None,
+                    now=now,
+                )
+            async with self._runtime.sessionmaker.begin() as session:
+                await set_binding(
+                    session,
+                    tenant_id=consumed_row.tenant_id,
+                    agent_id=consumed_row.agent_id,
+                    repo_url=consumed_row.target,
+                    default_branch=branch,
+                    ma_secret_ref=ma_secret_ref,
+                    proof=proof,
+                )
+        except DaimonError as err:
+            # This copy is written for the user -- surface it verbatim, plus
+            # the fact that the request itself was used up either way.
+            await interaction.followup.send(
+                f"{err} The request was used up — ask again to retry.",
+                ephemeral=True,
+            )
+            return
+        except Exception as err:
+            _log.exception(
+                "credential_modal.repo_write_failed",
+                repo_url=consumed_row.target,
+                err_type=type(err).__name__,
+            )
+            # Surface only the exception class name — never the stringified
+            # exception, which for SDK/network errors can carry the request
+            # envelope (a token-leak surface). Full traceback goes to structlog.
+            await interaction.followup.send(
+                "Credential request consumed, but binding the repo failed "
+                f"(`{type(err).__name__}`). Ask for a new request to retry.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"Bound `{consumed_row.target}` on `{branch}`. Takes effect on the next session.",
             ephemeral=True,
         )
