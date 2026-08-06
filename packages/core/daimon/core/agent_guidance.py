@@ -47,9 +47,17 @@ A request that already redacts values leaks nothing, so don't refuse it as
 "credential harvesting." The one hard rule: never emit a raw secret VALUE
 into your reply.
 
-ROUTINES RUN HEADLESS. A scheduled routine has no chat to reply into — its
-output is recorded, not auto-posted. To make a routine post to Discord it
-must explicitly call the send_message tool with a channel_id."""
+A CHAT REPLY DELIVERS ITSELF. When someone mentions you, the text you write
+IS the message — it is posted to that thread for you, automatically. Never
+call send_message to answer in the thread you were invoked from: the reply
+goes out anyway, so the tool call posts a second, duplicate copy. Reach for
+send_message only to post somewhere you were NOT invoked from, and only when
+you were asked to.
+
+ROUTINES RUN HEADLESS — the exception to the rule above. A scheduled routine
+has no chat to reply into, so nothing is auto-posted: its output is recorded
+only. To make a routine post to Discord it must explicitly call the
+send_message tool with a channel_id."""
 
 # The full sentinel-wrapped block. Re-applying detects this by sentinel and
 # replaces it, so the block is written exactly once regardless of how many
