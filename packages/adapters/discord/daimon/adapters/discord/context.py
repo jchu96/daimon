@@ -38,12 +38,26 @@ def _render_location(thread: discord.Thread) -> list[str]:
     alongside the ids so the agent can say where it is, not just post there;
     ``thread.parent`` is None when the parent is not in the client cache, so the
     channel name is emitted only when it resolves.
+
+    The thread hint is deliberately scoped to *posting*. ``channel_id`` is
+    overloaded across the toolset: for the send and credential-request tools it
+    means "where to put this message", and the thread id is right; for the
+    scope tools (``set_agent_default``, ``clear_agent_default``,
+    ``explain_agent_resolution``) it means "which scope to key on", and only
+    the parent channel id is ever right. A hint phrased as a blanket rule for
+    every ``channel_id`` parameter taught the second case wrongly, so each
+    role carries its own hint instead.
     """
-    thread_hint = "to post in this thread, pass this id as channel_id"
+    thread_hint = "to post a message in this thread, pass this id as channel_id"
+    channel_hint = (
+        "the channel these turns belong to; agent-default and routing scopes key on this id, "
+        "never on the thread id"
+    )
     channel_name = "" if thread.parent is None else f" name={quoteattr(thread.parent.name)}"
     return [
         f"<channel platform={quoteattr('discord')} id={quoteattr(str(thread.parent_id))}"
-        f" role={quoteattr('parent_channel')}{channel_name}/>",
+        f" role={quoteattr('parent_channel')}{channel_name}"
+        f" hint={quoteattr(channel_hint)}/>",
         f"<thread platform={quoteattr('discord')} id={quoteattr(str(thread.id))}"
         f" role={quoteattr('current_thread')} hint={quoteattr(thread_hint)}"
         f" name={quoteattr(thread.name)}/>",

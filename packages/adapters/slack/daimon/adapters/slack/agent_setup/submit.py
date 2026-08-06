@@ -62,6 +62,7 @@ from daimon.adapters.slack.agent_setup.write import (
     store_inline_pat,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.core.constants import DEFAULT_AGENT_MODEL
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
@@ -247,7 +248,7 @@ def evaluate_new_agent_submission(payload: dict[str, Any]) -> SubmitDecision:
         payload=payload,
         extra={
             "name": name,
-            "model": model or "claude-sonnet-4-6",
+            "model": model or DEFAULT_AGENT_MODEL,
             "system": system or None,
         },
     )
@@ -605,7 +606,7 @@ async def run_new_agent_submission(
             tenant_id=tenant_id,
             name=str(extra.get("name") or ""),
             system=str(extra["system"]) if extra.get("system") else None,
-            model=str(extra.get("model") or "claude-sonnet-4-6"),
+            model=str(extra.get("model") or DEFAULT_AGENT_MODEL),
             account_id=account_id,
         )
 

@@ -108,13 +108,13 @@ class TestBuildContextXml:
 
         result, _ = await build_context_xml(thread, trigger)
 
-        assert '<channel platform="discord" id="800" role="parent_channel"/>' in result, (
+        assert '<channel platform="discord" id="800" role="parent_channel"' in result, (
             "should have channel element with discord platform and parent-channel id"
         )
         assert '<thread platform="discord" id="900" role="current_thread"' in result, (
             "should have thread element carrying the current thread id"
         )
-        channel_pos = result.index('<channel platform="discord" id="800" role="parent_channel"/>')
+        channel_pos = result.index('<channel platform="discord" id="800" role="parent_channel"')
         context_pos = result.index("<context>")
         history_pos = result.index("<thread_history>")
         assert context_pos < channel_pos < history_pos, (
@@ -134,7 +134,7 @@ class TestBuildContextXml:
 
         result, _ = await build_context_xml(thread, trigger)
 
-        assert '<channel platform="discord" id="42" role="parent_channel"/>' in result, (
+        assert '<channel platform="discord" id="42" role="parent_channel"' in result, (
             "channel id should be the thread's parent_id"
         )
         assert '<thread platform="discord" id="900" role="current_thread"' in result, (
@@ -500,13 +500,13 @@ class TestBuildDeltaXml:
 
         result, _ = await build_delta_xml(thread, trigger, after_message_id=50, bot_user_id=None)
 
-        assert '<channel platform="discord" id="800" role="parent_channel"/>' in result, (
+        assert '<channel platform="discord" id="800" role="parent_channel"' in result, (
             "delta should have channel element with discord platform and parent-channel id"
         )
         assert '<thread platform="discord" id="900" role="current_thread"' in result, (
             "delta should have thread element carrying the current thread id"
         )
-        channel_pos = result.index('<channel platform="discord" id="800" role="parent_channel"/>')
+        channel_pos = result.index('<channel platform="discord" id="800" role="parent_channel"')
         context_pos = result.index("<context>")
         delta_pos = result.index("<thread_delta>")
         assert context_pos < channel_pos < delta_pos, (
@@ -728,6 +728,41 @@ class TestBuildChannelContextXml:
         )
         assert 'id="42" role="parent_channel"' in result, (
             "channel-mention context must name the parent channel id"
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_location_hint_is_scoped_to_its_own_role(self) -> None:
+        """Neither hint may read as a blanket rule for every ``channel_id`` parameter.
+
+        A single hint saying "pass this id as channel_id" against the thread taught
+        the agent to hand the thread id to `set_agent_default`, whose `channel_id`
+        keys a routing scope rather than naming a place to post. The write landed on
+        a scope the turn path never reads, so scoping an agent to a channel silently
+        did nothing while reporting success.
+        """
+        trigger = _make_message(msg_id=10, content="<@999> scope this channel to me")
+        channel = _make_text_channel([trigger])
+        thread = _make_thread([trigger], thread_id=900, parent_id=42)
+
+        result, _ = await build_channel_context_xml(channel, trigger, thread=thread)
+
+        thread_el = result[result.index("<thread ") : result.index(">", result.index("<thread "))]
+        channel_el = result[
+            result.index("<channel ") : result.index(">", result.index("<channel "))
+        ]
+
+        assert "post" in thread_el, (
+            "the thread hint must confine itself to posting, not claim every channel_id"
+        )
+        assert "hint=" in channel_el, (
+            "the parent-channel element must carry its own hint, or the thread's is the "
+            "only guidance the agent sees for a channel_id argument"
+        )
+        assert "scope" in channel_el, (
+            "the parent-channel hint must say that routing scopes key on this id"
+        )
+        assert "never on the thread id" in channel_el, (
+            "the parent-channel hint must rule out the thread id explicitly"
         )
 
     @pytest.mark.asyncio

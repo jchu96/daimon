@@ -33,6 +33,7 @@ from daimon.adapters.discord.agent_setup.write import (
     validate_model_id,
 )
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.constants import DEFAULT_AGENT_MODEL
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
 from daimon.core.github_visibility import (
@@ -119,7 +120,7 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
         self.model_in: discord.ui.TextInput[AgentSectionModal] = discord.ui.TextInput(
             label="Model",
             max_length=64,
-            default=current.model if current is not None else "claude-sonnet-4-6",
+            default=current.model if current is not None else DEFAULT_AGENT_MODEL,
         )
         self.add_item(self.name_in)
         self.add_item(self.prompt_in)
@@ -127,7 +128,7 @@ class AgentSectionModal(discord.ui.Modal, title="Agent"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         # name_in is intentionally ignored — rename forbidden (Pitfall 4).
-        model_value = str(self.model_in).strip() or "claude-sonnet-4-6"
+        model_value = str(self.model_in).strip() or DEFAULT_AGENT_MODEL
         submitted_system = str(self.prompt_in).strip()
         if self._system_omitted and not submitted_system:
             # Prompt was too long to show; a blank submit must KEEP it, not wipe it.
