@@ -49,6 +49,25 @@ def test_carves_out_redacted_self_inspection() -> None:
     assert "REDACTED" in block, "block must endorse value-redacted inspection as safe"
 
 
+def test_states_the_interactive_delivery_contract_not_only_the_headless_one() -> None:
+    # Regression for the staging trace where an agent answered one mention
+    # twice: it called send_message into the thread it was already running in,
+    # and its ordinary reply was delivered too. The block previously described
+    # only the headless-routine path ("a routine must call send_message"), so
+    # that was the sole statement about how output reaches Discord and a
+    # weakly-primed agent generalised it to interactive turns.
+    block = CREDENTIAL_GUIDANCE_BLOCK
+    assert "send_message" in block, "block must name the tool the failure mode misuses"
+    assert "ROUTINES RUN HEADLESS" in block, "the headless-routine path must still be stated"
+    assert block.index("A CHAT REPLY DELIVERS ITSELF") < block.index("ROUTINES RUN HEADLESS"), (
+        "the interactive contract must precede the routine exception, so the "
+        "default case is read first and the exception reads as an exception"
+    )
+    assert "Never" in block and "invoked from" in block, (
+        "block must forbid send_message into the thread the turn was invoked from"
+    )
+
+
 def test_replaces_stale_block_preserving_user_body() -> None:
     seeded = apply_credential_guidance("ORIGINAL BODY")
     # Simulate a user editing only their body underneath the (now stale) block.
