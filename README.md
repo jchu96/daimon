@@ -36,6 +36,9 @@ by [PyMC Labs](https://www.pymc-labs.com), the team behind the PyMC project.
 
 ## It doesn't chat. It does the work.
 
+ChatGPT analyzes your data for you, alone, in a tab. daimon does it with your
+whole team, in the thread — and hands back a notebook anyone can run.
+
 - `@daimon` in a channel starts (or continues) a threaded conversation with
   session continuity
 - Everything happens in conversation — setup, scheduling, billing: `@mention`
@@ -49,6 +52,21 @@ by [PyMC Labs](https://www.pymc-labs.com), the team behind the PyMC project.
 - CLI and MCP adapters sharing the same core turn pipeline
 - Tenant isolation enforced at the database `tenant_id` layer, so one shared
   Anthropic key can safely power every guild
+
+## What you can ask it
+
+> "Here's last quarter's sales export — we changed pricing in week 6. Did it
+> actually help?"
+
+> "Is variant B actually better than A, or is that just noise?"
+
+> "Forecast next month's signups, with uncertainty bands."
+
+> "Every Monday at 9am, pull the weekend's numbers and post a summary here."
+
+Answers come back in the thread: a fitted model, a chart, a plain-English
+read on the uncertainty, and a runnable [marimo](https://marimo.io) notebook
+that reproduces the analysis.
 
 ## How it works
 
@@ -102,9 +120,8 @@ deltas into the thread until the session goes idle.
 
 You need an Anthropic API key **in a workspace dedicated to this deployment**
 (daimon manages the workspace's Managed Agents resources as its own, so
-sharing the workspace with anything else causes collisions),
-[Docker](https://docs.docker.com/get-docker/), and
-[`uv`](https://docs.astral.sh/uv/).
+sharing the workspace with anything else causes collisions) and
+[Docker](https://docs.docker.com/get-docker/).
 
 ### 1. Configure environment
 
@@ -121,34 +138,10 @@ Open `.env`, then uncomment and fill in:
 
 All four must be set before your first `docker compose` command:
 `docker-compose.yml` interpolates them for every service with fail-fast
-`${VAR:?...}` guards, even for `docker compose up -d postgres`. You'll add
-the Discord bot token in step 4. `.env` is gitignored, so secrets never get
-committed.
+`${VAR:?...}` guards. You'll add the Discord bot token in step 2. `.env` is
+gitignored, so secrets never get committed.
 
-### 2. Install dependencies
-
-```bash
-uv sync --all-extras --all-packages
-```
-
-### 3. Start Postgres and run migrations
-
-```bash
-docker compose up -d postgres
-export DAIMON_DATABASE_URL=postgresql+asyncpg://daimon:<your-POSTGRES_PASSWORD>@localhost:5432/daimon
-uv run alembic upgrade head
-```
-
-The `export` is required because the `alembic` CLI reads the shell
-environment and does not auto-load `.env`.
-
-Then seed the default agents, environments, and skills:
-
-```bash
-uv run daimon defaults apply
-```
-
-### 4. Create the Discord application
+### 2. Create the Discord application
 
 1. Create an application in the
    [Discord Developer Portal](https://discord.com/developers/applications).
@@ -164,16 +157,39 @@ uv run daimon defaults apply
 5. Open the generated URL in a browser and invite the bot to a test server
    you control.
 
-### 5. Run the bot
+### 3. Start the stack
 
 ```bash
+docker compose up --build -d
+```
+
+One command brings up Postgres, runs migrations and seeds the default
+agents, environments, and skills (the `init` service does both
+automatically), then starts the `mcp`, `discord`, and `scheduler` services.
+
+Once it settles, send a message that `@mention`s the bot. It replies in a
+new thread, and that's a working deployment. If the bot stays silent, check
+`docker compose logs discord` — an unset `DAIMON_DISCORD__BOT_TOKEN` is the
+usual cause.
+
+<details>
+<summary>Prefer to run the processes by hand?</summary>
+
+Requires [`uv`](https://docs.astral.sh/uv/):
+
+```bash
+uv sync --all-extras --all-packages
+docker compose up -d postgres
+export DAIMON_DATABASE_URL=postgresql+asyncpg://daimon:<your-POSTGRES_PASSWORD>@localhost:5432/daimon
+uv run alembic upgrade head
+uv run daimon defaults apply
 uv run python -m daimon.adapters.discord
 ```
 
-Send a message that `@mention`s the bot. It replies in a new thread, and
-that's a working deployment. `docker-compose.yml` also runs the full stack
-(Postgres plus the `mcp`, `discord`, and `scheduler` process groups) from
-one image if you'd rather not run processes by hand.
+The `export` is required because the `alembic` CLI reads the shell
+environment and does not auto-load `.env`.
+
+</details>
 
 ## Layout
 
