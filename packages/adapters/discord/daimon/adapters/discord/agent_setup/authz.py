@@ -27,12 +27,20 @@ the field it writes is part of the agent spec:
 A new mutating control belongs to one of those two sets. Pick its gate from the
 set the field is in, not from the button it happens to sit next to.
 
-The one deliberate exception is `credential_modals.py`, whose write is bounded
-by a single-use `credential_requests` token rather than by guild-admin status:
-the agent asks a specific member for a specific key, and consuming the token is
-what authorizes exactly that one write. It is not reachable from this panel and
-is not an exception you can extend — a control a member reaches by clicking has
-no such token and belongs to one of the two sets above.
+There are now two writes bounded by a single-use `credential_requests` token
+rather than by guild-admin status: `credential_modals.py`'s env/MCP credential
+writes, and the repo bind reached from a chat-posted request button. What
+admits a write to that class is the token, consumed by the write itself, not
+proximity to this panel — a control a member reaches by clicking with no such
+token still belongs to one of the two sets above.
+
+A token alone is sufficient authorization for an env secret or an MCP token:
+the requester supplies a value only they hold, scoped to one key on one agent.
+It is not sufficient for a repo binding, which changes what code the agent
+clones and runs and, on a shared agent, reaches every member of the install.
+So the repo-bind path additionally re-derives this module's
+`refuse_if_shared_and_not_admin` decision from primitives, at click time, in
+`credential_repo_bind.refuse_if_shared_and_not_admin_for_request`.
 """
 
 from __future__ import annotations
