@@ -33,6 +33,7 @@ from daimon.adapters.discord.checks import refuse_if_not_admin
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.constants import DEFAULT_AGENT_MODEL
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid
@@ -770,7 +771,7 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
             required=False,
         )
         self.model_in: discord.ui.TextInput[NewAgentModal] = discord.ui.TextInput(
-            label="Model", default="claude-sonnet-4-6", max_length=64
+            label="Model", default=DEFAULT_AGENT_MODEL, max_length=64
         )
         self.add_item(self.name_in)
         self.add_item(self.prompt_in)
@@ -778,7 +779,7 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         new_name = str(self.name_in).strip()
-        model_value = str(self.model_in).strip() or "claude-sonnet-4-6"
+        model_value = str(self.model_in).strip() or DEFAULT_AGENT_MODEL
         system_value = str(self.prompt_in).strip() or None
         log.info(
             "agent_setup.new.submit",

@@ -772,7 +772,10 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     ) -> AgentInfo:
         """Create a new agent. Pass fields directly — there is NO ``spec`` wrapper.
 
-        Required: ``name`` and ``model`` (e.g. ``"claude-sonnet-4-6"``).
+        Required: ``name`` and ``model``. Use ``"claude-sonnet-5"`` when the user
+        asks for Sonnet and ``"claude-opus-5"`` when they ask for Opus — always
+        the current generation. Only pass an older id (``claude-sonnet-4-6``,
+        ``claude-opus-4-8``, …) when the user names that version themselves.
         Optional: ``description``, ``system`` (the system prompt), ``tools``,
         ``mcp_servers``, and ``skill_repos`` — GitHub repos to sync skills from,
         e.g. ``[{"url": "https://github.com/owner/repo", "branch": "main"}]``.
@@ -805,7 +808,10 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     ) -> AgentInfo:
         """Patch-update an agent.
 
-        Scalar fields (``model``, ``description``, ``system``) replace.
+        Scalar fields (``model``, ``description``, ``system``) replace. For
+        ``model``, prefer the current generation — ``"claude-sonnet-5"`` for
+        Sonnet, ``"claude-opus-5"`` for Opus — unless the user names an older
+        version explicitly.
         List fields (``tools``, ``mcp_servers``, ``skills``) UNION with the
         agent's current state — caller's entries win on collision. To remove
         an existing entry, use the ``/agent-setup`` panel.

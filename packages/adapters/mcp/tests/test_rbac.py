@@ -429,7 +429,16 @@ async def test_non_admin_search_excludes_remaining_admin_tool(
     sessionmaker: async_sessionmaker[AsyncSession],
     tool_name: str,
 ) -> None:
-    """Each tenant-wide tool stays invisible to a non-admin session's search_tools."""
+    """Each tenant-wide tool stays invisible to a non-admin session's search_tools.
+
+    Asserted against the ``### <name>`` heading the renderer gives every returned
+    tool, not against the bare name anywhere in the output. Docstrings cross-
+    reference each other by tool name — ``explain_agent_resolution`` warns about
+    ``set_agent_default``, ``remove_skill`` contrasts itself with ``delete_skill``
+    — so a substring search cannot tell "this tool is exposed" from "some visible
+    tool mentions it in prose". The heading only appears for a tool the filter
+    actually returned, which is the property being protected.
+    """
     _, user_token = await _seed_admin_and_user(sessionmaker)
     app = _make_app(sessionmaker)
 
@@ -442,7 +451,7 @@ async def test_non_admin_search_excludes_remaining_admin_tool(
     call_result = result.get("result", result)
     content = call_result.get("content", [])  # type: ignore[union-attr]
     output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
-    assert tool_name not in output_text, (
+    assert f"### {tool_name}" not in output_text, (
         f"{tool_name} must NOT be discoverable by a non-admin session; got: {output_text!r}"
     )
 
