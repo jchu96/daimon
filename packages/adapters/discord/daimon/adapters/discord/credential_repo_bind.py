@@ -1,8 +1,9 @@
-"""Click-time authorization for the chat-initiated repo bind.
+"""Click-time authorization and clone-credential resolution for the
+chat-initiated repo bind.
 
 This module holds the shell halves of the chat-initiated repo bind: the
-click-time gate below, and — added by the plan that follows this one — the
-clone-credential resolution the write itself needs.
+click-time gate below, and the clone-credential resolution the write itself
+needs (`resolve_repo_binding_credential`).
 
 `refuse_if_shared_and_not_admin_for_request` re-derives the panel gate's
 (`refuse_if_shared_and_not_admin`) decision from primitives rather than
@@ -44,16 +45,23 @@ pre-filter itself.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Final
 
+import httpx
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
+from daimon.adapters.discord.agent_setup.write import load_agent_inline_pat, store_inline_pat
 from daimon.adapters.discord.checks import is_guild_admin
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.defaults.ma_index import list_agents_by_tenant
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
+from daimon.core.errors import DaimonError
+from daimon.core.github_repo_auth import normalize_owner_repo
+from daimon.core.github_visibility import is_public_repo, pat_can_access_repo
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.stores.domain import RepoAccessProof
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 
 import discord
@@ -190,3 +198,84 @@ async def refuse_if_shared_and_not_admin_for_request(
         await _send_ephemeral(interaction, _SHARED_AGENT_MESSAGE)
         return True
     return False
+
+
+async def resolve_repo_binding_credential(
+    runtime: DiscordRuntime,
+    http_client: httpx.AsyncClient,
+    *,
+    agent_id: uuid.UUID,
+    account_id: uuid.UUID,
+    repo_url: str,
+    pasted_pat: str | None,
+    now: datetime,
+) -> tuple[str, RepoAccessProof]:
+    """Resolve the clone credential for a chat-initiated repo bind.
+
+    Mirrors `agent_setup.modals.RepoAuthModal`'s repo branch step for step —
+    same order, same messages, same precedence — because reusing the panel's
+    resolution rather than writing a second one is what closes the
+    ungated-repo-bind defect this decision guards against. There is
+    deliberately no GitHub App tier here: an App installation is keyed by the
+    repo, not by the tenant doing this bind, so its coverage proves nothing
+    about whether *this* binder may read the repo (the panel dropped this
+    same tier for the same reason, and re-adding it here would reopen the
+    cross-tenant private-repo read it closed).
+
+    Order, each short-circuiting:
+
+    1. A non-empty `pasted_pat` must grant access to `repo_url` itself
+       (`pat_can_access_repo`) before it is stored — a token that can't read
+       the repo it's meant to clone must never reach `store_inline_pat`.
+    2. Otherwise, a PAT already stored for this agent
+       (`load_agent_inline_pat`) has unconditional precedence in
+       `select_clone_auth`'s tier ordering, so — if one exists — it, not any
+       other coverage, is what will clone this repo. It is re-verified
+       against `repo_url` rather than trusted blindly: falling through to
+       the public probe on a mismatch would let a "successful" bind produce
+       a broken clone later.
+    3. Otherwise, `repo_url` must be verifiably public (`is_public_repo`):
+       the only credential that will ever clone an unauthenticated binding
+       is the operator's public-read-only fallback PAT, so an unpinned bind
+       can only be trusted against a repo anyone can read.
+
+    Raises `DaimonError` — never a sentinel — before any write when the
+    presented credential does not clear the repo it names. `http_client` is
+    injected; this function carries no `discord` type in its signature, so
+    it can be driven directly by a test with no Discord interaction at all.
+    """
+    owner_repo = normalize_owner_repo(repo_url)
+    pat = (pasted_pat or "").strip()
+    if pat:
+        has_access = await pat_can_access_repo(http_client, owner_repo=owner_repo, pat=pat)
+        if not has_access:
+            raise DaimonError(
+                "That token can't access this repo (or the repo doesn't "
+                "exist). Paste a PAT that has access, or connect GitHub."
+            )
+        ma_secret_ref = await store_inline_pat(
+            runtime, account_id=account_id, agent_id=agent_id, plaintext_pat=pat
+        )
+        return ma_secret_ref, RepoAccessProof(kind="pat", at=now, account_id=account_id)
+
+    existing_pat = await load_agent_inline_pat(runtime, agent_id=agent_id)
+    if existing_pat is not None:
+        covers_new_repo = await pat_can_access_repo(
+            http_client, owner_repo=owner_repo, pat=existing_pat
+        )
+        if not covers_new_repo:
+            raise DaimonError(
+                "This agent already has a stored GitHub token that can't "
+                "access this repo. Paste a token that can, or clear the "
+                "stored one, then bind again."
+            )
+        return f"inline-pat:{agent_id}", RepoAccessProof(kind="pat", at=now, account_id=account_id)
+
+    public = await is_public_repo(http_client, owner_repo=owner_repo)
+    if not public:
+        raise DaimonError(
+            "This repo isn't publicly readable (it's private, or it "
+            "doesn't exist) — paste a GitHub token that can read it to "
+            "bind it."
+        )
+    return "anon:", RepoAccessProof(kind="public", at=now, account_id=account_id)
