@@ -62,6 +62,9 @@ _request_env_credential_impl = (
 _request_mcp_credential_impl = (
     _credential_requests_mod._request_mcp_credential_impl  # pyright: ignore[reportPrivateUsage]
 )
+_request_repo_binding_impl = (
+    _credential_requests_mod._request_repo_binding_impl  # pyright: ignore[reportPrivateUsage]
+)
 register_credential_request_tools = _credential_requests_mod.register_credential_request_tools
 
 pytestmark = pytest.mark.asyncio
@@ -551,6 +554,144 @@ async def test_request_mcp_credential_rejects_non_http_url(
 # ---------------------------------------------------------------------------
 # 10. A failed button post raises a ToolError rather than silently succeeding
 # ---------------------------------------------------------------------------
+
+
+async def test_request_repo_binding_creates_row_and_posts_button(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_repo", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    before = datetime.now(UTC)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9204", posted=posted)
+
+    result = await _request_repo_binding_impl(
+        runtime,
+        auth,
+        agent_name="daimon",
+        repo_url="https://github.com/clsandoval/daimon-qa-scratch",
+        purpose="binding the QA scratch repo",
+        channel_id="222",
+    )
+
+    assert result.kind == "repo", "result must report the repo kind"
+    assert result.target == "https://github.com/clsandoval/daimon-qa-scratch", (
+        "result must report the exact submitted repo url"
+    )
+    assert result.message_id == "9204", "result must report the posted message id"
+    assert before + DEFAULT_TTL <= result.expires_at, "expires_at must be at least now + TTL"
+    assert await _row_count(db_session) == 1, "exactly one credential_requests row must be created"
+
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None, "the minted token must resolve to the created row"
+    assert row.kind == "repo"
+    assert row.target == "https://github.com/clsandoval/daimon-qa-scratch"
+    assert row.mcp_server_url is None, "repo rows must not carry an mcp_server_url"
+    assert row.account_id == auth.account_id, "row must stamp the caller's account_id"
+    assert row.requester_platform_user_id == auth.platform_user_id, (
+        "row must stamp the caller's platform_user_id"
+    )
+    assert row.tenant_id == tenant.id
+
+
+async def test_request_repo_binding_rejects_unknown_agent(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents([])  # no agents in the tenant
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    with pytest.raises(ToolError, match="not found in this tenant"):
+        await _request_repo_binding_impl(
+            runtime,
+            auth,
+            agent_name="ghost",
+            repo_url="https://github.com/clsandoval/daimon-qa-scratch",
+            purpose="x",
+            channel_id="222",
+        )
+    assert await _row_count(db_session) == 0, "an unknown agent must create no row"
+
+
+async def test_request_repo_binding_rejects_invalid_repo_url(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity()
+    with pytest.raises(ToolError, match="owner/repo"):
+        await _request_repo_binding_impl(
+            runtime,
+            auth,
+            agent_name="daimon",
+            repo_url="https://github.com/not-a-repo-shape",
+            purpose="x",
+            channel_id="222",
+        )
+    assert await _row_count(db_session) == 0, "an invalid repo url must create no row"
+
+
+async def test_request_repo_binding_signature_has_no_secret_or_branch_parameter() -> None:
+    """Belt-and-suspenders: the repo-binding impl's own signature carries no
+    token/secret/value/pat parameter, and no default_branch parameter — the
+    row has no column to persist one."""
+    params = set(inspect.signature(_request_repo_binding_impl).parameters)
+    forbidden = {
+        p
+        for p in params
+        if any(w in p.lower() for w in ("token", "secret", "value", "pat", "default_branch"))
+    }
+    assert not forbidden, (
+        f"_request_repo_binding_impl must not accept a secret or branch parameter, "
+        f"found {forbidden}"
+    )
+
+
+async def test_request_repo_binding_posts_message_naming_agent_and_repo(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_repo_msg", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9205", posted=posted)
+
+    await _request_repo_binding_impl(
+        runtime,
+        auth,
+        agent_name="daimon",
+        repo_url="https://github.com/clsandoval/daimon-qa-scratch",
+        purpose="binding the QA scratch repo",
+        channel_id="222",
+    )
+
+    content = posted["json"]["content"]
+    assert "daimon" in content, "message body must name the agent"
+    assert "https://github.com/clsandoval/daimon-qa-scratch" in content, (
+        "message body must name the exact repo"
+    )
+    button = posted["json"]["components"][0]["components"][0]
+    assert button["custom_id"].startswith(CUSTOM_ID_PREFIX), (
+        "the button's custom_id must carry the credential-request prefix"
+    )
+    assert button["label"].startswith("Bind repo: "), (
+        "the button's label must use the repo-kind prefix"
+    )
 
 
 async def test_request_env_credential_raises_when_button_post_fails(
