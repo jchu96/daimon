@@ -2168,6 +2168,42 @@
         'type': 'object',
       }),
     }),
+    'request_repo_binding': dict({
+      'description': '''
+        Request a repo binding for an agent via a private modal.
+        
+        Call this INSTEAD of ever telling the user to open ``/agent-setup``
+        to bind a repository. Posts a button in the thread naming the exact
+        repo and agent; clicking it opens a native Discord modal where the
+        user confirms the branch and, only if the repo is private and not
+        otherwise readable, pastes a GitHub token that never appears in this
+        channel or in your context.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'purpose': dict({
+            'type': 'string',
+          }),
+          'repo_url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'repo_url',
+          'purpose',
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'search_messages': dict({
       'description': '''
         Search messages with server-side filters.
