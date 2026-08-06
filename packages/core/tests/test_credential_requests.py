@@ -69,3 +69,18 @@ def test_build_button_label_truncates_long_target_within_discord_label_limit() -
     assert label.startswith("Add MCP credential: "), (
         "truncation must not lose the human-readable prefix"
     )
+
+
+def test_build_button_label_repo() -> None:
+    assert (
+        build_button_label("repo", "clsandoval/daimon-qa-scratch")
+        == "Bind repo: clsandoval/daimon-qa-scratch"
+    )
+
+
+def test_build_button_label_truncates_long_repo_target_within_discord_label_limit() -> None:
+    label = build_button_label("repo", "https://github.com/" + "x" * 200)
+
+    assert len(label) <= MAX_BUTTON_LABEL_CHARS, "label must fit Discord's 80-char button limit"
+    assert label.startswith("Bind repo: "), "truncation must not lose the human-readable prefix"
+    assert label.endswith("…"), "truncation must append the single-character ellipsis"

@@ -20,6 +20,12 @@ names the human-readable target, via `build_button_label`.
 `DynamicItem` dispatch matches incoming custom_ids with `pattern.fullmatch`,
 not a prefix search, so a template that merely starts with the right prefix
 would never dispatch (or could over-match unrelated ids).
+
+Each kind puts something different in `target`: for `env` it is the
+environment variable's key name, for `mcp` it is the MCP server name, and
+for `repo` it is the repo URL. A `repo` request's branch is collected in the
+modal at click time, not stored on the row — `credential_requests` has no
+branch column, and this module adds none.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ TOKEN_BYTES: Final[int] = 16
 CUSTOM_ID_TEMPLATE: Final[str] = r"ztc:(?P<token>[A-Za-z0-9_-]{16,64})"
 CUSTOM_ID_PATTERN: Final[re.Pattern[str]] = re.compile(CUSTOM_ID_TEMPLATE)
 
-CredentialRequestKind = Literal["env", "mcp"]
+CredentialRequestKind = Literal["env", "mcp", "repo"]
 
 # TTL bounds the replay window for a never-clicked button sitting in channel
 # scrollback; combined with the store's single-use consume, this is the full
@@ -49,7 +55,14 @@ DEFAULT_TTL: Final[dt.timedelta] = dt.timedelta(minutes=30)
 # Discord's documented Button.label limit.
 MAX_BUTTON_LABEL_CHARS: Final[int] = 80
 
-_KIND_DISPLAY: Final[dict[CredentialRequestKind, str]] = {"env": "env", "mcp": "MCP"}
+# The full label prefix for each kind. "env" and "mcp" reproduce the
+# pre-repo-kind wording byte-for-byte. "repo" cannot reuse the "Add {X}
+# credential: " interpolation — a repo binding is not a credential.
+_KIND_LABEL_PREFIX: Final[dict[CredentialRequestKind, str]] = {
+    "env": "Add env credential: ",
+    "mcp": "Add MCP credential: ",
+    "repo": "Bind repo: ",
+}
 
 
 def mint_request_token() -> str:
@@ -69,7 +82,7 @@ def build_button_label(kind: CredentialRequestKind, target: str) -> str:
     80-character button label limit — the label, not the custom_id, is what
     names the exact target, so it must fit on its own.
     """
-    prefix = f"Add {_KIND_DISPLAY[kind]} credential: "
+    prefix = _KIND_LABEL_PREFIX[kind]
     available = MAX_BUTTON_LABEL_CHARS - len(prefix)
     if len(target) <= available:
         return f"{prefix}{target}"
