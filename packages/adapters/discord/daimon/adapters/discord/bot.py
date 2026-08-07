@@ -396,6 +396,7 @@ class DaimonBot(commands.Bot):
         try:
             report = await reconcile_tenant_defaults(
                 self.runtime.anthropic,
+                self.runtime.sessionmaker,
                 self.runtime.settings.defaults_root,
                 tenant_id=tenant_id,
                 public_url=public_url,

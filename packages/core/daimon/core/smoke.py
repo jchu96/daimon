@@ -138,6 +138,7 @@ async def run_smoke_check(
             # daimon-mcp server — a bare turn binds no vault credential, and
             # MA fails session init for an agent whose MCP server has none.
             anthropic,
+            session_factory,
             defaults_root,
             tenant_id=tenant_id,
             public_url=None,

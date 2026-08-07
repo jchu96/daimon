@@ -69,9 +69,9 @@ admin-managed — changing its prompt, model, skills, or MCP servers needs a
 workspace admin, because people are already relying on that configuration.
 And the agent this deployment ships with can't be edited at all, by anyone,
 admin included — fork it (`fork_agent`) to get an editable copy, and
-configure that instead. Deleting an agent (**archive_agent**) is never
-available from chat either way — that always goes through `/agent-setup` or
-the `daimon agents archive` CLI command.
+configure that instead. Deleting an agent (**archive_agent**) is admin-only
+in the same way — a workspace admin can archive from chat; for anyone else
+it goes through `/agent-setup` or the `daimon agents archive` CLI command.
 
 ## Credentials never travel through chat
 

@@ -1,12 +1,20 @@
 """Per-resource reconciliation for skills.
 
-Two-state decision tree: find on MA by display_title → skip (found) or create
-(not found). Skills are org-wide on MA, have no metadata field, and the
-`latest_version` column is an opaque monotonic counter rather than a content
-hash, so there is no carrier to drive idempotent updates from. `defaults apply`
-treats skills as immutable: when an MA match exists, it is adopted as-is and no
-new version is uploaded. Content updates flow through `daimon skills sync`
-explicitly. See L13 smoke-matrix finding + skills_idempotency_carrier probe.
+Three-state decision tree: find on MA by display_title → create (no match),
+skip (match, content unchanged), or upload a new version (match, content
+changed).
+
+MA offers nothing to compare content against. Skills carry no metadata field,
+`latest_version` is an opaque monotonic counter rather than a content hash, no
+endpoint returns a version's file bytes, and the API rejects any zip whose
+top-level directory differs from the SKILL.md `name:` — so the folder name
+cannot smuggle a digest either. The fingerprint therefore lives in our own
+`seeded_skills` table.
+
+Updates go to a new VERSION of the existing skill rather than a
+delete-and-recreate. Agents pin `version="latest"`, so they pick the new
+content up with no re-attach, and the skill id never changes — deleting a
+skill an agent references 400s every one of that agent's turns.
 
 Duplicate skills sharing a display_title (a race-prone artifact, observed in
 production with two cli-auth skills created 54ms apart) are deleted inline,
@@ -28,12 +36,15 @@ from daimon.core.defaults.report import Action, ResourceOutcome
 from daimon.core.errors import DefaultsError
 from daimon.core.ma import delete_skill_and_versions
 from daimon.core.skill_zip import build_skill_zip
+from daimon.core.stores.seeded_skills import load_seeded_skill, record_seeded_skill
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = structlog.get_logger(__name__)
 
 
 async def reconcile_skill(
     client: AsyncAnthropic,
+    session_factory: async_sessionmaker[AsyncSession],
     skill_dir: Path,
     *,
     tenant_id: uuid.UUID,
@@ -68,22 +79,64 @@ async def reconcile_skill(
             )
             await delete_skill_and_versions(client, dup.id)
 
-    if ma_match is not None:
-        return ResourceOutcome(
-            kind="skill",
-            name=spec.name,
-            action=Action.SKIPPED,
-            anthropic_id=None if dry_run else ma_match.id,
-        )
-
-    if dry_run:
-        return ResourceOutcome(kind="skill", name=spec.name, action=Action.CREATED)
     pkg = build_skill_zip(skill_dir)
     try:
+        if ma_match is not None:
+            async with session_factory() as session:
+                recorded = await load_seeded_skill(session, tenant_id=tenant_id, name=spec.name)
+            # A recorded hash for a DIFFERENT skill id describes content we can
+            # no longer vouch for on this one, so it does not count as a match.
+            if (
+                recorded is not None
+                and recorded.anthropic_id == ma_match.id
+                and recorded.content_hash == pkg.content_hash
+            ):
+                return ResourceOutcome(
+                    kind="skill",
+                    name=spec.name,
+                    action=Action.SKIPPED,
+                    anthropic_id=None if dry_run else ma_match.id,
+                )
+            if dry_run:
+                return ResourceOutcome(kind="skill", name=spec.name, action=Action.UPDATED)
+            _log.info(
+                "reconcile.skill_content_changed",
+                name=spec.name,
+                skill_id=ma_match.id,
+                had_fingerprint=recorded is not None,
+            )
+            with pkg.path.open("rb") as fh:
+                await client.beta.skills.versions.create(
+                    ma_match.id, files=[("SKILL.zip", fh, "application/zip")]
+                )
+            async with session_factory() as session:
+                await record_seeded_skill(
+                    session,
+                    tenant_id=tenant_id,
+                    name=spec.name,
+                    content_hash=pkg.content_hash,
+                    anthropic_id=ma_match.id,
+                )
+                await session.commit()
+            return ResourceOutcome(
+                kind="skill", name=spec.name, action=Action.UPDATED, anthropic_id=ma_match.id
+            )
+
+        if dry_run:
+            return ResourceOutcome(kind="skill", name=spec.name, action=Action.CREATED)
         with pkg.path.open("rb") as fh:
             created = await client.beta.skills.create(
                 display_title=display_title, files=[("SKILL.zip", fh, "application/zip")]
             )
+        async with session_factory() as session:
+            await record_seeded_skill(
+                session,
+                tenant_id=tenant_id,
+                name=spec.name,
+                content_hash=pkg.content_hash,
+                anthropic_id=created.id,
+            )
+            await session.commit()
     finally:
         pkg.path.unlink(missing_ok=True)
     return ResourceOutcome(

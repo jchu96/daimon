@@ -697,6 +697,7 @@ async def test_fire_closure_threads_public_url_from_settings(
 
     async def fake_reconcile(
         client: object,
+        session_factory: object,
         defaults_root: object,
         *,
         tenant_id: uuid.UUID,

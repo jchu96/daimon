@@ -79,8 +79,9 @@ _TOKEN_RE = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b")
 _INTENTIONAL_NON_CHAT_MENTIONS: dict[str, str] = {
     # named only to distinguish it from remove_skill, its chat-reachable sibling
     "delete_skill": "tenant-wide destructive skill delete; admin-only, panel-only",
-    # named only to say it is NOT available from chat, unlike most roster ops
-    "archive_agent": "destructive agent delete; admin-only, panel/CLI-only",
+    # admin-only, so an ADMIN chat turn does reach it — this test's chat
+    # session is deliberately non-admin, which is the only reason it is here
+    "archive_agent": "destructive agent delete; admin-gated, so absent from a non-admin chat turn",
 }
 
 

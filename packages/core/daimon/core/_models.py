@@ -421,6 +421,42 @@ class UserSkill(Base):
     )
 
 
+class SeededSkill(Base):
+    """Content fingerprint for one seeded (`defaults/skills/**`) skill per tenant.
+
+    Exists because MA gives skills no idempotence carrier of its own: they hold
+    no metadata field, `latest_version` is an opaque counter rather than a
+    content hash, and the API rejects any zip whose top-level directory differs
+    from the SKILL.md `name:` — so the folder name cannot carry a digest either.
+    Without a local fingerprint, `defaults apply` had no way to tell an edited
+    skill from an unchanged one and adopted every MA match as-is, which left
+    every `defaults/skills/**` edit undeliverable to an already-provisioned
+    install.
+
+    Distinct from `user_skills`, which fingerprints repo-synced skills per
+    principal and per agent. Seeded skills have neither: they are one row per
+    (tenant, skill name).
+    """
+
+    __tablename__ = "seeded_skills"
+    __table_args__ = (PrimaryKeyConstraint("tenant_id", "name", name="pk_seeded_skills"),)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    anthropic_id: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class AgentGithubBinding(Base):
     """Per-agent GitHub credential overlay. Day-1 always empty; populated by
     Discord agent-setup panel. Single credential per principal day-1,

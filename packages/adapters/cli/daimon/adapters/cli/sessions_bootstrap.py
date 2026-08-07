@@ -121,7 +121,7 @@ async def resolve_agent_and_environment(
             daimon_tag=agent_name,
             cached_id=None,
             apply_callable=lambda: reconcile_tenant_defaults(
-                anthropic, defaults_root, tenant_id=tenant_id, public_url=None
+                anthropic, session_factory, defaults_root, tenant_id=tenant_id, public_url=None
             ),
             cache=cache,
         )
@@ -137,7 +137,7 @@ async def resolve_agent_and_environment(
             daimon_tag=env_name,
             cached_id=None,
             apply_callable=lambda: reconcile_tenant_defaults(
-                anthropic, defaults_root, tenant_id=tenant_id, public_url=None
+                anthropic, session_factory, defaults_root, tenant_id=tenant_id, public_url=None
             ),
             cache=cache,
         )

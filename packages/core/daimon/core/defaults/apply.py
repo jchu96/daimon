@@ -43,6 +43,7 @@ async def apply_defaults(
     # 2-7. Delegate the shared reconcile spine.
     return await _reconcile_core(
         client,
+        session_factory,
         defaults_root,
         tenant_id=tenant_id,
         account_id=None,

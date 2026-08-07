@@ -19,6 +19,7 @@ idempotent across re-syncs.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -42,6 +43,7 @@ class SkillPackage:
 
     path: Path
     included_paths: list[str]
+    content_hash: str
     dropped_paths: list[str] = field(default_factory=list[str])
     uncompressed_bytes: int = 0
 
@@ -89,6 +91,17 @@ def build_skill_zip(skill_dir: Path, *, name: str | None = None) -> SkillPackage
         if len(included) > MAX_FILES:
             raise DefaultsError(f"{skill_dir}: too many files (> {MAX_FILES})")
 
+    # Hashed off the same (arc_name, bytes) pairs that are about to be written,
+    # so the digest can never describe something other than what was uploaded.
+    # The zip file itself is not hashable for this — it carries real mtimes, so
+    # two builds of identical content differ byte-for-byte.
+    digest = hashlib.sha256()
+    for arc_name, file in included:
+        digest.update(arc_name.encode())
+        digest.update(b"\0")
+        digest.update(file.read_bytes())
+        digest.update(b"\0")
+
     fd, tmp_path = tempfile.mkstemp(prefix=f"skill-{top}-", suffix=".zip")
     os.close(fd)
     tmp = Path(tmp_path)
@@ -99,6 +112,7 @@ def build_skill_zip(skill_dir: Path, *, name: str | None = None) -> SkillPackage
     return SkillPackage(
         path=tmp,
         included_paths=[arc for arc, _ in included],
+        content_hash=digest.hexdigest(),
         dropped_paths=dropped,
         uncompressed_bytes=total_bytes,
     )
