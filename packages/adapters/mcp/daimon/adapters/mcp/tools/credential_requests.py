@@ -354,20 +354,27 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         branch: str = "main",
         path: str = "",
     ) -> RequestCredentialResult:
-        """Ask for a GitHub token so ``sync_skills`` can read a PRIVATE repo.
+        """Ask for a GitHub token so a skill import can read a PRIVATE repo.
 
-        Call this when ``sync_skills`` reports that no credential was
-        available — NOT ``request_repo_binding``. Importing skills from a repo
-        and binding a repo for the agent to check out are different things:
-        this one writes no ``agent_repo_binding`` row, so it will not make the
-        agent start cloning the skill repo. The stored token is shared between
-        the two, so a user who has already bound a repo with a token that can
-        also read this one will not be asked twice.
+        Call this when importing skills from a repo reports that no
+        credential was available — NOT ``request_repo_binding``. Importing
+        skills from a repo and binding a repo for the agent to check out are
+        different things: this one writes no ``agent_repo_binding`` row, so
+        it will not make the agent start cloning the skill repo. The stored
+        token is shared between the two, so a user who has already bound a
+        repo with a token that can also read this one will not be asked
+        twice.
 
-        Pass the same ``repo_url``/``branch``/``path`` you passed to
-        ``sync_skills`` — they are carried through the click, and the import
-        re-runs automatically on submit, so you do not need to call
-        ``sync_skills`` again afterwards.
+        Pass the same repo url, branch, and path the failed import used —
+        they are carried through the click, and the import re-runs
+        automatically on submit, so there is nothing to call afterwards.
+
+        Deliberately does NOT name the import tool. That tool is admin-gated,
+        this one is not (matching its sibling ``request_*`` tools), so naming
+        it here would disclose a gated tool's existence to every principal
+        that can discover this one — which
+        ``test_chat_session_tool_reachability`` asserts against by searching
+        the rendered tool text for the gated name.
         """
         return await _request_skill_repo_credential_impl(
             runtime,
