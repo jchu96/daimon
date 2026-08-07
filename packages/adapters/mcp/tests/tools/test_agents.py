@@ -4651,3 +4651,49 @@ async def test_update_agent_allows_an_mcp_merge_exactly_at_the_cap() -> None:
     assert len(update_calls[0]["mcp_servers"]) == AGENT_MCP_CAP, (
         "the merged patch must carry exactly AGENT_MCP_CAP mcp servers"
     )
+
+
+def test_create_spec_rejects_a_model_this_deployment_does_not_meter() -> None:
+    """The chat path validates model ids the way the panel always has.
+
+    An unmetered id is worse than a wrong one: the agent is created, fails only
+    when a session tries to start, and every turn it does run is billed by
+    Anthropic while `pricing.cost_of` returns None for it — spend that never
+    reaches the ledger. `claude-opus-4-5` is real and in the SDK's Literal, but
+    absent from AGENT_MODEL_PRICING, which is exactly the gap.
+    """
+    from daimon.adapters.mcp.tools.agents import (
+        _build_create_spec,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        _build_create_spec(
+            name="a",
+            model="claude-opus-4-5",
+            description=None,
+            system=None,
+            tools=None,
+            mcp_servers=None,
+            skill_repos=None,
+        )
+    assert "claude-opus-5" in str(excinfo.value), (
+        "the refusal must list what IS available, or the caller has to guess"
+    )
+
+
+def test_create_spec_accepts_the_current_generation_models() -> None:
+    from daimon.adapters.mcp.tools.agents import (
+        _build_create_spec,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    for model in ("claude-sonnet-5", "claude-opus-5"):
+        spec = _build_create_spec(
+            name="a",
+            model=model,
+            description=None,
+            system=None,
+            tools=None,
+            mcp_servers=None,
+            skill_repos=None,
+        )
+        assert spec.model == model, f"{model} must be accepted"

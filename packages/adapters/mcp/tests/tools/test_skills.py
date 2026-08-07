@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from pathlib import Path
@@ -422,7 +423,9 @@ def _agent_json(*, agent_id: str, tenant_id: uuid.UUID, skill_ids: list[str]) ->
         type="agent",
         name="agent",
         model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(tenant_id)},
+        # daimon_name too: name lookups go through the metadata tag, not the
+        # MA `name` field, so an agent without it is invisible to them.
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "agent"},
         description=None,
         created_at="2026-04-21T00:00:00Z",
         updated_at="2026-04-21T00:00:00Z",
@@ -489,7 +492,11 @@ async def test_sync_impl_reports_zero_attached_when_no_agent_attaches_synced_ski
     assert "3" in result.summary and "0" in result.summary, (
         "summary must name both the registry and attached counts"
     )
-    assert "registry" in result.summary, "summary must name the registry explicitly"
+    assert "librar" in result.summary, "summary must name where the skills landed"
+    assert "agent_name" in result.summary, (
+        "with no agent named, the summary must say how to attach — describing the gap "
+        "without naming the next call is what left skills stranded in the library"
+    )
     assert len(agent_list_calls) == 1, "exactly one agent-listing request per sync, not per skill"
 
 
@@ -702,3 +709,86 @@ async def test_get_skill_and_alias_dispatch_identically() -> None:
     assert canonical.structured_content == alias.structured_content, (
         "get_skill and its skills_get alias must dispatch to identical behavior"
     )
+
+
+async def test_sync_impl_attaches_to_the_named_agent_and_preserves_its_existing_skills(
+    tmp_path: Path,
+) -> None:
+    """``agent_name`` closes the import/attach gap in one call.
+
+    Without it, an import left ``attached_count`` structurally 0 — the skill sat
+    in the shared library and reached no agent, and nothing in the tool or the
+    prompt told the model to make the second call. The union matters as much as
+    the attach: an agent that loses its existing skills to gain a new one has
+    traded one broken state for another.
+    """
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    outcomes = [
+        ResourceOutcome(kind="skill", name="skill-a", action=Action.CREATED, anthropic_id="sk_a"),
+    ]
+
+    with (
+        patch("daimon.core.skills.pipeline.fetch_repo") as mock_fetch,
+        patch("daimon.core.skills.pipeline.discover_skills"),
+        patch("daimon.core.skills.pipeline.sync_skills") as mock_sync,
+    ):
+        from daimon.core.skills.fetch import FetchResult
+
+        cleanup_dir = tmp_path / "cleanup"
+        cleanup_dir.mkdir()
+        mock_fetch.return_value = FetchResult(path=tmp_path, cleanup_dir=cleanup_dir)
+        mock_sync.return_value = outcomes
+
+        updates: list[dict[str, Any]] = []
+        attached_after_update = ["sk_existing"]
+
+        def on_agents_list(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+            return list_response(
+                [_agent_json(agent_id="ag_1", tenant_id=tenant_id, skill_ids=attached_after_update)]
+            )
+
+        def on_agent_get(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=_agent_json(agent_id="ag_1", tenant_id=tenant_id, skill_ids=["sk_existing"]),
+            )
+
+        def on_agent_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+            body = json.loads(req.content)
+            updates.append(body)
+            ids = [s["skill_id"] for s in body["skills"]]
+            attached_after_update[:] = ids
+            return httpx.Response(
+                200, json=_agent_json(agent_id="ag_1", tenant_id=tenant_id, skill_ids=ids)
+            )
+
+        router = MARouter()
+        router.add("GET", r"/v1/agents$", on_agents_list)
+        router.add("GET", r"/v1/agents/ag_1$", on_agent_get)
+        router.add("POST", r"/v1/agents/ag_1$", on_agent_update)
+        client = build_fake_anthropic(router.dispatch)
+
+        auth = AuthIdentity(
+            account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+        )
+        result = await _sync_impl(
+            _runtime(client),
+            auth,
+            url="https://github.com/org/repo",
+            branch="main",
+            path="",
+            agent_name="agent",
+        )
+
+    assert len(updates) == 1, "the named agent must actually be updated, not just counted"
+    attached_ids = {s["skill_id"] for s in updates[0]["skills"]}
+    assert "sk_a" in attached_ids, "the freshly imported skill must be attached"
+    assert "sk_existing" in attached_ids, (
+        "attaching is a union — the agent's existing skills must survive"
+    )
+    assert result.attached_count == 1, (
+        "attached_count must reflect this call's own attach, not the state it saw on the way in"
+    )
+    assert "agent" in result.summary, "the summary must name the agent it attached to"

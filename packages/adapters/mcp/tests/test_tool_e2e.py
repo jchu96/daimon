@@ -139,7 +139,7 @@ async def test_create_agent_end_to_end_validates_ma_response(
     async with Client(mcp) as client:
         result = await client.call_tool(
             "create_agent",
-            {"name": "newagent", "model": "claude-opus-4-5"},
+            {"name": "newagent", "model": "claude-opus-5"},
         )
         row = json.loads(result.content[0].text)  # type: ignore[union-attr]
         assert row["name"] == "newagent", "should persist created agent name"

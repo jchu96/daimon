@@ -32,7 +32,7 @@ from daimon.adapters.mcp.tools._ctx import (
 )
 from daimon.core import agent_lifecycle
 from daimon.core.agent_guidance import apply_credential_guidance
-from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
+from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP, ALLOWED_MODEL_IDS
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     find_agents_by_daimon_tag,
@@ -301,6 +301,21 @@ async def _get_agent_impl(
     return await _build_agent_info(runtime.client, agent, tenant_id=auth.tenant_id)
 
 
+def _reject_unknown_model(model: str) -> None:
+    """Raise unless ``model`` is one this deployment meters and allows.
+
+    The panel paths have validated free-text model input against
+    ALLOWED_MODEL_IDS since UX-25-03; the chat paths never did, so a typo or a
+    hallucinated id was accepted here and only surfaced later as a session that
+    would not start. An unpriced id is also invisible to cost accounting —
+    ``pricing.cost_of`` returns None for a model it has no rates for, so the
+    turn is billed by Anthropic and recorded as free by us.
+    """
+    if model not in ALLOWED_MODEL_IDS:
+        allowed = ", ".join(ALLOWED_MODEL_IDS)
+        raise ToolError(f"Model '{model}' is not available. Choose one of: {allowed}")
+
+
 def _build_create_spec(
     *,
     name: str,
@@ -321,6 +336,7 @@ def _build_create_spec(
     ``mcp_toolset``) is reshaped into a readable ``ToolError`` rather than leaking
     raw validator output.
     """
+    _reject_unknown_model(model)
     try:
         return AgentSpec(
             name=name,
@@ -446,6 +462,8 @@ async def _update_agent_impl(
     mcp_servers: list[BetaManagedAgentsURLMCPServerParams] | None,
     skills: list[str | BetaManagedAgentsSkillParams] | None,
 ) -> AgentInfo:
+    if model is not None:
+        _reject_unknown_model(model)
     scalars: dict[str, Any] = {"model": model, "description": description, "system": system}
     list_fields = (tools, mcp_servers, skills)
     if all(v is None for v in scalars.values()) and all(v is None for v in list_fields):

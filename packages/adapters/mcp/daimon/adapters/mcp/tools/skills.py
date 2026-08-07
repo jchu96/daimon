@@ -10,26 +10,34 @@ from __future__ import annotations
 import datetime
 import time
 
+import anthropic
 import httpx
-from anthropic.types.beta import SkillListResponse
+from anthropic.types.beta import (
+    BetaManagedAgentsAgent,
+    BetaManagedAgentsSkillParams,
+    SkillListResponse,
+)
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.core.constants import AGENT_SKILL_CAP
 from daimon.core.defaults.ma_index import (
+    find_agent_by_daimon_tag,
     find_skill_by_display_title,
     list_agents_by_tenant,
     list_skills_lenient,
 )
 from daimon.core.defaults.metadata import strip_tenant_prefix, tenant_scoped_display_title
 from daimon.core.defaults.report import Action, ResourceOutcome
+from daimon.core.defaults.spec_merge import merge_skills_with_ma
 from daimon.core.errors import DaimonError
 from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_repo
 from daimon.core.github_credentials import get_pat
 from daimon.core.github_repo_auth import InstallationLookup, resolve_skill_sync_token
-from daimon.core.ma import delete_skill_and_versions
+from daimon.core.ma import delete_skill_and_versions, update_agent_with_version_retry
 from daimon.core.skills.pipeline import run_skill_sync
 from daimon.core.stores.agent_repo_binding import get_bindings_for_repo
 from daimon.core.stores.domain import RepoProofKind
@@ -67,12 +75,15 @@ class SkillSyncResult(BaseModel):
     should report that back to the user rather than presenting an opaque list of
     skills with no origin.
 
-    Landing in the registry is not the same as being usable by any agent —
-    synced skills are attached to nothing until a separate attach step runs.
-    This model reports that distinction (``registry_count`` /
-    ``attached_count`` / ``summary``) rather than the caller inferring it from
-    ``outcomes``' ``action`` values, which read as "available now" but say
-    nothing about attachment.
+    Landing in the library is not the same as being usable by any agent — an
+    import with no ``agent_name`` attaches to nothing. This model reports that
+    distinction (``registry_count`` / ``attached_count`` / ``summary``) rather
+    than the caller inferring it from ``outcomes``' ``action`` values, which
+    read as "available now" but say nothing about attachment.
+
+    The counts stayed permanently lopsided while the tool had no way to
+    attach: ``attached_count`` was structurally 0 and the summary could only
+    describe the gap it could not close. ``agent_name`` closes it.
     """
 
     source_url: str
@@ -84,11 +95,11 @@ class SkillSyncResult(BaseModel):
     attached_count: int
     """Of ``registry_count``, how many are attached to at least one agent in
     the tenant right now — computed from the tenant's agents at report time,
-    not asserted."""
+    not asserted. Recounted after this call's own attach, when one ran."""
     summary: str
-    """One-line plain-language statement of both counts, naming the registry
-    and that attachment is a separate step (e.g. "3 skill(s) added to the
-    tenant's shared registry; 0 attached to an agent yet.")."""
+    """One-line plain-language statement of both counts, and either what was
+    attached or how to attach (e.g. "3 skill(s) imported into the workspace's
+    shared skill library; 3 attached to an agent. Attached to 'analyst'.")."""
 
 
 async def _resolve_sync_token(
@@ -189,12 +200,55 @@ async def _resolve_sync_token(
     )
 
 
+async def _attach_synced_skills(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    agent_name: str,
+    skill_ids: set[str],
+) -> str:
+    """Attach ``skill_ids`` to ``agent_name``, returning a one-line outcome.
+
+    Returns prose rather than raising, because the upload has already
+    succeeded by the time this runs: a failure here is partial, not total,
+    and the caller must report both halves truthfully rather than lose the
+    successful import behind an exception.
+    """
+    agent = await find_agent_by_daimon_tag(
+        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    )
+    if agent is None:
+        return f"Could not attach: agent '{agent_name}' not found. The skills are in the registry."
+
+    new_skills: list[BetaManagedAgentsSkillParams] = [
+        {"type": "custom", "skill_id": skill_id} for skill_id in sorted(skill_ids)
+    ]
+
+    async def _apply(fresh: BetaManagedAgentsAgent) -> BetaManagedAgentsAgent:
+        merged = merge_skills_with_ma(new_skills, fresh)
+        if len(merged) > AGENT_SKILL_CAP:
+            raise ToolError(
+                f"Cannot attach: the merged skill set ({len(merged)}) exceeds this "
+                f"organization's per-agent skill limit ({AGENT_SKILL_CAP})."
+            )
+        return await runtime.client.beta.agents.update(
+            fresh.id, version=fresh.version, skills=merged
+        )
+
+    try:
+        await update_agent_with_version_retry(runtime.client, agent.id, _apply)
+    except (ToolError, anthropic.APIStatusError) as exc:
+        return f"Uploaded to the registry, but attaching to '{agent_name}' failed: {exc}"
+    return f"Attached to '{agent_name}'."
+
+
 async def _sync_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
     url: str,
     branch: str,
     path: str,
+    agent_name: str | None = None,
 ) -> SkillSyncResult:
     _require_admin(auth)
     async with httpx.AsyncClient(timeout=30.0) as http:
@@ -221,14 +275,25 @@ async def _sync_impl(
         for outcome in outcomes
         if outcome.anthropic_id is not None and outcome.action in (Action.CREATED, Action.UPDATED)
     }
+    attach_note = ""
+    if agent_name is not None and registry_ids:
+        attach_note = " " + await _attach_synced_skills(
+            runtime, auth, agent_name=agent_name, skill_ids=registry_ids
+        )
+
+    # Recounted AFTER any attach, so attached_count reflects this call's own
+    # effect rather than the state it observed on the way in.
     agents = await list_agents_by_tenant(runtime.client, tenant_id=auth.tenant_id)
     attached_ids = {skill.skill_id for agent in agents for skill in agent.skills}
     attached = registry_ids & attached_ids
 
     summary = (
-        f"{len(registry_ids)} skill(s) added to the tenant's shared registry; "
-        f"{len(attached)} attached to an agent so far (registry membership and "
-        "agent attachment are separate steps)."
+        f"{len(registry_ids)} skill(s) imported into the workspace's shared skill "
+        f"library; {len(attached)} attached to an agent."
+        + (
+            attach_note
+            or " Importing and attaching are separate steps — pass agent_name to do both."
+        )
     )
     return SkillSyncResult(
         source_url=url,
@@ -303,20 +368,30 @@ def register_skill_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         url: str,
         branch: str = "main",
         path: str = "",
+        agent_name: str | None = None,
     ) -> SkillSyncResult:
-        """Sync skills from a GitHub repository. Discovers SKILL.md and creates or updates them.
+        """Import skills from a GitHub repo into this workspace's shared skill library.
 
-        LOCAL-FIRST: before syncing an external repo, call ``list_skills`` to see
-        what is already installed and prefer an existing skill over pulling a
-        near-duplicate. Only sync an external repo the user explicitly asked for.
+        Discovers SKILL.md files and creates or updates them. This is an IMPORT,
+        not a per-agent change: the library is visible to every agent in the
+        workspace, and importing alone attaches nothing.
 
-        Synced skills are added to this tenant's shared skill registry (visible to
-        every agent in the tenant), so name where they came from when you report
-        back — the returned ``source_url``/``branch``/``path`` echo that provenance.
+        Pass ``agent_name`` to also attach everything imported to that agent —
+        which is almost always what someone means by "add this skill to my
+        agent". Omit it only to stock the library without touching any agent.
+        Existing skills on the agent are preserved; the attach is a union.
+
+        LOCAL-FIRST: before importing an external repo, call ``list_skills`` to
+        see what is already in the library and prefer an existing skill over
+        pulling a near-duplicate. Only import a repo the user explicitly asked for.
+
+        Report where the skills came from — the returned
+        ``source_url``/``branch``/``path`` echo that provenance, and ``summary``
+        states both what was imported and what was attached.
 
         Before calling, inspect the repo structure to determine the correct ``path``
         parameter (empty string = repo root). ``branch`` defaults to ``"main"``."""
-        return await _sync_impl(runtime, await _auth(ctx), url, branch, path)
+        return await _sync_impl(runtime, await _auth(ctx), url, branch, path, agent_name)
 
     @mcp.tool
     async def list_skills(ctx: Context) -> list[SkillInfo]:  # pyright: ignore[reportUnusedFunction]
@@ -342,11 +417,13 @@ def register_skill_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         url: str,
         branch: str = "main",
         path: str = "",
+        agent_name: str | None = None,
     ) -> SkillSyncResult:
-        """Sync skills from a GitHub repository (alias of ``sync_skills``).
+        """Import skills from a GitHub repo into the shared library (alias of ``sync_skills``).
 
-        Discovers SKILL.md and creates or updates them."""
-        return await _sync_impl(runtime, await _auth(ctx), url, branch, path)
+        Discovers SKILL.md and creates or updates them. Pass ``agent_name`` to
+        also attach them to that agent; importing alone attaches nothing."""
+        return await _sync_impl(runtime, await _auth(ctx), url, branch, path, agent_name)
 
     @mcp.tool
     async def skills_list(ctx: Context) -> list[SkillInfo]:  # pyright: ignore[reportUnusedFunction]
