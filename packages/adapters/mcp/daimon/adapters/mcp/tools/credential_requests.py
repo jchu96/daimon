@@ -38,6 +38,7 @@ from daimon.adapters.mcp.tools.discord import (
 from daimon.core.credential_requests import (
     DEFAULT_TTL,
     CredentialRequestKind,
+    build_skill_repo_target,
     mint_request_token,
 )
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
@@ -214,6 +215,48 @@ async def _request_mcp_credential_impl(
 # would be silently discarded — the exact class of surface-that-lies this
 # tool exists not to become. The modal collects the branch instead,
 # defaulting to `main`.
+async def _request_skill_repo_credential_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    agent_name: str,
+    repo_url: str,
+    branch: str,
+    path: str,
+    purpose: str,
+    channel_id: str,
+) -> RequestCredentialResult:
+    if auth.platform == "slack":
+        raise ToolError("request_skill_repo_credential is not supported on Slack yet")
+    if auth.platform_user_id is None:
+        raise ToolError("credential requests require a platform-bound identity")
+    if urlparse(repo_url).scheme not in ("http", "https"):
+        raise ToolError("repo url must be http or https, e.g. https://github.com/owner/repo")
+    if not _OWNER_REPO_RE.fullmatch(normalize_owner_repo(repo_url)):
+        raise ToolError(
+            "repo url must name exactly one owner/repo, e.g. https://github.com/owner/repo"
+        )
+    # "@" and "#" are the packing delimiters; a branch or path carrying one
+    # would round-trip as a different repo, so refuse rather than mangle.
+    if "@" in branch or "#" in branch:
+        raise ToolError("branch must not contain '@' or '#'")
+    if "#" in path:
+        raise ToolError("path must not contain '#'")
+    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name)
+    return await _mint_and_post(
+        runtime,
+        auth,
+        kind="skill_repo",
+        target=build_skill_repo_target(repo_url, branch, path),
+        mcp_server_url=None,
+        agent_id=agent_id,
+        requester_platform_user_id=auth.platform_user_id,
+        agent_name=agent_name,
+        purpose=purpose,
+        channel_id=channel_id,
+    )
+
+
 async def _request_repo_binding_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -298,6 +341,51 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             agent_name=agent_name,
             server_name=server_name,
             url=url,
+            channel_id=channel_id,
+        )
+
+    # The docstring below deliberately does NOT name the skill-import tool.
+    # That tool is admin-gated; this one is not (matching its sibling
+    # `request_*` tools), so naming it would disclose a gated tool's existence
+    # to every principal that can discover this one —
+    # `test_chat_session_tool_reachability` asserts against exactly that by
+    # searching the rendered tool text for the gated name. Kept as a comment
+    # rather than a docstring paragraph because the docstring IS prompt
+    # context: it is rendered into every model's tool list, where an internal
+    # rationale is noise.
+    @mcp.tool
+    async def request_skill_repo_credential(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        agent_name: str,
+        repo_url: str,
+        purpose: str,
+        channel_id: str,
+        branch: str = "main",
+        path: str = "",
+    ) -> RequestCredentialResult:
+        """Ask for a GitHub token so a skill import can read a PRIVATE repo.
+
+        Call this when importing skills from a repo reports that no
+        credential was available — NOT ``request_repo_binding``. Importing
+        skills from a repo and binding a repo for the agent to check out are
+        different things: this one writes no ``agent_repo_binding`` row, so
+        it will not make the agent start cloning the skill repo. The stored
+        token is shared between the two, so a user who has already bound a
+        repo with a token that can also read this one will not be asked
+        twice.
+
+        Pass the same repo url, branch, and path the failed import used —
+        they are carried through the click, and the import re-runs
+        automatically on submit, so there is nothing to call afterwards.
+        """
+        return await _request_skill_repo_credential_impl(
+            runtime,
+            await _auth(ctx),
+            agent_name=agent_name,
+            repo_url=repo_url,
+            branch=branch,
+            path=path,
+            purpose=purpose,
             channel_id=channel_id,
         )
 

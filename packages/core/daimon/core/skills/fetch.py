@@ -15,6 +15,25 @@ from daimon.core.errors import DaimonError
 _log = structlog.get_logger(__name__)
 
 
+class GitHubFetchError(DaimonError):
+    """A non-2xx response from GitHub, carrying the status for the caller.
+
+    A ``DaimonError`` subclass so every existing ``except DaimonError``
+    handler keeps catching it unchanged — this adds a discriminator, it does
+    not reroute anything.
+
+    The status matters because 404 is ambiguous on an *anonymous* fetch:
+    GitHub 404s a private repo rather than 403ing it, specifically so an
+    unauthenticated caller cannot probe for existence. Callers that know
+    whether they sent a credential can resolve that ambiguity; this layer
+    cannot, so it reports the status instead of guessing at a message.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 @dataclass(frozen=True)
 class FetchResult:
     """Result of fetch_repo: ``path`` is the repo root, ``cleanup_dir`` is what to rmtree."""
@@ -91,8 +110,9 @@ async def fetch_repo(
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise DaimonError(
-                f"failed to fetch {url!r} (branch {branch!r}): HTTP {exc.response.status_code}"
+            raise GitHubFetchError(
+                f"failed to fetch {url!r} (branch {branch!r}): HTTP {exc.response.status_code}",
+                status_code=exc.response.status_code,
             ) from exc
 
         if max_tarball_bytes > 0:
