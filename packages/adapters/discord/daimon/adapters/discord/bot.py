@@ -1231,13 +1231,27 @@ class DaimonBot(commands.Bot):
         lifecycle_holder: list[DiscordTurnLifecycle] = [lifecycle]
 
         async def _reseed_user_message() -> str:
-            """Full history re-seed for the recreated session (dead-session recovery)."""
+            """Full history re-seed for the recreated session (dead-session recovery).
+
+            ``omit_oversized_image_urls=True`` is what stops recovery from
+            recreating the failure it is recovering from. An oversized image in
+            the history is the most likely reason the previous session died:
+            the agent curls the URL, ``read``s it at full size, and MA
+            terminates the session. Reseeding that same URL into the fresh
+            session just repeats it, so the thread recovers, dies, recovers,
+            dies -- each cycle billing a full agentic run. Observed on staging
+            thread 1535185295245582356: two consecutive recoveries burned 243k
+            then 62k input tokens and both ended terminated. Withholding the
+            URL (rather than only warning about it, which the model may ignore)
+            is what actually breaks the loop.
+            """
             full_message, _ = await build_context_xml(
                 thread,
                 trigger=message,
                 limit=100,
                 bot_user_id=self.user.id if self.user else None,
                 bot_display_name=discord_settings.bot_display_name,
+                omit_oversized_image_urls=True,
             )
             if synthetic_prefix:
                 full_message = synthetic_prefix + "\n" + full_message
@@ -1250,6 +1264,10 @@ class DaimonBot(commands.Bot):
                 agent_name=agent.name,
                 model_id=agent.model.id,
                 cancel_view=CancelView(allowed_user_id=message.author.id, cancel=cancel_event),
+                # Take over the failed attempt's message so its upstream-error
+                # embed is edited into this turn's answer rather than left
+                # standing next to a second, successful message.
+                adopt_message_ref=lifecycle.message_ref,
             )
             lifecycle_holder[0] = new_lifecycle
             return new_lifecycle

@@ -107,6 +107,7 @@ class DiscordTurnLifecycle:
         model_id: str,
         cancel_view: discord.ui.View | None = None,
         clock: Callable[[], float] = time.monotonic,
+        adopt_message_ref: Any | None = None,
     ) -> None:
         self._send = send
         self._edit = edit
@@ -119,12 +120,28 @@ class DiscordTurnLifecycle:
             agent_name=agent_name,
             started_at=self._clock(),
         )
-        self._message_ref: Any | None = None
+        # Seeded only by dead-session recovery, which hands over the message the
+        # failed attempt already posted. Without this the recovery lifecycle
+        # sends a SECOND message and the first attempt's ❌ embed stays in the
+        # thread forever — the user sees a scary upstream error immediately
+        # followed by a working answer, and cannot tell that the error was
+        # retracted. Adopting the ref means the recovered turn edits that embed
+        # into the real answer, so a recovered turn looks like a normal one.
+        self._message_ref: Any | None = adopt_message_ref
         self._last_flush: float = 0.0
         self._terminal: bool = False
         self._cancel_view = cancel_view
         self._persisted_sealed_indices: set[int] = set()
         self._was_answered: bool = False
+
+    @property
+    def message_ref(self) -> Any | None:
+        """The message this lifecycle is rendering into, if it has posted one.
+
+        Public so dead-session recovery can hand it to the replacement
+        lifecycle via ``adopt_message_ref``; nothing else should need it.
+        """
+        return self._message_ref
 
     async def post_initial(self) -> None:
         """Post the initial thinking embed immediately, before the turn starts.

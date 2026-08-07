@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import discord
+import pytest
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
@@ -803,3 +804,42 @@ class TestTurnSummaryFooter:
         assert expected in footer, (
             f"footer cost must equal the billing-ledger cost {expected} to the cent"
         )
+
+
+@pytest.mark.asyncio
+async def test_adopted_message_ref_edits_instead_of_posting_a_second_message() -> None:
+    """Dead-session recovery must reuse the failed attempt's message.
+
+    Without this the recovery lifecycle posts a SECOND message and the first
+    attempt's upstream-error embed is left standing in the thread — the user
+    sees a red failure immediately followed by a working answer, with no way to
+    tell the failure was retracted. Observed on staging after the recovery fix
+    landed: the turn ran fine but the 400 embed stayed above it.
+    """
+    sent: list[object] = []
+    edited: list[object] = []
+
+    async def _send(**kwargs: object) -> object:
+        sent.append(kwargs)
+        return "new-message"
+
+    async def _edit(ref: object, **kwargs: object) -> None:
+        edited.append((ref, kwargs))
+
+    lifecycle = DiscordTurnLifecycle(
+        send=_send,
+        edit=_edit,
+        agent_name="content-daimon",
+        model_id="claude-sonnet-5",
+        adopt_message_ref="failed-attempt-message",
+    )
+
+    assert lifecycle.message_ref == "failed-attempt-message"
+
+    await lifecycle.on_terminal_success(_make_success_state())
+
+    assert sent == [], "must not post a second message when one was adopted"
+    assert edited, "the recovered answer must be written somewhere"
+    assert {ref for ref, _ in edited} == {"failed-attempt-message"}, (
+        "every write must target the failed attempt's message, overwriting its error embed"
+    )
