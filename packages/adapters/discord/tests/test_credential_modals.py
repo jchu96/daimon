@@ -260,7 +260,10 @@ async def _seed_mcp_request(
             token=token,
             kind="mcp",
             tenant_id=tenant.id,
-            agent_id=uuid.uuid4(),
+            # Derived, not random: the modal now resolves the MA agent by
+            # re-deriving this uuid5, so a random value would make every
+            # attach take the agent-not-found branch.
+            agent_id=derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=_MA_AGENT_ID),
             account_id=uuid.uuid4(),
             target="linear",
             mcp_server_url=mcp_server_url,
@@ -435,10 +438,53 @@ async def test_env_modal_never_logs_the_secret_value(
 # --- McpCredentialModal ------------------------------------------------------
 
 
+_MA_AGENT_ID = "agent_01CredModal"
+
+
+def _ma_agent_json(tenant_id: str, *, mcp_servers: list[dict[str, str]] | None = None) -> Any:
+    """One MA agent payload, shaped as the SDK parses it."""
+    return {
+        "id": _MA_AGENT_ID,
+        "type": "agent",
+        "name": "test-agent",
+        "description": None,
+        "system": None,
+        "model": {"id": "claude-sonnet-5"},
+        "mcp_servers": mcp_servers if mcp_servers is not None else [],
+        "skills": [],
+        "tools": [],
+        "metadata": {"daimon_tenant": tenant_id},
+        "archived_at": None,
+        "created_at": "2026-04-01T00:00:00Z",
+        "updated_at": "2026-04-01T00:00:00Z",
+        "version": 1,
+    }
+
+
 def _vault_handler(
-    vault_id: str, per_agent_display: str, creds_created: list[dict[str, Any]]
+    vault_id: str,
+    per_agent_display: str,
+    creds_created: list[dict[str, Any]],
+    *,
+    tenant_id: str = "",
+    agent_updates: list[dict[str, Any]] | None = None,
 ) -> Any:
     def _handler(req: httpx.Request) -> httpx.Response:
+        # Agent routes back the attach half of the flow (#49): the modal must
+        # add the server to the agent it just stored a credential for.
+        if req.method == "GET" and req.url.path == "/v1/agents":
+            return httpx.Response(
+                200, json={"data": [_ma_agent_json(tenant_id)], "has_more": False}
+            )
+        if req.method == "GET" and req.url.path == f"/v1/agents/{_MA_AGENT_ID}":
+            return httpx.Response(200, json=_ma_agent_json(tenant_id))
+        if req.method == "POST" and req.url.path == f"/v1/agents/{_MA_AGENT_ID}":
+            body = json.loads(req.content)
+            if agent_updates is not None:
+                agent_updates.append(body)
+            return httpx.Response(
+                200, json=_ma_agent_json(tenant_id, mcp_servers=body.get("mcp_servers") or [])
+            )
         if req.method == "GET" and req.url.path == "/v1/vaults":
             return httpx.Response(
                 200,
@@ -486,10 +532,19 @@ async def test_mcp_modal_submit_consumes_token_and_writes_vault_credential(
     vault_id = "vlt_credmodal"
     per_agent_display = f"daimon-mcp:{row.account_id}:{row.agent_id}"
     creds_created: list[dict[str, Any]] = []
+    agent_updates: list[dict[str, Any]] = []
 
     runtime = _runtime(
         sessionmaker=db_session_factory,
-        anthropic=build_stub_anthropic(_vault_handler(vault_id, per_agent_display, creds_created)),
+        anthropic=build_stub_anthropic(
+            _vault_handler(
+                vault_id,
+                per_agent_display,
+                creds_created,
+                tenant_id=str(row.tenant_id),
+                agent_updates=agent_updates,
+            )
+        ),
         public_url=HttpUrl("https://mcp.example.com/mcp"),
         jwt_secret="x" * 32,
     )
@@ -504,6 +559,19 @@ async def test_mcp_modal_submit_consumes_token_and_writes_vault_credential(
         "the mcp_server_url must come from the consumed row, never user input"
     )
     assert creds_created[0]["auth"]["token"] == _MCP_TOKEN
+
+    assert len(agent_updates) == 1, (
+        "the server must also be attached to the agent — a vault credential for a "
+        "server the agent never declares is unreachable (#49)"
+    )
+    attached = agent_updates[0]
+    assert {"name": "linear", "type": "url", "url": "https://ext.example.com/mcp"} in (
+        attached["mcp_servers"]
+    ), "the attached server takes its name from the consumed row and its url from the request"
+    assert any(
+        t.get("type") == "mcp_toolset" and t.get("mcp_server_name") == "linear"
+        for t in attached["tools"]
+    ), "MA rejects an mcp_servers entry with no matching mcp_toolset, so both must be written"
 
     toast = interaction.followup.send.call_args.args[0]
     assert "anyone who talks to this agent" in toast.lower(), (
@@ -538,7 +606,12 @@ async def test_mcp_modal_unconfigured_mcp_reports_misconfiguration_no_consume_no
     retry_runtime = _runtime(
         sessionmaker=db_session_factory,
         anthropic=build_stub_anthropic(
-            _vault_handler("vlt_retry", f"daimon-mcp:{row.account_id}:{row.agent_id}", [])
+            _vault_handler(
+                "vlt_retry",
+                f"daimon-mcp:{row.account_id}:{row.agent_id}",
+                [],
+                tenant_id=str(row.tenant_id),
+            )
         ),
         public_url=HttpUrl("https://mcp.example.com/mcp"),
         jwt_secret="x" * 32,
