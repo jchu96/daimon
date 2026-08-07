@@ -2219,6 +2219,56 @@
         'type': 'object',
       }),
     }),
+    'request_skill_repo_credential': dict({
+      'description': '''
+        Ask for a GitHub token so a skill import can read a PRIVATE repo.
+        
+        Call this when importing skills from a repo reports that no
+        credential was available — NOT ``request_repo_binding``. Importing
+        skills from a repo and binding a repo for the agent to check out are
+        different things: this one writes no ``agent_repo_binding`` row, so
+        it will not make the agent start cloning the skill repo. The stored
+        token is shared between the two, so a user who has already bound a
+        repo with a token that can also read this one will not be asked
+        twice.
+        
+        Pass the same repo url, branch, and path the failed import used —
+        they are carried through the click, and the import re-runs
+        automatically on submit, so there is nothing to call afterwards.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'branch': dict({
+            'default': 'main',
+            'type': 'string',
+          }),
+          'channel_id': dict({
+            'type': 'string',
+          }),
+          'path': dict({
+            'default': '',
+            'type': 'string',
+          }),
+          'purpose': dict({
+            'type': 'string',
+          }),
+          'repo_url': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'repo_url',
+          'purpose',
+          'channel_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'search_messages': dict({
       'description': '''
         Search messages with server-side filters.

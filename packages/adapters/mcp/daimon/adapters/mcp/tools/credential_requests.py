@@ -344,6 +344,15 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             channel_id=channel_id,
         )
 
+    # The docstring below deliberately does NOT name the skill-import tool.
+    # That tool is admin-gated; this one is not (matching its sibling
+    # `request_*` tools), so naming it would disclose a gated tool's existence
+    # to every principal that can discover this one —
+    # `test_chat_session_tool_reachability` asserts against exactly that by
+    # searching the rendered tool text for the gated name. Kept as a comment
+    # rather than a docstring paragraph because the docstring IS prompt
+    # context: it is rendered into every model's tool list, where an internal
+    # rationale is noise.
     @mcp.tool
     async def request_skill_repo_credential(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
@@ -368,13 +377,6 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         Pass the same repo url, branch, and path the failed import used —
         they are carried through the click, and the import re-runs
         automatically on submit, so there is nothing to call afterwards.
-
-        Deliberately does NOT name the import tool. That tool is admin-gated,
-        this one is not (matching its sibling ``request_*`` tools), so naming
-        it here would disclose a gated tool's existence to every principal
-        that can discover this one — which
-        ``test_chat_session_tool_reachability`` asserts against by searching
-        the rendered tool text for the gated name.
         """
         return await _request_skill_repo_credential_impl(
             runtime,
