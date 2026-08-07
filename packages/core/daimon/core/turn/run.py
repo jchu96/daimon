@@ -44,19 +44,53 @@ class RunOutcome:
     recovered: bool
 
 
-def _is_dead_session(state: TurnState) -> bool:
-    """Return True if state.error signals a gone/expired MA session (HTTP 404).
+# MA's rejection when events.send targets a session it has terminated. The id
+# is well-formed and the session exists — it is simply closed to new events, so
+# this is a 400 rather than the 404 a deleted session gives.
+_ARCHIVED_SESSION_MARKER = "cannot send events to archived session"
 
-    A 404 not_found_error from events.send means the session existed but is now
-    gone (deleted / expired / GC'd). The turn recreates silently.
-    A 400 means a malformed session id -- not reachable with well-formed stored ids
-    and must surface as a normal turn error (do NOT recreate on it).
+
+def _is_dead_session(state: TurnState) -> bool:
+    """Return True if state.error signals a gone or closed MA session.
+
+    Two distinct signatures, both meaning "this session can never accept
+    another event, so recreate rather than surfacing a dead end":
+
+    - **404** from events.send: the session existed but is gone (deleted /
+      expired / GC'd).
+    - **400 whose message is `Cannot send events to archived session`**: MA
+      terminated the session (e.g. a turn hit a terminal model error) and
+      closed it to further events.
+
+    Every OTHER 400 still surfaces as a normal turn error. That distinction is
+    the point: a bare 400 means a malformed session id, which is not reachable
+    with well-formed stored ids and must not trigger a recreate. Matching on
+    the message rather than the status alone keeps that case excluded.
+
+    The 400 limb is why this function exists in its current shape. Without it a
+    single terminal error bricked the thread PERMANENTLY: MA terminated the
+    session, the mapping row still pointed at it, and every later message in
+    that thread 400'd here forever with zero tokens billed and no path back.
+    Observed on staging thread 1535185295245582356 / session
+    sesn_01TBcsjhyD4KMEc6wasC3vyg (2026-08-07), where an oversized image ended
+    the session and the next "hello" — and every message after it — failed.
+
+    Note this deliberately does NOT fire on the terminating turn itself (whose
+    error is `session terminated by MA`, carrying no APIStatusError cause).
+    That turn really did fail, and re-running it against a fresh session would
+    just replay whatever killed it. Recovery instead happens on the NEXT
+    message, which is the first to see the archived-session 400 — so the thread
+    heals on its own without retrying poison.
     """
     err = state.error
     if err is None or err.kind != "upstream":
         return False
     cause = err.cause
-    return isinstance(cause, _anthropic.APIStatusError) and cause.status_code == 404
+    if not isinstance(cause, _anthropic.APIStatusError):
+        return False
+    if cause.status_code == 404:
+        return True
+    return cause.status_code == 400 and _ARCHIVED_SESSION_MARKER in str(cause).lower()
 
 
 async def run_prepared_turn(

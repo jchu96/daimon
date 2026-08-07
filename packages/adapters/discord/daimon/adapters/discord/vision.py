@@ -113,6 +113,16 @@ def build_image_url_prefix(attachments: list[discord.Attachment]) -> str:
     )
 
 
+def _skipped_for_dimensions(reason: str) -> bool:
+    """Was this skip the pixel cap (rather than bytes/count/type/fetch)?
+
+    Matches the reason string `download_as_image_blocks` writes for the
+    dimension gate. Keyed on the shared `MAX_VISION_IMAGE_DIMENSION` constant
+    rather than a copied literal, so the two cannot drift apart silently.
+    """
+    return f"{MAX_VISION_IMAGE_DIMENSION}px" in reason
+
+
 def build_skipped_image_prefix(skipped: list[tuple[discord.Attachment, str]]) -> str:
     """One ``*system: ...*`` line per image that was NOT inlined as a vision block.
 
@@ -122,11 +132,38 @@ def build_skipped_image_prefix(skipped: list[tuple[discord.Attachment, str]]) ->
     downloaded to disk — so surfacing the URL keeps the image usable (curl it to
     disk then ``read`` it to view, or hand the URL to an external API) instead of
     silently dropping it.
+
+    **A dimension-skipped image gets a different line, and must.** For every
+    other skip reason "curl it and `read` it" is sound advice. For this one it
+    is the exact sequence that kills the session: `read` inlines the image at
+    full size, the next model request is rejected with "image dimensions exceed
+    max allowed size: 8000 pixels", and that rejection is terminal — MA
+    terminates the session and every later message in the thread 400s with
+    "Cannot send events to archived session".
+
+    That is not hypothetical. Staging session sesn_01TBcsjhyD4KMEc6wasC3vyg
+    (2026-08-07) died exactly this way: four images refused inline here, the
+    agent curled them to /tmp and `read` all four, and the thread was
+    permanently unusable. This gate rejecting the image and then handing over a
+    URL with instructions to reintroduce it through an unguarded path made the
+    cap self-defeating. So the line below tells the agent to downscale FIRST.
     """
     return "\n".join(
-        f"*system: image `{attachment.filename}` was NOT inlined as a vision block "
-        f"({reason}); fetch it yourself — signed CDN URL (curl to disk then use your "
-        f"`read` tool to view it, or pass to an external API; expires ~24h): {attachment.url}*"
+        (
+            f"*system: image `{attachment.filename}` was NOT inlined as a vision block "
+            f"({reason}). Do NOT `read` it at full size — that inlines it at its "
+            f"original dimensions and the request is rejected terminally, which kills "
+            f"this whole conversation. Downscale it first so its longest edge is under "
+            f'{MAX_VISION_IMAGE_DIMENSION}px (e.g. python -c "from PIL import Image; '
+            f"im=Image.open('in.jpg'); im.thumbnail(({MAX_VISION_IMAGE_DIMENSION - 1000},"
+            f"{MAX_VISION_IMAGE_DIMENSION - 1000})); im.save('small.jpg')\"), then `read` "
+            f"the downscaled copy. Signed CDN URL (expires ~24h): {attachment.url}*"
+            if _skipped_for_dimensions(reason)
+            else f"*system: image `{attachment.filename}` was NOT inlined as a vision block "
+            f"({reason}); fetch it yourself — signed CDN URL (curl to disk then use your "
+            f"`read` tool to view it, or pass to an external API; expires ~24h): "
+            f"{attachment.url}*"
+        )
         for attachment, reason in skipped
     )
 

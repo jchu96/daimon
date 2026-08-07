@@ -447,3 +447,49 @@ class TestBuildSkippedImagePrefix:
         lines = prefix.split("\n")
         assert len(lines) == 2, "each skipped image should contribute exactly one line"
         assert "a.png" in lines[0] and "b.png" in lines[1], "lines should preserve order"
+
+
+def test_dimension_skipped_image_is_warned_not_told_to_read_it() -> None:
+    """The pixel cap must not hand the agent a URL and say "curl it then read it".
+
+    Regression: staging session sesn_01TBcsjhyD4KMEc6wasC3vyg. Four images were
+    refused inline here for exceeding 8000px, the note told the agent to fetch
+    and ``read`` them, ``read`` inlined them at full size, and the resulting
+    terminal rejection killed the session and bricked the whole thread.
+    """
+    att = FakeAttachment(
+        filename="huge.jpg",
+        content_type="image/jpeg",
+        size=1024,
+        width=12000,
+        height=4000,
+        url="https://cdn.discordapp.com/attachments/1/2/huge.jpg?ex=a",
+    )
+
+    text = build_skipped_image_prefix(
+        [(att, f"image dimensions unknown or exceed {MAX_VISION_IMAGE_DIMENSION}px")]
+    )
+
+    assert "Do NOT `read` it at full size" in text
+    assert "Downscale it first" in text
+    assert "kills" in text, "the consequence must be stated, not just the instruction"
+    assert att.url in text, "the URL is still surfaced — downscaling needs the bytes"
+
+
+def test_non_dimension_skip_keeps_the_plain_fetch_and_read_instruction() -> None:
+    """Only the pixel cap is dangerous to ``read``; other skips keep the old advice."""
+    att = FakeAttachment(
+        filename="big.png",
+        content_type="image/png",
+        size=9_000_000,
+        width=800,
+        height=600,
+        url="https://cdn.discordapp.com/attachments/1/2/big.png?ex=a",
+    )
+
+    text = build_skipped_image_prefix(
+        [(att, f"exceeds vision size cap (9000000 > {MAX_VISION_IMAGE_BYTES})")]
+    )
+
+    assert "`read` tool to view it" in text
+    assert "Do NOT `read`" not in text
