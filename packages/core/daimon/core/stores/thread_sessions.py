@@ -151,6 +151,66 @@ async def update_watermark(
     await session.flush()
 
 
+async def mark_turn_active(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+    active_turn_message_id: str,
+    now: datetime,
+) -> None:
+    """Record that a turn is running and which message is rendering it.
+
+    Written once the embed exists and the mapping row is known. The pair is
+    what lets a restarted process find embeds it can never finish -- the
+    process holding them is gone, and nothing else knows they were mid-flight.
+    """
+    await session.execute(
+        update(ThreadSession)
+        .where(ThreadSession.id == id)
+        .values(active_turn_message_id=active_turn_message_id, active_turn_started_at=now)
+    )
+    await session.flush()
+
+
+async def clear_active_turn(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+) -> None:
+    """Clear the in-flight marker. Call on every terminal path, including failure."""
+    await session.execute(
+        update(ThreadSession)
+        .where(ThreadSession.id == id)
+        .values(active_turn_message_id=None, active_turn_started_at=None)
+    )
+    await session.flush()
+
+
+async def list_orphaned_turns(
+    session: AsyncSession,
+    *,
+    platform: str,
+) -> list[ThreadSessionRow]:
+    """Rows still flagged as mid-turn, i.e. turns no live process owns.
+
+    Only meaningful at process start: a turn cannot outlive the process
+    rendering it, so any marker still set when we boot belongs to a turn that
+    died with the previous container.
+
+    ponytail: assumes one adapter process per platform. With two, this would
+    reap the other's in-flight turns -- gate on an owner id before scaling out.
+    """
+    rows = (
+        await session.execute(
+            select(ThreadSession).where(
+                ThreadSession.platform == platform,
+                ThreadSession.active_turn_message_id.is_not(None),
+            )
+        )
+    ).scalars()
+    return [ThreadSessionRow.model_validate(row) for row in rows]
+
+
 async def mark_dead(
     session: AsyncSession,
     *,
