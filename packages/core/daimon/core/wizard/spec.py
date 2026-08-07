@@ -18,12 +18,20 @@ a shorter follow-up wizard.
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from math import ceil
-from typing import Final
+from typing import Final, cast
 
 from daimon.core.wizard.state import build_custom_id, new_short_id
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 MAX_SELECT_OPTIONS: Final[int] = 25
 MAX_TOTAL_COMPONENTS: Final[int] = 40
@@ -70,22 +78,66 @@ class Option(BaseModel):
     )
 
 
-class Step(BaseModel):
-    """One screen of the wizard: a question plus how it is answered."""
+_KIND_SYNONYMS: Final[dict[str, str]] = {
+    "single_choice": "choice",
+    "single": "choice",
+    "radio": "choice",
+    "multi_select": "multi",
+    "multiselect": "multi",
+    "checkbox": "multi",
+    "free_text": "text",
+    "freetext": "text",
+    "input": "text",
+}
 
-    model_config = ConfigDict(frozen=True)
+_SLUG_RE: Final = re.compile(r"[^a-z0-9]+")
+
+
+def _derive_key(question: str) -> str:
+    """Slug a question into a step key. Only used when the author omits `key`."""
+    slug = _SLUG_RE.sub("_", question.strip().lower()).strip("_")[:40].rstrip("_")
+    return slug or "step"
+
+
+class Step(BaseModel):
+    """One screen of the wizard: a question plus how it is answered.
+
+    Accepts the shape a model actually writes as well as the canonical one.
+    Authored by an LLM at a tool boundary, and the canonical field names lose
+    every coin-flip against the prior set by other form APIs: `type` for
+    `kind`, `title` for `question`, plain strings for `options`, and
+    `single_choice`/`multi_select`/`free_text` for the enum's
+    `choice`/`multi`/`text`. A real session sent exactly that, collected 28
+    validation errors, retried with the same shape, and abandoned the form
+    (#51). Rejecting it was defensible per-field and useless in aggregate, so
+    the aliases and coercions below absorb the difference instead.
+    """
+
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
 
     key: str = Field(
-        description="Stable identifier for this step's answer; must be unique across the form."
+        default="",
+        description=(
+            "Stable identifier for this step's answer; must be unique across the form. "
+            "Omit it and a slug of the question is used."
+        ),
     )
-    question: str = Field(description="The question text shown to the user on this step.")
+    question: str = Field(
+        validation_alias=AliasChoices("question", "title"),
+        description="The question text shown to the user on this step.",
+    )
     kind: StepKind = Field(
-        description="Whether this step is a single choice, a multi-select, or free text."
+        validation_alias=AliasChoices("kind", "type"),
+        description="Whether this step is a single choice, a multi-select, or free text.",
     )
     options: list[Option] = Field(
         default_factory=list[Option],
-        description="The selectable options for a `choice` or `multi` step. Unused for `text`.",
+        description=(
+            "The selectable options for a `choice` or `multi` step. Unused for `text`. "
+            "A plain string is accepted and becomes both the label and the value."
+        ),
     )
+
     allow_custom: bool = Field(
         default=True,
         description="Whether the user may add a free-text option alongside the listed options.",
@@ -108,6 +160,37 @@ class Step(BaseModel):
         default=None,
         description="Server-populated; ignored when supplied by the caller.",
     )
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _accept_kind_synonyms(cls, value: object) -> object:
+        """Map the vocabulary models reach for onto the canonical enum values."""
+        if isinstance(value, str):
+            return _KIND_SYNONYMS.get(value.strip().lower(), value)
+        return value
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _accept_bare_string_options(cls, value: object) -> object:
+        """Coerce ``["A", "B"]`` into full ``Option`` objects.
+
+        A list of strings is the obvious way to express choices, and carries
+        every bit of information a two-field Option does when label and value
+        are the same — which is the common case.
+        """
+        if isinstance(value, list):
+            return [
+                {"label": item, "value": item} if isinstance(item, str) else item
+                for item in cast(list[object], value)
+            ]
+        return value
+
+    @model_validator(mode="after")
+    def _fill_key_from_question(self) -> Step:
+        if not self.key:
+            # frozen model: rebuild rather than mutate.
+            return self.model_copy(update={"key": _derive_key(self.question)})
+        return self
 
 
 def _estimate_step_components(step: Step) -> int:
