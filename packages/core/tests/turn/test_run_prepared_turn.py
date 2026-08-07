@@ -764,3 +764,126 @@ def test_dead_session_ignores_a_terminating_turn_with_no_api_cause() -> None:
     state = TurnState(error=TurnError(kind="upstream", message="session terminated by MA"))
 
     assert _is_dead_session(state) is False
+
+
+async def test_recovered_turn_never_shows_the_user_a_failure(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A recoverable dead session must not paint a terminal failure.
+
+    The adapter renders its red error embed from ``on_terminal_failure``, so
+    delivering that hook for an error we heal three seconds later shows the
+    user a scary upstream 400 that is then retracted.
+    """
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-quiet-recovery",
+        ma_session_id="sess_old",
+    )
+    await db_session.commit()
+
+    router = _router(session_bodies=[], dead_session_ids={"sess_old"})
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_old",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    caller_lifecycle = RecordingLifecycle()
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-quiet-recovery",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=caller_lifecycle,
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is True, "the dead session must still recover"
+    assert caller_lifecycle.terminal_failures == [], (
+        "a recovered turn must never deliver on_terminal_failure -- that hook is "
+        "what paints the error embed the user sees retracted"
+    )
+
+
+async def test_unrecovered_failure_is_still_delivered_to_the_caller(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Withholding is only for the recovery path; a real failure must surface."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-real-failure",
+        ma_session_id="sess_bad",
+    )
+    await db_session.commit()
+
+    router = MARouter()
+
+    def _400(_request: httpx.Request, _match: object) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"type": "error", "error": {"type": "invalid_request_error", "message": "bad id"}},
+        )
+
+    router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _400)
+
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_bad",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    caller_lifecycle = RecordingLifecycle()
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-real-failure",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=caller_lifecycle,
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is False, "a plain 400 must not recover"
+    assert len(caller_lifecycle.terminal_failures) == 1, (
+        "a turn that is not recovered must still deliver its failure exactly once"
+    )
