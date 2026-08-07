@@ -152,10 +152,17 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     ) -> MessageRow:
         """Post a message to a Discord channel.
 
-        Only call this when the user explicitly asks you to send or post something
-        to Discord. Do NOT call it to share results, summaries, or outputs unless
-        the user specifically requested a Discord post. Deliver output in your reply
-        instead.
+        For TEXT: only call this when the user explicitly asks you to send or
+        post something to Discord. Do NOT call it to share results, summaries,
+        or outputs unless the user specifically requested a Discord post.
+        Deliver text output in your reply instead.
+
+        For FILES that rule does not apply, because a reply cannot carry an
+        attachment. Posting a file in the thread you were invoked from is
+        delivery, not a duplicate — asking you to "attach it here" is a
+        request to call this tool with ``file_handles``. Read the two
+        paragraphs above together or you will conclude, wrongly, that you
+        should hand a file back "in your reply" and silently deliver nothing.
 
         ``attachments=[{url, filename}]`` fetches over https, restricted to
         Discord's own CDN hosts — an arbitrary external URL will be refused

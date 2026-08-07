@@ -1003,8 +1003,16 @@
     }),
     'create_file_upload_url': dict({
       'description': '''
-        Get a one-time URL for uploading a file you produced — a chart, a
-        table, a data file — so it can be posted as a Discord attachment.
+        Attach, post, send, or share a file in Discord — step 1 of 2.
+        
+        This is the ONLY way to put a file you produced (a chart, a table, an
+        image, a data file) into Discord as an attachment. Your reply text
+        delivers itself; a file never does. Reading a file, or copying it to
+        /mnt/session/outputs/, does not send it anywhere.
+        
+        The intent words are in this first line on purpose: an agent looking
+        for "attach an image" or "post a file" has to find this tool by
+        search, and the name alone does not carry any of them.
         
         Call this FIRST, then send the bytes from your sandbox with curl:
         
@@ -2455,10 +2463,17 @@
       'description': '''
         Post a message to a Discord channel.
         
-        Only call this when the user explicitly asks you to send or post something
-        to Discord. Do NOT call it to share results, summaries, or outputs unless
-        the user specifically requested a Discord post. Deliver output in your reply
-        instead.
+        For TEXT: only call this when the user explicitly asks you to send or
+        post something to Discord. Do NOT call it to share results, summaries,
+        or outputs unless the user specifically requested a Discord post.
+        Deliver text output in your reply instead.
+        
+        For FILES that rule does not apply, because a reply cannot carry an
+        attachment. Posting a file in the thread you were invoked from is
+        delivery, not a duplicate — asking you to "attach it here" is a
+        request to call this tool with ``file_handles``. Read the two
+        paragraphs above together or you will conclude, wrongly, that you
+        should hand a file back "in your reply" and silently deliver nothing.
         
         ``attachments=[{url, filename}]`` fetches over https, restricted to
         Discord's own CDN hosts — an arbitrary external URL will be refused

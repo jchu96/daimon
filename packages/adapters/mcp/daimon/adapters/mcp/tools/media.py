@@ -166,8 +166,16 @@ def register_upload_tool(mcp: FastMCP, *, runtime: McpRuntime) -> None:
         title: str,
         mime_type: str,
     ) -> str:
-        """Get a one-time URL for uploading a file you produced — a chart, a
-        table, a data file — so it can be posted as a Discord attachment.
+        """Attach, post, send, or share a file in Discord — step 1 of 2.
+
+        This is the ONLY way to put a file you produced (a chart, a table, an
+        image, a data file) into Discord as an attachment. Your reply text
+        delivers itself; a file never does. Reading a file, or copying it to
+        /mnt/session/outputs/, does not send it anywhere.
+
+        The intent words are in this first line on purpose: an agent looking
+        for "attach an image" or "post a file" has to find this tool by
+        search, and the name alone does not carry any of them.
 
         Call this FIRST, then send the bytes from your sandbox with curl:
 
