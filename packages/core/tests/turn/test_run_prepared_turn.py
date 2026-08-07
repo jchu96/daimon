@@ -14,11 +14,13 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import anthropic
 import httpx
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.core.config import McpSettings
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
+from daimon.core.errors import TurnError
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.core.stores import usage_events
@@ -26,7 +28,8 @@ from daimon.core.stores.thread_sessions import get_live_thread_session
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.prepare import PreparedTurn, bind_recorder
-from daimon.core.turn.run import run_prepared_turn
+from daimon.core.turn.run import _is_dead_session, run_prepared_turn
+from daimon.core.turn.state import TurnState
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     MARouter,
@@ -715,3 +718,49 @@ async def test_second_consecutive_dead_session_does_not_loop(
         "exactly one recovery create_session call -- no second recovery"
     )
     assert len(stream_calls) == 2, "exactly two run_turn attempts total -- no further retry loop"
+
+
+def _api_status_error(status_code: int, message: str) -> anthropic.APIStatusError:
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/sessions/sess_1/events")
+    response = httpx.Response(status_code, request=request, json={"error": {"message": message}})
+    return anthropic.APIStatusError(message, response=response, body=None)
+
+
+def _state_with_upstream_cause(cause: Exception) -> TurnState:
+    return TurnState(error=TurnError(kind="upstream", message=str(cause), cause=cause))
+
+
+def test_dead_session_detects_archived_400_so_a_thread_can_heal() -> None:
+    """A terminated session 400s rather than 404ing, and must still recover.
+
+    Regression: staging session sesn_01TBcsjhyD4KMEc6wasC3vyg. MA terminated
+    it, the mapping row kept pointing at it, and because only 404 counted as
+    dead, every later message in that thread failed forever.
+    """
+    cause = _api_status_error(
+        400, "Cannot send events to archived session: sesn_01TBcsjhyD4KMEc6wasC3vyg"
+    )
+
+    assert _is_dead_session(_state_with_upstream_cause(cause)) is True
+
+
+def test_dead_session_still_detects_404() -> None:
+    assert _is_dead_session(_state_with_upstream_cause(_api_status_error(404, "not found"))) is True
+
+
+def test_dead_session_ignores_other_400s() -> None:
+    """A malformed-id 400 must surface as a turn error, not trigger a recreate."""
+    cause = _api_status_error(400, "session_id: invalid format")
+
+    assert _is_dead_session(_state_with_upstream_cause(cause)) is False
+
+
+def test_dead_session_ignores_a_terminating_turn_with_no_api_cause() -> None:
+    """The turn that KILLS the session must not recover — it would replay the poison.
+
+    Its error carries no APIStatusError; recovery happens on the next message,
+    which is the first to see the archived-session 400.
+    """
+    state = TurnState(error=TurnError(kind="upstream", message="session terminated by MA"))
+
+    assert _is_dead_session(state) is False
