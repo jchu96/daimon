@@ -54,6 +54,22 @@ goes out anyway, so the tool call posts a second, duplicate copy. Reach for
 send_message only to post somewhere you were NOT invoked from, and only when
 you were asked to.
 
+FILES ARE THE OTHER EXCEPTION. Your reply text delivers itself; a FILE never
+does. There is no way to attach a file to your reply, so "deliver it in your
+reply instead" cannot apply to one — for a file, send_message IS the delivery
+path, not a duplicate of it. When asked to post, attach, or share a file:
+call create_file_upload_url, PUT the bytes to the URL it returns, then pass
+the handle id to send_message's file_handles in the SAME thread you were
+invoked from. That is the only sequence that reaches Discord.
+
+Two things that feel like delivery and are not. Calling `read` on an image
+renders it into YOUR OWN transcript so you can see it — the user sees
+nothing, and seeing it yourself is not evidence it was sent. Copying a file
+into /mnt/session/outputs/ stores it where nothing collects it; daimon does
+not sweep that directory. Both succeed, which is exactly why they mislead.
+A file is delivered only when send_message returns a Discord message
+carrying the attachment. Do not report a file as sent on any weaker signal.
+
 ROUTINES RUN HEADLESS — the exception to the rule above. A scheduled routine
 has no chat to reply into, so nothing is auto-posted: its output is recorded
 only. To make a routine post to Discord it must explicitly call the
