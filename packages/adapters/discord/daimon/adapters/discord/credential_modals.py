@@ -58,7 +58,9 @@ from daimon.adapters.discord.credential_repo_bind import (
     resolve_repo_binding_credential,
 )
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.defaults.ma_index import find_agent_by_derived_uuid
 from daimon.core.errors import DaimonError
+from daimon.core.mcp_attach import attach_mcp_server_to_agent
 from daimon.core.mcp_vault import add_external_mcp_credential
 from daimon.core.stores import credential_requests
 from daimon.core.stores.agent_files import put_agent_file
@@ -221,9 +223,56 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP credential"):
             )
             return
 
+        # The vault credential alone is inert: MA rejects an agent whose
+        # mcp_servers are not each referenced by an mcp_toolset, so a token
+        # stored against a server the agent never declares is unreachable.
+        # This tool is documented as the replacement for attach_mcp_server on
+        # auth-required servers, so it owes the attach too (#49) — the vault
+        # write happens first, because a declared server with no credential
+        # advertises calls that fail.
+        agent = await find_agent_by_derived_uuid(
+            self._runtime.anthropic,
+            tenant_id=consumed_row.tenant_id,
+            agent_id=consumed_row.agent_id,
+        )
+        if agent is None:
+            _log.error(
+                "credential_modal.mcp_agent_not_found",
+                agent_id=str(consumed_row.agent_id),
+            )
+            await interaction.followup.send(
+                "Auth token stored, but the agent could not be found to attach "
+                f"`{mcp_server_url}` to it. The server is not connected yet.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await attach_mcp_server_to_agent(
+                self._runtime.anthropic,
+                agent.id,
+                server_name=consumed_row.target,
+                url=mcp_server_url,
+            )
+        except Exception as err:
+            # Partial state is real and must not be reported as success: the
+            # token is stored, the server is not attached. Exception class name
+            # only, for the same token-leak reason as the vault-write branch.
+            _log.exception(
+                "credential_modal.mcp_attach_failed",
+                mcp_server_url=mcp_server_url,
+                err_type=type(err).__name__,
+            )
+            await interaction.followup.send(
+                f"Auth token stored, but attaching `{mcp_server_url}` to the agent "
+                f"failed (`{type(err).__name__}`). The server is not connected yet — "
+                "ask the agent to attach it, or request a new credential to retry.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.followup.send(
-            f"MCP credential added for `{mcp_server_url}`. Anyone who talks to "
-            "this agent can use it.",
+            f"MCP credential added for `{mcp_server_url}` and attached as "
+            f"`{consumed_row.target}`. Anyone who talks to this agent can use it.",
             ephemeral=True,
         )
 

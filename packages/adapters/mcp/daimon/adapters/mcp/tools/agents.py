@@ -58,6 +58,7 @@ from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_r
 from daimon.core.github_repo_auth import InstallationLookup
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.mcp_attach import attach_mcp_server_to_agent
 from daimon.core.memory_resource import archive_memory_store_for_agent
 from daimon.core.skill_sync import SyncRepoFailure, sync_agent_skills, sync_report_failures
 from daimon.core.specs import (
@@ -584,49 +585,15 @@ async def _attach_mcp_server_impl(
         if s.name == server_name and s.url == url:
             return await _build_agent_info(runtime.client, agent, tenant_id=auth.tenant_id)
 
-    # #144-2: version-retry closure. new_mcp_servers and new_tools are recomputed
-    # from `fresh` on each retry attempt. The reserved-server guard above is not
-    # repeated here — it depends only on caller inputs.
-    async def _apply(fresh: BetaManagedAgentsAgent) -> BetaManagedAgentsAgent:
-        # Replace any entry with the same server_name (last-write-wins); keep the rest.
-        fresh_existing = list(fresh.mcp_servers or [])
-        new_mcp_servers: list[BetaManagedAgentsURLMCPServerParams] = [
-            {"name": s.name, "type": "url", "url": s.url}
-            for s in fresh_existing
-            if s.name != server_name
-        ]
-        new_mcp_servers.append({"name": server_name, "type": "url", "url": url})
-
-        # MA rejects an agent whose mcp_servers names are not each referenced by
-        # a matching mcp_toolset entry in tools. Mirror the panel's
-        # apply_mcp_modal (state.py): append the missing toolset entry atomically
-        # — bug 3 of issue #56. Preserve every existing tool (caller win on
-        # mcp_toolset same-name collision is implicit since we keep the existing
-        # entry below).
-        new_tools: list[Tool] = [_ma_tool_to_param(t) for t in fresh.tools]
-        if not any(
-            t.get("type") == "mcp_toolset" and t.get("mcp_server_name") == server_name
-            for t in new_tools
-        ):
-            new_tools.append(
-                cast(
-                    Tool,
-                    {
-                        "type": "mcp_toolset",
-                        "mcp_server_name": server_name,
-                        "default_config": _DEFAULT_MCP_TOOLSET_CONFIG,
-                    },
-                )
-            )
-        return await runtime.client.beta.agents.update(
-            fresh.id,
-            version=fresh.version,
-            mcp_servers=new_mcp_servers,
-            tools=new_tools,
-        )
-
+    # #144-2: the spec recompute lives in core.mcp_attach so the Discord
+    # credential modal performs the identical write — it must attach the server
+    # it just stored a vault credential for, and cannot import this module.
+    # The reserved-server guard above is not repeated there: it depends only on
+    # caller inputs, so each entry point applies its own policy.
     try:
-        updated = await update_agent_with_version_retry(runtime.client, agent.id, _apply)
+        updated = await attach_mcp_server_to_agent(
+            runtime.client, agent.id, server_name=server_name, url=url
+        )
     except anthropic.ConflictError as exc:
         # Residual conflict after the one retry — surface as a clean ToolError.
         raise ToolError("the agent was modified concurrently — please retry the operation") from exc

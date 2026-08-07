@@ -23,6 +23,7 @@ from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_TENANT,
 )
 from daimon.core.errors import SkillsListTruncatedError
+from daimon.core.ma_identity import derive_agent_uuid
 
 _log = structlog.get_logger(__name__)
 
@@ -127,6 +128,22 @@ async def list_agents_by_tenant(
         if ag.metadata.get(MA_METADATA_KEY_TENANT) == str(tenant_id):
             results.append(ag)
     return results
+
+
+async def find_agent_by_derived_uuid(
+    client: AsyncAnthropic, *, tenant_id: uuid.UUID, agent_id: uuid.UUID
+) -> BetaManagedAgentsAgent | None:
+    """Return the tenant's MA agent whose derived uuid5 is ``agent_id``, or None.
+
+    The inverse of ``derive_agent_uuid``, which is one-way — so this scans the
+    tenant's agents and re-derives. Needed by callers that hold only daimon's
+    derived id (rows in ``credential_requests`` and other daimon-side tables
+    key on it, never on the MA id) but must act on the MA agent itself.
+    """
+    for agent in await list_agents_by_tenant(client, tenant_id=tenant_id):
+        if derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)) == agent_id:
+            return agent
+    return None
 
 
 async def list_referenced_skill_ids(client: AsyncAnthropic) -> set[str]:
