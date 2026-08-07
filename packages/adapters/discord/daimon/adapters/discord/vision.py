@@ -87,6 +87,19 @@ def _exceeds_dimension_cap(attachment: discord.Attachment) -> bool:
     return width > MAX_VISION_IMAGE_DIMENSION or height > MAX_VISION_IMAGE_DIMENSION
 
 
+def is_oversized_image(attachment: discord.Attachment) -> bool:
+    """True for an image attachment whose pixels exceed the API cap.
+
+    Distinct from ``not is_vision_image_attachment``, which is also True for a
+    perfectly small PDF. Callers rendering history need to single out the
+    images that will terminate a session if the agent curls and ``read``s them
+    at full size.
+    """
+    return (attachment.content_type or "").startswith("image/") and _exceeds_dimension_cap(
+        attachment
+    )
+
+
 def is_vision_image_attachment(attachment: discord.Attachment) -> bool:
     """True when the attachment can be sent as an API vision content block."""
     return (

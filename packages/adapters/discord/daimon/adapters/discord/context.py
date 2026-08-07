@@ -9,7 +9,11 @@ from __future__ import annotations
 import re
 from xml.sax.saxutils import escape, quoteattr
 
-from daimon.adapters.discord.vision import is_vision_image_attachment
+from daimon.adapters.discord.vision import (
+    MAX_VISION_IMAGE_DIMENSION,
+    is_oversized_image,
+    is_vision_image_attachment,
+)
 
 import discord
 
@@ -65,9 +69,25 @@ def _render_location(thread: discord.Thread) -> list[str]:
 
 
 def _render_message(
-    msg: discord.Message, bot_user_id: int | None, *, bot_display_name: str = "daimon"
+    msg: discord.Message,
+    bot_user_id: int | None,
+    *,
+    bot_display_name: str = "daimon",
+    omit_oversized_image_urls: bool = False,
 ) -> list[str]:
-    """Render a single message as XML lines."""
+    """Render a single message as XML lines.
+
+    Image attachments over the API's pixel cap are marked ``oversized="true"``
+    and carry a warning, because the agent otherwise sees a plain URL, curls it,
+    ``read``s it at full size, and the resulting rejection is terminal — it
+    kills the session and (before recovery existed) the whole thread.
+
+    ``omit_oversized_image_urls`` drops those URLs entirely rather than merely
+    warning. Set only on a dead-session recovery reseed: there the previous
+    session provably died, so a prompt-level warning the model may ignore is
+    not good enough — withholding the URL is what actually breaks the
+    recover-replay-die loop.
+    """
     attrs = (
         f" author_name={quoteattr(msg.author.display_name)}"
         f" user_id={quoteattr(str(msg.author.id))}"
@@ -83,12 +103,29 @@ def _render_message(
 
     lines = [f"<message{attrs}>", content, "<attachments>"]
     for att in msg.attachments:
-        att_attrs = (
-            f" filename={quoteattr(att.filename)}"
-            f" url={quoteattr(att.url)}"
+        oversized = is_oversized_image(att)
+        att_attrs = f" filename={quoteattr(att.filename)}"
+        if not (oversized and omit_oversized_image_urls):
+            att_attrs += f" url={quoteattr(att.url)}"
+        att_attrs += (
             f" content_type={quoteattr(att.content_type or 'unknown')}"
             f" size={quoteattr(str(att.size))}"
         )
+        if att.width is not None and att.height is not None:
+            att_attrs += f" width={quoteattr(str(att.width))} height={quoteattr(str(att.height))}"
+        if oversized:
+            att_attrs += ' oversized="true"'
+            att_attrs += " note=" + quoteattr(
+                "Larger than "
+                f"{MAX_VISION_IMAGE_DIMENSION}px on an edge. Do NOT read this at full "
+                "size — that inlines it at its original dimensions and the request is "
+                "rejected terminally, which kills this conversation. Downscale a copy "
+                "first, then read the copy."
+                if not omit_oversized_image_urls
+                else "Larger than "
+                f"{MAX_VISION_IMAGE_DIMENSION}px on an edge. Its URL is withheld: "
+                "reading it at full size already terminated a session in this thread."
+            )
         lines.append(f"<attachment{att_attrs}/>")
     lines.append("</attachments>")
     lines.append("</message>")
@@ -102,8 +139,12 @@ async def build_context_xml(
     limit: int = 100,
     bot_user_id: int | None = None,
     bot_display_name: str = "daimon",
+    omit_oversized_image_urls: bool = False,
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context from thread history for the turn driver.
+
+    Pass ``omit_oversized_image_urls=True`` on a dead-session recovery reseed
+    so an image that already terminated a session cannot be fetched again.
 
     Returns ``(xml, image_attachments)`` where ``xml`` has
     ``<context>/<thread_history>`` wrapping prior messages and a
@@ -146,7 +187,14 @@ async def build_context_xml(
         "<thread_history>",
     ]
     for msg in messages:
-        lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
+        lines.extend(
+            _render_message(
+                msg,
+                bot_user_id,
+                bot_display_name=bot_display_name,
+                omit_oversized_image_urls=omit_oversized_image_urls,
+            )
+        )
     lines.append("</thread_history>")
     lines.append("</context>")
 
@@ -172,6 +220,7 @@ async def build_delta_xml(
     after_message_id: int | None,
     bot_user_id: int | None = None,
     bot_display_name: str = "daimon",
+    omit_oversized_image_urls: bool = False,
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context for a continuation turn (delta since watermark).
 
@@ -222,7 +271,14 @@ async def build_delta_xml(
         "<thread_delta>",
     ]
     for msg in messages:
-        lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
+        lines.extend(
+            _render_message(
+                msg,
+                bot_user_id,
+                bot_display_name=bot_display_name,
+                omit_oversized_image_urls=omit_oversized_image_urls,
+            )
+        )
     lines.append("</thread_delta>")
     lines.append("</context>")
 
@@ -248,6 +304,7 @@ async def build_channel_context_xml(
     limit: int = CHANNEL_BACKFILL_LIMIT,
     bot_user_id: int | None = None,
     bot_display_name: str = "daimon",
+    omit_oversized_image_urls: bool = False,
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context from parent channel history for a channel-mention turn.
 
@@ -276,7 +333,14 @@ async def build_channel_context_xml(
 
     lines: list[str] = [*_render_location(thread), f'<channel_context count="{len(messages)}">']
     for msg in messages:
-        lines.extend(_render_message(msg, bot_user_id, bot_display_name=bot_display_name))
+        lines.extend(
+            _render_message(
+                msg,
+                bot_user_id,
+                bot_display_name=bot_display_name,
+                omit_oversized_image_urls=omit_oversized_image_urls,
+            )
+        )
     lines.append("</channel_context>")
 
     trigger_attrs = (

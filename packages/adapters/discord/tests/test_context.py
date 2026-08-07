@@ -934,3 +934,59 @@ class TestBuildChannelContextXml:
     async def test_channel_backfill_limit_constant_is_twenty_five(self) -> None:
         """CHANNEL_BACKFILL_LIMIT module constant must be 25."""
         assert CHANNEL_BACKFILL_LIMIT == 25, "CHANNEL_BACKFILL_LIMIT must equal 25"
+
+
+async def test_oversized_history_image_is_marked_and_warned() -> None:
+    """A history image over the pixel cap must not look like a safe URL.
+
+    The agent otherwise curls it, ``read``s it at full size, and MA terminates
+    the session — which is how staging thread 1535185295245582356 died.
+    """
+    huge = _make_attachment(
+        filename="huge.jpg", content_type="image/jpeg", width=12000, height=4000
+    )
+    history = _make_message(msg_id=1, content="here", attachments=[huge])
+    trigger = _make_message(msg_id=2, content="look")
+    thread = _make_thread([history, trigger])
+
+    xml, _ = await build_context_xml(thread, trigger=trigger)
+
+    assert 'oversized="true"' in xml
+    assert "Do NOT read this at full size" in xml
+    assert 'width="12000"' in xml, "dimensions must be visible so the agent can reason about them"
+    assert huge.url in xml, "normal history still exposes the URL — downscaling needs it"
+
+
+async def test_recovery_reseed_withholds_the_oversized_image_url() -> None:
+    """The reseed must not hand back the URL that just killed a session.
+
+    A warning is a prompt-level hint the model may ignore; on a recovery we
+    KNOW the previous session died, so the URL is withheld outright. Without
+    this the thread recovers, replays the image, dies, and repeats — two such
+    cycles on staging burned 243k then 62k input tokens.
+    """
+    huge = _make_attachment(
+        filename="huge.jpg", content_type="image/jpeg", width=12000, height=4000
+    )
+    history = _make_message(msg_id=1, content="here", attachments=[huge])
+    trigger = _make_message(msg_id=2, content="hello?")
+    thread = _make_thread([history, trigger])
+
+    xml, _ = await build_context_xml(thread, trigger=trigger, omit_oversized_image_urls=True)
+
+    assert huge.url not in xml, "the URL that terminated the last session must be withheld"
+    assert 'oversized="true"' in xml, "the agent must still know the image exists"
+    assert "already terminated a session" in xml
+
+
+async def test_reseed_still_exposes_normal_image_urls() -> None:
+    """Only oversized images are withheld — ordinary attachments are untouched."""
+    ok = _make_attachment(filename="fine.png", width=800, height=600)
+    history = _make_message(msg_id=1, content="here", attachments=[ok])
+    trigger = _make_message(msg_id=2, content="hello?")
+    thread = _make_thread([history, trigger])
+
+    xml, _ = await build_context_xml(thread, trigger=trigger, omit_oversized_image_urls=True)
+
+    assert ok.url in xml
+    assert "oversized" not in xml

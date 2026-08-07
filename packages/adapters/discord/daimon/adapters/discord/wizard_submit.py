@@ -489,6 +489,10 @@ async def run_wizard_submit_turn(
                 agent_name=agent.name,
                 model_id=agent.model.id,
                 cancel_view=CancelView(allowed_user_id=interaction.user.id, cancel=cancel_event),
+                # Take over the failed attempt's message so its upstream-error
+                # embed is edited into this turn's answer rather than left
+                # standing next to a second, successful message.
+                adopt_message_ref=lifecycle.message_ref,
             )
             lifecycle_holder[0] = new_lifecycle
             return new_lifecycle
