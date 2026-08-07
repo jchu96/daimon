@@ -45,7 +45,7 @@ TOKEN_BYTES: Final[int] = 16
 CUSTOM_ID_TEMPLATE: Final[str] = r"ztc:(?P<token>[A-Za-z0-9_-]{16,64})"
 CUSTOM_ID_PATTERN: Final[re.Pattern[str]] = re.compile(CUSTOM_ID_TEMPLATE)
 
-CredentialRequestKind = Literal["env", "mcp", "repo"]
+CredentialRequestKind = Literal["env", "mcp", "repo", "skill_repo"]
 
 # TTL bounds the replay window for a never-clicked button sitting in channel
 # scrollback; combined with the store's single-use consume, this is the full
@@ -58,11 +58,44 @@ MAX_BUTTON_LABEL_CHARS: Final[int] = 80
 # The full label prefix for each kind. "env" and "mcp" reproduce the
 # pre-repo-kind wording byte-for-byte. "repo" cannot reuse the "Add {X}
 # credential: " interpolation — a repo binding is not a credential.
+# "skill_repo" is deliberately worded as an import, not a binding: it shares
+# "repo"'s PAT store but writes NO agent_repo_binding row, so a label saying
+# "bind" would promise a checkout the user never asked for.
 _KIND_LABEL_PREFIX: Final[dict[CredentialRequestKind, str]] = {
     "env": "Add env credential: ",
     "mcp": "Add MCP credential: ",
     "repo": "Bind repo: ",
+    "skill_repo": "Import skills from: ",
 }
+
+
+def build_skill_repo_target(url: str, branch: str, path: str) -> str:
+    """Pack a skill-sync target into one `target` column value.
+
+    `URL[@branch][#path]` — the same grammar the CLI's `--repo` argument
+    already accepts, reused so the round trip needs no schema change and no
+    second parser. `branch`/`path` have to survive the button click because
+    the modal re-runs the sync on submit, and a click carries nothing but
+    the request row.
+    """
+    packed = url
+    if branch:
+        packed = f"{packed}@{branch}"
+    if path:
+        packed = f"{packed}#{path}"
+    return packed
+
+
+def split_skill_repo_target(target: str) -> tuple[str, str, str]:
+    """Inverse of `build_skill_repo_target`. Returns `(url, branch, path)`.
+
+    Defaults match `sync_skills`' own defaults: branch "main", path "".
+    Split on "#" first — a branch name cannot contain "#", but a path can
+    contain "@", so splitting on "@" first would mangle it.
+    """
+    rest, _, path = target.partition("#")
+    url, _, branch = rest.partition("@")
+    return url, branch or "main", path
 
 
 def mint_request_token() -> str:

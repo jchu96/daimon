@@ -38,6 +38,7 @@ from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_r
 from daimon.core.github_credentials import get_pat
 from daimon.core.github_repo_auth import InstallationLookup, resolve_skill_sync_token
 from daimon.core.ma import delete_skill_and_versions, update_agent_with_version_retry
+from daimon.core.skills.fetch import GitHubFetchError
 from daimon.core.skills.pipeline import run_skill_sync
 from daimon.core.stores.agent_repo_binding import get_bindings_for_repo
 from daimon.core.stores.domain import RepoProofKind
@@ -267,6 +268,26 @@ async def _sync_impl(
                     runtime.settings.github.max_tarball_decompressed_bytes
                 ),
             )
+        except GitHubFetchError as exc:
+            # A 404 from an ANONYMOUS fetch is ambiguous: GitHub returns it for
+            # a private repo as well as a missing one, so that the caller
+            # cannot probe for existence. We know `token is None` here, which
+            # makes "private, and nothing authorized us" by far the likelier
+            # read — and it is the only one the user can act on. Left as the
+            # bare "HTTP 404" this reads as "that repo does not exist", which
+            # is why the agent used to apologize for a typo instead of asking
+            # for a credential.
+            if exc.status_code == 404 and token is None:
+                raise ToolError(
+                    f"No GitHub credential was available for {url!r}, and an "
+                    "unauthenticated fetch got HTTP 404 — which GitHub returns "
+                    "for a private repo as well as a missing one. If this repo "
+                    "is private, call `request_skill_repo_credential` with this "
+                    "url/branch/path to post a button the user can paste a "
+                    "token into; it syncs on submit. If it is public, re-check "
+                    "the url and branch."
+                ) from exc
+            raise ToolError(str(exc)) from exc
         except DaimonError as exc:
             raise ToolError(str(exc)) from exc
 

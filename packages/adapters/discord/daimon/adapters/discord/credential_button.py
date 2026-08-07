@@ -74,6 +74,7 @@ from daimon.adapters.discord.credential_modals import (
     EnvCredentialModal,
     McpCredentialModal,
     RepoBindModal,
+    SkillRepoModal,
 )
 from daimon.adapters.discord.credential_repo_bind import (
     refuse_if_shared_and_not_admin_for_request,
@@ -233,6 +234,17 @@ class CredentialRequestButton(
                 )
             elif request_row.kind == "repo":
                 await self._open_repo_modal(interaction, runtime=bot.runtime, row=request_row)
+            elif request_row.kind == "skill_repo":
+                # Explicit branch, not a fall-through: the `else` below is the
+                # MCP modal, so a kind added without a branch here silently
+                # opens the wrong modal rather than failing.
+                #
+                # No admin pre-filter, unlike the repo kind — this writes no
+                # agent_repo_binding, so the "changes what code the agent runs
+                # for every member" reasoning behind that gate does not apply.
+                await interaction.response.send_modal(
+                    SkillRepoModal(runtime=bot.runtime, request_row=request_row)
+                )
             else:
                 await interaction.response.send_modal(
                     McpCredentialModal(runtime=bot.runtime, request_row=request_row)

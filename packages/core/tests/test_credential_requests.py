@@ -7,7 +7,9 @@ from daimon.core.credential_requests import (
     MAX_BUTTON_LABEL_CHARS,
     build_button_label,
     build_custom_id,
+    build_skill_repo_target,
     mint_request_token,
+    split_skill_repo_target,
 )
 
 
@@ -84,3 +86,40 @@ def test_build_button_label_truncates_long_repo_target_within_discord_label_limi
     assert len(label) <= MAX_BUTTON_LABEL_CHARS, "label must fit Discord's 80-char button limit"
     assert label.startswith("Bind repo: "), "truncation must not lose the human-readable prefix"
     assert label.endswith("…"), "truncation must append the single-character ellipsis"
+
+
+def test_build_button_label_skill_repo_does_not_say_bind() -> None:
+    label = build_button_label("skill_repo", "clsandoval/seedance-2.0")
+
+    assert label == "Import skills from: clsandoval/seedance-2.0"
+    assert "Bind" not in label, (
+        "a skill import writes no agent_repo_binding, so the label must not "
+        "promise the user a checkout they did not ask for"
+    )
+
+
+def test_skill_repo_target_round_trips_url_branch_and_path() -> None:
+    for url, branch, path in [
+        ("https://github.com/o/r", "main", ""),
+        ("https://github.com/o/r", "dev", "skills"),
+        ("https://github.com/o/r", "release/1.x", "nested/skills"),
+    ]:
+        packed = build_skill_repo_target(url, branch, path)
+
+        assert split_skill_repo_target(packed) == (url, branch, path)
+
+
+def test_skill_repo_target_splits_path_before_branch() -> None:
+    """A path may contain '@'; splitting on '@' first would mangle it."""
+    packed = build_skill_repo_target("https://github.com/o/r", "main", "a@b/c")
+
+    assert split_skill_repo_target(packed) == ("https://github.com/o/r", "main", "a@b/c")
+
+
+def test_split_skill_repo_target_defaults_match_sync_skills_defaults() -> None:
+    """A bare url must resolve to sync_skills' own defaults, not to empties."""
+    assert split_skill_repo_target("https://github.com/o/r") == (
+        "https://github.com/o/r",
+        "main",
+        "",
+    )

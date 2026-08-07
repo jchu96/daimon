@@ -52,16 +52,20 @@ import structlog
 from daimon.adapters.discord.agent_setup.credentials import (
     _MAX_SECRET_VALUE_BYTES,  # pyright: ignore[reportPrivateUsage]  # reusing PasteSecretModal's byte cap rather than inventing a second number
 )
-from daimon.adapters.discord.agent_setup.write import mask_tail
+from daimon.adapters.discord.agent_setup.write import mask_tail, store_inline_pat
 from daimon.adapters.discord.credential_repo_bind import (
     refuse_if_shared_and_not_admin_for_request,
     resolve_repo_binding_credential,
 )
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.credential_requests import split_skill_repo_target
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid
 from daimon.core.errors import DaimonError
+from daimon.core.github_repo_auth import normalize_owner_repo
+from daimon.core.github_visibility import pat_can_access_repo
 from daimon.core.mcp_attach import attach_mcp_server_to_agent
 from daimon.core.mcp_vault import add_external_mcp_credential
+from daimon.core.skills.pipeline import run_skill_sync
 from daimon.core.stores import credential_requests
 from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.agent_repo_binding import set_binding
@@ -273,6 +277,136 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP credential"):
         await interaction.followup.send(
             f"MCP credential added for `{mcp_server_url}` and attached as "
             f"`{consumed_row.target}`. Anyone who talks to this agent can use it.",
+            ephemeral=True,
+        )
+
+
+class SkillRepoModal(discord.ui.Modal, title="Import skills"):
+    """Collect a GitHub token for a PRIVATE skill repo, then run the import.
+
+    Deliberately NOT a `RepoBindModal` variant, even though both collect a
+    GitHub token into the same per-agent overlay. Two differences are the
+    whole point of the separate class:
+
+    1. No `set_binding`. Importing skills from a repo must not also tell the
+       agent to check that repo out. Sharing the store is intended; sharing
+       the binding write is the bug this exists to avoid.
+    2. The token is verified against the SKILL repo (`target`), not the
+       agent's clone repo — for a skill import those are routinely different
+       repos, and validating the wrong one both refuses good tokens and
+       accepts ones that cannot read what is about to be fetched.
+
+    Because the credential lands in the same overlay `get_pat(agent_id=…)`
+    resolves, a user who already pasted a token that can read this repo is
+    never asked twice — the agent should attempt `sync_skills` first and only
+    reach for this button on an actual no-credential failure.
+
+    No admin gate. This mirrors the env/mcp kinds rather than the repo kind:
+    the repo kind is admin-gated on a shared agent because a binding changes
+    what code the agent runs for every member, and that reasoning does not
+    reach an import into the shared skill library, which `sync_skills` itself
+    already gates with `_require_admin` at request time.
+    """
+
+    def __init__(self, *, runtime: DiscordRuntime, request_row: CredentialRequestRow) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._row = request_row
+        url, _branch, _path = split_skill_repo_target(request_row.target)
+        self.pat_in: discord.ui.TextInput[SkillRepoModal] = discord.ui.TextInput(
+            label="GitHub token",
+            required=True,
+            max_length=_MAX_SECRET_VALUE_BYTES,
+            placeholder=f"Needs read access to {normalize_owner_repo(url)}",
+        )
+        self.add_item(self.pat_in)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        pat = str(self.pat_in.value or "").strip()
+        if not pat:
+            await interaction.followup.send("Enter a GitHub token.", ephemeral=True)
+            return
+
+        now = datetime.now(UTC)
+        async with self._runtime.sessionmaker() as session, session.begin():
+            consumed_row = await credential_requests.consume_credential_request(
+                session, token=self._row.token, now=now
+            )
+        if consumed_row is None:
+            await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
+            return
+
+        url, branch, path = split_skill_repo_target(consumed_row.target)
+        # The token appears only as a masked tail, never in full, and never
+        # the (now-consumed) request token either.
+        _log.info(
+            "credential_modal.skill_repo.submit",
+            repo_url=url,
+            branch=branch,
+            path=path,
+            pat_masked=mask_tail(pat),
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                # Verify BEFORE storing: a token that cannot read this repo is
+                # not a credential for it, and storing it would shadow a
+                # working one on the next `get_pat` (the overlay is
+                # last-write-wins, and tier 1 short-circuits the rest).
+                if not await pat_can_access_repo(
+                    http_client, owner_repo=normalize_owner_repo(url), pat=pat
+                ):
+                    await interaction.followup.send(
+                        f"That token cannot read `{normalize_owner_repo(url)}`. Nothing was "
+                        "stored, and the request was used up — ask again to retry.",
+                        ephemeral=True,
+                    )
+                    return
+                await store_inline_pat(
+                    self._runtime,
+                    account_id=consumed_row.account_id,
+                    agent_id=consumed_row.agent_id,
+                    plaintext_pat=pat,
+                )
+                outcomes = await run_skill_sync(
+                    self._runtime.anthropic,
+                    http_client,
+                    url=url,
+                    branch=branch,
+                    path=path,
+                    tenant_id=consumed_row.tenant_id,
+                    token=pat,
+                )
+        except DaimonError as err:
+            # Written for the user by the raiser — surface verbatim. The
+            # credential is already stored and still good; only the import
+            # leg failed, so say which half survived.
+            await interaction.followup.send(
+                f"Token stored, but the import failed: {err} The request was used up — "
+                "ask again to retry the import.",
+                ephemeral=True,
+            )
+            return
+        except Exception as err:
+            _log.exception(
+                "credential_modal.skill_repo_sync_failed",
+                repo_url=url,
+                err_type=type(err).__name__,
+            )
+            # Class name only — a stringified SDK/network error can carry the
+            # request envelope, which is a token-leak surface.
+            await interaction.followup.send(
+                f"Token stored, but the import failed (`{type(err).__name__}`). "
+                "Ask again to retry the import.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"Imported {len(outcomes)} skill(s) from `{normalize_owner_repo(url)}`. "
+            "The token is stored, so future imports from repos it can read will not ask again.",
             ephemeral=True,
         )
 

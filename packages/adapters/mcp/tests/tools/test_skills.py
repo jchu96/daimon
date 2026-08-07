@@ -792,3 +792,62 @@ async def test_sync_impl_attaches_to_the_named_agent_and_preserves_its_existing_
         "attached_count must reflect this call's own attach, not the state it saw on the way in"
     )
     assert "agent" in result.summary, "the summary must name the agent it attached to"
+
+
+async def test_sync_impl_anonymous_404_names_the_credential_remedy() -> None:
+    """An anonymous 404 must read as "no credential", not "no such repo".
+
+    GitHub 404s a private repo rather than 403ing it, so the bare status is
+    ambiguous. `_sync_impl` knows it sent no token, which makes the private
+    case both the likelier read and the only actionable one — and naming the
+    remedy is what makes the agent reach for the button instead of
+    apologizing for a typo.
+    """
+    from daimon.core.skills.fetch import GitHubFetchError
+
+    with (
+        patch("daimon.adapters.mcp.tools.skills._resolve_sync_token", return_value=None),
+        patch("daimon.core.skills.pipeline.fetch_repo") as mock_fetch,
+    ):
+        mock_fetch.side_effect = GitHubFetchError("HTTP 404", status_code=404)
+
+        auth = AuthIdentity(
+            account_id=uuid.uuid4(), tenant_id=uuid.uuid4(), role=Role.ADMIN, is_admin=True
+        )
+        with pytest.raises(ToolError, match="request_skill_repo_credential") as excinfo:
+            await _sync_impl(
+                _runtime(build_fake_anthropic(MARouter().dispatch)),
+                auth,
+                url="https://github.com/org/private-repo",
+                branch="main",
+                path="",
+            )
+
+    assert "no github credential was available" in str(excinfo.value).lower()
+
+
+async def test_sync_impl_404_with_a_token_does_not_blame_credentials() -> None:
+    """With a token that GitHub accepted, a 404 really is a bad url/branch."""
+    from daimon.core.skills.fetch import GitHubFetchError
+
+    with (
+        patch("daimon.adapters.mcp.tools.skills._resolve_sync_token", return_value="ghp_x"),
+        patch("daimon.core.skills.pipeline.fetch_repo") as mock_fetch,
+    ):
+        mock_fetch.side_effect = GitHubFetchError("HTTP 404", status_code=404)
+
+        auth = AuthIdentity(
+            account_id=uuid.uuid4(), tenant_id=uuid.uuid4(), role=Role.ADMIN, is_admin=True
+        )
+        with pytest.raises(ToolError) as excinfo:
+            await _sync_impl(
+                _runtime(build_fake_anthropic(MARouter().dispatch)),
+                auth,
+                url="https://github.com/org/repo",
+                branch="typo",
+                path="",
+            )
+
+    assert "request_skill_repo_credential" not in str(excinfo.value), (
+        "a 404 on an authenticated fetch is a bad url/branch, not a missing credential"
+    )
