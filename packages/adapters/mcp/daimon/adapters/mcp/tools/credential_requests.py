@@ -187,6 +187,13 @@ async def _request_mcp_credential_impl(
         raise ToolError("credential requests require a platform-bound identity")
     if urlparse(url).scheme not in ("http", "https"):
         raise ToolError("mcp server url must be http or https")
+    # Normalise the trailing slash once, here, before the URL is persisted.
+    # The vault stores it as the credential's `auth.mcp_server_url` and
+    # mcp_vault's idempotent replace matches on that string exactly, so
+    # `…/mcp/` and `…/mcp` are two credentials for one server — a re-paste
+    # would stack rather than replace. Observed live: request row held the
+    # slashed form while the vault held the bare one.
+    url = url.rstrip("/")
     agent_id = await _resolve_agent_uuid(runtime, auth, agent_name)
     return await _mint_and_post(
         runtime,

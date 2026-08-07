@@ -2572,13 +2572,25 @@
     }),
     'skills_sync': dict({
       'description': '''
-        Sync skills from a GitHub repository (alias of ``sync_skills``).
+        Import skills from a GitHub repo into the shared library (alias of ``sync_skills``).
         
-        Discovers SKILL.md and creates or updates them.
+        Discovers SKILL.md and creates or updates them. Pass ``agent_name`` to
+        also attach them to that agent; importing alone attaches nothing.
       ''',
       'parameters': dict({
         'additionalProperties': False,
         'properties': dict({
+          'agent_name': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'branch': dict({
             'default': 'main',
             'type': 'string',
@@ -2620,15 +2632,24 @@
     }),
     'sync_skills': dict({
       'description': '''
-        Sync skills from a GitHub repository. Discovers SKILL.md and creates or updates them.
+        Import skills from a GitHub repo into this workspace's shared skill library.
         
-        LOCAL-FIRST: before syncing an external repo, call ``list_skills`` to see
-        what is already installed and prefer an existing skill over pulling a
-        near-duplicate. Only sync an external repo the user explicitly asked for.
+        Discovers SKILL.md files and creates or updates them. This is an IMPORT,
+        not a per-agent change: the library is visible to every agent in the
+        workspace, and importing alone attaches nothing.
         
-        Synced skills are added to this tenant's shared skill registry (visible to
-        every agent in the tenant), so name where they came from when you report
-        back — the returned ``source_url``/``branch``/``path`` echo that provenance.
+        Pass ``agent_name`` to also attach everything imported to that agent —
+        which is almost always what someone means by "add this skill to my
+        agent". Omit it only to stock the library without touching any agent.
+        Existing skills on the agent are preserved; the attach is a union.
+        
+        LOCAL-FIRST: before importing an external repo, call ``list_skills`` to
+        see what is already in the library and prefer an existing skill over
+        pulling a near-duplicate. Only import a repo the user explicitly asked for.
+        
+        Report where the skills came from — the returned
+        ``source_url``/``branch``/``path`` echo that provenance, and ``summary``
+        states both what was imported and what was attached.
         
         Before calling, inspect the repo structure to determine the correct ``path``
         parameter (empty string = repo root). ``branch`` defaults to ``"main"``.
@@ -2636,6 +2657,17 @@
       'parameters': dict({
         'additionalProperties': False,
         'properties': dict({
+          'agent_name': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'branch': dict({
             'default': 'main',
             'type': 'string',
