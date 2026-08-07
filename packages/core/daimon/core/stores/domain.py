@@ -176,6 +176,8 @@ class ThreadSessionRow(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    active_turn_message_id: str | None = None
+    active_turn_started_at: datetime | None = None
 
 
 class GitHubOauthStateRow(BaseModel):

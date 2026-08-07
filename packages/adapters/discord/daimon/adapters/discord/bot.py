@@ -48,7 +48,12 @@ from daimon.core.stores.tenants import (
     list_tenants_by_platform,
     set_provision_status,
 )
-from daimon.core.stores.thread_sessions import update_watermark
+from daimon.core.stores.thread_sessions import (
+    clear_active_turn,
+    list_orphaned_turns,
+    mark_turn_active,
+    update_watermark,
+)
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
@@ -230,6 +235,10 @@ class DaimonBot(commands.Bot):
         # Drain flag — set by _drain_and_close on SIGTERM/SIGINT.
         # While True, on_message rejects new mentions; existing turns finish.
         self.draining: bool = False
+        # One-shot guard for the orphaned-turn sweep. on_ready re-fires on every
+        # full gateway reconnect, and a second run would reap the turns THIS
+        # process is currently rendering.
+        self._orphans_retired: bool = False
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         """Fire-and-forget a background task, tracked so it isn't GC'd."""
@@ -486,10 +495,86 @@ class DaimonBot(commands.Bot):
             self._seed_tenant_defaults(tenant_id=result.tenant_id, guild=guild, was_ready=False)
         )
 
+    async def _retire_orphaned_turns(self) -> None:
+        """Lay to rest every embed whose turn died with the previous process.
+
+        A turn's render loop lives in the process that started it, so a deploy
+        mid-turn freezes the embed on 'thinking' forever while MA completes and
+        bills the answer server-side. The user sees a spinner that never stops
+        and has no way to tell it is dead.
+
+        Marking it failed is honest and cheap, and the alternative -- draining
+        in-flight turns before the container exits -- needs a lameduck story the
+        compose refresh does not have. This runs first in on_ready so a user
+        reading the thread sees the truth before anything else happens.
+
+        Failures to edit are swallowed per row: the message may be deleted, the
+        thread archived, or permissions changed since. One unreachable embed
+        must not stop the sweep clearing the rest, and the row is cleared either
+        way so a permanently unreachable message is not retried on every boot.
+
+        Runs at most once per process: on_ready re-fires on every full gateway
+        reconnect, and a marker set by this process is a LIVE turn, not an
+        orphan.
+        """
+        if self._orphans_retired:
+            return
+        self._orphans_retired = True
+        async with self.runtime.sessionmaker() as session:
+            orphans = await list_orphaned_turns(session, platform="discord")
+        if not orphans:
+            return
+        log.info("turn.orphans_found", count=len(orphans))
+
+        for row in orphans:
+            if row.active_turn_message_id is None:  # pragma: no cover - filtered by the query
+                continue
+            try:
+                channel = self.get_channel(int(row.thread_id)) or await self.fetch_channel(
+                    int(row.thread_id)
+                )
+                if isinstance(channel, discord.abc.Messageable):
+                    message = await channel.fetch_message(int(row.active_turn_message_id))
+                    await message.edit(
+                        embed=discord.Embed(
+                            color=theme.COLOR_RED,
+                            description=(
+                                "❌ This turn was interrupted by a restart and cannot be "
+                                "resumed. Nothing was lost on your side — mention me again "
+                                "to retry."
+                            ),
+                        ),
+                        view=None,
+                    )
+                    log.info(
+                        "turn.orphan_retired",
+                        thread_id=row.thread_id,
+                        message_id=row.active_turn_message_id,
+                        # How long the user stared at a spinner. The only place
+                        # this is visible -- the turn's own logs died with its
+                        # container.
+                        frozen_for_s=(
+                            (datetime.now(UTC) - row.active_turn_started_at).total_seconds()
+                            if row.active_turn_started_at is not None
+                            else None
+                        ),
+                    )
+            except (discord.HTTPException, discord.ClientException, ValueError) as err:
+                log.warning(
+                    "turn.orphan_retire_failed",
+                    thread_id=row.thread_id,
+                    message_id=row.active_turn_message_id,
+                    error=str(err),
+                )
+            async with self.runtime.sessionmaker() as session:
+                await clear_active_turn(session, id=row.id)
+                await session.commit()
+
     async def on_ready(self) -> None:
         """Forward-only reconcile sweep: provision-if-missing, re-seed pending/failed,
         sync the command tree. NO archive-on-absence."""
         log.info("bot_ready", user=str(self.user))
+        await self._retire_orphaned_turns()
         tenants = await list_tenants_by_platform(self.runtime.sessionmaker, platform="discord")
         known_guild_ids = {tr.external_id for tr in tenants}
         sem = asyncio.Semaphore(_SWEEP_CONCURRENCY)
@@ -1127,6 +1212,20 @@ class DaimonBot(commands.Bot):
             reused=prepared.reused,
         )
 
+        # Flag the turn as in flight. The render loop lives in THIS process, so
+        # if the container is recreated mid-turn the embed freezes forever while
+        # MA completes and bills the answer server-side. Recording the embed's
+        # id is what lets the next boot find it and say so.
+        if prepared.mapping_id is not None and lifecycle.final_message_id is not None:
+            async with self.runtime.sessionmaker() as _at_session:
+                await mark_turn_active(
+                    _at_session,
+                    id=prepared.mapping_id,
+                    active_turn_message_id=lifecycle.final_message_id,
+                    now=datetime.now(UTC),
+                )
+                await _at_session.commit()
+
         # Split trigger-message attachments: API-consumable images → vision
         # blocks; everything else (data files, unsupported/oversized images)
         # → signed CDN URL surfaced to the agent (it has bash + network egress
@@ -1297,6 +1396,17 @@ class DaimonBot(commands.Bot):
         state = outcome.state
         mapping_id = outcome.mapping_id
         final_lifecycle = lifecycle_holder[0]
+
+        # The turn reached a terminal state under this process, so its embed is
+        # settled and must not be reaped by a later boot. Both ids are cleared:
+        # recovery moves the turn to a new mapping row and leaves the marker
+        # behind on the old one, which is still pointing at this same message.
+        for _done_id in {prepared.mapping_id, mapping_id} - {None}:
+            if _done_id is None:  # pragma: no cover - set comprehension guarantees this
+                continue
+            async with self.runtime.sessionmaker() as _ct_session:
+                await clear_active_turn(_ct_session, id=_done_id)
+                await _ct_session.commit()
 
         if state.error is not None:
             log.warning(

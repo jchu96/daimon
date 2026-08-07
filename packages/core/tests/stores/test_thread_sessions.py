@@ -16,10 +16,13 @@ import pytest_asyncio
 from daimon.core._models import ThreadSession
 from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.thread_sessions import (
+    clear_active_turn,
     create_thread_session,
     get_latest_thread_session,
     get_live_thread_session,
+    list_orphaned_turns,
     mark_dead,
+    mark_turn_active,
     update_watermark,
 )
 from daimon.testing.factories import make_tenant
@@ -420,3 +423,77 @@ async def test_get_latest_thread_session_returns_none_for_unknown_thread(
     )
 
     assert fetched is None
+
+
+async def test_healthy_threads_are_never_reported_as_orphans(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    """The load-bearing safety property of the whole sweep.
+
+    `status` stays 'live' on every healthy thread forever, so a sweep keyed on
+    it would mark every working thread failed. Only an explicit in-flight
+    marker may qualify a row.
+    """
+    await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="healthy-1",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_healthy",
+    )
+
+    orphans = await list_orphaned_turns(db_session, platform="discord")
+
+    assert orphans == [], "a live row with no in-flight marker is not an orphaned turn"
+
+
+async def test_marked_turn_is_listed_then_cleared(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="inflight-1",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_inflight",
+    )
+    started = datetime.now(UTC)
+
+    await mark_turn_active(db_session, id=row.id, active_turn_message_id="msg-42", now=started)
+    orphans = await list_orphaned_turns(db_session, platform="discord")
+    assert [o.id for o in orphans] == [row.id], "a marked row must be reapable after a restart"
+    assert orphans[0].active_turn_message_id == "msg-42", (
+        "the embed id must survive, since it is the only handle on the frozen message"
+    )
+
+    await clear_active_turn(db_session, id=row.id)
+    assert await list_orphaned_turns(db_session, platform="discord") == [], (
+        "a turn that reached a terminal state must not be reaped later"
+    )
+
+
+async def test_orphan_listing_is_scoped_to_one_platform(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    """A Discord boot must not retire Slack's in-flight turns."""
+    slack_row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="slack-1",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack",
+    )
+    await mark_turn_active(
+        db_session, id=slack_row.id, active_turn_message_id="slack-msg", now=datetime.now(UTC)
+    )
+
+    assert await list_orphaned_turns(db_session, platform="discord") == [], (
+        "each adapter reaps only its own platform's turns"
+    )
+    assert len(await list_orphaned_turns(db_session, platform="slack")) == 1
