@@ -33,6 +33,7 @@ from daimon.core.defaults.sweep import (
     sweep_removed_skills,
 )
 from daimon.core.errors import DaimonError, DefaultsError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = structlog.get_logger(__name__)
 
@@ -96,6 +97,7 @@ async def _run_per_resource(
 
 async def _reconcile_core(
     client: AsyncAnthropic,
+    session_factory: async_sessionmaker[AsyncSession],
     defaults_root: Path,
     *,
     tenant_id: uuid.UUID,
@@ -109,6 +111,9 @@ async def _reconcile_core(
     Called by both `apply_defaults` (account_id=None, dry_run/run_preflight from caller)
     and `reconcile_tenant_defaults` (account_id=_derive_account_uuid(tenant_id),
     dry_run=False, run_preflight=True).
+
+    `session_factory` is here for the skill pass alone: MA has no carrier for
+    skill content idempotence, so the fingerprint lives in `seeded_skills`.
     """
     report = ApplyReport()
 
@@ -147,7 +152,7 @@ async def _reconcile_core(
         await _run_per_resource(
             report,
             lambda skill_dir=skill_dir: reconcile_skill(
-                client, skill_dir, tenant_id=tenant_id, dry_run=dry_run
+                client, session_factory, skill_dir, tenant_id=tenant_id, dry_run=dry_run
             ),
             kind="skill",
             name=skill_dir.name,

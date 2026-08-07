@@ -136,6 +136,7 @@ async def provision_tenant(
 
 async def reconcile_tenant_defaults(
     client: AsyncAnthropic,
+    session_factory: async_sessionmaker[AsyncSession],
     defaults_root: Path,
     *,
     tenant_id: uuid.UUID,
@@ -154,6 +155,7 @@ async def reconcile_tenant_defaults(
     """
     return await _reconcile_core(
         client,
+        session_factory,
         defaults_root,
         tenant_id=tenant_id,
         account_id=_derive_account_uuid(tenant_id),
@@ -165,6 +167,7 @@ async def reconcile_tenant_defaults(
 
 async def verify_tenant_defaults(
     client: AsyncAnthropic,
+    session_factory: async_sessionmaker[AsyncSession],
     defaults_root: Path,
     *,
     tenant_id: uuid.UUID,
@@ -193,6 +196,7 @@ async def verify_tenant_defaults(
     """
     return await _reconcile_core(
         client,
+        session_factory,
         defaults_root,
         tenant_id=tenant_id,
         account_id=_derive_account_uuid(tenant_id),

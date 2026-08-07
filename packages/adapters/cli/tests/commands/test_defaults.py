@@ -132,6 +132,7 @@ def _install_verify_tenant_defaults(
 
     async def fake_verify_tenant_defaults(
         client: Any,
+        session_factory: Any,
         defaults_root: Path,
         *,
         tenant_id: uuid.UUID,

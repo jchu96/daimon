@@ -217,7 +217,7 @@ async def defaults_verify(
         # with rate limits, and the ready-tenant count here is small enough that
         # parallelizing would only add provider-side contention risk for no gain.
         report = await verify_tenant_defaults(
-            rt.anthropic, defaults_root, tenant_id=tenant.id, public_url=public_url
+            rt.anthropic, rt.sessionmaker, defaults_root, tenant_id=tenant.id, public_url=public_url
         )
         outcome = classify_verification(report)
         results.append(

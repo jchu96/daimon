@@ -319,6 +319,16 @@ class TenantLedgerRow(BaseModel):
     occurred_at: datetime
 
 
+class SeededSkillRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    tenant_id: uuid.UUID
+    name: str
+    content_hash: str
+    anthropic_id: str
+    updated_at: datetime
+
+
 class UserSkillRow(BaseModel):
     model_config = ConfigDict(from_attributes=True, frozen=True)
 

@@ -218,7 +218,7 @@ async def _build_fire(
             daimon_tag=agent_tag,
             cached_id=row.agent_id,
             apply_callable=lambda: reconcile_tenant_defaults(
-                client, settings.defaults_root, tenant_id=row.tenant_id, public_url=_public_url
+                client, sm, settings.defaults_root, tenant_id=row.tenant_id, public_url=_public_url
             ),
             cache=resolver_cache,
         )
@@ -228,7 +228,7 @@ async def _build_fire(
             daimon_tag=deployment_default.environment_name or "default",
             cached_id=None,
             apply_callable=lambda: reconcile_tenant_defaults(
-                client, settings.defaults_root, tenant_id=row.tenant_id, public_url=_public_url
+                client, sm, settings.defaults_root, tenant_id=row.tenant_id, public_url=_public_url
             ),
             cache=resolver_cache,
         )

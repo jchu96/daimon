@@ -346,6 +346,7 @@ async def test_reconcile_tenant_defaults_idempotent_on_rerun(
 
     first = await reconcile_tenant_defaults(
         build_fake_anthropic_http(_create_serving_router().dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -355,6 +356,7 @@ async def test_reconcile_tenant_defaults_idempotent_on_rerun(
 
     second = await reconcile_tenant_defaults(
         build_fake_anthropic_http(_existing_resources_router(tenant_id=result.tenant_id).dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -411,6 +413,7 @@ async def test_reconcile_tenant_defaults_uses_passed_tenant_not_bootstrap(
     router = _create_serving_router(agent_create_handler=on_agent_create)
     await reconcile_tenant_defaults(
         build_fake_anthropic_http(router.dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -452,6 +455,7 @@ async def test_reconcile_tenant_defaults_applies_tenant_prefix_to_skill_title(
     router = _create_serving_router(skill_create_handler=on_skill_create)
     await reconcile_tenant_defaults(
         build_fake_anthropic_http(router.dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -526,6 +530,7 @@ async def test_reconcile_tenant_defaults_stamps_guild_account_on_agents(
     )
     await reconcile_tenant_defaults(
         build_fake_anthropic_http(router.dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -683,6 +688,7 @@ async def test_reconcile_tenant_defaults_seed_tree_with_skill_ref_pins_tenant_sk
 
     report = await reconcile_tenant_defaults(
         build_fake_anthropic_http(router.dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -846,6 +852,7 @@ async def test_reconcile_tenant_defaults_flips_status_failed_when_skills_list_pa
     # Assertion 1: run completes without raising (boundary catches SkillsListTruncatedError).
     report = await reconcile_tenant_defaults(
         build_fake_anthropic_http(router.dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -1102,11 +1109,15 @@ async def test_verify_tenant_defaults_in_sync_report_makes_zero_write_requests(
     client = build_fake_anthropic_http(router.dispatch)
 
     # Build real state once: a genuine reconcile creates the skill/env/agent.
-    first = await reconcile_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    first = await reconcile_tenant_defaults(
+        client, db_session_factory, tmp_path, tenant_id=result.tenant_id
+    )
     assert not first.is_failure(), "seeding reconcile must succeed before verifying"
 
     writes_before_verify = write_count[0]
-    report = await verify_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    report = await verify_tenant_defaults(
+        client, db_session_factory, tmp_path, tenant_id=result.tenant_id
+    )
 
     assert write_count[0] == writes_before_verify, (
         "verify_tenant_defaults must make zero write requests: "
@@ -1136,7 +1147,9 @@ async def test_verify_tenant_defaults_classifies_missing_agent_as_diverged(
     client = build_fake_anthropic_http(router.dispatch)
 
     # Build real state for env/skill only, never for the agent.
-    first = await reconcile_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    first = await reconcile_tenant_defaults(
+        client, db_session_factory, tmp_path, tenant_id=result.tenant_id
+    )
     assert not first.is_failure()
 
     # A second router with an empty agent list (env/skill state carried over via a
@@ -1184,6 +1197,7 @@ async def test_verify_tenant_defaults_classifies_missing_agent_as_diverged(
     )
     report = await verify_tenant_defaults(
         build_fake_anthropic_http(missing_agent_router.dispatch),
+        db_session_factory,
         tmp_path,
         tenant_id=result.tenant_id,
     )
@@ -1207,14 +1221,18 @@ async def test_verify_tenant_defaults_classifies_fingerprint_mismatch_as_diverge
     router, _write_count = _build_stateful_router(tenant_id=result.tenant_id)
     client = build_fake_anthropic_http(router.dispatch)
 
-    first = await reconcile_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    first = await reconcile_tenant_defaults(
+        client, db_session_factory, tmp_path, tenant_id=result.tenant_id
+    )
     assert not first.is_failure()
 
     # The spec changed since that reconcile ran (model bumped) — MA still carries
     # the OLD spec_hash, so a fresh fingerprint no longer matches it.
     (tmp_path / "agents" / "daimon.yaml").write_text("name: daimon\nmodel: claude-opus-4-7\n")
 
-    report = await verify_tenant_defaults(client, tmp_path, tenant_id=result.tenant_id)
+    report = await verify_tenant_defaults(
+        client, db_session_factory, tmp_path, tenant_id=result.tenant_id
+    )
     outcome = classify_verification(report)
     assert outcome.status == "diverged", f"expected diverged, got {outcome.status!r}"
     assert ("agent", "daimon") in [(c.kind, c.name) for c in outcome.changed], (
@@ -1248,7 +1266,10 @@ async def test_verify_tenant_defaults_classifies_provider_read_failure_as_unveri
         ),
     )
     report = await verify_tenant_defaults(
-        build_fake_anthropic_http(router.dispatch), tmp_path, tenant_id=result.tenant_id
+        build_fake_anthropic_http(router.dispatch),
+        db_session_factory,
+        tmp_path,
+        tenant_id=result.tenant_id,
     )
     outcome = classify_verification(report)
     assert outcome.status == "unverifiable", (

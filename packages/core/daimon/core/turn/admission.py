@@ -94,6 +94,7 @@ async def admit(
     async def _apply() -> object:
         return await reconcile_tenant_defaults(
             deps.anthropic,
+            deps.sessionmaker,
             deps.defaults_root,
             tenant_id=tenant_id,
             public_url=deps.public_url,
