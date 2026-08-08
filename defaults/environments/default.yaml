@@ -1,3 +1,12 @@
 name: default
 config:
   type: cloud
+  packages:
+    type: packages
+    # `typst` ships the compiler as a prebuilt wheel, so this costs seconds at
+    # environment build rather than a Rust rebuild per session (`cargo install
+    # typst-cli` would). The artifact-style skill bundles the PyMC report class
+    # and its fonts, and needs a compiler present to render them; without this
+    # every report turn spends its first minute on `pip install typst`.
+    pip:
+      - typst
