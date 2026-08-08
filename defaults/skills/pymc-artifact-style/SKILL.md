@@ -1,133 +1,217 @@
 ---
 name: pymc-artifact-style
-description: Apply PyMC Labs' house style to every artifact you produce — charts, images, PDFs, reports, notebooks. Use whenever you generate something a person will look at, before you deliver it.
+description: Apply PyMC Labs' house style to every artifact you produce — reports, PDFs, charts, images, notebooks. Use whenever you generate something a person will look at, before you deliver it.
 ---
 
 # PyMC artifact style
 
-Everything you hand a user is a PyMC Labs deliverable. It should look like one.
-This is the house style — PyMC's own, not any client's. Never substitute a
-client's brand colors unless the user explicitly asks for a client-branded
-artifact.
+Everything you hand a user is a PyMC Labs deliverable and should look like one.
+A client skims a report; polish is what makes the content land. This is PyMC's
+own style — never substitute a client's brand colors unless the user explicitly
+asks for a client-branded artifact.
 
-Apply it to charts, plots, diagrams, generated images, PDFs, and notebooks. If
-you are about to render something and you have not applied this, stop and apply it.
+**The canonical implementation is a real repo, not a description.**
+`pymc-labs/pymc-labs-report-template` holds the Typst report class, the brand
+fonts, the cover art, and a matplotlib package that matches it. When a document
+is the deliverable, **render through that repo**. Everything below the first
+section is the fallback for when you genuinely cannot reach it.
 
-## Brand palette
+## Reports and PDFs — use the template repo
+
+```
+https://github.com/pymc-labs/pymc-labs-report-template
+```
+
+It is **private**. Cloning it needs a repo binding on this agent — if you get a
+404, that is the cause, not a missing repo. Ask the user to bind it via
+`request_repo_binding` (or `/agent-setup` → GitHub) and retry.
+
+```bash
+git clone https://github.com/pymc-labs/pymc-labs-report-template
+cd pymc-labs-report-template
+pip install -e .                      # installs `pymclabsreport`
+python -m pymclabsreport.report_figures   # regenerate example figures
+make fmt                              # wrap python code blocks to the column
+./build.sh path/to/your.typ out.pdf   # ALWAYS build via build.sh
+```
+
+`build.sh` is the only supported way to compile — it wires `--root .` plus the
+three font paths. Compiling with bare `typst` gets you wrong weights or a hard
+import error.
+
+Read `examples/report.typ` before writing your own; it is the worked example and
+the visual regression target.
+
+### Writing the document
+
+```typ
+#import "../lib/pymc-report.typ": *
+
+#show: pymc-report.with(
+  title:    [Report title],
+  subtitle: [One-line description],
+  client:   [Client name],
+  author:   [PyMC Labs],
+  date:     [August 2026],
+  status:   "Confidential",   // cover + footer; none to hide
+  paper:    "a4",             // or "us-letter"
+  cover-background: 4,        // approved cover art: 4 or 9
+  draft: false,               // true → DRAFT on cover + footer
+  abstract: [ Executive summary … ],
+  outline-depth: 2,           // 0 disables the TOC
+  number-headings: false,     // unnumbered headings are the house default
+)
+
+= Section heading
+Body text …
+```
+
+### Layout helpers — the Tufte margin is the whole point
+
+The template is a ⅔ text column + ⅓ margin. Figures, captions, sidenotes and key
+numbers live in that margin, beside the prose that discusses them. Using it as a
+plain single-column document throws away the design.
+
+| Helper | Use |
+|---|---|
+| `#sidenote[…]` | numbered margin note — citations, sourcing, asides |
+| `#marginnote[…]` | un-numbered margin commentary |
+| `#dtable(…)` | table with Butterick rules (heavy top/bottom, light header rule, **no verticals**) |
+| `#flowfigure(x, caption: […], label: <id>)` | figure/table in the text column, caption in the margin |
+| `#marginfigure(…)` | small figure entirely in the margin |
+| `#widefigure(…)` | spans text + margin |
+| `#fullpagefigure(…)` | its own page |
+| `#widetable(dtable(…), caption: […])` | full-width, page-breakable — for tables taller than a page |
+| `#keyfigure[value][label]` | large key-number callout in the margin |
+| `#executive-summary[…]` | the summary panel |
+| `#callout[…]` | in-flow emphasis box |
+| `#quotebox(by: [Name])[…]` | pull quote, colored spine |
+| `#appendix("A", [Title])` | appendix divider |
+
+Cross-reference with `@label`, and attach labels via the helper's `label:`
+argument — never a trailing `<label>`, which errors with `cannot reference
+context`.
+
+## Brand palette — these exact hexes
 
 | Token | Hex | Use |
 |---|---|---|
-| brand-blue | `#006FFF` | primary; first series; links and accents |
-| brand-cyan | `#1AD5FF` | highlight; never as body text |
-| brand-navy | `#0A3A7E` | headings, rules, dark accents |
-| ink | `#111311` | body text |
-| mist | `#F2F2F2` | grid lines, table banding, fills |
+| navy | `#0C1F40` | body text, headings, first series |
+| periwinkle | `#9FAAE2` | accent, series |
+| aqua | `#B4E7DD` | rules, spines, series |
+| peach | `#F6AE72` | single status accent — use sparingly |
+| soft-white | `#F7F7F7` | code slabs, fills |
 
-These five are the identity. The chart palette below is derived from them.
+Variants — light: navy `#798496`, peri `#CAD0EF`, aqua `#D6F2EC`, peach `#FAD2B1`.
+Dark: navy `#08142A`, peri `#676E93`, aqua `#759690`, peach `#A0714A`.
 
-## Charts — write this file, then use it
+Navy text on white. Color earns its place (Butterick) — the accent punctuates,
+it does not decorate.
 
-The brand five are not directly usable as a categorical chart palette: navy and
-cyan sit outside the readable lightness band and cyan falls under 3:1 contrast on
-a light surface. The set below keeps brand-blue as the first series and re-steps
-the rest so that all six pass a lightness band of OKLCH L 0.43–0.77, a chroma
-floor, colorblind separation on adjacent pairs, and 3:1 contrast against a light
-background.
+## Typography
 
-Write this to `pymc.mplstyle` and load it before plotting:
+| Role | Face |
+|---|---|
+| Body | **Inter** (static `Inter 18pt`) |
+| Headings | **Archivo Expanded** (`Archivo` at `stretch: 125%`) |
+| Math | **Fira Math**, weight 300 |
+| Code | **Fira Mono** on soft-white |
+
+Headings are unnumbered by default — hierarchy is typographic, the register is
+editorial.
+
+## Charts — `pymclabsreport` does this for you
+
+```python
+import pymclabsreport   # activates the style on import
+```
+
+That one import applies the brand matplotlibrc, patches `fill_between` to a
+clean edge, and exposes `PALETTE`, `PALETTE_LIGHT`, `PALETTE_DARK` and
+`add_axis_end_tick_caps`. ArviZ draws through matplotlib, so `az.plot_posterior`,
+`az.plot_trace` and friends inherit it.
+
+Save figures as **vector PDF** and embed with `image("fig.pdf")`. Requires
+matplotlib ≥ 3.10.1. Do not use SVG path output — the Inter statics share a
+PostScript name and SVG path-mode collides bold/regular glyphs.
+
+If you cannot install the package, this is the rc it applies:
 
 ```
-# pymc.mplstyle — PyMC Labs house chart style
-axes.prop_cycle: cycler('color', ['006FFF', 'E8590C', '0CA678', '7048E8', '0090B3', 'C2255C'])
+font.family:       sans-serif
+font.sans-serif:   Inter, Fira Sans, DejaVu Sans
+font.size:         8.0
 
-figure.facecolor: FCFCFB
-axes.facecolor:   FCFCFB
-savefig.facecolor: FCFCFB
-figure.dpi: 150
-savefig.dpi: 150
-savefig.bbox: tight
+axes.prop_cycle: cycler('color', ['0C1F40', 'F6AE72', '9FAAE2', '759690', '798496', 'E0886A', '676E93', 'B4E7DD'])
 
-font.family: sans-serif
-font.sans-serif: Liberation Sans, DejaVu Sans, Arial, sans-serif
-font.size: 10.5
-text.color: 111311
-
-axes.edgecolor: 111311
-axes.labelcolor: 111311
-axes.titlecolor: 0A3A7E
-axes.titlesize: 13
-axes.titleweight: semibold
-axes.titlelocation: left
-axes.titlepad: 12
-axes.labelsize: 10.5
+text.color: 333333
+axes.edgecolor: 333333
+axes.labelcolor: 333333
+xtick.color: 333333
+ytick.color: 333333
 axes.linewidth: 0.8
+
+axes.titlecolor: 0C1F40
+axes.titleweight: bold
+axes.titlesize: medium
+axes.titlelocation: left
+
 axes.spines.top: False
 axes.spines.right: False
 
-axes.grid: True
-axes.grid.axis: y
-grid.color: F2F2F2
-grid.linewidth: 0.8
-grid.alpha: 1.0
-axes.axisbelow: True
-
-xtick.color: 111311
-ytick.color: 111311
-xtick.labelsize: 9.5
-ytick.labelsize: 9.5
-xtick.direction: out
-ytick.direction: out
-
-lines.linewidth: 2.0
-lines.markersize: 8
-lines.solid_capstyle: round
+lines.linewidth: 1.5
+lines.markersize: 5.0
+lines.markeredgecolor: white
+lines.markeredgewidth: 0.6
+scatter.edgecolors: white
 
 legend.frameon: False
-legend.fontsize: 9.5
+legend.fontsize: 7
+grid.color: 333333
+grid.alpha: 0.12
+grid.linewidth: 0.6
+
+figure.figsize: 4.8, 3.0     # 122 mm = the Typst text column
+figure.facecolor: white
+axes.facecolor: white
+savefig.facecolor: white
+savefig.dpi: 300
+pdf.fonttype: 42
 ```
 
-```python
-import matplotlib.pyplot as plt
-plt.style.use("pymc.mplstyle")
-```
-
-ArviZ draws through matplotlib, so the same style applies to `az.plot_posterior`,
-`az.plot_trace`, and friends — load it first and they inherit it.
+Note the figure width: 4.8 in matches the text column exactly, so figures land
+at native scale rather than being resampled.
 
 ## Chart rules that matter more than color
 
 - **Assign series colors in the cycle's fixed order.** Never reorder by rank — a
   filter that drops a series must not repaint the survivors.
-- **Never a dual y-axis.** Two measures of different scale become two charts, small
-  multiples, or an index to a common base.
-- **Sequential data: one hue, light→dark.** Diverging: two hues with a neutral gray
-  midpoint. Never a rainbow, never a hue at a diverging midpoint.
-- **A legend whenever there are 2+ series.** With ≤ 4, also label them directly.
+- **Never a dual y-axis.** Two measures of different scale become two charts,
+  small multiples, or an index to a common base.
+- **Sequential: one hue, light→dark. Diverging: two hues, neutral midpoint.**
+  Never a rainbow, never a hue at a diverging midpoint.
+- **A legend whenever there are 2+ series.** With ≤ 4, label directly too.
   Identity must never rest on color alone.
-- **Beyond 6 series, do not invent a 7th color.** Fold the tail into "Other", or
-  use small multiples.
-- **Label the axes, and name the units.** Title states the finding, not the
+- **Beyond the cycle, do not invent another color.** Fold the tail into "Other",
+  or use small multiples.
+- **Label the axes and name the units.** The title states the finding, not the
   variable names.
 
-## Documents and PDFs
+## When the template repo is unreachable
 
-The canonical EAP document format lives in the private repo
-`pymc-labs/daimon-memory` under `eaps/_general/document-template/` — `README.md`
-is the spec, `eap-template.typ` the Typst template, `_brand.yml` the Quarto brand
-file, plus the logo and a worked example. When that repo is available in your
-workspace, render through it and do not ship an unbranded export.
-
-When it is not available, match this palette by hand: brand-navy headings,
-brand-blue accents, ink body text, mist rules and table banding, Liberation Sans
-throughout.
+Match the palette and typography by hand: navy body and headings, aqua rules,
+peach for a single status accent, soft-white code slabs, Inter (or the closest
+humanist sans available). Tables get horizontal rules only. Say plainly in the
+delivery that this is an unbranded fallback and the binding is missing — do not
+quietly ship something that looks nothing like a PyMC report.
 
 There is no Word or Google Docs template. For a Docs deliverable, apply the
-palette and typography manually, or export a PDF from Typst/Quarto and attach that
-instead — the PDF path is the one with a real template behind it.
+palette manually, or export a PDF from the Typst template and attach that — the
+PDF path is the one with a real template behind it.
 
 ## Sales collateral is a different standard
 
 Proposals and sales material follow `teams/sales/` in `daimon-memory` (navy
-`#1e3a5f`, Calibri), which deliberately differs from the EAP style above. Do not
-mix them. If you are unsure which applies, ask — an EAP deliverable and a
-proposal are not interchangeable.
+`#1e3a5f`, Calibri), which deliberately differs from the report style above. Do
+not mix them. If unsure which applies, ask — a modeling report and a proposal are
+not interchangeable.
