@@ -32,6 +32,9 @@ from anthropic.types.beta.skills import VersionCreateResponse
 from cryptography.fernet import Fernet, MultiFernet
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from daimon.core.defaults.ma_index import (
+    _SKILLS_PAGE_LIMIT,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.core.defaults.metadata import tenant_scoped_display_title
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.ma_identity import derive_agent_uuid
@@ -1211,7 +1214,8 @@ async def test_recovery_raises_skills_list_truncated_error_on_full_page(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
 
-    # 100 rows (a full page) — triggers SkillsListTruncatedError in strict mode.
+    # A full page — triggers SkillsListTruncatedError in strict mode. Sized off
+    # the constant so raising the limit cannot turn this into a partial page.
     full_page = [
         SkillListResponse(
             id=f"sk_{i:03d}",
@@ -1222,7 +1226,7 @@ async def test_recovery_raises_skills_list_truncated_error_on_full_page(
             updated_at="2026-04-21T00:00:00Z",
             source="custom",
         )
-        for i in range(100)
+        for i in range(_SKILLS_PAGE_LIMIT)
     ]
 
     def on_create(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:

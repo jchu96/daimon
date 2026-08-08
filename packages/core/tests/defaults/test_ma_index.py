@@ -7,6 +7,7 @@ import httpx
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent, SkillListResponse
 from daimon.core.defaults.ma_index import (
+    _SKILLS_PAGE_LIMIT,  # pyright: ignore[reportPrivateUsage]
     find_agent_by_daimon_tag,
     find_skill_by_display_title,
     list_skills_lenient,
@@ -266,23 +267,13 @@ async def test_find_skill_by_display_title() -> None:
 
 
 async def test_find_skill_by_display_title_warns_when_ceiling_hit() -> None:
-    """When `skills.list` returns a full page of 100 rows with no next_page
-    cursor, the helper must emit a ceiling-hit warning so callers know
-    adoption may be incomplete."""
-    # 100 filler skills, no target. `has_more`/`next_page` omitted so async-for
-    # stops after the first page (mirrors the MA bug shape).
-    filler = [
-        SkillListResponse(
-            id=f"sk_{i}",
-            type="custom",
-            display_title=f"unrelated-{i}",
-            latest_version="1",
-            created_at="2026-04-21T00:00:00Z",
-            updated_at="2026-04-21T00:00:00Z",
-            source="custom",
-        ).model_dump(mode="json")
-        for i in range(100)
-    ]
+    """When `skills.list` returns a FULL page with no next_page cursor, the
+    helper must emit a ceiling-hit warning so callers know adoption may be
+    incomplete. Sized off the constant so raising the limit cannot silently
+    turn this into a half-page test that proves nothing."""
+    # A full page of filler, no target. `has_more`/`next_page` omitted so
+    # async-for stops after the first page (mirrors the MA bug shape).
+    filler = _make_filler_skills(_SKILLS_PAGE_LIMIT)
     router = MARouter()
     router.add("GET", r"/v1/skills", lambda req, _m: list_response(filler))
     client = build_fake_anthropic_http(router.dispatch)
@@ -292,7 +283,8 @@ async def test_find_skill_by_display_title_warns_when_ceiling_hit() -> None:
 
     assert match is None, "target is absent; adoption must return None"
     assert any(
-        r["event"] == "ma_index.skills_list_ceiling_hit" and r["limit"] == 100 for r in logs
+        r["event"] == "ma_index.skills_list_ceiling_hit" and r["limit"] == _SKILLS_PAGE_LIMIT
+        for r in logs
     ), f"expected skills_list_ceiling_hit warning, got events: {[r['event'] for r in logs]}"
 
 
@@ -317,9 +309,11 @@ def _make_filler_skills(count: int) -> list[dict[str, object]]:
 
 
 async def test_list_skills_strict_raises_when_page_full() -> None:
-    """list_skills_strict must raise SkillsListTruncatedError on a 100-row page."""
+    """list_skills_strict must raise SkillsListTruncatedError on a full page."""
     router = MARouter()
-    router.add("GET", r"/v1/skills", lambda req, _m: list_response(_make_filler_skills(100)))
+    router.add(
+        "GET", r"/v1/skills", lambda req, _m: list_response(_make_filler_skills(_SKILLS_PAGE_LIMIT))
+    )
     client = build_fake_anthropic_http(router.dispatch)
     import pytest
 
@@ -328,12 +322,13 @@ async def test_list_skills_strict_raises_when_page_full() -> None:
 
 
 async def test_list_skills_strict_returns_rows_on_partial_page() -> None:
-    """list_skills_strict must return rows normally on a 99-row page."""
+    """list_skills_strict must return rows normally on a one-short-of-full page."""
     router = MARouter()
-    router.add("GET", r"/v1/skills", lambda req, _m: list_response(_make_filler_skills(99)))
+    partial = _SKILLS_PAGE_LIMIT - 1
+    router.add("GET", r"/v1/skills", lambda req, _m: list_response(_make_filler_skills(partial)))
     client = build_fake_anthropic_http(router.dispatch)
     rows = await list_skills_strict(client)
-    assert len(rows) == 99, "strict list must return all 99 rows from a partial page"
+    assert len(rows) == partial, "strict list must return every row from a partial page"
 
 
 # ---------------------------------------------------------------------------
@@ -344,12 +339,14 @@ async def test_list_skills_strict_returns_rows_on_partial_page() -> None:
 async def test_list_skills_lenient_truncated_flag_is_true_on_full_page() -> None:
     """list_skills_lenient must return (rows, True) and emit a warning on a full page."""
     router = MARouter()
-    router.add("GET", r"/v1/skills", lambda req, _m: list_response(_make_filler_skills(100)))
+    router.add(
+        "GET", r"/v1/skills", lambda req, _m: list_response(_make_filler_skills(_SKILLS_PAGE_LIMIT))
+    )
     client = build_fake_anthropic_http(router.dispatch)
     with structlog.testing.capture_logs() as logs:
         rows, truncated = await list_skills_lenient(client)
     assert truncated is True, "truncated flag must be True when page is full"
-    assert len(rows) == 100, "all 100 rows must still be returned in lenient mode"
+    assert len(rows) == _SKILLS_PAGE_LIMIT, "every row must still be returned in lenient mode"
     assert any(r["event"] == "ma_index.skills_list_truncated" for r in logs), (
         f"expected skills_list_truncated warning, got: {[r['event'] for r in logs]}"
     )
@@ -381,8 +378,8 @@ async def test_find_skill_by_display_title_raises_on_full_page_even_when_match_f
         updated_at="2026-04-21T00:00:00Z",
         source="custom",
     ).model_dump(mode="json")
-    # 99 filler + 1 target = 100 total (full page)
-    skills = _make_filler_skills(99) + [target]
+    # one short of the limit, plus the target = exactly a full page
+    skills = _make_filler_skills(_SKILLS_PAGE_LIMIT - 1) + [target]
     router = MARouter()
     router.add("GET", r"/v1/skills", lambda req, _m: list_response(skills))
     client = build_fake_anthropic_http(router.dispatch)

@@ -32,7 +32,17 @@ _log = structlog.get_logger(__name__)
 # live, 2026-06-10); agents.list paginates correctly under identical
 # conditions. A full page therefore means
 # the org skill view is truncated, not simply "more pages to follow".
-_SKILLS_PAGE_LIMIT = 100
+#
+# Raised 100 -> 1000 after production crossed 100 skills and locked itself out
+# of every write path: the seeded-agent reconcile could not resolve a skill id,
+# `defaults verify` reported every tenant unverifiable, the smoke turn could not
+# resolve its agent, and a fresh install would have failed to provision at all.
+# `skills.list` honours a larger limit — 103 rows came back with has_more=False
+# at limit=200 against production, verified live 2026-08-08 — so the ceiling was
+# ours, not the API's. This buys headroom, it does not remove the ceiling: the
+# truncation guards below are still the thing that keeps a partial view from
+# driving a delete, and at 1000 skills they will fire again.
+_SKILLS_PAGE_LIMIT = 1000
 
 
 async def find_agents_by_daimon_tag(
