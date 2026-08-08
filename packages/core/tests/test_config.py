@@ -198,8 +198,8 @@ def test_billing_defaults_when_no_env_set(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.billing.markup == Decimal("1.0"), (
         "default markup must be Decimal('1.0') (pass-through)"
     )
-    assert settings.billing.signup_credit == Decimal("5.00"), (
-        "default signup_credit must be >0 (Decimal('5.00')) so one-click works on trial "
+    assert settings.billing.signup_credit == Decimal("10.00"), (
+        "default signup_credit must be >0 (Decimal('10.00')) so one-click works on trial "
         "credit before payment; operators set 0 for pay-first"
     )
 
