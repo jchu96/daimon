@@ -40,6 +40,19 @@ class RaiseConnection:
 
 
 @dataclass
+class RaiseStreamDrop:
+    """Stream step: raise the raw httpx error a mid-body SSE drop produces.
+
+    The SDK does not wrap this one — it escapes while iterating the already
+    open response, not while opening it.
+    """
+
+    message: str = (
+        "peer closed connection without sending complete message body (incomplete chunked read)"
+    )
+
+
+@dataclass
 class RaiseStatus:
     """Stream step: raise APIStatusError (non-429) mid-iteration."""
 
@@ -68,7 +81,9 @@ class BlockForever:
     """
 
 
-StreamAction = YieldEvent | RaiseConnection | RaiseStatus | RaiseRateLimit | BlockForever
+StreamAction = (
+    YieldEvent | RaiseConnection | RaiseStreamDrop | RaiseStatus | RaiseRateLimit | BlockForever
+)
 
 
 @dataclass
@@ -118,6 +133,8 @@ class _FakeEventStream:
                 yield step.event
             elif isinstance(step, RaiseConnection):
                 raise anthropic.APIConnectionError(request=_make_request())  # type: ignore[call-arg]
+            elif isinstance(step, RaiseStreamDrop):
+                raise httpx.RemoteProtocolError(step.message, request=_make_request())
             elif isinstance(step, RaiseStatus):
                 raise _make_status_error(step.status_code, step.message)
             elif isinstance(step, BlockForever):

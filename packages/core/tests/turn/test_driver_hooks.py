@@ -18,6 +18,7 @@ from .fakes import (
     FakeAnthropic,
     RaiseConnection,
     RaiseRateLimit,
+    RaiseStreamDrop,
     RecordingLifecycle,
     YieldEvent,
 )
@@ -104,6 +105,43 @@ async def test_driver_calls_on_reconnect_on_connection_drop() -> None:
         "driver must call on_reconnect with 'connection_dropped' after APIConnectionError"
     )
     assert len(lc.terminal_success) == 1, "turn must complete successfully after reconnect"
+
+
+@pytest.mark.asyncio
+async def test_driver_reconnects_when_sse_body_drops_mid_stream() -> None:
+    """A mid-body SSE drop arrives as a raw httpx error, not APIConnectionError.
+
+    It must still take the reconnect-and-replay path rather than escaping the
+    driver as an unhandled exception.
+    """
+    fa = FakeAnthropic()
+    pre = make_agent_message(event_id="sevt_1", text="hello ")
+    mid = make_agent_message(event_id="sevt_2", text="world")
+    done = make_status_idle(event_id="sevt_3", stop_reason=make_end_turn())
+
+    fa.beta.sessions.events.stream_scripts = [
+        [YieldEvent(pre), RaiseStreamDrop()],
+        [YieldEvent(mid), YieldEvent(done)],
+    ]
+    fa.beta.sessions.events.replay_events = [pre, mid]
+    lc = RecordingLifecycle()
+
+    await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="hi",
+        lifecycle=lc,
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+    )
+
+    assert lc.reconnects == ["connection_dropped"], (
+        "driver must reconnect after a raw httpx.RemoteProtocolError mid-stream"
+    )
+    assert len(lc.terminal_success) == 1, "turn must complete successfully after reconnect"
+    assert not lc.terminal_failures, "a recovered stream drop must not surface as a failure"
 
 
 @pytest.mark.asyncio
