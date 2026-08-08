@@ -505,7 +505,7 @@ class BillingSettings(BaseModel):
         ),
     )
     signup_credit: Decimal = Field(
-        default=Decimal("5.00"),
+        default=Decimal("10.00"),
         description=(
             "USD credit automatically seeded when a guild/workspace is "
             "provisioned, so a freshly-installed tenant can chat immediately "
