@@ -411,7 +411,18 @@ def register_skill_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         states both what was imported and what was attached.
 
         Before calling, inspect the repo structure to determine the correct ``path``
-        parameter (empty string = repo root). ``branch`` defaults to ``"main"``."""
+        parameter (empty string = repo root). ``branch`` defaults to ``"main"``.
+
+        IF THIS FAILS BECAUSE THE REPO IS PRIVATE AND UNREADABLE, call
+        ``request_repo_binding`` for that repo — do not report the sync as
+        blocked and do not ask the user to paste a token here. This tool
+        deliberately has no token parameter: the credential is supplied
+        out-of-band through a button and modal so it never passes through tool
+        arguments. Once the binding exists, the per-agent tier short-circuits
+        every later sync of that repo with zero GitHub I/O. Credential
+        precedence is documented on ``_resolve_skill_sync_credentials`` above,
+        which delegates to ``resolve_skill_sync_token``; a missing GitHub App
+        installation is NOT a blocker, it is just a later tier."""
         return await _sync_impl(runtime, await _auth(ctx), url, branch, path, agent_name)
 
     @mcp.tool
