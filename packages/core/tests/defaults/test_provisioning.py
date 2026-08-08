@@ -22,6 +22,9 @@ from anthropic.types.beta import (
     SkillListResponse,
 )
 from daimon.core._models import Account, Tenant
+from daimon.core.defaults.ma_index import (
+    _SKILLS_PAGE_LIMIT,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_ACCOUNT,
     MA_METADATA_KEY_NAME,
@@ -746,7 +749,7 @@ async def test_reconcile_tenant_defaults_flips_status_failed_when_skills_list_pa
     tmp_path: Path,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """SC-5 end-to-end proof: skills list at 100 rows (full page) -> SkillsListTruncatedError
+    """SC-5 end-to-end proof: skills list at a FULL page -> SkillsListTruncatedError
     is caught by _run_per_resource -> FAILED skill outcome -> provision_status 'failed'.
 
     Assertions:
@@ -779,7 +782,7 @@ async def test_reconcile_tenant_defaults_flips_status_failed_when_skills_list_pa
             updated_at="2026-04-21T00:00:00Z",
             source="custom",
         ).model_dump(mode="json")
-        for i in range(100)
+        for i in range(_SKILLS_PAGE_LIMIT)
     ]
 
     router = MARouter()
