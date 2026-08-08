@@ -1,6 +1,6 @@
 ---
 name: pymc-artifact-style
-description: Apply PyMC Labs' house style to every artifact you produce — reports, PDFs, charts, images, notebooks. Use whenever you generate something a person will look at, before you deliver it.
+description: Apply PyMC Labs' house style to every artifact you produce — reports, PDFs, slide decks, charts, images, notebooks. Use whenever you generate something a person will look at, before you deliver it.
 ---
 
 # PyMC artifact style
@@ -29,6 +29,7 @@ typst/starter.typ          minimal working report; copy it and replace content
 typst/report-example.typ   the full worked example — read it for the helpers
 fonts/                     Inter, Archivo Expanded, Fira Math, Fira Mono
 assets/pymc-labs-logo.png  the cover logo (already wired as the default)
+assets/pymc-labs-logo-transparent.png  same mark, white keyed out — use on slides
 assets/cover-4.png, -9.png the two approved cover backgrounds
 mpl/                       matplotlibrc + plotstyle.py + axes.py
 ```
@@ -193,6 +194,62 @@ The palette the rc cycles, if you need it by hand:
   or use small multiples.
 - **Label the axes and name the units.** The title states the finding, not the
   variable names.
+
+## Slide decks (.pptx) — render the slides, do not typeset them
+
+There is no PowerPoint template. Build a deck by typesetting each slide in
+Typst at slide dimensions, rendering it to PNG, and placing one full-bleed
+image per slide. The house style then survives the trip, because the fonts are
+baked into the pixels.
+
+```python
+import typst
+from pptx import Presentation
+from pptx.util import Inches
+
+# 1. One Typst file per slide, 16:9 with no margin:
+#      #set page(width: 13.333in, height: 7.5in, margin: 0pt)
+typst.compile("slide1.typ", output="slide1.png", root="..",
+              font_paths=["../fonts"], format="png", ppi=144)  # 144 → 1920x1080
+
+# 2. Blank layout, picture at full bleed.
+prs = Presentation()
+prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+for png in slides:
+    s = prs.slides.add_slide(prs.slide_layouts[6])   # 6 is the blank layout
+    s.shapes.add_picture(png, 0, 0, width=prs.slide_width, height=prs.slide_height)
+prs.save("deck.pptx")
+```
+
+**Do not build slides out of pptx text boxes.** A text run stores the font by
+*name*, and Inter and Archivo Expanded are not installed on the machines that
+open the file — PowerPoint and Google Slides silently substitute a generic
+sans and the deck stops looking like PyMC. This is the same failure as the
+`font_paths` trap above, one layer further out: the PDF survives because Typst
+embeds the faces, and a pptx has nothing to embed.
+
+The cost is real: rendered slides are images, so the text is no longer
+editable and does not reflow. Slide order, deletion, and speaker notes still
+work. If the recipient needs to edit the words, say so and hand over the
+Typst sources — do not quietly ship a deck that cannot be edited.
+
+### The logo has no transparency — use the keyed copy
+
+`assets/pymc-labs-logo.png` is RGBA but every alpha byte is 255. It carries an
+opaque white rectangle, so it renders as a visible white box on any background
+that is not already white. RGBA in the mode string is not evidence of
+transparency — check the alpha channel's actual range.
+
+Use `assets/pymc-labs-logo-transparent.png`, the same mark with the white keyed
+out. `assets/pymc-marketing-logo.png` already has real alpha and needs nothing.
+
+Two separate things go wrong, and fixing one does not fix the other:
+
+- **The box** — solved only by keying. Moving the logo onto the gradient cover
+  art makes the box less obvious against pale artwork, but it is still there.
+- **Legibility** — the wordmark is dark grey. Even keyed, it disappears into
+  navy. There is no light version of the mark bundled here, so put the logo on
+  a light ground: `cover-4.png` / `cover-9.png`, or white. Not a navy fill.
 
 ## When the template repo is unreachable
 
