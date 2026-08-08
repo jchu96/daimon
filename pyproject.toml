@@ -37,6 +37,11 @@ daimon-testing = { workspace = true }
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Skill payloads are shipped to the agent verbatim, not imported by us. The
+# matplotlib style under pymc-artifact-style/mpl is vendored upstream from the
+# brand report template — reformatting it would silently fork our copy from the
+# source it is supposed to mirror.
+extend-exclude = ["defaults/skills/**"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

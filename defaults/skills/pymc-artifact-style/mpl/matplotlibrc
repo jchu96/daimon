@@ -1,0 +1,79 @@
+# pymclabs matplotlibrc — PyMC Labs report plotting style (package copy).
+# pymclabsplot/__init__.py sets MPLCONFIGDIR to this directory, so THIS file is
+# the rc that applies to every plot when `import pymclabsplot` runs first. Kept in
+# sync with the global ~/.matplotlib/stylelib/pymclabs.mplstyle.
+#
+# Brand palette
+#   navy #0C1F40  periwinkle #9FAAE2  aqua #B4E7DD  peach #F6AE72  soft-white #F7F7F7
+# Variants: navy L#798496 D#08142A | peri L#CAD0EF D#676E93 | aqua L#D6F2EC D#759690 | peach L#FAD2B1 D#A0714A
+#
+# fill_between's default edge cannot be set here; `import pymclabsplot.plotstyle`
+# defaults its edgecolor to 'none'.
+
+#### FONT
+font.family:       sans-serif
+font.sans-serif:   Inter, Fira Sans, DejaVu Sans
+font.size:         8.0
+mathtext.fontset:  dejavusans
+
+#### COLOR CYCLE — brand bases then variants
+axes.prop_cycle: cycler('color', ['0C1F40', 'F6AE72', '9FAAE2', '759690', '798496', 'E0886A', '676E93', 'B4E7DD'])
+
+#### FOREGROUND — near-black furniture (#333333), navy title
+text.color:         333333
+axes.edgecolor:     333333
+axes.labelcolor:    333333
+xtick.color:        333333
+ytick.color:        333333
+axes.linewidth:     0.8
+#### TITLE — navy, bold, tick-label size, left-aligned
+axes.titlecolor:    0C1F40
+axes.titleweight:   bold
+axes.titlesize:     medium
+axes.titlelocation: left
+
+#### SPINES — clean report look
+axes.spines.top:    False
+axes.spines.right:  False
+
+#### MARKERS — always a thin white edge
+lines.markeredgecolor:  white
+lines.markeredgewidth:  0.6
+lines.markersize:       5.0
+scatter.edgecolors:     white
+
+#### LINES
+lines.linewidth:  1.5
+
+#### BOXPLOTS — lean lines
+boxplot.boxprops.linewidth:     0.8
+boxplot.whiskerprops.linewidth: 0.8
+boxplot.capprops.linewidth:     0.8
+boxplot.medianprops.linewidth:  1.0
+boxplot.flierprops.linewidth:   0.8
+
+#### LEGEND / GRID
+legend.frameon:   False
+legend.fontsize:  7
+grid.color:       333333
+grid.alpha:       0.12
+grid.linewidth:   0.6
+
+#### FIGURE — width = typst text-column width (122 mm = 4.8 in)
+figure.figsize:    4.8, 3.0
+figure.facecolor:  white
+figure.dpi:        110
+axes.facecolor:    white
+savefig.facecolor: white
+savefig.dpi:       300
+
+#### OUTPUT — export figures as PDF (see report_figures.py): true vector with
+#### correctly embedded per-face Inter, and Typst embeds PDF images directly.
+#### Requires matplotlib >= 3.10.1 (3.10.0's PDF backend crashes on the Inter
+#### variable font: "StyleFlags invalid value 589824"; matplotlib issue #29396).
+#### pdf.fonttype 42 embeds TrueType (selectable, subset) rather than Type 3.
+#### NB: do NOT use SVG path output here — the instanced Inter statics share one
+#### PostScript name ("Inter-Regular"), so SVG path-mode collides bold/regular
+#### glyph ids (random bold letters). PDF embeds per font file, so it is fine.
+pdf.fonttype:      42
+svg.fonttype:      path
