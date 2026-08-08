@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
 import anthropic as _anthropic
+import httpx
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta.sessions import (
@@ -36,6 +37,14 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 log = structlog.get_logger(__name__)
 
 InterruptPhase = Literal["pre-stream", "replay", "reattach"]
+
+# The SDK only wraps httpx failures raised while *opening* a request into
+# `APIConnectionError`. Once an SSE stream is open, a mid-body drop surfaces
+# raw from httpx while iterating the response — `RemoteProtocolError` for the
+# common "peer closed connection without sending complete message body"
+# case. Both mean the same thing to us (stream died, session still alive
+# server-side), so both take the reconnect-and-replay path.
+_CONNECTION_LOST = (_anthropic.APIConnectionError, httpx.RemoteProtocolError)
 
 # Guarded single-render: no-op if `diff(prev, state)` is empty; else calls
 # `lifecycle.on_render(state)` and advances the render anchor. Finalizers
@@ -161,7 +170,7 @@ async def _pump(
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(2),
-                retry=retry_if_exception_type(_anthropic.APIConnectionError),
+                retry=retry_if_exception_type(_CONNECTION_LOST),
                 reraise=True,
             ):
                 with attempt:
@@ -195,7 +204,7 @@ async def _pump(
                 render_once=_render_once,
                 interrupt_timeout_s=interrupt_timeout_s,
             )
-        except _anthropic.APIConnectionError as err:
+        except _CONNECTION_LOST as err:
             # tenacity exhausted with reraise=True.
             await _cancel_render()
             return await _finalize_connection_lost(
