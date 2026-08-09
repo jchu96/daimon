@@ -110,7 +110,7 @@ def is_vision_image_attachment(attachment: discord.Attachment) -> bool:
 
 
 def build_image_url_prefix(attachments: list[discord.Attachment]) -> str:
-    """One ``*system: ...*`` line per image attachment exposing its signed CDN URL.
+    """One ``[attachment] ...`` line per image attachment exposing its signed CDN URL.
 
     Vision blocks give the model pixels but no byte- or URL-level handle: the
     agent can describe an image yet cannot fetch its bytes or pass it to an
@@ -119,9 +119,10 @@ def build_image_url_prefix(attachments: list[discord.Attachment]) -> str:
     states that window.
     """
     return "\n".join(
-        f"*system: user attached image `{attachment.filename}` ({attachment.size} bytes), "
-        f"forwarded inline as a vision block. Signed CDN URL (fetchable with curl or "
-        f"passable to external APIs; expires ~24h): {attachment.url}*"
+        f"[attachment] image `{attachment.filename}` ({attachment.size} bytes), uploaded by "
+        f"the user with this message and forwarded to you inline as a vision block. Signed "
+        f"Discord CDN URL (fetchable with curl or passable to external APIs; expires ~24h): "
+        f"{attachment.url}"
         for attachment in attachments
     )
 
@@ -137,7 +138,7 @@ def _skipped_for_dimensions(reason: str) -> bool:
 
 
 def build_skipped_image_prefix(skipped: list[tuple[discord.Attachment, str]]) -> str:
-    """One ``*system: ...*`` line per image that was NOT inlined as a vision block.
+    """One ``[attachment] ...`` line per image that was NOT inlined as a vision block.
 
     The base64 block was skipped (too large, too many, unsupported type, fetch
     error), so the model has no pixels for it. The signed CDN URL is still
@@ -163,19 +164,21 @@ def build_skipped_image_prefix(skipped: list[tuple[discord.Attachment, str]]) ->
     """
     return "\n".join(
         (
-            f"*system: image `{attachment.filename}` was NOT inlined as a vision block "
+            f"[attachment] image `{attachment.filename}`, uploaded by the user with this "
+            f"message, was NOT inlined as a vision block "
             f"({reason}). Do NOT `read` it at full size — that inlines it at its "
             f"original dimensions and the request is rejected terminally, which kills "
             f"this whole conversation. Downscale it first so its longest edge is under "
             f'{MAX_VISION_IMAGE_DIMENSION}px (e.g. python -c "from PIL import Image; '
             f"im=Image.open('in.jpg'); im.thumbnail(({MAX_VISION_IMAGE_DIMENSION - 1000},"
             f"{MAX_VISION_IMAGE_DIMENSION - 1000})); im.save('small.jpg')\"), then `read` "
-            f"the downscaled copy. Signed CDN URL (expires ~24h): {attachment.url}*"
+            f"the downscaled copy. Signed CDN URL (expires ~24h): {attachment.url}"
             if _skipped_for_dimensions(reason)
-            else f"*system: image `{attachment.filename}` was NOT inlined as a vision block "
+            else f"[attachment] image `{attachment.filename}`, uploaded by the user with this "
+            f"message, was NOT inlined as a vision block "
             f"({reason}); fetch it yourself — signed CDN URL (curl to disk then use your "
             f"`read` tool to view it, or pass to an external API; expires ~24h): "
-            f"{attachment.url}*"
+            f"{attachment.url}"
         )
         for attachment, reason in skipped
     )

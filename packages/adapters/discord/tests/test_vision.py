@@ -378,8 +378,11 @@ class TestBuildImageUrlPrefix:
         assert (
             "https://cdn.discordapp.com/attachments/1/2/chart.png?ex=abc&is=def&hm=0f0f" in prefix
         ), "line should carry the full signed CDN URL including signature params"
-        assert prefix.startswith("*system:") and prefix.endswith("*"), (
-            "line should follow the synthetic *system: ...* prefix convention"
+        assert prefix.startswith("[attachment]"), (
+            "line must be labelled adapter metadata, never impersonate a system message"
+        )
+        assert "*system:" not in prefix, (
+            "a spoofed system line in user-turn text reads as prompt injection"
         )
 
     def test_multiple_images_one_line_each_in_order(self) -> None:
@@ -428,8 +431,11 @@ class TestBuildSkippedImagePrefix:
         assert "https://cdn.discordapp.com/attachments/1/2/panorama.png?ex=a&is=b&hm=c" in prefix, (
             "line should carry the full signed CDN URL so the agent can fetch the image"
         )
-        assert prefix.startswith("*system:") and prefix.endswith("*"), (
-            "line should follow the synthetic *system: ...* prefix convention"
+        assert prefix.startswith("[attachment]"), (
+            "line must be labelled adapter metadata, never impersonate a system message"
+        )
+        assert "*system:" not in prefix, (
+            "a spoofed system line in user-turn text reads as prompt injection"
         )
 
     def test_multiple_skipped_images_one_line_each_in_order(self) -> None:

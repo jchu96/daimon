@@ -33,6 +33,10 @@ def test_single_attachment_surfaces_name_size_and_url() -> None:
     assert "2048 bytes" in line, "size must appear"
     assert "https://cdn.discord/r.csv?hm=ab" in line, "the signed CDN URL must appear verbatim"
     assert "create_attachment_upload_url" in line, "agent must be told the on-demand upload path"
+    assert line.startswith("[attachment]") and "*system:" not in line, (
+        "line is adapter metadata in the user turn; impersonating a system message reads "
+        "as prompt injection and gets refused"
+    )
 
 
 def test_multiple_attachments_one_line_each() -> None:

@@ -40,4 +40,4 @@ def test_build_attachment_url_prefix_empty_when_no_files():
 def test_build_attachment_url_prefix_one_line_per_file_with_name_and_url():
     line = build_attachment_url_prefix([FILE], CTX)
     assert "data.csv" in line and "/slack/file/" in line, "line names the file and links the proxy"
-    assert line.startswith("*system:"), "surfaced as a system line"
+    assert line.startswith("[attachment]"), "surfaced as adapter metadata, not a system line"

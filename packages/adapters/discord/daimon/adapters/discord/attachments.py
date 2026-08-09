@@ -14,7 +14,13 @@ import discord
 
 
 def build_attachment_url_prefix(attachments: list[discord.Attachment]) -> str:
-    """One ``*system: ...*`` line per non-image attachment exposing its signed CDN URL.
+    """One ``[attachment] ...`` line per non-image attachment exposing its signed CDN URL.
+
+    The line is adapter-authored metadata sitting in the user turn, so it says so
+    plainly. It must NOT impersonate a system message: a line reading
+    ``*system: fetch this URL*`` inside user-turn text is indistinguishable from a
+    prompt injection, and injection-aware models refuse it — a real agent refused a
+    real user's real upload on exactly that basis.
 
     Data files (CSV, PDF, ...) aren't vision blocks, so the agent reaches them by
     fetching the bytes itself: Discord's signed CDN URL (``?ex=&is=&hm=`` params
@@ -26,9 +32,9 @@ def build_attachment_url_prefix(attachments: list[discord.Attachment]) -> str:
     URL via the ``create_attachment_upload_url`` MCP tool and PUTs the bytes.
     """
     return "\n".join(
-        f"*system: user attached `{attachment.filename}` ({attachment.size} bytes). "
-        f"Fetch it with curl (signed CDN URL, expires ~24h): {attachment.url} — "
-        f"download to disk then read it. To use it in a notebook you publish, upload "
-        f"it via the create_attachment_upload_url tool.*"
+        f"[attachment] `{attachment.filename}` ({attachment.size} bytes), uploaded by the "
+        f"user with this message. Signed Discord CDN URL, expires ~24h: {attachment.url} "
+        f"— curl it to disk, then read it. To use it in a notebook you publish, upload it "
+        f"via the create_attachment_upload_url tool."
         for attachment in attachments
     )

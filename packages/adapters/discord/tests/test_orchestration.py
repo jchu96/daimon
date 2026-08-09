@@ -1435,7 +1435,7 @@ class TestAttachmentOrchestration:
 
         mock_run_turn.assert_called_once()
         user_msg: str = mock_run_turn.call_args.kwargs["user_message"]
-        assert user_msg.startswith("*system: user attached `x.csv`"), (
+        assert user_msg.startswith("[attachment] `x.csv`"), (
             "data attachment CDN-URL prefix must be prepended to the user message"
         )
         assert "https://cdn.discord/x.csv" in user_msg, "the signed CDN URL must be surfaced"
@@ -1503,7 +1503,7 @@ class TestAttachmentOrchestration:
 
         mock_run_turn.assert_called_once()
         user_msg: str = mock_run_turn.call_args.kwargs["user_message"]
-        assert user_msg.startswith("*system: user attached image `chart.png`"), (
+        assert user_msg.startswith("[attachment] image `chart.png`"), (
             "image URL prefix must be prepended to user message"
         )
         assert signed_url in user_msg, "full signed CDN URL must reach the agent"
