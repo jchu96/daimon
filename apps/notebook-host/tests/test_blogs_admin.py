@@ -132,3 +132,30 @@ def test_delete_blog_unregisters_and_kills(tmp_path: Path, monkeypatch: pytest.M
     assert not get_slug_paths(tmp_path, "pre-radar").notebook.exists(), (
         "delete must remove the source file"
     )
+
+
+def test_delete_notebook_route_also_unregisters_a_blog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One delete route handles both kinds — including the blog registry.
+
+    Callers see a single kind of thing ("something I published"), so they get a
+    single delete. If this route killed the process without dropping the record,
+    the sweep's self-heal would read the registry and respawn the blog.
+    """
+    from notebook_host.blogs_store import load_blogs
+
+    client, state, _calls = _make_blog_app(tmp_path, monkeypatch)
+    client.put(
+        "/admin/blogs/pre-radar",
+        json={"source": "import marimo as mo\napp = mo.App()"},
+        headers={"Authorization": AUTH},
+    )
+
+    r = client.delete("/admin/notebooks/pre-radar", headers={"Authorization": AUTH})
+
+    assert r.status_code == 200 and r.json()["deleted"] is True, r.text
+    assert "pre-radar" not in load_blogs(tmp_path / "blogs.json"), (
+        "the notebooks route must drop the blog record too, or the sweep respawns it"
+    )
+    assert "pre-radar" not in state.processes, "delete must drop the tracked process"

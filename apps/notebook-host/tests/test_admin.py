@@ -384,8 +384,8 @@ def test_put_notebook_returns_200_when_break_glass_set(
 # ─── /admin/notebooks DELETE ─────────────────────────────────────────────────
 
 
-def test_delete_notebook_returns_204(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """DELETE /admin/notebooks/{slug} returns 204, removes file, clears registry."""
+def test_delete_notebook_reports_deleted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DELETE /admin/notebooks/{slug} removes file, clears registry, says it deleted."""
     client, state, _ = _make_test_app(tmp_path, monkeypatch)
 
     # First PUT to create
@@ -395,7 +395,8 @@ def test_delete_notebook_returns_204(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     # Now DELETE
     resp = client.delete("/admin/notebooks/del-me", headers={"Authorization": AUTH})
-    assert resp.status_code == 204, "DELETE should return 204"
+    assert resp.status_code == 200, "DELETE should return 200 with a body"
+    assert resp.json()["deleted"] is True, "removing a real notebook reports deleted=true"
     assert "del-me" not in state.processes, "registry should not contain del-me after DELETE"
     assert not (tmp_path / "del-me" / "notebook.py").exists(), "file should be removed after DELETE"
 
@@ -414,7 +415,7 @@ def test_delete_notebook_releases_uid_from_registry(
     save_uid_registry(state.settings.resolved_uids_file, {"del-uid": 100042})
 
     resp = client.delete("/admin/notebooks/del-uid", headers={"Authorization": AUTH})
-    assert resp.status_code == 204, "DELETE should return 204"
+    assert resp.status_code == 200, "DELETE should return 200 with a body"
 
     registry = load_uid_registry(state.settings.resolved_uids_file)
     assert "del-uid" not in registry, "DELETE should release the slug's uid back to the pool"
@@ -440,7 +441,8 @@ def test_delete_notebook_removes_source_attachment_and_workspace_in_one_call(
     assert (tmp_path / "del-me").exists(), "slug root should exist after publish + attach"
 
     resp = client.delete("/admin/notebooks/del-me", headers={"Authorization": AUTH})
-    assert resp.status_code == 204, "DELETE should return 204"
+    assert resp.status_code == 200, "DELETE should return 200 with a body"
+    assert resp.json()["deleted"] is True, "removing a real notebook reports deleted=true"
     assert (tmp_path / "del-me").exists() is False, (
         "source, attachment, workspace and log must all be gone after one DELETE"
     )
@@ -455,8 +457,12 @@ def test_delete_notebook_when_dirs_missing_is_idempotent(
 
     # No PUT — nothing exists for this slug.
     resp = client.delete("/admin/notebooks/never-existed", headers={"Authorization": AUTH})
-    assert resp.status_code == 204, (
-        "DELETE on a never-existed slug should still 204 (idempotent rmtree)"
+    assert resp.status_code == 200, (
+        "DELETE on a never-existed slug still succeeds (idempotent rmtree)"
+    )
+    assert resp.json()["deleted"] is False, (
+        "but it must say nothing was there — a caller cannot otherwise tell a wrong "
+        "slug from a real removal, which is how a broken delete stayed invisible"
     )
 
 

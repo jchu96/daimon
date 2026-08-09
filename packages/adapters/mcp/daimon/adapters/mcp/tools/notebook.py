@@ -13,41 +13,24 @@ from daimon.core.notebooks.publish import (
     HostNotConfiguredError,
     InvalidSlugError,
     NotebookRateLimitError,
-    delete_blog,
-    list_blogs,
+    delete_notebook,
+    list_notebooks,
 )
 from daimon.core.notebooks.upload import (
     create_attachment_upload,
-    create_blog_upload,
     create_notebook_upload,
 )
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
 
-async def _create_blog_upload_impl(
-    runtime: McpRuntime, *, slug: str, principal_key: str
-) -> dict[str, str]:
-    try:
-        return create_blog_upload(
-            slug=slug,
-            notebook_settings=runtime.settings.notebook,
-            principal_key=principal_key,
-            now=datetime.now(UTC),
-            rate_limiter=runtime.notebook_rate_limiter,
-        )
-    except HostNotConfiguredError as err:
-        raise ToolError("notebook host not configured") from err
-    except (InvalidSlugError, NotebookRateLimitError) as err:
-        raise ToolError(str(err)) from err
-
-
 async def _create_notebook_upload_impl(
-    runtime: McpRuntime, *, slug: str | None, principal_key: str
+    runtime: McpRuntime, *, slug: str | None, permanent: bool, principal_key: str
 ) -> dict[str, str]:
     try:
         return create_notebook_upload(
             slug=slug,
+            permanent=permanent,
             notebook_settings=runtime.settings.notebook,
             principal_key=principal_key,
             now=datetime.now(UTC),
@@ -77,16 +60,22 @@ async def _create_attachment_upload_impl(
         raise ToolError(str(err)) from err
 
 
-async def _delete_blog_impl(
+async def _delete_notebook_impl(
     runtime: McpRuntime,
     *,
     principal_key: str,
     slug: str,
     client_factory: type[httpx.AsyncClient] = httpx.AsyncClient,
-) -> dict[str, str]:
+) -> dict[str, object]:
+    """Delete and report what actually happened, not a fixed 'deleted'.
+
+    An unconditional success string makes a wrong slug indistinguishable from a
+    real removal, which is how a delete that never deleted anything went
+    unnoticed in production.
+    """
     try:
         async with client_factory() as client:
-            await delete_blog(
+            deleted = await delete_notebook(
                 slug=slug,
                 notebook_settings=runtime.settings.notebook,
                 client=client,
@@ -100,10 +89,10 @@ async def _delete_blog_impl(
         raise ToolError("notebook host timed out") from err
     except httpx.TransportError as err:
         raise ToolError(f"notebook host unreachable: {err}") from err
-    return {"slug": slug, "status": "deleted"}
+    return {"slug": slug, "deleted": deleted}
 
 
-async def _list_blogs_impl(
+async def _list_notebooks_impl(
     runtime: McpRuntime,
     *,
     principal_key: str,
@@ -111,7 +100,7 @@ async def _list_blogs_impl(
 ) -> dict[str, object]:
     try:
         async with client_factory() as client:
-            blogs = await list_blogs(
+            notebooks = await list_notebooks(
                 notebook_settings=runtime.settings.notebook,
                 client=client,
                 principal_key=principal_key,
@@ -124,53 +113,39 @@ async def _list_blogs_impl(
         raise ToolError("notebook host timed out") from err
     except httpx.TransportError as err:
         raise ToolError(f"notebook host unreachable: {err}") from err
-    result: dict[str, object] = {"blogs": blogs}
+    result: dict[str, object] = {"notebooks": notebooks}
     return result
 
 
 def register_notebook_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     @mcp.tool
     async def create_notebook_upload_url(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context, slug: str | None = None
+        ctx: Context, slug: str | None = None, permanent: bool = False
     ) -> dict[str, str]:
-        """Mint a one-time upload URL for an ephemeral marimo notebook.
+        """Mint a one-time upload URL for a marimo notebook.
 
         Get your notebook's .py into a sandbox file (author it incrementally with
         write/edit + read-back, or curl it from an origin), then PUT the file to the
         returned upload_url — the source never goes through a tool argument (which
         truncates large notebooks).
 
+        permanent=False (default) publishes a scratch notebook: the editor is
+        visible, and the host reaps it after its TTL. permanent=True publishes it
+        as a read-only blog — code hidden, interactive widgets live, survives host
+        restarts, never reaped. Prefer the default; re-upload the same slug with
+        permanent=True once the notebook is worth keeping.
+
         Returns {upload_url, slug, upload_expires_at}. upload_expires_at is when the
         URL stops working (~5 min); use it promptly. Pass slug to reuse a stable URL
         across iterations, or omit it for a fresh random one.
 
         Then upload with: curl -sS -X PUT --data-binary @<file> "<upload_url>". The
-        curl response JSON carries the live url (and expires_at for notebooks); share
-        that. Never paste large file contents into a tool argument.
+        curl response JSON carries the live url (and expires_at for scratch
+        notebooks); share that. Never paste large file contents into a tool argument.
         """
         auth = await _auth(ctx)
         return await _create_notebook_upload_impl(
-            runtime, slug=slug, principal_key=str(auth.account_id)
-        )
-
-    @mcp.tool
-    async def create_blog_upload_url(  # pyright: ignore[reportUnusedFunction]
-        ctx: Context, slug: str
-    ) -> dict[str, str]:
-        """Mint a one-time upload URL for a PERMANENT, shareable blog (run mode).
-
-        Get the blog's .py into a sandbox file, then PUT it to upload_url. slug is
-        required and becomes part of the permanent public URL — choose a meaningful,
-        stable name. The host validates that the cells execute before serving; the
-        curl response carries the live url on success or a 422 with the failing cells.
-
-        Returns {upload_url, slug, upload_expires_at}. Upload with:
-        curl -sS -X PUT --data-binary @<file> "<upload_url>". Never paste large file
-        contents into a tool argument.
-        """
-        auth = await _auth(ctx)
-        return await _create_blog_upload_impl(
-            runtime, slug=slug, principal_key=str(auth.account_id)
+            runtime, slug=slug, permanent=permanent, principal_key=str(auth.account_id)
         )
 
     @mcp.tool
@@ -194,17 +169,26 @@ def register_notebook_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         )
 
     @mcp.tool
-    async def delete_blog(ctx: Context, slug: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        """Un-publish a blog you previously published (frees its host port).
+    async def delete_notebook(ctx: Context, slug: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Un-publish a notebook or blog you published (frees its host port).
 
-        slug is the same slug you passed to create_blog_upload_url.
+        slug is the bare name — the same one you passed to
+        create_notebook_upload_url, and the same one list_notebooks reports.
+
+        Returns {slug, deleted}. deleted=false means nothing by that name existed:
+        check list_notebooks for the right slug rather than retrying.
         """
         auth = await _auth(ctx)
-        return await _delete_blog_impl(runtime, principal_key=str(auth.account_id), slug=slug)
+        return await _delete_notebook_impl(runtime, principal_key=str(auth.account_id), slug=slug)
 
     @mcp.tool
-    async def list_blogs(ctx: Context) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """List the blogs you've published (slug, url, alive). Use to review or
-        clean up — pass a slug to delete_blog to reclaim a host port."""
+    async def list_notebooks(ctx: Context) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """List what you've published — scratch notebooks and permanent blogs alike.
+
+        Each entry carries slug, url, alive, and permanent (true = a blog that
+        survives restarts, false = a scratch notebook the host will reap). The slug
+        is the bare name: pass it straight to delete_notebook to reclaim a host
+        port, or to create_notebook_upload_url to re-upload over it.
+        """
         auth = await _auth(ctx)
-        return await _list_blogs_impl(runtime, principal_key=str(auth.account_id))
+        return await _list_notebooks_impl(runtime, principal_key=str(auth.account_id))

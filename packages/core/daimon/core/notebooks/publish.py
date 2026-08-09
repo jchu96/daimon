@@ -14,8 +14,9 @@ import httpx
 from daimon.core.config import NotebookSettings
 from daimon.core.errors import DaimonError
 from daimon.core.notebooks.host_client import (
-    delete_blog_from_host,
+    delete_notebook_from_host,
     list_blogs_from_host,
+    list_notebooks_from_host,
 )
 from daimon.core.notebooks.slug import AGENT_SLUG_PATTERN, sanitize_slug
 
@@ -58,22 +59,26 @@ def _resolve_slug(*, agent_slug: str | None, principal_key: str | None) -> str:
     return f"{_principal_prefix(principal_key)}-{sanitized}"
 
 
-async def delete_blog(
+async def delete_notebook(
     *,
     slug: str,
     notebook_settings: NotebookSettings,
     client: httpx.AsyncClient,
     principal_key: str,
-) -> None:
-    """Delete a blog the caller owns.
+) -> bool:
+    """Delete a notebook the caller owns; True if one was actually removed.
 
-    Namespaces ``slug`` with the principal prefix so a tenant can only target
-    its own blogs.
+    ``slug`` is the bare authoring name — the same form ``list_notebooks``
+    returns and ``create_notebook_upload`` accepts. It is namespaced with the
+    principal prefix here, exactly once, so a tenant can only target its own.
+    Passing an already-namespaced slug would prefix it twice and silently
+    target nothing, which is why nothing in this module ever hands a caller
+    the namespaced form.
     """
     if notebook_settings.host_url is None or notebook_settings.admin_secret is None:
         raise HostNotConfiguredError("notebook host not configured")
     resolved_slug = _resolve_slug(agent_slug=slug, principal_key=principal_key)
-    await delete_blog_from_host(
+    return await delete_notebook_from_host(
         slug=resolved_slug,
         host_url=notebook_settings.host_url,
         admin_secret=notebook_settings.admin_secret,
@@ -81,36 +86,75 @@ async def delete_blog(
     )
 
 
-async def list_blogs(
+def _strip_principal_prefix(slug: str, prefix: str) -> str:
+    return slug[len(prefix) + 1 :]
+
+
+async def list_notebooks(
     *,
     notebook_settings: NotebookSettings,
     client: httpx.AsyncClient,
     principal_key: str,
 ) -> list[dict[str, object]]:
-    """List the caller's own blogs (filtered from the host's full list).
+    """List the caller's own notebooks, permanent and ephemeral alike.
 
-    The host exposes every tenant's blogs; we keep only those whose slug carries
-    this principal's prefix so a tenant sees only what it published. Parses the
-    host JSON via local ``Any``/``cast`` (same shape as host_client's
+    The host exposes every tenant's; we keep only those whose slug carries this
+    principal's prefix, then hand back the **bare** slug so the value round-trips
+    into ``delete_notebook`` and ``create_notebook_upload``. ``url`` keeps the
+    namespaced slug, because that is the real address.
+
+    Each entry carries ``permanent``: True for a run-mode blog (survives
+    restarts, never reaped), False for an edit-mode scratch notebook (TTL). Both
+    kinds appear because both are things the caller published and may want back.
+
+    Parses the host JSON via local ``Any``/``cast`` (same shape as host_client's
     ``_parse_cell_errors``) so strict pyright stays clean without nested-Unknown
     narrowing.
     """
     if notebook_settings.host_url is None or notebook_settings.admin_secret is None:
         raise HostNotConfiguredError("notebook host not configured")
-    body = await list_blogs_from_host(
+    blogs_body = await list_blogs_from_host(
+        host_url=notebook_settings.host_url,
+        admin_secret=notebook_settings.admin_secret,
+        client=client,
+    )
+    notebooks_body = await list_notebooks_from_host(
         host_url=notebook_settings.host_url,
         admin_secret=notebook_settings.admin_secret,
         client=client,
     )
     prefix = _principal_prefix(principal_key)
-    blogs_any: Any = body.get("blogs", [])
-    if not isinstance(blogs_any, list):
+    blog_entries = _own_entries(blogs_body.get("blogs", []), prefix)
+    process_entries = _own_entries(notebooks_body.get("notebooks", []), prefix)
+    blog_slugs = {cast("str", entry["slug"]) for entry in blog_entries}
+    own: list[dict[str, object]] = []
+    seen: set[str] = set()
+    # Blogs first so a live blog's richer record (created_at, title) wins over
+    # its process-list twin; the process list then adds anything not registered.
+    for entry in (*blog_entries, *process_entries):
+        namespaced = cast("str", entry["slug"])
+        if namespaced in seen:
+            continue
+        seen.add(namespaced)
+        own.append(
+            {
+                **entry,
+                "slug": _strip_principal_prefix(namespaced, prefix),
+                "permanent": namespaced in blog_slugs,
+            }
+        )
+    return own
+
+
+def _own_entries(entries_any: object, prefix: str) -> list[dict[str, object]]:
+    """The dict entries whose ``slug`` carries ``prefix``, in host order."""
+    if not isinstance(entries_any, list):
         return []
     own: list[dict[str, object]] = []
-    for entry in cast("list[Any]", blogs_any):
+    for entry in cast("list[Any]", entries_any):
         if isinstance(entry, dict):
-            blog = cast("dict[str, object]", entry)
-            slug_val = blog.get("slug")
+            item = cast("dict[str, object]", entry)
+            slug_val = item.get("slug")
             if isinstance(slug_val, str) and slug_val.startswith(f"{prefix}-"):
-                own.append(blog)
+                own.append(item)
     return own

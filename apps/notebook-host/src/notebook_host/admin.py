@@ -318,14 +318,23 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 "path": f"data/{name}",
             }
 
-    @router.delete(
-        "/admin/notebooks/{slug}",
-        dependencies=[Depends(require_admin)],
-        status_code=status.HTTP_204_NO_CONTENT,
-    )
-    async def delete_notebook(slug: str) -> None:  # pyright: ignore[reportUnusedFunction]
+    @router.delete("/admin/notebooks/{slug}", dependencies=[Depends(require_admin)])
+    async def delete_notebook(slug: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Delete either kind of notebook, and say whether one was there.
+
+        Reports ``deleted`` rather than answering 204-for-everything. A caller
+        that cannot tell "I removed it" from "there was nothing by that name"
+        will report a typo'd or wrong-namespace slug as a successful delete —
+        which is exactly how a broken delete stayed invisible in production.
+
+        Unregisters any blog record under the same lock, so this one route
+        handles run-mode blogs too: leaving the record behind would have the
+        sweep's self-heal respawn the blog we just killed.
+        """
         slug = safe_slug(slug)
         async with state.lock_for(slug):
+            was_blog = unregister_blog(state.settings.resolved_blogs_file, slug)
+            had_tree = get_slug_paths(state.settings.data_dir, slug).root.exists()
             np = state.processes.pop(slug, None)
             if np is not None:
                 # kill blocks up to 5s (SIGTERM wait); must not block the
@@ -335,6 +344,7 @@ def create_admin_router(state: AdminState) -> APIRouter:
                 state.settings.data_dir, slug, uids_file=state.settings.resolved_uids_file
             )
             state.snapshot_pids()
+            return {"slug": slug, "deleted": np is not None or was_blog or had_tree}
 
     @router.get("/admin/notebooks", dependencies=[Depends(require_admin)])
     def list_notebooks() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

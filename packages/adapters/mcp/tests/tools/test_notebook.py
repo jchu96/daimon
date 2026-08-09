@@ -1,18 +1,22 @@
-"""Tests for notebook MCP upload-URL minter tools."""
+"""Tests for the notebook MCP tools: upload-URL minters, list, and delete."""
 
 from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
+from typing import Any, cast
 from unittest.mock import create_autospec
 
+import httpx
 import pytest
 from anthropic import AsyncAnthropic
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.notebook import (
     _create_attachment_upload_impl,  # pyright: ignore[reportPrivateUsage]
-    _create_blog_upload_impl,  # pyright: ignore[reportPrivateUsage]
     _create_notebook_upload_impl,  # pyright: ignore[reportPrivateUsage]
+    _delete_notebook_impl,  # pyright: ignore[reportPrivateUsage]
+    _list_notebooks_impl,  # pyright: ignore[reportPrivateUsage]
 )
 from daimon.core.config import (
     AnthropicSettings,
@@ -20,6 +24,7 @@ from daimon.core.config import (
     NotebookSettings,
     Settings,
 )
+from daimon.core.notebooks.publish import _principal_prefix  # pyright: ignore[reportPrivateUsage]
 from daimon.core.scope import DeploymentDefault
 from fastmcp.exceptions import ToolError
 from pydantic import HttpUrl, PostgresDsn, SecretStr
@@ -67,16 +72,30 @@ def _token_payload(upload_url: str) -> dict[str, object]:
     return json.loads(raw)
 
 
-async def test_create_blog_upload_impl_returns_signed_url() -> None:
+def _factory(handler: Callable[[httpx.Request], httpx.Response]) -> type[httpx.AsyncClient]:
+    class _FakeClient(httpx.AsyncClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    return _FakeClient  # type: ignore[return-value]
+
+
+async def test_create_notebook_upload_impl_permanent_mints_blog_op() -> None:
     runtime = _make_runtime(_make_settings(host_url="http://nb:8001", admin_secret="s"))
-    out = await _create_blog_upload_impl(runtime, slug="radar", principal_key="acct-1")
+    out = await _create_notebook_upload_impl(
+        runtime, slug="radar", permanent=True, principal_key="acct-1"
+    )
     assert out["upload_url"].startswith("http://nb:8001/upload/"), "returns a host upload URL"
-    assert _token_payload(out["upload_url"])["op"] == "blog", "token op is blog"
+    assert _token_payload(out["upload_url"])["op"] == "blog", (
+        "permanent=True must mint the run-mode blog op, not a scratch notebook"
+    )
 
 
 async def test_create_notebook_upload_impl_random_slug() -> None:
     runtime = _make_runtime(_make_settings(host_url="http://nb:8001", admin_secret="s"))
-    out = await _create_notebook_upload_impl(runtime, slug=None, principal_key="acct-1")
+    out = await _create_notebook_upload_impl(
+        runtime, slug=None, permanent=False, principal_key="acct-1"
+    )
     assert _token_payload(out["upload_url"])["op"] == "notebook", "token op is notebook"
 
 
@@ -88,10 +107,12 @@ async def test_create_attachment_upload_impl_signs_name() -> None:
     assert _token_payload(out["upload_url"])["name"] == "d.nc", "attachment name signed into token"
 
 
-async def test_create_blog_upload_impl_raises_when_host_unset() -> None:
+async def test_create_notebook_upload_impl_raises_when_host_unset() -> None:
     runtime = _make_runtime(_make_settings(host_url=None, admin_secret=None))
     with pytest.raises(ToolError, match="not configured"):
-        await _create_blog_upload_impl(runtime, slug="x", principal_key="acct-1")
+        await _create_notebook_upload_impl(
+            runtime, slug="x", permanent=True, principal_key="acct-1"
+        )
 
 
 async def test_create_attachment_upload_impl_rejects_bad_name() -> None:
@@ -100,3 +121,78 @@ async def test_create_attachment_upload_impl_rejects_bad_name() -> None:
         await _create_attachment_upload_impl(
             runtime, slug="x", name="../bad", principal_key="acct-1"
         )
+
+
+async def test_delete_notebook_impl_namespaces_the_bare_slug_once() -> None:
+    runtime = _make_runtime(_make_settings(host_url="http://h:8001", admin_secret="bearer"))
+    seen: list[tuple[str, str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append((req.method, req.url.path))
+        return httpx.Response(200, json={"slug": "x", "deleted": True})
+
+    out = await _delete_notebook_impl(
+        runtime, principal_key="acct-1", slug="radar", client_factory=_factory(handler)
+    )
+    prefix = _principal_prefix("acct-1")
+    assert seen == [("DELETE", f"/admin/notebooks/{prefix}-radar")], (
+        "the bare slug is namespaced exactly once, against the unified notebooks route"
+    )
+    assert out["deleted"] is True, "a real removal reports deleted=True"
+
+
+async def test_delete_notebook_impl_reports_false_when_nothing_existed() -> None:
+    runtime = _make_runtime(_make_settings(host_url="http://h:8001", admin_secret="bearer"))
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"slug": "x", "deleted": False})
+
+    out = await _delete_notebook_impl(
+        runtime, principal_key="acct-1", slug="never-existed", client_factory=_factory(handler)
+    )
+    assert out["deleted"] is False, (
+        "a delete that removed nothing must not read as success — that is what hid a "
+        "delete which silently targeted a doubly-namespaced slug"
+    )
+
+
+async def test_list_notebooks_impl_returns_bare_slugs_that_round_trip_to_delete() -> None:
+    runtime = _make_runtime(_make_settings(host_url="http://h:8001", admin_secret="bearer"))
+    prefix = _principal_prefix("acct-1")
+    mine = f"{prefix}-radar"
+    theirs = f"{_principal_prefix('acct-2')}-radar"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/admin/blogs"):
+            return httpx.Response(200, json={"blogs": [{"slug": mine}, {"slug": theirs}]})
+        return httpx.Response(200, json={"notebooks": [{"slug": mine}, {"slug": theirs}]})
+
+    result = await _list_notebooks_impl(
+        runtime, principal_key="acct-1", client_factory=_factory(handler)
+    )
+    notebooks = result["notebooks"]
+    assert isinstance(notebooks, list), "notebooks must be a list"
+    entries = cast("list[dict[str, object]]", notebooks)
+    assert len(entries) == 1, "another principal's notebook must not be listed, and no duplicates"
+    assert entries[0]["slug"] == "radar", (
+        "the listed slug is the bare name delete_notebook accepts; returning the "
+        "namespaced form makes the round-trip prefix it twice and hit nothing"
+    )
+    assert entries[0]["permanent"] is True, "a slug in the blog registry is permanent"
+
+
+async def test_list_notebooks_impl_marks_scratch_notebooks_not_permanent() -> None:
+    runtime = _make_runtime(_make_settings(host_url="http://h:8001", admin_secret="bearer"))
+    mine = f"{_principal_prefix('acct-1')}-scratch"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/admin/blogs"):
+            return httpx.Response(200, json={"blogs": []})
+        return httpx.Response(200, json={"notebooks": [{"slug": mine, "alive": True}]})
+
+    result = await _list_notebooks_impl(
+        runtime, principal_key="acct-1", client_factory=_factory(handler)
+    )
+    entries = cast("list[dict[str, object]]", result["notebooks"])
+    assert entries[0]["permanent"] is False, "an unregistered live process is a scratch notebook"
+    assert entries[0]["alive"] is True, "host fields are passed through untouched"

@@ -118,3 +118,76 @@ async def test_list_blogs_from_host_returns_body() -> None:
             host_url=_HOST_URL, admin_secret=_ADMIN_SECRET, client=client
         )
     assert body["blogs"] == [{"slug": "pre-a", "alive": True}]
+
+
+async def test_delete_notebook_from_host_returns_the_hosts_deleted_flag() -> None:
+    from daimon.core.notebooks.host_client import delete_notebook_from_host
+
+    seen: list[tuple[str, str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append((req.method, str(req.url)))
+        return httpx.Response(200, json={"slug": _SLUG, "deleted": True})
+
+    async with _make_client(handler) as client:
+        deleted = await delete_notebook_from_host(
+            slug=_SLUG, host_url=_HOST_URL, admin_secret=_ADMIN_SECRET, client=client
+        )
+    assert seen == [("DELETE", "http://notebook-host:8001/admin/notebooks/abc123")], (
+        "one route deletes either kind"
+    )
+    assert deleted is True, "the host's answer is passed through, not assumed"
+
+
+async def test_delete_notebook_from_host_reports_false_for_a_slug_that_was_not_there() -> None:
+    from daimon.core.notebooks.host_client import delete_notebook_from_host
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"slug": _SLUG, "deleted": False})
+
+    async with _make_client(handler) as client:
+        deleted = await delete_notebook_from_host(
+            slug=_SLUG, host_url=_HOST_URL, admin_secret=_ADMIN_SECRET, client=client
+        )
+    assert deleted is False, "a no-op delete must not read as a removal"
+
+
+async def test_delete_notebook_from_host_treats_404_as_nothing_deleted() -> None:
+    from daimon.core.notebooks.host_client import delete_notebook_from_host
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="gone")
+
+    async with _make_client(handler) as client:
+        deleted = await delete_notebook_from_host(
+            slug=_SLUG, host_url=_HOST_URL, admin_secret=_ADMIN_SECRET, client=client
+        )
+    assert deleted is False, "an absent slug is not an error, but it is not a deletion either"
+
+
+async def test_delete_notebook_from_host_raises_on_500() -> None:
+    from daimon.core.notebooks.host_client import NotebookHostError, delete_notebook_from_host
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    async with _make_client(handler) as client:
+        with pytest.raises(NotebookHostError, match="500"):
+            await delete_notebook_from_host(
+                slug=_SLUG, host_url=_HOST_URL, admin_secret=_ADMIN_SECRET, client=client
+            )
+
+
+async def test_list_notebooks_from_host_returns_body() -> None:
+    from daimon.core.notebooks.host_client import list_notebooks_from_host
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.method == "GET"
+        assert str(req.url) == "http://notebook-host:8001/admin/notebooks"
+        return httpx.Response(200, json={"notebooks": [{"slug": "pre-a", "alive": True}]})
+
+    async with _make_client(handler) as client:
+        body = await list_notebooks_from_host(
+            host_url=_HOST_URL, admin_secret=_ADMIN_SECRET, client=client
+        )
+    assert body["notebooks"] == [{"slug": "pre-a", "alive": True}]

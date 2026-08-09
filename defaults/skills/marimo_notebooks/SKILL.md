@@ -1,24 +1,45 @@
 ---
 name: marimo_notebooks
-description: Publish a marimo notebook for the user via the daimon MCP server's create_notebook_upload_url tool — you mint a one-time upload URL, get the notebook's .py into a sandbox file, and curl -X PUT --data-binary it to the URL (the source never goes through a tool argument, which truncates large notebooks). The curl response returns a slug-as-secret URL the user can open.
+description: Publish interactive marimo notebooks via the daimon MCP server. Mint a one-time upload URL with create_notebook_upload_url, get the .py into a sandbox file, and curl -X PUT --data-binary it to the URL — source never goes through a tool argument, which truncates. permanent=True publishes the same notebook as a read-only shareable blog instead of a scratch one. Also covers attaching data files, list_notebooks and delete_notebook. Use when someone asks for a notebook, dashboard, data explorer, or to publish an analysis as a blog post.
 ---
 
 # marimo_notebooks
 
-Use the daimon MCP server's `create_notebook_upload_url` tool to render and
-publish an interactive marimo notebook for the user. You mint a one-time upload
-URL, get the notebook's `.py` into a sandbox file, and `curl -X PUT --data-binary`
-it to the URL — the source never goes through a tool argument, which truncates
-large notebooks. The curl response returns a slug-as-secret URL that the user can
-open directly in a browser. Treat that URL as private — share it only with the
-user who asked.
+Publish an interactive marimo notebook for the user. You mint a one-time upload
+URL, get the notebook's `.py` into a sandbox file, and
+`curl -X PUT --data-binary` it to the URL — the source never goes through a tool
+argument, which truncates large notebooks. The curl response returns a
+slug-as-secret URL the user opens in a browser. Treat that URL as private —
+share it only with the user who asked.
 
-A notebook is data work, not decoration. The person on the other end is
-usually trying to answer a real question. A polished notebook that answers
-the *wrong* question, or that "discovers" conclusions you secretly invented,
-or that errors on the first cell, is worse than no notebook — it looks
-authoritative while being hollow. The three rules below exist to prevent
-exactly that. Read them before you build anything.
+A notebook is data work, not decoration. The person on the other end is usually
+trying to answer a real question. A polished notebook that answers the *wrong*
+question, or that "discovers" conclusions you secretly invented, or that errors
+on the first cell, is worse than no notebook — it looks authoritative while
+being hollow. The three rules below exist to prevent exactly that. Read them
+before you build anything.
+
+## Scratch notebook or permanent blog
+
+One tool publishes both. `create_notebook_upload_url(slug=..., permanent=...)`:
+
+| | `permanent=False` (default) | `permanent=True` |
+|---|---|---|
+| Shape | edit mode — the editor is visible | run mode — a read-only app, source hidden |
+| Lifetime | reaped after the host's TTL | survives host restarts, never reaped |
+| Slug | optional; omit for a random one | choose a meaningful, stable name — it is part of the URL |
+
+**Default to `permanent=False`.** Publish the scratch version, let the user look
+at it, and re-upload the *same slug* with `permanent=True` once it is worth
+keeping. Deciding permanence before anyone has seen the notebook is how hosts
+accumulate blogs nobody wanted.
+
+Both are a live Python kernel, not a WASM export — so PyMC/ArviZ widgets
+genuinely work, sliders re-plot a real posterior, dropdowns switch parameters.
+That is what this tool buys over a static image.
+
+A permanent blog runs its cells **on every page load, per reader**. See
+"Precompute, never sample live" below — it is the rule that matters most there.
 
 ## 1. Align before you build
 
@@ -142,16 +163,15 @@ Either way, getting real data is almost always possible; reach for it first.
 
 The host **runs your notebook before serving it**: it executes every cell, and
 if any fails the curl response is HTTP 422 carrying a list of cell errors —
-the broken notebook is never served. A 200 response with `url` and `expires_at`
-in the JSON means every cell actually executed.
+the broken notebook is never served. A 200 response with `url` in the JSON
+means every cell actually executed.
 
 When the curl returns a 422 with "notebook failed validation — cells did not
 execute" and a list of errors, **read them, fix the source, mint a fresh upload
-URL (`create_notebook_upload_url` — each URL is single-use), and re-upload.**
-Do not surface the raw validation error to the user as if the task failed — it's
-yours to fix. The most common entry is `MultipleDefinitionError` (a name, often
-a loop variable, defined in two cells): fix it with the function-wrapping pattern
-below.
+URL (each URL is single-use), and re-upload.** Do not surface the raw validation
+error to the user as if the task failed — it's yours to fix. The most common
+entry is `MultipleDefinitionError` (a name, often a loop variable, defined in
+two cells): fix it with the function-wrapping pattern below.
 
 You don't need to self-run the notebook first — the host does it for you. But if
 you want to catch errors before spending a publish (e.g. you're iterating fast),
@@ -175,6 +195,65 @@ cannot see `MultipleDefinitionError` or any runtime failure. Add
 `--with pymc --with arviz` when the notebook uses them. Note the host's
 validation has a time budget: a notebook doing heavy `pm.sample` may be
 published without a full execution check, so still keep sampling small (below).
+
+## Publishing: upload URL + curl, never tool arguments
+
+You do **not** paste notebook source or data into a tool argument. Large source
+truncates and ~1 MB data files can't be base64'd through a tool call at all.
+Instead you mint a **one-time upload URL** and `curl` your file to it from bash —
+the bytes go straight to the host, never through the model.
+
+1. **Get the `.py` into a sandbox file.** Either author it incrementally with
+   write/edit and then `read` it back to confirm it's complete, or `curl` it from
+   an origin. Never try to emit the whole notebook in one shot.
+2. **Mint the upload URL:** `create_notebook_upload_url(slug="churn")` returns
+   `{upload_url, slug, upload_expires_at}`. The URL is good for ~5 minutes and is
+   single-use — use it promptly, and mint a fresh one for every retry.
+3. **Upload:**
+   ```bash
+   curl -sS -X PUT --data-binary @nb.py "<upload_url>"
+   ```
+   The curl response is JSON carrying the live `url` — share that. On a 422 it
+   carries the failing cells; fix them, mint a fresh URL, re-upload.
+
+Slugs must match `[A-Za-z0-9_-]{1,32}` and not start with `-`. Use a short
+human-readable name (`"churn"`, `"mmm-prior-check"`) — the server namespaces it
+per user, so two users picking the same slug never collide. **Pass the same slug
+to re-upload in place**: the URL stays stable across iterations, which keeps the
+user's browser tab working. Re-uploading restarts the kernel, so in-browser
+state (filter selections, scroll position) resets.
+
+### Precompute, never sample live
+
+A permanent blog runs a **real kernel per reader, and every cell executes on
+page load.** A cell that calls `pm.sample(...)` makes *every visitor* wait
+minutes, and concurrent readers each spawn their own sampler — which exhausts
+host memory. So do all heavy computation **offline, before publishing**:
+
+1. Run the expensive work once in bash and save the artifact:
+   ```python
+   idata = pm.sample(2000, tune=1000)
+   idata.to_netcdf("posterior.nc")
+   ```
+2. Attach it under the **same slug** you'll publish under (see below).
+3. In the notebook, **load** it and do only cheap work:
+   ```python
+   import arviz as az
+   idata = az.from_netcdf("data/posterior.nc")   # cheap
+   # interactive widgets explore the posterior — no resampling
+   ```
+
+A blog that re-samples on load is a broken blog. The same advice makes a scratch
+notebook pleasant rather than painful.
+
+### Writing a blog worth keeping
+
+- **Write it as an article, not a code dump.** Lead with prose (`mo.md(...)`),
+  interleave figures and interactive widgets, read top-to-bottom.
+- **Keep every cell cheap** — loads, slicing, plotting, `arviz` over the
+  precomputed `InferenceData`. Reactive widgets recompute plots from data
+  already in memory, never refit models.
+- **Use `width="medium"`** in the marimo app config, not `"wide"`.
 
 ## Declaring extra dependencies (PEP 723)
 
@@ -201,13 +280,11 @@ app = marimo.App()
   (e.g. `torch`) can blow the validation time budget — the notebook then ships
   unverified and slow to first load.
 - **No header → baked env.** Omit the header and the notebook runs on the fast
-  default stack with no install step. Only add a header when you need something
-  outside `pandas`/`numpy`/`scipy`/`scikit-learn`/`matplotlib`/`pymc`/`arviz`.
+  default stack with no install step.
 - **Heavy runtime fetching still belongs in bash.** A header lets the notebook
   *import* `fastf1`, but a cell that downloads large telemetry re-runs that
   download on every reactive re-render and can hit the subprocess memory/CPU
-  caps. For big or slow data, fetch once in bash and attach the result (§2)
-  rather than fetching live in the notebook.
+  caps. For big or slow data, fetch once in bash and attach the result.
 
 ## Cell dataflow rules (this is the #1 source of broken notebooks)
 
@@ -271,49 +348,6 @@ def _(mo, df):          # ← names READ from upstream cells
 Forget a name in the return tuple and downstream cells can't see it. List a name
 in the signature that no upstream cell exports and the cell errors.
 
-## PyMC / ArviZ notebooks
-
-The runtime ships **PyMC 5.x and ArviZ 0.x** (pinned — do not assume PyMC 6 or
-ArviZ 1.x entry points; use the 0.x surface like `az.plot_posterior`,
-`az.plot_trace`, `az.summary`). Bayesian work is a first-class use of this tool,
-not a fallback.
-
-The notebook runs in a **resource-capped subprocess** (memory + CPU limits, ~2h
-TTL). Real MCMC there must be modest, or the kernel gets killed mid-sample:
-
-- Keep `pm.sample(...)` small: a few hundred to ~1–2k draws, `tune` similar,
-  `cores=1` (the cap makes multi-core a liability, not a speedup), and
-  `progressbar=False`.
-- For anything heavier, sample in your **bash tool** instead, save the
-  `InferenceData` (`az.to_netcdf`), mint an attachment upload URL
-  (`create_attachment_upload_url`) and curl it up, then have the notebook load
-  it via `az.from_netcdf("data/idata.nc")` to render diagnostics. The notebook
-  then visualises real results without paying the sampling cost at load time.
-- A notebook that re-samples on every reactive re-run is painful to use — fit
-  once in an early cell (or load attached `InferenceData`), explore downstream.
-
-## Iterating on the same notebook
-
-When refining a notebook in the same conversation, pass the same `slug` to
-`create_notebook_upload_url(slug=prior_slug)` so the user keeps the same browser
-tab. The URL is stable across re-uploads of the same slug:
-
-```python
-# 1. update nb.py with your edits (write/edit tools, then read back to verify)
-```
-```bash
-# create_notebook_upload_url(slug="churn")  ->  {upload_url, slug, upload_expires_at}
-curl -sS -X PUT --data-binary @nb.py "<upload_url>"
-# curl response JSON carries url + expires_at — same url as before; notebook is now updated
-```
-
-Slugs must match `[A-Za-z0-9_-]{1,32}` and not start with `-`. Use a short
-human-readable name (`"churn"`, `"mmm-prior-check"`) — the daimon server
-namespaces it per user so two users picking the same slug never collide.
-
-Note: re-uploading restarts the notebook's kernel, so any in-browser state
-(filter selections, scroll position) resets. The URL stays the same.
-
 ## Data attachments
 
 Use `create_attachment_upload_url(slug, name)` to get a one-time upload URL for
@@ -329,129 +363,88 @@ cannot see another's attachments.
 ```python
 import pandas as pd
 df = pd.read_csv("data/sales.csv")
-# or: open("data/raw.json")
 ```
 
-Data is **ephemeral**: it dies with the notebook subprocess TTL reap (default
-2 hours). No persistence, no cross-conversation sharing. If a user expects
-long-term storage, tell them this isn't the right tool.
+Attachment data lives and dies with its workspace: on a scratch notebook it goes
+when the TTL reap does. If a user expects long-term storage, tell them this isn't
+the right tool.
 
 Per-attachment cap is 10 MiB (operator-configurable). Larger files: ask the user
-to subsample or aggregate before sending. No streaming uploads in v1.
+to subsample or aggregate before sending. Attach and publish share a single
+per-principal hourly rate-limit budget, so a loop that attaches → publishes →
+attaches → publishes burns the budget twice as fast as one that publishes alone.
+If `create_attachment_upload_url` raises a tool error containing "not configured"
+or "rate limit", surface that to the user — don't retry blindly.
 
-Attach and publish share a single per-principal hourly rate-limit budget. A loop
-that attaches → publishes → attaches → publishes burns the budget twice as fast
-as one that publishes alone.
+### Worked example — a file the user attached in chat
 
-When a user attaches files to a Discord message, the bot uploads them for you and
-prepends a system line listing each attachment's slug and path. **Reuse that
-slug** when calling `create_notebook_upload_url` to include the data.
-
-### Worked examples
-
-**(a) Discord auto-upload — you only publish.** The system line gives you the
-slug; bind to it:
+The attachment reaches you as an `[attachment]` line carrying a signed URL, not
+as a file on disk. Fetch it, then attach it to the workspace:
 
 ```
-# User (Discord, with sales.csv attached): "load this CSV and plot column A"
-# System: *user attached `sales.csv` (1024 bytes) at `data/sales.csv` on notebook workspace `abc123...`. Use slug=abc123... when publishing to include it.*
-
-# 1. Write the notebook to nb.py (write/edit tools), then read it back to verify it's complete.
+# User (with sales.csv attached): "load this CSV and plot column A"
+# [attachment] `sales.csv` (1024 bytes), uploaded by the user with this message.
+#   Signed Discord CDN URL, expires ~24h: https://cdn.discordapp.com/... — curl it
+#   to disk, then read it. To use it in a notebook you publish, upload it via the
+#   create_attachment_upload_url tool.
 ```
 ```bash
-# create_notebook_upload_url(slug="abc123...")  ->  {upload_url, slug, upload_expires_at}
-curl -sS -X PUT --data-binary @nb.py "<upload_url>"   # response JSON carries url + expires_at
-```
-
-**(b) MCP-only client (Claude Desktop, Cursor, ...) — you attach data, then publish.**
-Pick a slug, use it for both calls:
-
-```
-# User: "here's the CSV data: save it to /tmp/sales.csv. plot column A."
-
-# 1. Save the data to a sandbox file, then:
-```
-```bash
-# create_attachment_upload_url(slug="my-csv-explore", name="sales.csv")  ->  {upload_url, ...}
+curl -sS "<the signed URL>" -o /tmp/sales.csv
+# create_attachment_upload_url(slug="sales-explore", name="sales.csv") -> {upload_url, ...}
 curl -sS -X PUT --data-binary @/tmp/sales.csv "<upload_url>"
 
-# 2. Write notebook to nb.py (reads data/sales.csv), verify it, then:
-# create_notebook_upload_url(slug="my-csv-explore")  ->  {upload_url, ...}
+# Write the notebook (it does pd.read_csv("data/sales.csv")), verify it, then:
+# create_notebook_upload_url(slug="sales-explore") -> {upload_url, ...}
 curl -sS -X PUT --data-binary @nb.py "<upload_url>"
 ```
 
-**(c) You fetched real data in bash — attach it, then publish.** This is the
-antidote to fabrication: get the real thing, hand it to the notebook.
+The same shape is the antidote to fabrication: fetch real data in bash with
+whatever library you like, attach the result, and let the notebook read it.
 
-```bash
-# In bash: fetched + cleaned real data into /tmp/races.csv (any library you like).
-# create_attachment_upload_url(slug="f1-overtaking", name="races.csv")  ->  {upload_url, ...}
-curl -sS -X PUT --data-binary @/tmp/races.csv "<upload_url>"
+## PyMC / ArviZ notebooks
 
-# Write notebook to nb.py (does pd.read_csv("data/races.csv")), verify it, then:
-# create_notebook_upload_url(slug="f1-overtaking")  ->  {upload_url, ...}
-curl -sS -X PUT --data-binary @nb.py "<upload_url>"   # response JSON carries url + expires_at
-```
+The runtime ships **PyMC 5.x and ArviZ 0.x** (pinned — do not assume PyMC 6 or
+ArviZ 1.x entry points; use the 0.x surface like `az.plot_posterior`,
+`az.plot_trace`, `az.summary`). Bayesian work is a first-class use of this tool,
+not a fallback.
 
-### Attachment errors
+The notebook runs in a **resource-capped subprocess** (memory + CPU limits).
+Real MCMC there must be modest, or the kernel gets killed mid-sample:
 
-If `create_attachment_upload_url` raises a tool error containing "not configured"
-or "rate limit", surface that to the user — don't retry blindly. The rate-limit
-budget is shared with `create_notebook_upload_url`, so retries make it worse.
+- Keep `pm.sample(...)` small: a few hundred to ~1–2k draws, `tune` similar,
+  `cores=1` (the cap makes multi-core a liability, not a speedup), and
+  `progressbar=False`.
+- For anything heavier, sample in bash, save the `InferenceData`
+  (`az.to_netcdf`), attach it, and load it with
+  `az.from_netcdf("data/idata.nc")` to render diagnostics.
+- A notebook that re-samples on every reactive re-run is painful to use — fit
+  once in an early cell (or load attached `InferenceData`), explore downstream.
 
-## When to use
+## Managing what you published
 
-- User asks for an interactive notebook, dashboard, or data explorer.
-- Dataset exploration with reactive sliders, dropdowns, or filters.
-- Visualisation tasks where a static image isn't enough (e.g. matplotlib +
-  marimo widgets, altair interactive charts).
+- `list_notebooks()` — everything you published, scratch and permanent. Each
+  entry carries `slug`, `url`, `alive`, and `permanent`.
+- `delete_notebook(slug)` — un-publish and free its host port. Each live
+  notebook holds one port from a finite pool (readers don't each consume one).
 
-## Notebook source shape
+The `slug` these report is the **bare** name — the same one you pass to
+`create_notebook_upload_url`. Pass it straight back to `delete_notebook`; don't
+reconstruct a slug from the URL, which carries an extra namespace segment.
 
-The notebook is a complete marimo `.py` file — written to a sandbox file, then
-curled to the upload URL. Minimal example:
+`delete_notebook` returns `{slug, deleted}`. `deleted: false` means nothing by
+that name existed — check `list_notebooks` for the right slug rather than
+retrying the same call.
 
-```python
-import marimo
+## Common failure modes
 
-app = marimo.App()
-
-@app.cell
-def _():
-    import marimo as mo
-    return (mo,)
-
-@app.cell
-def _(mo):
-    mo.md("# Hello from marimo")
-    return ()
-
-if __name__ == "__main__":
-    app.run()
-```
-
-Keep cells small and independent. Do not use `marimo.run()` or blocking calls;
-marimo drives execution. Four to six cells is enough for most tasks.
-
-## Constraints
-
-- **Notebook runtime imports** default to `marimo`, `pandas`, `numpy`, `scipy`,
-  `scikit-learn`, `matplotlib`, `pymc`, `arviz`. To use anything else, declare a
-  PEP 723 header (see "Declaring extra dependencies") and the notebook installs
-  it into an isolated env — or fetch the data in bash and attach it (§2). Both
-  beat the old "show the code in chat and have the user run it locally" fallback.
-- Notebooks are **ephemeral**: the host may reap a subprocess after ~2h of
-  uptime or on host restart. Tell the user to export their work before the
-  session ends. The curl response JSON carries an `expires_at` — surface it.
-- URL is **slug-as-secret** — the slug is the only access boundary. Share only
-  with the user who asked; never post it in a public channel.
-
-## Errors
-
-If `create_notebook_upload_url` raises `ToolError("notebook host not configured")`:
-tell the user interactive notebooks aren't available in this deployment and show
-the notebook source as a code block in chat instead. Do not retry.
-
-If a publish fails for another reason (timeout, host unreachable, upstream
-error), don't leave the user empty-handed: tell them it failed and paste the
-notebook source you built as a code block so the work isn't lost.
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Curl returns 422 with cell errors | A cell genuinely fails to execute | Read the errors, fix the source, mint a **fresh** URL (single-use), re-upload |
+| `MultipleDefinitionError` | A name — often a loop variable — defined in two cells | Wrap each cell body in a function so locals don't leak (Rule 1) |
+| A cell produces no output at all | Mid-body `return` | Move the `return` to the last statement (Rule 2) |
+| Downstream cell can't see a value | Name missing from the return tuple | Add it (Rule 3) |
+| `ModuleNotFoundError` despite a PEP 723 header | The header omits a library the notebook imports — the isolated env replaces the baked one | List **every** import, `marimo` included |
+| Blog takes minutes to load, or dies under two readers | Sampling on page load | Precompute in bash, attach the `InferenceData`, load it in the notebook |
+| Upload URL rejected on retry | Each URL is single-use, and expires in ~5 min | Mint a new one per attempt |
+| `delete_notebook` returns `deleted: false` | Wrong slug — most often a URL-derived one carrying the namespace prefix | Take the bare slug from `list_notebooks` |
+| ToolError "notebook host not configured" | This deployment has no notebook host | Tell the user, show the source as a code block, don't retry |

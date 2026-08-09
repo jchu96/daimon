@@ -78,8 +78,10 @@ def register_blog(path: Path, record: BlogRecord) -> None:
     save_blogs(path, records)
 
 
-def unregister_blog(path: Path, slug: str) -> None:
-    """Drop a blog's record. A no-op if the slug isn't registered."""
+def unregister_blog(path: Path, slug: str) -> bool:
+    """Drop a blog's record; True if one was there. A no-op if not registered."""
     records = load_blogs(path)
-    if records.pop(slug, None) is not None:
-        save_blogs(path, records)
+    if records.pop(slug, None) is None:
+        return False
+    save_blogs(path, records)
+    return True

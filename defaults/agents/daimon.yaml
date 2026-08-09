@@ -78,8 +78,6 @@ skills:
   - type: custom
     skill_id: marimo_notebooks
   - type: custom
-    skill_id: marimo_blog
-  - type: custom
     skill_id: workspace-setup
   - type: custom
     skill_id: pymc-artifact-style

@@ -14,7 +14,6 @@ from daimon.core.notebooks.publish import HostNotConfiguredError, NotebookRateLi
 from daimon.core.notebooks.slug import sanitize_slug
 from daimon.core.notebooks.upload import (
     create_attachment_upload,
-    create_blog_upload,
     create_notebook_upload,
 )
 from pydantic import HttpUrl, SecretStr
@@ -36,9 +35,10 @@ def _payload(upload_url: str) -> dict[str, object]:
     return json.loads(raw)
 
 
-def test_create_blog_upload_namespaces_slug_and_builds_url() -> None:
-    out = create_blog_upload(
+def test_create_notebook_upload_permanent_namespaces_slug_and_builds_url() -> None:
+    out = create_notebook_upload(
         slug="radar-plots",
+        permanent=True,
         notebook_settings=_settings(),
         principal_key="acct-1",
         now=_NOW,
@@ -49,7 +49,7 @@ def test_create_blog_upload_namespaces_slug_and_builds_url() -> None:
     assert out["slug"].endswith(f"-{sanitize_slug('radar-plots')}"), "slug is principal-prefixed"
     assert out["upload_expires_at"] == "2026-06-09T12:05:00+00:00", "expiry is now + 300s, ISO-8601"
     payload = _payload(out["upload_url"])
-    assert payload["op"] == "blog", "blog op signed into the token"
+    assert payload["op"] == "blog", "permanent=True signs the run-mode blog op into the token"
     assert payload["slug"] == out["slug"], "token slug matches the namespaced slug returned"
     assert payload["max_bytes"] == _settings().max_source_bytes, "source budget signed in"
 
@@ -92,25 +92,36 @@ def test_create_attachment_upload_rejects_unsafe_name() -> None:
         )
 
 
-def test_create_blog_upload_raises_when_host_unset() -> None:
+def test_create_notebook_upload_raises_when_host_unset() -> None:
     with pytest.raises(HostNotConfiguredError):
-        create_blog_upload(
+        create_notebook_upload(
             slug="x",
+            permanent=True,
             notebook_settings=NotebookSettings(host_url=None, admin_secret=None),
             principal_key="acct-1",
             now=_NOW,
         )
 
 
-def test_create_blog_upload_rate_limited() -> None:
+def test_create_notebook_upload_permanent_rate_limited() -> None:
     limiter = RateLimiter(max_requests=1)
     s = _settings()
-    create_blog_upload(
-        slug="x", notebook_settings=s, principal_key="acct-1", now=_NOW, rate_limiter=limiter
+    create_notebook_upload(
+        slug="x",
+        permanent=True,
+        notebook_settings=s,
+        principal_key="acct-1",
+        now=_NOW,
+        rate_limiter=limiter,
     )
     with pytest.raises(NotebookRateLimitError):
-        create_blog_upload(
-            slug="y", notebook_settings=s, principal_key="acct-1", now=_NOW, rate_limiter=limiter
+        create_notebook_upload(
+            slug="y",
+            permanent=True,
+            notebook_settings=s,
+            principal_key="acct-1",
+            now=_NOW,
+            rate_limiter=limiter,
         )
 
 
@@ -144,3 +155,13 @@ def test_create_attachment_upload_rate_limited() -> None:
             now=_NOW,
             rate_limiter=limiter,
         )
+
+
+def test_create_notebook_upload_defaults_to_the_ephemeral_op() -> None:
+    """Permanence is opt-in: the cheap, reapable shape is what you get by default."""
+    out = create_notebook_upload(
+        slug="scratch", notebook_settings=_settings(), principal_key="acct-1", now=_NOW
+    )
+    assert _payload(out["upload_url"])["op"] == "notebook", (
+        "omitting permanent must not mint a blog nobody asked to keep forever"
+    )

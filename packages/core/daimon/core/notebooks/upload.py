@@ -63,46 +63,24 @@ def _mint_url(
     }
 
 
-def create_blog_upload(
-    *,
-    slug: str,
-    notebook_settings: NotebookSettings,
-    principal_key: str,
-    now: datetime,
-    rate_limiter: RateLimiter | None = None,
-) -> dict[str, str]:
-    """Mint an upload URL for a permanent run-mode blog under ``slug``."""
-    if notebook_settings.host_url is None or notebook_settings.admin_secret is None:
-        raise HostNotConfiguredError("notebook host not configured")
-    resolved_slug = _resolve_slug(agent_slug=slug, principal_key=principal_key)
-    # Charged at mint time, no refund: minting performs no host call that
-    # could fail (unlike publish.py). One token mints → at most one host
-    # spawn (single-use jti), so capping mints caps spawns.
-    if rate_limiter is not None and not rate_limiter.check_and_record(principal_key):
-        raise NotebookRateLimitError(
-            f"publish rate limit exceeded for principal {principal_key!r}: "
-            f"max {rate_limiter.max_requests}/hour"
-        )
-    return _mint_url(
-        host=str(notebook_settings.host_url),
-        secret=notebook_settings.admin_secret.get_secret_value(),
-        slug=resolved_slug,
-        op="blog",
-        max_bytes=notebook_settings.max_source_bytes,
-        now=now,
-        name=None,
-    )
-
-
 def create_notebook_upload(
     *,
     slug: str | None = None,
+    permanent: bool = False,
     notebook_settings: NotebookSettings,
     principal_key: str | None = None,
     now: datetime,
     rate_limiter: RateLimiter | None = None,
 ) -> dict[str, str]:
-    """Mint an upload URL for an ephemeral edit-mode notebook.
+    """Mint an upload URL for a notebook.
+
+    ``permanent`` picks the host's two shapes: False mints an ephemeral
+    edit-mode notebook (TTL-reaped, the editor is visible), True mints a
+    run-mode blog that survives restarts and is never reaped. It is one flag
+    rather than two minters because everything else — the slug namespace, the
+    single-use token, the rate-limit charge, the curl the agent then runs — is
+    identical, and a caller choosing between two tool names at mint time has to
+    decide permanence before it knows whether the notebook is any good.
 
     ``slug`` None → a fresh random slug; otherwise principal-namespaced.
     """
@@ -125,7 +103,7 @@ def create_notebook_upload(
         host=str(notebook_settings.host_url),
         secret=notebook_settings.admin_secret.get_secret_value(),
         slug=resolved_slug,
-        op="notebook",
+        op="blog" if permanent else "notebook",
         max_bytes=notebook_settings.max_source_bytes,
         now=now,
         name=None,

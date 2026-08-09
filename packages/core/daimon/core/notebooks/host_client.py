@@ -126,3 +126,47 @@ async def list_blogs_from_host(
     if not r.is_success:
         raise NotebookHostError(f"notebook host returned {r.status_code}: {r.text[:200]}")
     return r.json()  # type: ignore[no-any-return]
+
+
+async def list_notebooks_from_host(
+    *,
+    host_url: HttpUrl,
+    admin_secret: SecretStr,
+    client: httpx.AsyncClient,
+) -> dict[str, object]:
+    """GET /admin/notebooks — returns the host body ({"notebooks": [...]}).
+
+    Every live subprocess, both kinds: a run-mode blog is also a tracked
+    process, so this list is a superset of the blog registry's live entries.
+    """
+    url = f"{str(host_url).rstrip('/')}/admin/notebooks"
+    headers = {"Authorization": f"Bearer {admin_secret.get_secret_value()}"}
+    r = await client.get(url, headers=headers, timeout=30.0)
+    if not r.is_success:
+        raise NotebookHostError(f"notebook host returned {r.status_code}: {r.text[:200]}")
+    return r.json()  # type: ignore[no-any-return]
+
+
+async def delete_notebook_from_host(
+    *,
+    slug: str,
+    host_url: HttpUrl,
+    admin_secret: SecretStr,
+    client: httpx.AsyncClient,
+) -> bool:
+    """DELETE /admin/notebooks/{slug}; True if something was actually removed.
+
+    Handles either kind — the route unregisters a blog record as well as
+    killing the process. The bool is the point: a caller that reports every
+    call as a successful delete cannot tell a real removal from a slug that
+    never existed.
+    """
+    url = f"{str(host_url).rstrip('/')}/admin/notebooks/{slug}"
+    headers = {"Authorization": f"Bearer {admin_secret.get_secret_value()}"}
+    r = await client.delete(url, headers=headers, timeout=30.0)
+    if r.status_code == 404:
+        return False
+    if not r.is_success:
+        raise NotebookHostError(f"notebook host returned {r.status_code}: {r.text[:200]}")
+    body: object = r.json()
+    return isinstance(body, dict) and bool(cast("dict[str, object]", body).get("deleted"))
