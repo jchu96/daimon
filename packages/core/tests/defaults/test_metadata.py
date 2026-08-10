@@ -8,6 +8,8 @@ from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_NAME,
     MA_METADATA_KEY_TENANT,
     build_metadata,
+    find_conflicting_skill_body,
+    find_mount_collision,
     strip_tenant_prefix,
     tenant_scoped_display_title,
 )
@@ -160,4 +162,84 @@ def test_strip_tenant_prefix_mangle_stability() -> None:
     re_prefixed = f"{prefix}{stripped}"
     assert re_prefixed == title, (
         "re-prefixing a stripped mangled title must reproduce the same 64-char string — no re-mangle"
+    )
+
+
+def test_find_conflicting_skill_body_registry_create_hits_agent_scoped_same_name() -> None:
+    result = find_conflicting_skill_body(
+        existing_bodies=["research daimon/last30days", "cli-auth"],
+        name="last30days",
+        agent_name=None,
+    )
+    assert result == "research daimon/last30days", (
+        "creating a registry skill must conflict with an agent-scoped skill of the same "
+        "mount name — both would mount at the same path on a shared agent"
+    )
+
+
+def test_find_conflicting_skill_body_scoped_create_hits_registry_same_name() -> None:
+    result = find_conflicting_skill_body(
+        existing_bodies=["last30days"],
+        name="last30days",
+        agent_name="research daimon",
+    )
+    assert result == "last30days", (
+        "creating an agent-scoped skill must conflict with a registry skill of the same name"
+    )
+
+
+def test_find_conflicting_skill_body_scoped_create_ignores_other_agents_scoped() -> None:
+    result = find_conflicting_skill_body(
+        existing_bodies=["other agent/last30days"],
+        name="last30days",
+        agent_name="research daimon",
+    )
+    assert result is None, (
+        "two agents may each own a scoped skill with the same name — they never mount together"
+    )
+
+
+def test_find_conflicting_skill_body_registry_create_ignores_exact_registry_match() -> None:
+    result = find_conflicting_skill_body(
+        existing_bodies=["last30days"],
+        name="last30days",
+        agent_name=None,
+    )
+    assert result is None, (
+        "an exact registry-shape match is the update-in-place path, not a conflict"
+    )
+
+
+def test_find_conflicting_skill_body_no_match_returns_none() -> None:
+    result = find_conflicting_skill_body(
+        existing_bodies=["research daimon/weekly", "cli-auth"],
+        name="last30days",
+        agent_name=None,
+    )
+    assert result is None, "unrelated names must not conflict"
+
+
+def test_find_mount_collision_registry_and_scoped_same_name() -> None:
+    result = find_mount_collision(
+        skill_ids=["sk_registry", "sk_scoped"],
+        body_by_skill_id={
+            "sk_registry": "last30days",
+            "sk_scoped": "research daimon/last30days",
+        },
+    )
+    assert result is not None, "registry + scoped same-name must collide"
+    mount_name, bodies = result
+    assert mount_name == "last30days", "collision must name the shared mount"
+    assert sorted(bodies) == ["last30days", "research daimon/last30days"], (
+        "collision must list both colliding bodies"
+    )
+
+
+def test_find_mount_collision_unique_names_return_none() -> None:
+    result = find_mount_collision(
+        skill_ids=["sk_a", "sk_b", "sk_builtin"],
+        body_by_skill_id={"sk_a": "last30days", "sk_b": "agent/weekly"},
+    )
+    assert result is None, (
+        "unique mounts must not collide; ids missing from the map (built-ins) are skipped"
     )

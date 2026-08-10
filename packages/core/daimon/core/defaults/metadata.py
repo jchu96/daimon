@@ -105,6 +105,61 @@ def tenant_scoped_display_title(
     return f"{prefix}{body[:keep]}~{digest}"
 
 
+def find_conflicting_skill_body(
+    *, existing_bodies: list[str], name: str, agent_name: str | None
+) -> str | None:
+    """Return the first existing skill body whose MA mount name would collide
+    with creating a skill called ``name`` under the given shape, else None.
+
+    MA mounts skills by their internal name (the terminal segment of the
+    display_title body), not the full display_title — two distinct skill
+    resources with the same terminal name attached to one agent make session
+    creation fail with a mount collision. Bodies are tenant-stripped
+    display_title bodies (see :func:`strip_tenant_prefix`).
+
+    Rules:
+    - Creating a registry skill (``agent_name is None``): any agent-scoped body
+      (``"agent/name"``) with the same terminal name conflicts — registry skills
+      are attachable to any agent, including that one. An exact registry-shape
+      match is NOT a conflict; that is the update-in-place path.
+    - Creating an agent-scoped skill: only an exact registry-shape body
+      conflicts. Other agents' scoped skills never mount alongside this one.
+    """
+    for body in existing_bodies:
+        is_scoped = "/" in body
+        terminal_name = body.rsplit("/", 1)[-1]
+        if terminal_name != name:
+            continue
+        if agent_name is None and is_scoped:
+            return body
+        if agent_name is not None and not is_scoped:
+            return body
+    return None
+
+
+def find_mount_collision(
+    *, skill_ids: list[str], body_by_skill_id: dict[str, str]
+) -> tuple[str, list[str]] | None:
+    """Return ``(mount_name, bodies)`` for the first mount path that two or
+    more of ``skill_ids`` would share, else None.
+
+    ``body_by_skill_id`` maps a tenant's custom skill ids to their
+    tenant-stripped display_title bodies; ids absent from the map (anthropic
+    built-ins, foreign tenants) are skipped — their mounts cannot collide with
+    tenant-owned names. The mount name is the body's terminal path segment.
+    """
+    bodies_by_mount: dict[str, list[str]] = {}
+    for skill_id in skill_ids:
+        body = body_by_skill_id.get(skill_id)
+        if body is None:
+            continue
+        bodies_by_mount.setdefault(body.rsplit("/", 1)[-1], []).append(body)
+    for mount_name, bodies in bodies_by_mount.items():
+        if len(bodies) > 1:
+            return mount_name, bodies
+    return None
+
+
 def strip_tenant_prefix(*, tenant_id: uuid.UUID, display_title: str) -> str | None:
     """Strip the tenant id-8 prefix from a display_title and return the body.
 

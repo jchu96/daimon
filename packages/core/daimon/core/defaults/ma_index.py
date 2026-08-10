@@ -16,11 +16,19 @@ from typing import Literal
 import sentry_sdk
 import structlog
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, SkillListResponse
+from anthropic.types.beta import (
+    BetaEnvironment,
+    BetaManagedAgentsAgent,
+    BetaManagedAgentsSkillParams,
+    SkillListResponse,
+)
 from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_ACCOUNT,
     MA_METADATA_KEY_NAME,
     MA_METADATA_KEY_TENANT,
+    find_conflicting_skill_body,
+    find_mount_collision,
+    strip_tenant_prefix,
 )
 from daimon.core.errors import SkillsListTruncatedError
 from daimon.core.ma_identity import derive_agent_uuid
@@ -267,6 +275,76 @@ async def find_skills_by_display_title(
         _log.warning("ma_index.multi_match", kind="skills", count=len(matches))
     matches.sort(key=lambda m: m.created_at, reverse=True)
     return matches
+
+
+async def find_conflicting_skill_mount(
+    client: AsyncAnthropic,
+    *,
+    tenant_id: uuid.UUID,
+    name: str,
+    agent_name: str | None,
+) -> SkillListResponse | None:
+    """Return a tenant skill whose MA mount name would collide with creating
+    ``name`` under the given shape (registry when ``agent_name`` is None,
+    agent-scoped otherwise), else None.
+
+    MA mounts by the skill's internal name at SESSION create, not at skill
+    create — so a registry skill and an agent-scoped skill sharing a terminal
+    name are both accepted on upload and only fail once attached to the same
+    agent. Call this before ``skills.create`` in write contexts; collision
+    rules live in :func:`~daimon.core.defaults.metadata.find_conflicting_skill_body`.
+
+    Truncation always raises SkillsListTruncatedError — this is a create-guard,
+    and a truncated view can hide the collider.
+    """
+    rows = await list_skills_strict(client)
+    bodies_by_title: dict[str, SkillListResponse] = {}
+    for sk in rows:
+        if sk.source != "custom":
+            continue
+        body = strip_tenant_prefix(tenant_id=tenant_id, display_title=sk.display_title or "")
+        if body is not None:
+            bodies_by_title[body] = sk
+    conflict = find_conflicting_skill_body(
+        existing_bodies=list(bodies_by_title), name=name, agent_name=agent_name
+    )
+    return bodies_by_title[conflict] if conflict is not None else None
+
+
+async def find_attach_mount_collision(
+    client: AsyncAnthropic,
+    *,
+    tenant_id: uuid.UUID,
+    skills: list[BetaManagedAgentsSkillParams],
+) -> str | None:
+    """Return a human-readable description of a mount-name collision in a
+    proposed agent skill list, else None.
+
+    Attach-side companion to :func:`find_conflicting_skill_mount`: the create
+    guards stop NEW colliding skills, but attaching an EXISTING registry skill
+    to an agent that owns a same-named agent-scoped skill would still brick
+    session creation. Call this on the merged list before ``agents.update``.
+
+    Truncation raises SkillsListTruncatedError — a truncated view can hide the
+    collider, and attaching blind bricks the agent.
+    """
+    rows = await list_skills_strict(client)
+    body_by_skill_id: dict[str, str] = {}
+    for sk in rows:
+        if sk.source != "custom":
+            continue
+        body = strip_tenant_prefix(tenant_id=tenant_id, display_title=sk.display_title or "")
+        if body is not None:
+            body_by_skill_id[sk.id] = body
+    skill_ids = [s["skill_id"] for s in skills]
+    collision = find_mount_collision(skill_ids=skill_ids, body_by_skill_id=body_by_skill_id)
+    if collision is None:
+        return None
+    mount_name, bodies = collision
+    return (
+        f"skills {bodies!r} would all mount at {mount_name!r} on this agent — "
+        f"rename one (e.g. {mount_name}-2) and re-sync before attaching"
+    )
 
 
 async def find_skill_by_display_title(
