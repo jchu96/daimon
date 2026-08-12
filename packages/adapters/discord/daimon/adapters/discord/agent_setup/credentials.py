@@ -337,7 +337,10 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
             return
         # key_name is the secret KEY NAME the option carried — never a value.
         _log.info("credentials.remove.click", key=key_name)
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # Bare defer() for the same reason as the paste path: a thinking ack
+        # would repoint `@original` at a fresh ephemeral message and the
+        # re-render below would never touch the panel.
+        await interaction.response.defer()
         try:
             async with self._runtime.sessionmaker() as session, session.begin():
                 await delete_agent_file(

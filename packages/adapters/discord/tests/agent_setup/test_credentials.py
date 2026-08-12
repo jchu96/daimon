@@ -850,6 +850,14 @@ async def test_remove_deletes_the_key_and_rerenders(
     # The re-render view must not leak the surviving value.
     rerender_kwargs = interaction.edit_original_response.call_args.kwargs
     assert _SECRET_VALUE not in str(rerender_kwargs), "no value in re-render call kwargs"
+    # Same ack mechanism as the paste path: a thinking defer would point
+    # `@original` at a fresh ephemeral message and the panel would never change.
+    assert interaction.response.defer.call_args.args == (), (
+        "the remove must ack with a bare defer() — no thinking, no ephemeral"
+    )
+    assert interaction.response.defer.call_args.kwargs == {}, (
+        "the remove must ack with a bare defer() — no thinking, no ephemeral"
+    )
 
 
 @pytest.mark.asyncio
