@@ -9,6 +9,7 @@ import discord
 import httpx
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.core.errors import DaimonError, SpecError, StoreError
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 TEST_RID = "01JTZXTEST000000000000000"
 
@@ -89,6 +90,21 @@ class TestRenderError:
         assert result.startswith("⚠️"), "should start with warning emoji"
         assert "**Invalid input**" in result, "should have bold label"
         assert "bad input" in result, "should include error detail"
+        assert TEST_RID in result, "should include request ID"
+
+    def test_database_error_omits_statement_and_parameters(self) -> None:
+        # str() on a DBAPIError embeds the failing statement and its bound
+        # parameters, so rendering it verbatim publishes both to the channel.
+        exc = DBAPIError(
+            "SELECT tenants.id FROM tenants WHERE tenants.id = $1::UUID",
+            {"id": "8014123e-f113-5516-a71e-3ba7401d3808"},
+            OperationalError("SELECT 1", None, Exception("connection was closed in the middle")),
+        )
+        result = render_error(exc, request_id=TEST_RID)
+        assert "SELECT" not in result, "must not leak the failing SQL statement"
+        assert "tenants" not in result, "must not leak table or column names"
+        assert "8014123e" not in result, "must not leak bound parameter values"
+        assert "DBAPIError" in result, "should name the exception class"
         assert TEST_RID in result, "should include request ID"
 
     def test_discord_http_exception(self) -> None:
