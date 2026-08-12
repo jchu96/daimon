@@ -1835,13 +1835,15 @@
       'description': '''
         Post a multi-step form in the channel instead of asking in prose.
         
-        Each entry in ``steps`` is single-choice, multi-select, or free-text.
-        A step may carry one finished image by passing the file-store handle
-        returned by the image-generation tool — never a URL, never a diagram
-        source. Server channels and threads are supported; direct messages
-        are not. A form that exceeds a platform ceiling (too many steps, too
-        many options, too large a label) raises an error naming the offending
-        step — split the form into a shorter follow-up and retry.
+        Each entry in ``steps`` carries ``question`` (the text shown to the
+        user), ``kind`` (``choice``, ``multi`` or ``text``), and ``options``
+        for the two choice kinds. A step may carry one finished image by
+        passing the file-store handle returned by the image-generation tool —
+        never a URL, never a diagram source. Server channels and threads are
+        supported; direct messages are not. A form that exceeds a platform
+        ceiling (too many steps, too many options, too long a question)
+        raises an error naming the offending step — split the form into a
+        shorter follow-up and retry.
         
         AFTER CALLING THIS TOOL YOU MUST END YOUR TURN IMMEDIATELY. Do not
         narrate the form, do not continue the conversation, and do not call
@@ -1886,12 +1888,12 @@
               Accepts the shape a model actually writes as well as the canonical one.
               Authored by an LLM at a tool boundary, and the canonical field names lose
               every coin-flip against the prior set by other form APIs: `type` for
-              `kind`, `title` for `question`, plain strings for `options`, and
+              `kind`, `title`/`label` for `question`, plain strings for `options`, and
               `single_choice`/`multi_select`/`free_text` for the enum's
               `choice`/`multi`/`text`. A real session sent exactly that, collected 28
-              validation errors, retried with the same shape, and abandoned the form
-              (#51). Rejecting it was defensible per-field and useless in aggregate, so
-              the aliases and coercions below absorb the difference instead.
+              validation errors, retried with the same shape, and abandoned the form.
+              Rejecting it was defensible per-field and useless in aggregate, so the
+              aliases and coercions below absorb the difference instead.
             ''',
             'properties': dict({
               'allow_custom': dict({

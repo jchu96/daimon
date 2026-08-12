@@ -23,6 +23,8 @@ from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.thread_sessions import (
     create_thread_session,
+    get_live_thread_session,
+    get_thread_session_by_id,
     list_orphaned_turns,
     mark_turn_active,
 )
@@ -142,3 +144,76 @@ async def test_sweep_runs_once_per_process_not_once_per_reconnect(
     assert [row.id for row in await list_orphaned_turns(db_session, platform="discord")] == [
         mapping_id
     ], "a reconnect must not reap the turns this process is still rendering"
+
+
+async def test_deadlocked_turn_is_marked_dead_so_the_next_mention_gets_a_fresh_session(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A turn that blows the wall-clock deadline must retire its session mapping.
+
+    The MA session is wedged, not slow — it will never reach a terminal state.
+    If the mapping stays live, the next mention binds the same dead session and
+    hangs again, so the thread would come unstuck for exactly one message.
+    """
+    mapping_id = await _make_orphan(db_session, thread_id="900", message_id="901")
+    bot = _make_bot(db_session_factory)
+    message = MagicMock(spec=discord.Message)
+    message.edit = AsyncMock()
+
+    await bot._retire_deadlocked_turn(  # pyright: ignore[reportPrivateUsage]
+        mapping_id=mapping_id,
+        thread_id="900",
+        session_id="sesn_test",
+        message_ref=message,
+    )
+
+    row = await get_thread_session_by_id(db_session, id=mapping_id)
+    assert row is not None, "the row must be retained as an audit trail, not deleted"
+    assert row.status == "dead", (
+        f"a deadlocked turn's mapping must be marked dead; got status={row.status!r}"
+    )
+    assert row.account_id is not None, "the fixture seeds an account_id"
+    assert (
+        await get_live_thread_session(
+            db_session,
+            tenant_id=row.tenant_id,
+            platform="discord",
+            thread_id="900",
+            account_id=row.account_id,
+        )
+        is None
+    ), "a dead mapping must drop out of the live lookup so the next turn binds a new session"
+
+    edited = message.edit.await_args.kwargs["embed"]  # pyright: ignore[reportAny]
+    assert edited.color.value == theme.COLOR_RED, "an abandoned turn must render as an error"
+    assert "abandoned" in edited.description, (
+        "the user must be told the turn was abandoned, not left on a frozen spinner"
+    )
+
+
+async def test_deadlocked_turn_still_marks_dead_when_the_embed_edit_fails(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A deleted spinner or archived thread must not stop the mapping being retired.
+
+    The embed is cosmetic; retiring the mapping is what stops the next mention
+    binding the wedged session.
+    """
+    mapping_id = await _make_orphan(db_session, thread_id="910", message_id="911")
+    bot = _make_bot(db_session_factory)
+    message = MagicMock(spec=discord.Message)
+    message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "gone"))
+
+    await bot._retire_deadlocked_turn(  # pyright: ignore[reportPrivateUsage]
+        mapping_id=mapping_id,
+        thread_id="910",
+        session_id="sesn_test",
+        message_ref=message,
+    )
+
+    row = await get_thread_session_by_id(db_session, id=mapping_id)
+    assert row is not None and row.status == "dead", (
+        "an unreachable embed must not prevent the mapping being retired"
+    )

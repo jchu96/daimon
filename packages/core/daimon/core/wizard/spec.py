@@ -111,13 +111,17 @@ class Step(BaseModel):
     validation errors, retried with the same shape, and abandoned the form.
     Rejecting it was defensible per-field and useless in aggregate, so the
     aliases and coercions below absorb the difference instead.
-
-    `label` joined that list after a later session lost only the `question`
-    coin-flip -- `type` and `single_choice` were both absorbed -- and had all
-    four of its steps rejected. `label` is the predictable miss: `Option.label`
-    is this schema's own word for user-facing text, so it is the name a model
-    reaches for when writing a step's text.
     """
+
+    # This docstring is rendered into the post_wizard tool schema, so it ships
+    # to the model on every request that carries the tool -- keep provenance in
+    # comments like this one rather than adding it above.
+    #
+    # `label` joined the alias set after a later session lost only the
+    # `question` coin-flip (`type` and `single_choice` were both absorbed) and
+    # had all four of its steps rejected. It is the predictable miss:
+    # `Option.label` is this schema's own word for user-facing text, so it is
+    # the name a model reaches for when writing a step's text.
 
     model_config = ConfigDict(frozen=True, populate_by_name=True)
 
