@@ -119,13 +119,15 @@ def register_wizard_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     ) -> str:
         """Post a multi-step form in the channel instead of asking in prose.
 
-        Each entry in ``steps`` is single-choice, multi-select, or free-text.
-        A step may carry one finished image by passing the file-store handle
-        returned by the image-generation tool — never a URL, never a diagram
-        source. Server channels and threads are supported; direct messages
-        are not. A form that exceeds a platform ceiling (too many steps, too
-        many options, too large a label) raises an error naming the offending
-        step — split the form into a shorter follow-up and retry.
+        Each entry in ``steps`` carries ``question`` (the text shown to the
+        user), ``kind`` (``choice``, ``multi`` or ``text``), and ``options``
+        for the two choice kinds. A step may carry one finished image by
+        passing the file-store handle returned by the image-generation tool —
+        never a URL, never a diagram source. Server channels and threads are
+        supported; direct messages are not. A form that exceeds a platform
+        ceiling (too many steps, too many options, too long a question)
+        raises an error naming the offending step — split the form into a
+        shorter follow-up and retry.
 
         AFTER CALLING THIS TOOL YOU MUST END YOUR TURN IMMEDIATELY. Do not
         narrate the form, do not continue the conversation, and do not call

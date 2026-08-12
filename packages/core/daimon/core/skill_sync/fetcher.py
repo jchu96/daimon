@@ -39,10 +39,6 @@ class TarballTooLarge(Exception):
     Open Question 3)."""
 
 
-class RepoCollisionError(Exception):
-    """Two repos in the same agent produced the same sanitized skill name."""
-
-
 class GitHubTarballFetcher:
     """Fetch a GitHub repo tarball authenticated with an optional bearer credential.
 

@@ -51,6 +51,7 @@ from daimon.core.stores.tenants import (
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
     list_orphaned_turns,
+    mark_dead,
     mark_turn_active,
     update_watermark,
 )
@@ -58,7 +59,7 @@ from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, 
 from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
-from daimon.core.turn.run import run_prepared_turn
+from daimon.core.turn.run import RunOutcome, run_prepared_turn
 from sqlalchemy.exc import SQLAlchemyError  # noqa: TCH002
 
 import discord
@@ -76,6 +77,27 @@ _DRAIN_GRACE_S: float = 60.0
 
 # Bounded concurrency for the on_ready re-seed sweep.
 _SWEEP_CONCURRENCY = 4
+
+# Wall-clock ceiling on a single turn. Not a latency target -- legitimate
+# agentic turns run many minutes (notebooks, model fits), so this is set well
+# above the longest real turn and exists only to bound the pathological case.
+#
+# Without it a turn can hang forever: an MA session that never leaves `running`
+# (e.g. a tool call whose result never comes back) leaves the await unresolved,
+# so the clear_active_turn below it is never reached and the thread's
+# active_turn marker is held for good. _retire_orphaned_turns cannot help --
+# it runs once per process at on_ready and deliberately has no age filter,
+# because it assumes "a turn cannot outlive the process rendering it". A hung
+# await outlives the process just fine, which is how a thread ends up
+# permanently unable to accept a mention until the next deploy.
+#
+# ponytail: a flat wall-clock deadline, not a liveness deadline. A turn
+# streaming events is alive no matter how long it runs, and one silent for ten
+# minutes is wedged regardless of total duration -- keying on time-since-last-
+# event would cut the dead case loose sooner and never touch a live one. That
+# needs the render loop to expose a last-event timestamp; upgrade to it if this
+# ceiling ever fires on a real turn.
+_TURN_DEADLINE_S: float = 45.0 * 60.0
 
 
 def _resolve_bot_display_name(settings: Settings) -> str:
@@ -564,6 +586,54 @@ class DaimonBot(commands.Bot):
             async with self.runtime.sessionmaker() as session:
                 await clear_active_turn(session, id=row.id)
                 await session.commit()
+
+    async def _retire_deadlocked_turn(
+        self,
+        *,
+        mapping_id: uuid.UUID | None,
+        thread_id: str,
+        session_id: str | None,
+        message_ref: Any | None,
+    ) -> None:
+        """Lay to rest a turn that blew `_TURN_DEADLINE_S`.
+
+        The session is wedged, not merely slow: it will never reach a terminal
+        state, so the mapping is marked dead. Without that the next mention
+        binds the same dead MA session and hangs again — the thread would come
+        unstuck for exactly one message.
+
+        Clearing the active_turn marker is deliberately NOT done here; the
+        caller's `finally` owns it, so it also runs for failures that are not
+        deadline-related.
+        """
+        log.error(
+            "turn.deadline_exceeded",
+            thread_id=thread_id,
+            session_id=session_id,
+            deadline_s=_TURN_DEADLINE_S,
+        )
+        if mapping_id is not None:
+            async with self.runtime.sessionmaker() as session:
+                await mark_dead(session, id=mapping_id)
+                await session.commit()
+        if message_ref is None:
+            return
+        try:
+            await message_ref.edit(
+                embed=discord.Embed(
+                    color=theme.COLOR_RED,
+                    description=(
+                        "❌ This turn stopped responding and was abandoned. Nothing was "
+                        "lost on your side — mention me again to start fresh."
+                    ),
+                ),
+                view=None,
+            )
+        except (discord.HTTPException, discord.ClientException) as err:
+            # The spinner may be deleted or the thread archived. The marker is
+            # cleared by the caller either way, which is what actually unsticks
+            # the thread; a stale embed is cosmetic by comparison.
+            log.warning("turn.deadline_embed_failed", thread_id=thread_id, error=str(err))
 
     async def on_ready(self) -> None:
         """Forward-only reconcile sweep: provision-if-missing, re-seed pending/failed,
@@ -1373,35 +1443,56 @@ class DaimonBot(commands.Bot):
             thread_id=thread.id,
             session_id=prepared.ma_session_id,
         )
-        outcome = await run_prepared_turn(
-            self.runtime.turn_deps,
-            prepared,
-            tenant_id=tenant_id,
-            platform="discord",
-            thread_id=str(thread.id),
-            external_user_id=str(message.author.id),
-            user_message=user_message,
-            lifecycle=lifecycle,
-            cancel=cancel,
-            reseed_user_message=_reseed_user_message,
-            recovery_lifecycle=_recovery_lifecycle,
-            image_blocks=image_blocks,
-            render_interval_s=2.0,
-        )
+        outcome: RunOutcome | None = None
+        try:
+            outcome = await asyncio.wait_for(
+                run_prepared_turn(
+                    self.runtime.turn_deps,
+                    prepared,
+                    tenant_id=tenant_id,
+                    platform="discord",
+                    thread_id=str(thread.id),
+                    external_user_id=str(message.author.id),
+                    user_message=user_message,
+                    lifecycle=lifecycle,
+                    cancel=cancel,
+                    reseed_user_message=_reseed_user_message,
+                    recovery_lifecycle=_recovery_lifecycle,
+                    image_blocks=image_blocks,
+                    render_interval_s=2.0,
+                ),
+                timeout=_TURN_DEADLINE_S,
+            )
+        except TimeoutError:
+            await self._retire_deadlocked_turn(
+                mapping_id=prepared.mapping_id,
+                thread_id=str(thread.id),
+                session_id=prepared.ma_session_id,
+                message_ref=lifecycle.message_ref,
+            )
+            return
+        finally:
+            # Runs on the deadline and on any exception, not just the happy
+            # path: whatever else went wrong, the thread must not be left
+            # holding its active_turn marker. Both ids are cleared -- recovery
+            # moves the turn to a new mapping row and leaves the marker behind
+            # on the old one, which is still pointing at this same message.
+            _done_ids = {prepared.mapping_id}
+            if outcome is not None:
+                _done_ids.add(outcome.mapping_id)
+            for _done_id in _done_ids - {None}:
+                if _done_id is None:  # pragma: no cover - set difference guarantees this
+                    continue
+                async with self.runtime.sessionmaker() as _ct_session:
+                    await clear_active_turn(_ct_session, id=_done_id)
+                    await _ct_session.commit()
+
+        if outcome is None:  # pragma: no cover - the deadline branch above returns
+            return
+
         state = outcome.state
         mapping_id = outcome.mapping_id
         final_lifecycle = lifecycle_holder[0]
-
-        # The turn reached a terminal state under this process, so its embed is
-        # settled and must not be reaped by a later boot. Both ids are cleared:
-        # recovery moves the turn to a new mapping row and leaves the marker
-        # behind on the old one, which is still pointing at this same message.
-        for _done_id in {prepared.mapping_id, mapping_id} - {None}:
-            if _done_id is None:  # pragma: no cover - set comprehension guarantees this
-                continue
-            async with self.runtime.sessionmaker() as _ct_session:
-                await clear_active_turn(_ct_session, id=_done_id)
-                await _ct_session.commit()
 
         if state.error is not None:
             log.warning(
