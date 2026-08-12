@@ -14,7 +14,6 @@ from daimon.core.skill_sync.fetcher import (
     GitHubTarballFetcher,
     GitHubUnreachable,
     PATMissingError,
-    RepoCollisionError,
 )
 from daimon.core.skill_sync.orchestrator import (
     SyncRepoFailure,
@@ -30,7 +29,6 @@ __all__ = [
     "GitHubUnreachable",
     "PATMissingError",
     "RemoveReport",
-    "RepoCollisionError",
     "SyncReport",
     "SyncRepoFailure",
     "remove_agent_skill_repo",

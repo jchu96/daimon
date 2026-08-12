@@ -3475,3 +3475,117 @@ async def test_attach_refuses_union_when_legacy_registry_skill_shares_mount_name
     assert "mount" in reason and "my-skill" in reason, (
         f"reason must describe the mount collision; got {reason!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-repo duplicate skill name must not abort the whole sync
+# ---------------------------------------------------------------------------
+
+
+async def test_sync_duplicate_name_across_repos_still_uploads_every_other_skill(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skill name shared by two repos must skip that one entry, not kill the sync.
+
+    Two repos each carry a skill named 'shared' plus one unique skill. Every other
+    failure in the repo-accumulation loop is isolated (skipped_repos / failed_uploads),
+    so a duplicate name must be too: the first repo's 'shared' wins, the second repo's
+    is reported, and 'only-a' / 'only-b' still upload.
+    """
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    fernet = _make_fernet()
+    await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
+
+    url_a = "https://github.com/orgA/skills"
+    url_b = "https://github.com/orgB/skills"
+
+    tarball_a = _make_tarball(
+        {
+            "skills-main/shared/SKILL.md": b"---\nname: shared\ndescription: from orgA\n---\nbody",
+            "skills-main/only-a/SKILL.md": b"---\nname: only-a\ndescription: only in A\n---\nbody",
+        }
+    )
+    tarball_b = _make_tarball(
+        {
+            "skills-main/shared/SKILL.md": b"---\nname: shared\ndescription: from orgB\n---\nbody",
+            "skills-main/only-b/SKILL.md": b"---\nname: only-b\ndescription: only in B\n---\nbody",
+        }
+    )
+
+    def tarball_router(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "orgA" in path:
+            return httpx.Response(200, content=tarball_a)
+        if "orgB" in path:
+            return httpx.Response(200, content=tarball_b)
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(tarball_router))
+
+    created_titles: list[str] = []
+
+    def on_create(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        raw = req.content.decode("latin-1")
+        marker = 'name="display_title"\r\n\r\n'
+        start = raw.index(marker) + len(marker)
+        title = raw[start : raw.index("\r\n", start)]
+        created_titles.append(title)
+        return httpx.Response(
+            200,
+            json=SkillListResponse(
+                id=f"sk_{len(created_titles)}",
+                type="custom",
+                display_title=title,
+                latest_version="1",
+                created_at="2026-04-21T00:00:00Z",
+                updated_at="2026-04-21T00:00:00Z",
+                source="custom",
+            ).model_dump(mode="json"),
+        )
+
+    router = MARouter()
+    router.add("GET", r"/v1/skills", lambda req, _m: list_response([]))
+    router.add("POST", r"/v1/skills", on_create)
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = _build_anthropic(router)
+
+    monkeypatch.setattr(orch_mod, "_UPLOAD_CONCURRENCY", 1)
+
+    report = await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[
+            SkillRepo(url=url_a, branch="main", split=True),
+            SkillRepo(url=url_b, branch="main", split=True),
+        ],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+    )
+
+    async with db_session_factory() as s, s.begin():
+        rows = await list_user_skills_for_agent(
+            s, tenant_id=cli.tenant_id, principal_id=cli.id, agent_name="agent"
+        )
+    names = {r.name for r in rows}
+
+    assert names == {"shared", "only-a", "only-b"}, (
+        "a duplicate name in one repo must not discard the other skills; "
+        f"got {sorted(names)} (report.failed_uploads={report.failed_uploads})"
+    )
+
+    shared_row = next(r for r in rows if r.name == "shared")
+    assert shared_row.source_repo_url == url_a, (
+        f"first repo in the list must win the shared name; got {shared_row.source_repo_url}"
+    )
+
+    dupes = [(n, r) for n, r in report.failed_uploads if n == "shared"]
+    assert len(dupes) == 1, (
+        f"the losing duplicate must be reported once; got {report.failed_uploads}"
+    )
+    assert url_b in dupes[0][1], f"reason must name the losing repo; got {dupes[0][1]!r}"

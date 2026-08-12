@@ -75,7 +75,6 @@ from daimon.core.skill_sync.fetcher import (
     GitHubAuthError,
     GitHubTarballFetcher,
     GitHubUnreachable,
-    RepoCollisionError,
     TarballTooLarge,
 )
 from daimon.core.skill_zip import canonical_zip_bytes
@@ -620,10 +619,22 @@ async def sync_agent_skills(
                     report.failed_uploads.append((entry.name, entry.skip_reason))
                     continue
                 if entry.name in pending:
-                    raise RepoCollisionError(
-                        f"skill name {entry.name!r} appears in "
-                        f"{pending[entry.name].repo_url} and {repo.url}"
+                    # First repo in the list wins; the loser is reported like any
+                    # other per-skill failure. Aborting here would discard every
+                    # already-bundled skill from every repo, including this one's
+                    # non-colliding siblings.
+                    reason = (
+                        f"skill name {entry.name!r} already provided by "
+                        f"{pending[entry.name].repo_url}; skipped this copy from {repo.url}"
                     )
+                    _log.warning(
+                        "skill_sync.duplicate_name_across_repos",
+                        name=entry.name,
+                        kept_repo=pending[entry.name].repo_url,
+                        skipped_repo=repo.url,
+                    )
+                    report.failed_uploads.append((entry.name, reason))
+                    continue
                 pending[entry.name] = _PendingSkill(
                     name=entry.name,
                     repo_url=repo.url,
