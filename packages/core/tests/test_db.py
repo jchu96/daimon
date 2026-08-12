@@ -22,6 +22,43 @@ async def test_build_engine_returns_live_async_engine_when_pointed_at_test_db() 
 
 
 @pytest.mark.asyncio
+async def test_build_engine_replaces_pooled_connection_when_killed_while_idle() -> None:
+    """A connection reaped while it sits in the pool must not fail the next query.
+
+    Long-lived adapters hold one engine for the process lifetime, so a quiet
+    thread leaves a pooled connection idle long enough for the network path to
+    drop it without a FIN. Without pool_pre_ping the pool hands that dead socket
+    straight back and the caller sees ConnectionDoesNotExistError.
+    """
+    url = os.environ["DAIMON_DATABASE__TEST_URL"]
+    engine = build_engine(url)
+    factory = build_session_factory(engine)
+    try:
+        async with factory() as session:
+            first_pid = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+        # `terminate()` drops the transport without a clean shutdown, which is
+        # what the client is left holding after a network-side idle reap: a
+        # socket that is gone with no FIN to announce it. Killing the backend
+        # server-side instead would not reproduce this — Postgres would send a
+        # FATAL and asyncpg would abort the protocol, a different failure.
+        pooled = await engine.raw_connection()
+        driver = pooled.driver_connection
+        assert driver is not None, "pooled connection should expose its asyncpg connection"
+        driver.terminate()
+        pooled.close()
+
+        async with factory() as session:
+            second_pid = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+        assert second_pid != first_pid, (
+            "pool should have opened a replacement backend, not reused the dead one"
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_build_session_factory_produces_usable_sessions_when_called() -> None:
     url = os.environ["DAIMON_DATABASE__TEST_URL"]
     engine = build_engine(url)

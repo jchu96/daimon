@@ -19,8 +19,19 @@ def build_engine(url: str, *, echo: bool = False) -> AsyncEngine:
     """Build an `AsyncEngine` for the given DSN.
 
     The caller owns lifecycle and must `await engine.dispose()` on shutdown.
+
+    Adapters hold one engine for the whole process lifetime, so pooled
+    connections outlive any single turn and go idle for hours between them. A
+    managed Postgres reached over a private network path drops such connections
+    without a FIN, and the pool cannot tell: it hands the dead socket back and
+    the next query fails with `ConnectionDoesNotExistError`. `pool_pre_ping`
+    validates on checkout and transparently substitutes a fresh connection;
+    `pool_recycle` retires connections before they reach that idle window.
+
+    Pre-ping only covers checkout, so a connection that dies mid-statement
+    (a failover, say) still raises — that needs retry at the adapter boundary.
     """
-    return create_async_engine(url, echo=echo)
+    return create_async_engine(url, echo=echo, pool_pre_ping=True, pool_recycle=1800)
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
