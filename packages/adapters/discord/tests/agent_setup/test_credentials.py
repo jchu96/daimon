@@ -21,6 +21,7 @@ from daimon.adapters.discord.agent_setup.credentials import (
     CredentialsSubView,
     PasteSecretModal,
     build_credentials_container,
+    format_paste_result,
 )
 from daimon.adapters.discord.agent_setup.edit_view import EditView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
@@ -191,6 +192,46 @@ def test_container_no_none_copy_in_empty_state() -> None:
     ]
     for d in displays:
         assert "(none)" not in d, "empty state must not say (none)"
+
+
+# --- the post-paste result line (pure) -------------------------------------
+
+
+def test_format_paste_result_is_singular_for_one_key_and_plural_above_one() -> None:
+    assert format_paste_result(key_count=1) == "Saved ✓ — 1 env var set", (
+        "one key reads as a singular env var"
+    )
+    assert format_paste_result(key_count=3) == "Saved ✓ — 3 env vars set", (
+        "more than one key pluralises"
+    )
+
+
+def test_container_appends_the_result_line_after_the_chips() -> None:
+    container = build_credentials_container(
+        agent_name="bot",
+        secret_names=["A_KEY", "B_KEY"],
+        result_line=format_paste_result(key_count=2),
+    )
+    displays = [
+        child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
+    ]
+    chips_index = next(i for i, d in enumerate(displays) if "`A_KEY`" in d)
+    result_index = next(i for i, d in enumerate(displays) if d == "Saved ✓ — 2 env vars set")
+    assert result_index > chips_index, "the result line renders after the chips, not before them"
+
+
+def test_container_result_line_never_carries_a_value() -> None:
+    """The result line is built from a count, so no value can ride along."""
+    container = build_credentials_container(
+        agent_name="bot",
+        secret_names=["XERO_API_KEY"],
+        result_line=format_paste_result(key_count=1),
+    )
+    all_text = " ".join(
+        child.content for child in container.children if isinstance(child, discord.ui.TextDisplay)
+    )
+    assert _SECRET_VALUE not in all_text, "no secret value may appear in the collapsed container"
+    assert "XERO_API_KEY" in all_text, "the key name is what the collapsed container shows"
 
 
 # --- CredentialsSubView item construction ----------------------------------
@@ -377,7 +418,9 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
     toast = interaction.followup.send.call_args.args[0]
     assert "Added 2 env vars" in toast, "multi-key success copy"
     assert _SECRET_VALUE not in toast, "toast never echoes a value"
-    on_added.assert_awaited_once()  # re-render callback fired after a successful paste
+    # The re-render callback fires after a successful paste, carrying the COUNT
+    # the collapsed render needs — never a key name and never a value.
+    on_added.assert_awaited_once_with(interaction, key_count=2)
 
     for entry in cap.entries:
         assert _SECRET_VALUE not in repr(entry), "no log line may contain a secret value"
@@ -556,6 +599,211 @@ async def test_paste_modal_refusal_logs_no_key_names_or_values(
         assert "TOGGL_TOKEN" not in rendered, "a refused paste must not log a key name either"
 
 
+# --- paste → panel collapse (real DB, full wiring) -------------------------
+
+
+@pytest.mark.asyncio
+async def test_paste_success_collapses_the_add_control_on_the_panel(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """After a successful paste the panel stops asking for more input: the add
+    control is gone, a result line names the count, and the freshly pasted keys
+    are in the chips and the remove select. Remove and ← Back stay live."""
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+    agent_id = uuid.uuid4()
+
+    view = CredentialsSubView(
+        runtime=_runtime(db_session_factory),
+        state=_state(_entry("bot"), account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        secret_names=[],
+    )
+
+    # Two distinct interactions, as in production: the click that opens the
+    # modal, then the modal submit.
+    click_interaction = _interaction()
+    await view._on_add(click_interaction)  # pyright: ignore[reportPrivateUsage]
+    modal = click_interaction.response.send_modal.call_args.args[0]
+    modal.content_input._value = (  # pyright: ignore[reportPrivateUsage]
+        f"XERO_API_KEY={_SECRET_VALUE}\nTOGGL_TOKEN=second-value"
+    )
+
+    submit_interaction = _interaction()
+    await modal.on_submit(submit_interaction)
+
+    submit_interaction.edit_original_response.assert_awaited_once()
+    panel = submit_interaction.edit_original_response.call_args.kwargs["view"]
+    labels = [b.label for b in _walk_buttons(panel)]
+    assert "+ Add env vars" not in labels, "the add control is swapped out, not left live"
+    assert "← Back" in labels, "← Back stays live on the collapsed panel"
+    select = _remove_select(panel)
+    assert select.disabled is False, "the remove select stays live on the collapsed panel"
+    assert sorted(o.value for o in select.options) == ["TOGGL_TOKEN", "XERO_API_KEY"], (
+        "the reload puts the freshly pasted keys into the remove select"
+    )
+    text = _container_all_text(panel)
+    assert "Saved ✓ — 2 env vars set" in text, "the result line names the count"
+    assert "XERO_API_KEY" in text and "TOGGL_TOKEN" in text, "the chips list both pasted keys"
+
+
+@pytest.mark.asyncio
+async def test_paste_success_acks_as_a_message_update_so_the_panel_is_the_edit_target(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """Regression guard on the ack TYPE, which is the whole mechanism.
+
+    A `defer(ephemeral=True, thinking=True)` on a modal submit is a
+    deferred_channel_message, which repoints this interaction's `@original` at
+    a brand-new ephemeral message — so `edit_original_response` below would
+    render a duplicate panel into the ex-spinner and the real panel would never
+    change. A bare `defer()` is a deferred_message_update, whose `@original` is
+    the message the modal was opened from: the panel."""
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+
+    view = CredentialsSubView(
+        runtime=_runtime(db_session_factory),
+        state=_state(_entry("bot"), account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        secret_names=[],
+    )
+
+    click_interaction = _interaction()
+    await view._on_add(click_interaction)  # pyright: ignore[reportPrivateUsage]
+    modal = click_interaction.response.send_modal.call_args.args[0]
+    modal.content_input._value = f"XERO_API_KEY={_SECRET_VALUE}"  # pyright: ignore[reportPrivateUsage]
+
+    submit_interaction = _interaction()
+    await modal.on_submit(submit_interaction)
+
+    assert submit_interaction.response.defer.call_args.args == (), (
+        "the modal submit must ack with a bare defer() — no thinking, no ephemeral"
+    )
+    assert submit_interaction.response.defer.call_args.kwargs == {}, (
+        "the modal submit must ack with a bare defer() — no thinking, no ephemeral"
+    )
+    submit_interaction.followup.send.assert_awaited()  # the toast still works after a type-6 ack
+
+
+@pytest.mark.asyncio
+async def test_paste_failure_leaves_the_panel_uncollapsed(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """A rejected paste wrote nothing, so the panel must keep its add control."""
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+
+    view = CredentialsSubView(
+        runtime=_runtime(db_session_factory),
+        state=_state(_entry("bot"), account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        secret_names=[],
+    )
+
+    click_interaction = _interaction()
+    await view._on_add(click_interaction)  # pyright: ignore[reportPrivateUsage]
+    modal = click_interaction.response.send_modal.call_args.args[0]
+    modal.content_input._value = "123BAD=value\nGOOD_KEY=val"  # pyright: ignore[reportPrivateUsage]
+
+    submit_interaction = _interaction()
+    await modal.on_submit(submit_interaction)
+
+    submit_interaction.edit_original_response.assert_not_awaited()
+    assert "Secret name must match" in submit_interaction.followup.send.call_args.args[0], (
+        "the invalid-key toast is the only feedback on a failed paste"
+    )
+
+
+@pytest.mark.asyncio
+async def test_collapsed_panel_renders_key_names_never_values(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """The collapse path is the newest place a value could leak, so the
+    module's hygiene invariant is asserted directly on it: the key name shows,
+    the value does not — not in the container, not in the edit call."""
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+
+    view = CredentialsSubView(
+        runtime=_runtime(db_session_factory),
+        state=_state(_entry("bot"), account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        secret_names=[],
+    )
+
+    click_interaction = _interaction()
+    await view._on_add(click_interaction)  # pyright: ignore[reportPrivateUsage]
+    modal = click_interaction.response.send_modal.call_args.args[0]
+    modal.content_input._value = (  # pyright: ignore[reportPrivateUsage]
+        f"XERO_API_KEY={_SECRET_VALUE}\nTOGGL_TOKEN=second-value"
+    )
+
+    submit_interaction = _interaction()
+    await modal.on_submit(submit_interaction)
+
+    all_text = _container_all_text(view)
+    assert "XERO_API_KEY" in all_text, "the collapsed panel shows the key name"
+    assert _SECRET_VALUE not in all_text, "no secret value may appear in the collapsed panel"
+    assert _SECRET_VALUE not in str(submit_interaction.edit_original_response.call_args.kwargs), (
+        "no secret value may ride along in the panel edit call"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_after_a_paste_restores_the_add_control_and_drops_the_result_line(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    account_id: uuid.UUID,
+) -> None:
+    """The result line is a per-render argument, never instance state: the next
+    mutation on the same view instance must render the add control back and no
+    `Saved ✓`. Stored on the view, this test fails with a stale result line."""
+    tenant = await make_tenant(db_session, platform="discord", workspace_id="test-guild")
+
+    view = CredentialsSubView(
+        runtime=_runtime(db_session_factory),
+        state=_state(_entry("bot"), account_id),
+        allowed_user_id=42,
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        secret_names=[],
+    )
+
+    click_interaction = _interaction()
+    await view._on_add(click_interaction)  # pyright: ignore[reportPrivateUsage]
+    modal = click_interaction.response.send_modal.call_args.args[0]
+    modal.content_input._value = (  # pyright: ignore[reportPrivateUsage]
+        f"XERO_API_KEY={_SECRET_VALUE}\nTOGGL_TOKEN=second-value"
+    )
+    await modal.on_submit(_interaction())
+
+    remove_interaction = _interaction()
+    select = _remove_select(view)
+    select._values = ["XERO_API_KEY"]  # pyright: ignore[reportPrivateUsage]  # simulate a user pick
+    assert select.callback is not None
+    await select.callback(remove_interaction)
+
+    panel = remove_interaction.edit_original_response.call_args.kwargs["view"]
+    labels = [b.label for b in _walk_buttons(panel)]
+    assert "+ Add env vars" in labels, "a removal renders the add control back"
+    assert "Saved ✓" not in _container_all_text(panel), (
+        "the paste result line must not stick around into the next render"
+    )
+
+
 # --- ✕ remove (real DB) -----------------------------------------------------
 
 
@@ -602,6 +850,14 @@ async def test_remove_deletes_the_key_and_rerenders(
     # The re-render view must not leak the surviving value.
     rerender_kwargs = interaction.edit_original_response.call_args.kwargs
     assert _SECRET_VALUE not in str(rerender_kwargs), "no value in re-render call kwargs"
+    # Same ack mechanism as the paste path: a thinking defer would point
+    # `@original` at a fresh ephemeral message and the panel would never change.
+    assert interaction.response.defer.call_args.args == (), (
+        "the remove must ack with a bare defer() — no thinking, no ephemeral"
+    )
+    assert interaction.response.defer.call_args.kwargs == {}, (
+        "the remove must ack with a bare defer() — no thinking, no ephemeral"
+    )
 
 
 @pytest.mark.asyncio
