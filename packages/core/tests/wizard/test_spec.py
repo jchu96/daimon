@@ -243,3 +243,33 @@ def test_choice_step_exceeding_component_ceiling_rejected() -> None:
             steps=[Step(key="k", question="q", kind=StepKind.CHOICE, options=options)],
         )
     assert "k" in str(exc_info.value), "the offending step's key must appear in the message"
+
+
+def test_step_accepts_label_as_the_question_field() -> None:
+    """`label` must alias `question`, like `title` already does.
+
+    A production session sent every step keyed on `label` with `type` +
+    `single_choice`/`free_text`/`multi_select`. The kind aliases absorbed their
+    half; `question` did not, so all four steps were rejected and the form was
+    abandoned. `label` is the predictable miss because `Option.label` is this
+    schema's own word for user-facing text.
+    """
+    step = Step.model_validate(
+        {
+            "type": "single_choice",
+            "label": "Which format do you want?",
+            "options": ["pdf", "docx"],
+        }
+    )
+    assert step.question == "Which format do you want?", (
+        "`label` must populate `question`; it is a documented alias"
+    )
+    assert step.kind is StepKind.CHOICE, "`type`/`single_choice` aliases must still apply"
+
+
+def test_step_prefers_question_over_label_when_both_are_present() -> None:
+    """AliasChoices resolves left-to-right: canonical `question` wins."""
+    step = Step.model_validate({"kind": "text", "question": "canonical", "label": "aliased"})
+    assert step.question == "canonical", (
+        "the canonical field name must win over an alias when both are supplied"
+    )

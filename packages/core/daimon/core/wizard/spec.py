@@ -105,12 +105,18 @@ class Step(BaseModel):
     Accepts the shape a model actually writes as well as the canonical one.
     Authored by an LLM at a tool boundary, and the canonical field names lose
     every coin-flip against the prior set by other form APIs: `type` for
-    `kind`, `title` for `question`, plain strings for `options`, and
+    `kind`, `title`/`label` for `question`, plain strings for `options`, and
     `single_choice`/`multi_select`/`free_text` for the enum's
     `choice`/`multi`/`text`. A real session sent exactly that, collected 28
-    validation errors, retried with the same shape, and abandoned the form
-    (#51). Rejecting it was defensible per-field and useless in aggregate, so
-    the aliases and coercions below absorb the difference instead.
+    validation errors, retried with the same shape, and abandoned the form.
+    Rejecting it was defensible per-field and useless in aggregate, so the
+    aliases and coercions below absorb the difference instead.
+
+    `label` joined that list after a later session lost only the `question`
+    coin-flip -- `type` and `single_choice` were both absorbed -- and had all
+    four of its steps rejected. `label` is the predictable miss: `Option.label`
+    is this schema's own word for user-facing text, so it is the name a model
+    reaches for when writing a step's text.
     """
 
     model_config = ConfigDict(frozen=True, populate_by_name=True)
@@ -123,7 +129,7 @@ class Step(BaseModel):
         ),
     )
     question: str = Field(
-        validation_alias=AliasChoices("question", "title"),
+        validation_alias=AliasChoices("question", "title", "label"),
         description="The question text shown to the user on this step.",
     )
     kind: StepKind = Field(
