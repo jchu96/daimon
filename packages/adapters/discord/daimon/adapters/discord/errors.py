@@ -12,6 +12,7 @@ from daimon.core.errors import (
     SpecError,
     StoreError,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from ulid import ULID
 
 import discord
@@ -42,6 +43,13 @@ def render_error(exc: Exception, *, request_id: str) -> str:
         return f"❌ **API Error**: {exc.message}\n`rid: {request_id}`"
     if isinstance(exc, discord.HTTPException):
         return f"❌ **Discord Error ({exc.status})**: {exc.text}\n`rid: {request_id}`"
+    if isinstance(exc, SQLAlchemyError):
+        # Never `{exc}` here: DBAPIError stringifies to the failing statement
+        # plus its bound parameters, which would publish both to the channel.
+        # The rid is the handle for the real detail, which stays in the logs.
+        return (
+            f"❌ **Database error** ({type(exc).__name__}). Please try again.\n`rid: {request_id}`"
+        )
     if isinstance(exc, ValueError):
         return f"⚠️ **Invalid input**: {exc}\n`rid: {request_id}`"
     return f"❌ **Unexpected error**: {exc}\n`rid: {request_id}`"
