@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 import structlog
 from daimon.adapters.discord.agent_setup import authz
@@ -43,20 +44,38 @@ _SECRET_CAP = 20
 _MAX_SECRET_VALUE_BYTES = 4096
 _POSIX_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+
 # Re-render callback: invoked after a successful paste so the sub-view can
-# reload and re-render in place. Takes the modal's interaction.
-OnAdded = Callable[[discord.Interaction], Awaitable[None]]
+# reload and re-render in place. Takes the modal's interaction plus the number
+# of keys written — the count is all the collapsed render needs, and keeping it
+# a count means the modal never hands a key name or a value to the renderer.
+class OnAdded(Protocol):
+    async def __call__(self, interaction: discord.Interaction, *, key_count: int) -> None: ...
+
+
+def format_paste_result(*, key_count: int) -> str:
+    """Pure: the line that replaces the add control after a successful paste.
+
+    Takes a COUNT — never a key name, never a value. The key names surface is
+    the chips line, which the post-paste reload refreshes.
+    """
+    noun = "env var" if key_count == 1 else "env vars"
+    return f"Saved ✓ — {key_count} {noun} set"
 
 
 def build_credentials_container(
     *,
     agent_name: str,
     secret_names: list[str],
+    result_line: str | None = None,
 ) -> discord.ui.Container[discord.ui.LayoutView]:
     """Pure: render the Credentials container from key NAMES only.
 
     Never receives or renders a secret value — every value is omitted entirely
     Key names render as `KEY` chips on a single line separated by · .
+
+    `result_line` is the optional post-paste acknowledgement; it carries a
+    count only (see `format_paste_result`), so it cannot carry a value either.
 
     Env variables are per-agent daimon state (agent_files, keyed by
     tenant/agent/key) and are never part of the agent spec, so provenance
@@ -80,6 +99,9 @@ def build_credentials_container(
     else:
         # Design-language collapse: dim hint instead of "(none)" copy.
         container.add_item(discord.ui.TextDisplay("-# ＋ add your first env var"))
+
+    if result_line is not None:
+        container.add_item(discord.ui.TextDisplay(result_line))
 
     return container
 
@@ -130,7 +152,15 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
             interaction, runtime=self._runtime, entry=self._entry
         ):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # A BARE defer() on purpose: for a modal_submit discord.py maps
+        # thinking=False to `deferred_message_update`, whose `@original` is the
+        # message this interaction came from — the panel, because `_on_add`
+        # opened the modal from a component click on it. With
+        # `thinking=True` the ack is a `deferred_channel_message` instead, which
+        # repoints `@original` at a brand-new ephemeral message, so the
+        # re-render below would patch that duplicate and the panel would never
+        # change. Ephemeral followups still work after this ack.
+        await interaction.response.defer()
         raw = str(self.content_input.value or "")
 
         pairs: list[tuple[str, str]] = []
@@ -191,7 +221,9 @@ class PasteSecretModal(discord.ui.Modal, title="Add env vars"):
         else:
             toast = f"Added {n} env vars. Takes effect on the next session."
         await interaction.followup.send(toast, ephemeral=True)
-        await self._on_added(interaction)
+        # Carries the count of keys actually WRITTEN — never a key name, never
+        # a value. It is all the collapsed render needs.
+        await self._on_added(interaction, key_count=len(pairs))
 
 
 class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
@@ -201,9 +233,10 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
     line, ✕ Remove a var… select, + Add env vars · ← Back button row.
 
     Carries key NAMES only (``secret_names``) — never values. Mutations
-    re-render this view in place via ``edit_original_response``; '← Back'
-    replaces the message with ``EditView`` (it does NOT delete it), preserving
-    the ephemeral isolation invariant.
+    re-render this view in place via ``edit_original_response``, and a
+    successful paste re-renders with the add control swapped for the result
+    line; '← Back' replaces the message with ``EditView`` (it does NOT delete
+    it), preserving the ephemeral isolation invariant.
     """
 
     def __init__(
@@ -228,12 +261,13 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
     def _agent_name(self) -> str:
         return self._state.selected.name if self._state.selected else "?"
 
-    def _build_items(self) -> None:
+    def _build_items(self, *, result_line: str | None = None) -> None:
         self.clear_items()
 
         container = build_credentials_container(
             agent_name=self._agent_name(),
             secret_names=self._secret_names,
+            result_line=result_line,
         )
 
         # ✕ Remove a var… select (cap 20, glyph in placeholder not emoji=).
@@ -244,16 +278,20 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
         select_row.add_item(remove_select)
         container.add_item(select_row)
 
-        # Button row: + Add env vars · ← Back.
+        # Button row: + Add env vars · ← Back. A result line means the paste
+        # just landed, so the add control is SWAPPED OUT for it — not greyed
+        # out. Remove and ← Back stay live: the panel is still a management
+        # surface, and re-adding is one '← Back' → 'Env vars' hop away.
         btn_row: discord.ui.ActionRow[CredentialsSubView] = discord.ui.ActionRow()
 
-        add_btn: discord.ui.Button[CredentialsSubView] = discord.ui.Button(
-            label="+ Add env vars",
-            style=discord.ButtonStyle.success,
-            disabled=len(self._secret_names) >= _SECRET_CAP,
-        )
-        add_btn.callback = self._on_add  # type: ignore[method-assign]
-        btn_row.add_item(add_btn)
+        if result_line is None:
+            add_btn: discord.ui.Button[CredentialsSubView] = discord.ui.Button(
+                label="+ Add env vars",
+                style=discord.ButtonStyle.success,
+                disabled=len(self._secret_names) >= _SECRET_CAP,
+            )
+            add_btn.callback = self._on_add  # type: ignore[method-assign]
+            btn_row.add_item(add_btn)
 
         back_btn: discord.ui.Button[CredentialsSubView] = discord.ui.Button(
             label="← Back",
@@ -346,13 +384,22 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    async def _reload_and_rerender(self, interaction: discord.Interaction) -> None:
+    async def _reload_and_rerender(
+        self, interaction: discord.Interaction, *, key_count: int | None = None
+    ) -> None:
+        # `key_count` is the OnAdded contract: a paste passes the number of keys
+        # it wrote and gets the collapsed render, everything else omits it and
+        # gets the normal one. It stays a per-render ARGUMENT and is never
+        # stored on the instance — a stored result line would survive into the
+        # next remove's re-render as a stale `Saved ✓`.
         async with self._runtime.sessionmaker() as session:
             rows = await list_agent_files(
                 session, tenant_id=self._tenant_id, agent_id=self._agent_id
             )
         self._secret_names = [row.key for row in rows]
-        self._build_items()
+        self._build_items(
+            result_line=None if key_count is None else format_paste_result(key_count=key_count)
+        )
         # This view is re-rendered IN PLACE (same instance across renders, not
         # reconstructed like the other four views), so the binding must be
         # refreshed here on every render — an interaction bound once at
