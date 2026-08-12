@@ -20,7 +20,7 @@ ALLOWED_MODEL_IDS: tuple[str, ...] = tuple(AGENT_MODEL_PRICING.keys())
 # modal and the Slack submit path, which is how three surfaces ended up a
 # generation behind `defaults/agents/daimon.yaml` while each looked correct in
 # isolation. Keep it equal to the model that file pins.
-DEFAULT_AGENT_MODEL: str = "claude-haiku-4-5"
+DEFAULT_AGENT_MODEL: str = "claude-sonnet-5"
 
 # The per-agent skill and MCP-server limits every surface enforces. The setup
 # panel (disabling its add controls) and the chat update path (refusing a
