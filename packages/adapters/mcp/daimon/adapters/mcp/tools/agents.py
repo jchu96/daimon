@@ -46,6 +46,7 @@ from daimon.core.defaults.mcp_merge import (
 )
 from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_ACCOUNT,
+    MA_METADATA_KEY_MANAGED,
     build_metadata,
     strip_tenant_prefix,
 )
@@ -244,15 +245,31 @@ def _union_tools(spec_tools: list[Tool], ma_agent: BetaManagedAgentsAgent) -> li
 
 
 def _reject_system_agent(agent: BetaManagedAgentsAgent) -> None:
-    """Reject system agents (no daimon_account stamp) from chat mutating tools.
+    """Reject defaults-owned agents from chat mutating tools.
 
     Unconditional — applies to admins too, with no bypass. A chat edit never
     stamps the seeded agent's spec hash, so the reconcile pipeline's hash
-    short-circuit would skip the drifted agent forever the next time defaults
-    are applied. Unstamped agents are the read-only seeded/system class — they
-    lack a daimon_account key — and must be forked before chat tools can edit
-    them.
+    short-circuit skips the drifted agent forever the next time defaults are
+    applied: the drift is permanent and `daimon defaults apply` cannot repair
+    it. Forking is the edit path.
+
+    Two markers, because either one on its own leaks:
+
+    - `daimon_managed="true"` is the reconciler's own provenance stamp and the
+      authoritative one. Keying on the absence of `daimon_account` alone did
+      NOT work: the guild seed path account-stamps seeded agents, so the
+      account key is present on them and this guard silently never fired. The
+      Discord panel hit the same trap and moved to this marker (#160); the MCP
+      tools did not follow until now. Panel forks stamp `managed=False` and
+      chat/CLI creates leave it unset, so both stay editable.
+    - a missing `daimon_account` still rejects, preserving cover for older
+      unstamped seeded agents that predate the account stamp.
     """
+    if agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true":
+        raise ToolError(
+            f"agent '{agent.name}' is managed by defaults; chat tools cannot modify it. "
+            "Use /agent-setup to fork it first, then edit the fork."
+        )
     owner = agent.metadata.get(MA_METADATA_KEY_ACCOUNT)
     if owner is None:
         raise ToolError(

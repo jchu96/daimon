@@ -2170,6 +2170,106 @@ async def test_update_agent_impl_rejects_system_agent_no_daimon_account() -> Non
         )
 
 
+async def test_update_agent_impl_rejects_seeded_agent_that_is_also_account_stamped() -> None:
+    """The real shape of a seeded agent: daimon_managed AND daimon_account both set.
+
+    The guild seed path account-stamps seeded agents, so keying the guard on a
+    missing `daimon_account` never fired for them — 14 of 16 seeded `daimon`
+    agents in production carried an account stamp, leaving update/attach/archive
+    open to any admin. A chat edit does not restamp the spec hash, so the
+    reconcile short-circuit then skips the drifted agent forever and `defaults
+    apply` cannot repair it. The Discord panel already keys on daimon_managed
+    (#160); this asserts the MCP tools do too.
+    """
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    _, client = _list_one(
+        {
+            "id": "ag_seeded",
+            "name": "daimon",
+            "metadata": {
+                "daimon_tenant": str(tenant_id),
+                "daimon_name": "daimon",
+                "daimon_managed": "true",
+                "daimon_account": str(account_id),
+                "daimon_spec_hash": "7639a077b2b89d74",
+            },
+        }
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    with pytest.raises(ToolError, match="managed by defaults"):
+        await _update_agent_impl(
+            _runtime(client),
+            auth,
+            name="daimon",
+            model=None,
+            description="hijack",
+            system=None,
+            tools=None,
+            mcp_servers=None,
+            skills=None,
+        )
+
+
+async def test_update_agent_impl_allows_a_panel_fork_of_a_seeded_agent() -> None:
+    """Panel forks stamp managed=False, so they must stay editable.
+
+    Guards the other side of the daimon_managed check: widening protection to
+    every managed agent must not sweep up the forks that Fork-then-edit exists
+    to produce.
+    """
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+
+    def on_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "ag_fork",
+                "type": "agent",
+                "name": "daimon-fork",
+                "version": 2,
+                "model": {"id": "claude-sonnet-5", "type": "model_config"},
+                "metadata": {
+                    "daimon_tenant": str(tenant_id),
+                    "daimon_name": "daimon-fork",
+                    "daimon_account": str(account_id),
+                },
+                "created_at": "2026-08-12T00:00:00Z",
+                "updated_at": "2026-08-12T00:00:00Z",
+            },
+        )
+
+    router, client = _list_one(
+        {
+            "id": "ag_fork",
+            "name": "daimon-fork",
+            "metadata": {
+                "daimon_tenant": str(tenant_id),
+                "daimon_name": "daimon-fork",
+                "daimon_account": str(account_id),
+            },
+        }
+    )
+    router.add("POST", r"/v1/agents/ag_fork", on_update)
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    info = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="daimon-fork",
+        model=None,
+        description="a fork is editable",
+        system=None,
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    assert info is not None, "an unmanaged fork must remain editable by chat tools"
+
+
 async def test_update_agent_impl_allows_any_stamped_agent_for_admin() -> None:
     """Admin must be able to mutate any stamped tenant agent regardless of which account owns it."""
     tenant_id = uuid.uuid4()
