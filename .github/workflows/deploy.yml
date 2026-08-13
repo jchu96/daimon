@@ -125,6 +125,20 @@ jobs:
               # at root docker config, where the boot startup script ran
               # `gcloud auth configure-docker`.
               export DOCKER_CONFIG=/root/.docker
+              # Ordering matters: refresh env -> refresh compose assets ->
+              # pull -> up -d. Recreating (up -d) is what makes a container
+              # read the new env_file; docker restart does NOT, which cost
+              # real time in the past. DAIMON_IMAGE must keep coming from the
+              # freshly computed tag exported above and must never be
+              # re-derived from VM metadata (stale metadata rolls the image
+              # back). The refresh script (from the companion infra repo, via
+              # the assets bucket) exits nonzero on a permission or transient
+              # Secret Manager failure, failing the deploy — intended: a
+              # config the pipeline cannot assemble must not read green.
+              sudo gcloud storage cp gs://${{ vars.GCP_AR_REPO }}-assets/daimon-refresh-env /usr/local/bin/daimon-refresh-env
+              sudo chmod 755 /usr/local/bin/daimon-refresh-env
+              sudo /usr/local/bin/daimon-refresh-env
+              sudo gcloud storage cp gs://${{ vars.GCP_AR_REPO }}-assets/compose.worker.yml /etc/daimon/compose.worker.yml
               cd /etc/daimon
               sudo -E docker compose -f compose.worker.yml pull
               sudo -E docker compose -f compose.worker.yml up -d --remove-orphans
@@ -147,6 +161,21 @@ jobs:
               # Same DOCKER_CONFIG redirect as the workers refresh: use root
               # docker config (has the Artifact Registry credential helper).
               export DOCKER_CONFIG=/root/.docker
+              # Ordering matters: refresh env -> refresh compose assets ->
+              # pull -> up -d. Recreating (up -d) is what makes a container
+              # read the new env_file; docker restart does NOT. NOTEBOOK_IMAGE
+              # must keep coming from the freshly computed tag exported above
+              # and must never be re-derived from VM metadata (stale metadata
+              # rolls the image back). The refresh script (from the companion
+              # infra repo, via the assets bucket) exits nonzero on a
+              # permission or transient Secret Manager failure, failing the
+              # deploy — intended: a config the pipeline cannot assemble must
+              # not read green.
+              sudo gcloud storage cp gs://${{ vars.GCP_AR_REPO }}-assets/daimon-refresh-env /usr/local/bin/daimon-refresh-env
+              sudo chmod 755 /usr/local/bin/daimon-refresh-env
+              sudo /usr/local/bin/daimon-refresh-env
+              sudo gcloud storage cp gs://${{ vars.GCP_AR_REPO }}-assets/compose.notebook.yml /etc/daimon/compose.notebook.yml
+              sudo gcloud storage cp gs://${{ vars.GCP_AR_REPO }}-assets/Caddyfile /etc/daimon/Caddyfile
               cd /etc/daimon
               sudo -E docker compose -f compose.notebook.yml pull
               sudo -E docker compose -f compose.notebook.yml up -d --remove-orphans
