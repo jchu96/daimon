@@ -317,7 +317,22 @@ def _interaction() -> MagicMock:
     interaction = MagicMock()
     interaction.response.defer = AsyncMock()
     interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
     return interaction
+
+
+def _consumed_button_labels(interaction: MagicMock) -> list[str]:
+    """Labels of the disabled buttons the modal edited onto the request message."""
+    labels: list[str] = []
+    for call in interaction.edit_original_response.call_args_list:
+        view = call.kwargs.get("view")
+        if view is None:
+            continue
+        for item in view.children:
+            if isinstance(item, discord.ui.Button):
+                labels.append(str(item.label))
+                assert item.disabled, "the confirmation button must be disabled"
+    return labels
 
 
 # --- EnvCredentialModal ------------------------------------------------------
@@ -343,6 +358,82 @@ async def test_env_modal_submit_consumes_token_and_writes_agent_file(
     toast = interaction.followup.send.call_args.args[0]
     assert "OPENAI_API_KEY" in toast, "confirmation names the key"
     assert _SECRET_VALUE not in toast, "confirmation never echoes the secret value"
+
+
+async def test_env_modal_successful_submit_disables_the_request_button(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    row = await _seed_env_request(db_session_factory, target="STRIPE_KEY")
+    runtime = _runtime(sessionmaker=db_session_factory)
+    modal = EnvCredentialModal(runtime=runtime, request_row=row)
+    modal.value_input._value = _SECRET_VALUE  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    interaction.response.defer.assert_awaited_once_with()
+    assert _consumed_button_labels(interaction) == ["✓ Received"], (
+        "a spent request must leave a disabled confirmation on the button's own message"
+    )
+
+
+async def test_env_modal_rejected_value_leaves_the_request_button_live(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    row = await _seed_env_request(db_session_factory, target="NEVER_SET")
+    runtime = _runtime(sessionmaker=db_session_factory)
+    modal = EnvCredentialModal(runtime=runtime, request_row=row)
+    modal.value_input._value = "   "  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    interaction.edit_original_response.assert_not_awaited()
+    assert _consumed_button_labels(interaction) == [], (
+        "nothing was consumed, so the button must stay clickable for a real value"
+    )
+
+
+async def test_env_modal_dead_request_does_not_touch_the_button(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    row = await _seed_env_request(db_session_factory, target="ONE_SHOT")
+    runtime = _runtime(sessionmaker=db_session_factory)
+
+    first = EnvCredentialModal(runtime=runtime, request_row=row)
+    first.value_input._value = "first-value"  # pyright: ignore[reportPrivateUsage]
+    await first.on_submit(_interaction())
+
+    second = EnvCredentialModal(runtime=runtime, request_row=row)
+    second.value_input._value = "second-value"  # pyright: ignore[reportPrivateUsage]
+    second_interaction = _interaction()
+    await second.on_submit(second_interaction)
+
+    # The resubmission consumed nothing, so it must not redraw the button.
+    second_interaction.edit_original_response.assert_not_awaited()
+
+
+async def test_env_modal_reports_success_even_when_the_button_edit_fails(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    row = await _seed_env_request(db_session_factory, target="EDIT_FAILS")
+    runtime = _runtime(sessionmaker=db_session_factory)
+    modal = EnvCredentialModal(runtime=runtime, request_row=row)
+    modal.value_input._value = _SECRET_VALUE  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    interaction.edit_original_response = AsyncMock(
+        side_effect=discord.HTTPException(MagicMock(), "message deleted")
+    )
+    await modal.on_submit(interaction)
+
+    rows = await list_agent_files(db_session, tenant_id=row.tenant_id, agent_id=row.agent_id)
+    assert len(rows) == 1, "the secret is written before the confirmation edit is attempted"
+    toast = interaction.followup.send.call_args.args[0]
+    assert "EDIT_FAILS" in toast, (
+        "a failed confirmation edit is a feedback downgrade, never a failed submission"
+    )
 
 
 async def test_env_modal_double_submit_writes_exactly_one_row(
@@ -690,6 +781,38 @@ async def test_mcp_modal_vault_write_failure_surfaces_only_exception_class_name(
     assert "secret=abc123" not in message, (
         "the stringified exception (which can carry the request envelope) must never reach the user"
     )
+
+
+async def test_mcp_modal_disables_the_button_even_when_the_write_below_it_fails(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The consume is what kills the button, not the vault write after it.
+
+    A downstream failure still leaves the request spent, so a button that
+    still looks live would only ever earn an "already used" refusal.
+    """
+
+    def _failing_vault(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("upstream reset by peer")
+
+    row = await _seed_mcp_request(db_session_factory)
+    runtime = _runtime(
+        sessionmaker=db_session_factory,
+        anthropic=build_stub_anthropic(_failing_vault),
+        public_url=HttpUrl("https://mcp.example.com/mcp"),
+        jwt_secret="x" * 32,
+    )
+    modal = McpCredentialModal(runtime=runtime, request_row=row)
+    modal.token_input._value = _MCP_TOKEN  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    assert _consumed_button_labels(interaction) == ["✓ Received"], (
+        "a consumed request disables its button regardless of the write's outcome"
+    )
+    message = interaction.followup.send.call_args.args[0]
+    assert "APIConnectionError" in message, "the failure is still reported in the reply"
 
 
 async def test_mcp_modal_never_logs_the_raw_token(

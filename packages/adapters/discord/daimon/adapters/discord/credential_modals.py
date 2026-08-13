@@ -31,6 +31,15 @@ only ever produce one write no matter how many times its modal is
 (re)submitted — the loser of a race, or any resubmission, gets `None` back
 and writes nothing.
 
+Every `on_submit` acks with a bare `defer()`, never `thinking=True`. On a
+modal opened from a component click that is a `deferred_message_update`,
+whose `@original` is the message the button lives on — which is what lets
+`_mark_button_consumed` disable the button in place once the row is spent.
+`thinking=True` would point `@original` at a fresh ephemeral instead and the
+edit would land there, the defect `agent_setup/credentials.py` already fixed
+on the setup panel. Ephemeral followups still work after this ack, so every
+validation, error and success toast below is unchanged.
+
 `RepoBindModal`'s write is additionally admin-gated on a shared agent: token
 consumption alone is sufficient authorization for an env secret or an MCP
 token (the requester supplies a value only they hold, scoped to one key on
@@ -84,6 +93,41 @@ _log = structlog.get_logger()
 
 _NO_LONGER_VALID = "This request is no longer valid — ask again."
 
+_CONSUMED_BUTTON_LABEL = "✓ Received"
+"""Replaces the request's own label once the row is consumed. Deliberately
+kind-agnostic and about the SUBMISSION rather than the write: this runs the
+moment the consume commits, before the vault/binding/import below it is known
+to have worked, and one of those failing still leaves the button dead."""
+
+
+async def _mark_button_consumed(interaction: discord.Interaction, *, kind: str) -> None:
+    """Swap the request's button for a disabled confirmation, in place.
+
+    The bare `defer()` every `on_submit` opens with makes this interaction's
+    `@original` the message the button lives on (`deferred_message_update`),
+    so this edit lands on the button itself rather than on a fresh ephemeral —
+    the same ack shape `agent_setup/credentials.py` uses to land its paste
+    re-render on the panel.
+
+    Called once the row is durably consumed. From that point the button can
+    only ever be refused by `interaction_check`, so leaving it looking live
+    invites a click that cannot succeed, and leaves a thread with no durable
+    record that the credential was ever supplied — the ephemeral reply is
+    gone on refresh and was never visible to anyone else.
+    """
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button[discord.ui.View](label=_CONSUMED_BUTTON_LABEL, disabled=True))
+    try:
+        await interaction.edit_original_response(view=view)
+    except discord.HTTPException as err:
+        # The consume already committed. A confirmation edit that fails
+        # (message deleted, thread archived, permissions lost) must not read
+        # as a failed submission — the ephemeral reply still carries the
+        # outcome, so this is a downgrade in feedback, not in correctness.
+        _log.warning(
+            "credential_modal.consumed_edit_failed", kind=kind, err_type=type(err).__name__
+        )
+
 
 class EnvCredentialModal(discord.ui.Modal, title="Add secret"):
     """Add secrets modal: one value, atomic consume, existing agent_files write."""
@@ -102,7 +146,7 @@ class EnvCredentialModal(discord.ui.Modal, title="Add secret"):
         self.add_item(self.value_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         raw_value = str(self.value_input.value or "")
 
         if not raw_value.strip():
@@ -142,6 +186,10 @@ class EnvCredentialModal(discord.ui.Modal, title="Add secret"):
 
         # Log the key NAME only — never the value.
         _log.info("credential_modal.env.submit", key=consumed_row.target)
+        # After the transaction, not inside it: the consume and the file write
+        # commit together here, so this is the first point the row is durably
+        # spent, and it keeps a Discord round trip out of an open transaction.
+        await _mark_button_consumed(interaction, kind="env")
         await interaction.followup.send(
             f"Added `{consumed_row.target}`. Takes effect on the next session — "
             "anyone who talks to this agent can use it.",
@@ -165,7 +213,7 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP credential"):
         self.add_item(self.token_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         token_value = str(self.token_input.value or "")
 
         if not token_value.strip():
@@ -192,6 +240,8 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP credential"):
         if consumed_row is None:
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
+
+        await _mark_button_consumed(interaction, kind="mcp")
 
         mcp_server_url = consumed_row.mcp_server_url
         if mcp_server_url is None:
@@ -333,7 +383,7 @@ class SkillRepoModal(discord.ui.Modal, title="Import skills"):
         self.add_item(self.pat_in)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
 
         pat = str(self.pat_in.value or "").strip()
         if not pat:
@@ -348,6 +398,8 @@ class SkillRepoModal(discord.ui.Modal, title="Import skills"):
         if consumed_row is None:
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
+
+        await _mark_button_consumed(interaction, kind="skill_repo")
 
         url, branch, path = split_skill_repo_target(consumed_row.target)
         # The token appears only as a masked tail, never in full, and never
@@ -543,7 +595,7 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
         self.add_item(self.pat_in)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
 
         if await refuse_if_shared_and_not_admin_for_request(
             interaction,
@@ -564,6 +616,8 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
         if consumed_row is None:
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
+
+        await _mark_button_consumed(interaction, kind="repo")
 
         # Log the repo and branch, and the token ONLY as a masked tail when
         # present — never the plain value, never the (now-consumed) request
