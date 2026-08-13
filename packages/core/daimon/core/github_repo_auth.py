@@ -298,6 +298,30 @@ async def resolve_clone_token(
     if mode == "public":
         assert fallback_pat  # narrows: has_fallback_pat implies this is truthy
         return fallback_pat
+
+    app_configured = app_id is not None and app_private_key is not None
+    # The operator branch is checked first because the public+no-fallback case
+    # is the one failure the user cannot fix: the binding is correct, the
+    # deployment just has no public-clone credential configured.
+    if binding.proof_kind == "public" and not has_fallback_pat:
+        log.error(
+            "github_repo_auth.operator_credential_missing",
+            repo_url=binding.repo_url,
+            proof_kind=binding.proof_kind,
+            app_configured=app_configured,
+        )
+        raise DaimonError(
+            f"This deployment has no credential configured for cloning public "
+            f"repositories, so {binding.repo_url} cannot be cloned. The repo binding "
+            "itself is correct — an operator must configure the deployment's GitHub "
+            "credentials."
+        )
+    if binding.proof_kind is not None and not app_configured:
+        log.error(
+            "github_repo_auth.app_not_configured",
+            repo_url=binding.repo_url,
+            proof_kind=binding.proof_kind,
+        )
     raise DaimonError(
         f"No credential is authorized to clone {binding.repo_url}. Re-bind this repo "
         "with a GitHub token that can read it, from the agent setup panel's GitHub option."
