@@ -13,10 +13,12 @@ an external API.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import uuid
 
 import httpx
 import pytest
+import structlog.testing
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.errors import DaimonError
@@ -407,6 +409,120 @@ async def test_resolve_clone_token_pat_kind_proof_never_unlocks_the_fallback_tie
             app_private_key=None,
             now=1_000_000,
         )
+
+
+# ---------------------------------------------------------------------------
+# Operator-config failures vs user re-bind failures (split failure copy)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_clone_token_public_proof_no_fallback_names_operator_gap() -> None:
+    """A correctly-bound public repo (verified-public proof) failing only
+    because the deployment has no public-clone credential (no fallback PAT,
+    App not configured) is an OPERATOR config gap. The message must name the
+    deployment/operator credential gap and must NOT tell the user to re-bind
+    a binding that is already correct."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"App is not configured; no request expected: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:", proof_kind="public")
+
+    with pytest.raises(DaimonError) as exc_info:
+        await resolve_clone_token(
+            client,
+            binding=binding,
+            per_agent_pat=None,
+            fallback_pat=None,
+            app_id=None,
+            app_private_key=None,
+            now=1_000_000,
+        )
+
+    message = str(exc_info.value)
+    assert "deployment" in message.lower(), (
+        "the operator-gap copy must name the deployment as what lacks the credential"
+    )
+    assert "operator" in message.lower(), (
+        "the operator-gap copy must say an operator has to configure credentials"
+    )
+    assert re.search(r"[Rr]e-bind", message) is None, (
+        "a correctly-bound public repo must never be blamed on the user's binding — "
+        "the incident's misdiagnosis, asserted as absent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_clone_token_public_proof_no_fallback_emits_operator_event() -> None:
+    """The operator-gap refusal must also emit an operator-facing log event
+    (github_repo_auth.operator_credential_missing) carrying the repo_url, so
+    the config gap is loud in operator logs, not only in the user's thread."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"App is not configured; no request expected: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    binding = _make_binding(repo_url="acme/oss-repo", ma_secret_ref="anon:", proof_kind="public")
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(DaimonError):
+        await resolve_clone_token(
+            client,
+            binding=binding,
+            per_agent_pat=None,
+            fallback_pat=None,
+            app_id=None,
+            app_private_key=None,
+            now=1_000_000,
+        )
+
+    operator_events = [
+        e for e in logs if e.get("event") == "github_repo_auth.operator_credential_missing"
+    ]
+    assert len(operator_events) == 1, (
+        "exactly one operator_credential_missing event must be emitted; "
+        f"captured events: {[e.get('event') for e in logs]}"
+    )
+    assert operator_events[0].get("repo_url") == "acme/oss-repo", (
+        "the operator event must carry the repo_url so the log alone identifies the repo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_clone_token_pat_proof_app_unavailable_keeps_rebind_and_logs() -> None:
+    """A binding with a recorded pat-kind proof, a fallback PAT configured,
+    but the App tier structurally unavailable (app_id=None) still raises the
+    re-bind copy — a token re-bind genuinely fixes that case — AND emits an
+    operator event recording that the App tier was unavailable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"App is not configured; no request expected: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    binding = _make_binding(
+        repo_url="acme/private-repo", ma_secret_ref="inline-pat:agent-1", proof_kind="pat"
+    )
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(DaimonError, match="[Rr]e-bind"):
+        await resolve_clone_token(
+            client,
+            binding=binding,
+            per_agent_pat=None,
+            fallback_pat="ghp_operator_fallback",
+            app_id=None,
+            app_private_key=None,
+            now=1_000_000,
+        )
+
+    app_events = [e for e in logs if e.get("event") == "github_repo_auth.app_not_configured"]
+    assert len(app_events) == 1, (
+        "an app_not_configured operator event must record the structurally unavailable "
+        f"App tier; captured events: {[e.get('event') for e in logs]}"
+    )
+    assert app_events[0].get("repo_url") == "acme/private-repo", (
+        "the app_not_configured event must carry the repo_url"
+    )
 
 
 # ---------------------------------------------------------------------------
