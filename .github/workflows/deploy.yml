@@ -119,6 +119,12 @@ jobs:
           fi
           gcloud compute ssh ${{ vars.GCP_AR_REPO }}-workers --zone "$ZONE" \
             --tunnel-through-iap --command '
+              # Without this the payload runs to the end regardless and the
+              # step exits with the status of the LAST command -- the trailing
+              # `prune || true` -- so a failed asset fetch, a failed env
+              # refresh, or a failed `up -d` all reported success. Every
+              # "refresh failed" comment below was aspirational until now.
+              set -euo pipefail
               export DAIMON_IMAGE="${{ steps.tags.outputs.daimon }}"
               # sudo -E keeps the SSH user HOME, so docker would look for
               # Artifact Registry credentials in ~/.docker (none there). Point
@@ -152,6 +158,10 @@ jobs:
         run: |
           gcloud compute ssh ${{ vars.GCP_AR_REPO }}-notebook --zone "$ZONE" \
             --tunnel-through-iap --command '
+              # Same reason as the workers refresh above: without this the
+              # exit status comes from the trailing `prune || true` and every
+              # failure inside is silent.
+              set -euo pipefail
               export NOTEBOOK_IMAGE="${{ steps.tags.outputs.notebook }}"
               # Caddy fronts notebook-host with TLS on this domain; the compose
               # file interpolates NOTEBOOK_DOMAIN + NOTEBOOK_PUBLIC_URL_BASE
