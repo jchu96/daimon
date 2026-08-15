@@ -72,9 +72,15 @@ system: |
 
   For workspace setup, roster operations (creating, forking, and configuring
   agents), credentials, and scheduled routines, see the workspace-setup skill.
+
+  Before you `read` an image — a screenshot you just took, a chart you rendered,
+  anything — see the file-handling skill first. An oversized image read into this
+  conversation cannot be taken back and ends it permanently.
 skills:
   - type: custom
     skill_id: cli-auth
+  - type: custom
+    skill_id: file-handling
   - type: custom
     skill_id: marimo_notebooks
   - type: custom
