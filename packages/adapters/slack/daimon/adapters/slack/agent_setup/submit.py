@@ -70,7 +70,7 @@ from daimon.core.errors import DaimonError, StoreError
 from daimon.core.github_visibility import is_public_repo, pat_can_access_repo
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.observability import capture_exception_with_scope
-from daimon.core.specs import AgentSpec
+from daimon.core.specs import AgentSpec, build_authoring_params
 from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.agent_repo_binding import (
     record_proof,
@@ -1177,7 +1177,7 @@ async def run_add_mcp_submission(
             return
 
         existing_mcp_servers: list[dict[str, Any]] = [
-            server.model_dump(mode="python") for server in ma_agent.mcp_servers
+            build_authoring_params(server) for server in ma_agent.mcp_servers
         ]
         # BetaManagedAgentsURLMCPServerParams is a TypedDict — build the dict directly.
         existing_mcp_servers.append({"name": mcp_name, "type": "url", "url": mcp_url})
@@ -1187,7 +1187,7 @@ async def run_add_mcp_submission(
         # SDK) — carry the agent's existing tools forward and append the new
         # server's toolset entry if it isn't already there.
         existing_tools: list[dict[str, Any]] = [
-            tool.model_dump(mode="python") for tool in ma_agent.tools
+            build_authoring_params(tool) for tool in ma_agent.tools
         ]
         has_mcp_toolset_entry = any(
             tool.get("type") == "mcp_toolset" and tool.get("mcp_server_name") == mcp_name

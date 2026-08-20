@@ -47,6 +47,7 @@ from daimon.core.skill_sync import SyncReport, sync_agent_skills
 from daimon.core.specs import (
     AgentSpec,
     SkillRepo,
+    build_authoring_params,
     dump_agent_spec,
     merge_default_agent_toolset,
 )
@@ -108,7 +109,7 @@ def _build_roster_entry(
     validation runs at the boundary — malformed shapes raise SpecError
     instead of leaking into a later reconcile.
     """
-    mcp_servers = [server.model_dump(mode="python") for server in agent.mcp_servers] or None
+    mcp_servers = [build_authoring_params(server) for server in agent.mcp_servers] or None
     skills: list[dict[str, str]] = []
     for skill in agent.skills:
         if skill.type == "custom":
@@ -130,7 +131,7 @@ def _build_roster_entry(
             skills.append({"type": "custom", "skill_id": title})
         else:
             skills.append({"type": skill.type, "skill_id": skill.skill_id})
-    tools = [tool.model_dump(mode="python") for tool in agent.tools] or None
+    tools = [build_authoring_params(tool) for tool in agent.tools] or None
     try:
         spec = AgentSpec.model_validate(
             {

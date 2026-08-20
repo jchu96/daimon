@@ -347,3 +347,32 @@ def load_environment_spec(path: Path) -> EnvironmentSpec:
         return EnvironmentSpec.model_validate(data)
     except ValidationError as err:
         raise SpecError(f"environment spec at {path} failed validation: {err}") from err
+
+
+def _prune_sdk_extras(value: object) -> object:
+    """Recursive half of `build_authoring_params`."""
+    if isinstance(value, BaseModel):
+        return build_authoring_params(value)
+    if isinstance(value, list):
+        return [_prune_sdk_extras(item) for item in cast("list[object]", value)]
+    return value
+
+
+def build_authoring_params(model: BaseModel) -> dict[str, object]:
+    """Dump an MA response model into an authoring-params dict, dropping fields
+    this SDK version does not declare.
+
+    MA's API ships response fields ahead of the SDK's generated models. The
+    `anthropic` BaseModel keeps those as pydantic extras and `model_dump()`
+    emits them, so feeding a response straight back into an `extra="forbid"`
+    `*Spec` fails on a field nobody authored — e.g. the `type` MA returns
+    alongside `name` on every agent-toolset tool config, which the SDK's
+    `BetaManagedAgentsAgentToolConfigParams` has no slot for. Only
+    SDK-declared fields survive this walk, at every nesting depth.
+    """
+    known = type(model).model_fields
+    return {
+        key: _prune_sdk_extras(getattr(model, key))
+        for key in model.model_dump(mode="python")
+        if key in known
+    }

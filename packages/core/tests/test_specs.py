@@ -3,6 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from anthropic.types.beta.beta_managed_agents_agent_tool_config import (
+    BetaManagedAgentsAgentToolConfig,
+)
+from anthropic.types.beta.beta_managed_agents_agent_toolset20260401 import (
+    BetaManagedAgentsAgentToolset20260401,
+)
+from anthropic.types.beta.beta_managed_agents_agent_toolset_default_config import (
+    BetaManagedAgentsAgentToolsetDefaultConfig,
+)
+from anthropic.types.beta.beta_managed_agents_always_allow_policy import (
+    BetaManagedAgentsAlwaysAllowPolicy,
+)
 from daimon.core.specs import (
     AgentSpec,
     EnvironmentSpec,
@@ -10,6 +22,7 @@ from daimon.core.specs import (
     SkillRepo,
     SkillSpec,
     SystemConfigSpec,
+    build_authoring_params,
     dump_agent_spec,
     merge_default_agent_toolset,
 )
@@ -520,4 +533,45 @@ def test_agent_spec_skill_repos_excluded_from_dump() -> None:
     )
     assert spec.skill_repos == [SkillRepo(url="https://github.com/owner/repo")], (
         "skill_repos still readable on the model instance after construction"
+    )
+
+
+def test_build_authoring_params_drops_response_fields_the_sdk_does_not_declare() -> None:
+    """MA returns a `type` alongside `name` on every agent-toolset tool config.
+
+    The SDK's params TypedDict has no slot for it, so an unpruned round-trip
+    into AgentSpec (extra="forbid") rejects every agent that has a toolset.
+    """
+    toolset = BetaManagedAgentsAgentToolset20260401(
+        type="agent_toolset_20260401",
+        configs=[
+            BetaManagedAgentsAgentToolConfig(
+                name="bash",
+                enabled=True,
+                permission_policy=BetaManagedAgentsAlwaysAllowPolicy(type="always_allow"),
+                type="bash",
+            )
+        ],
+        default_config=BetaManagedAgentsAgentToolsetDefaultConfig(
+            enabled=True,
+            permission_policy=BetaManagedAgentsAlwaysAllowPolicy(type="always_allow"),
+        ),
+    )
+    assert toolset.configs[0].model_dump(mode="python")["type"] == "bash", (
+        "precondition: the SDK keeps the unmodelled field as a pydantic extra"
+    )
+
+    params = build_authoring_params(toolset)
+
+    assert params["configs"] == [
+        {"name": "bash", "enabled": True, "permission_policy": {"type": "always_allow"}}
+    ], "the unmodelled nested `type` must not survive into authoring params"
+    assert params["type"] == "agent_toolset_20260401", (
+        "the toolset's own declared discriminator must survive"
+    )
+    spec = AgentSpec.model_validate(
+        {"name": "daimon", "model": "claude-sonnet-4-6", "tools": [params]}
+    )
+    assert spec.tools is not None and spec.tools[0]["type"] == "agent_toolset_20260401", (
+        "pruned params validate against the extra=forbid authoring spec"
     )
