@@ -118,6 +118,16 @@ async def deliver_session_outputs(
                         session_id=session_id,
                         required_scope="files:write",
                     )
+                    await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        text=(
+                            "I couldn't attach the generated file because this app is missing "
+                            "the `files:write` Slack scope. A workspace admin must add that "
+                            "scope and reinstall daimon from the install link before file "
+                            "delivery can work."
+                        ),
+                    )
                     return
                 log.warning(
                     "slack.output_delivery.upload_failed",

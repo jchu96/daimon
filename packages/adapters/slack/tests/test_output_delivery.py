@@ -57,6 +57,7 @@ def _clients(
     anthropic_mock.beta.files.download = AsyncMock(side_effect=_download)
     web_mock: Any = MagicMock(spec=AsyncWebClient)
     web_mock.files_upload_v2 = AsyncMock(side_effect=upload_side_effect)
+    web_mock.chat_postMessage = AsyncMock()
     return (
         cast(AsyncAnthropic, anthropic_mock),
         cast(AsyncWebClient, web_mock),
@@ -109,7 +110,7 @@ async def test_empty_output_listing_is_a_no_op() -> None:
     web_mock.files_upload_v2.assert_not_awaited()
 
 
-async def test_missing_files_write_scope_is_logged_and_does_not_raise() -> None:
+async def test_missing_files_write_scope_posts_actionable_thread_message() -> None:
     missing_scope = SlackApiError(
         message="missing_scope",
         response={"ok": False, "error": "missing_scope", "needed": "files:write"},
@@ -132,6 +133,15 @@ async def test_missing_files_write_scope_is_logged_and_does_not_raise() -> None:
     assert len(scope_events) == 1
     assert web_mock.files_upload_v2.await_count == 1, (
         "missing files:write must stop later upload attempts after one warning"
+    )
+    web_mock.chat_postMessage.assert_awaited_once_with(
+        channel="C123",
+        thread_ts="171234.5678",
+        text=(
+            "I couldn't attach the generated file because this app is missing the "
+            "`files:write` Slack scope. A workspace admin must add that scope and "
+            "reinstall daimon from the install link before file delivery can work."
+        ),
     )
 
 
