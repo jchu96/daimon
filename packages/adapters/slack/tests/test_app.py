@@ -651,6 +651,9 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
             "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
         patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch(
+            "daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock
+        ) as mock_deliver_outputs,
     ):
         mock_resolve_agent.return_value = "agent_test_id"
         mock_resolve_env.return_value = "env_test_id"
@@ -686,6 +689,11 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
         assert cs_kwargs.get("agent_uuid") is not None, (
             "create_session must receive agent_uuid (per-agent vault key)"
         )
+        mock_deliver_outputs.assert_awaited_once()
+        delivery_kwargs = mock_deliver_outputs.await_args.kwargs
+        assert delivery_kwargs["session_id"] == "sess-first-001"
+        assert delivery_kwargs["channel_id"] == channel
+        assert delivery_kwargs["thread_ts"] == thread_ts
 
     # Assert thread_sessions row was created with platform="slack".
     async with db_session_factory() as s:
@@ -903,6 +911,9 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
             "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
         ) as mock_create_session,
         patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch(
+            "daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock
+        ) as mock_deliver_outputs,
     ):
         mock_principal.return_value = fake_principal
         mock_get_session.return_value = None  # simulate new thread each time
@@ -936,6 +947,7 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
             vault_ids=[],
         )
         mock_run_turn.side_effect = _fake_run_turn
+        mock_deliver_outputs.side_effect = [RuntimeError("delivery exploded"), None]
 
         # Start the first orchestrate as a background task.
         task1 = asyncio.create_task(
@@ -984,6 +996,9 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
 
     # Assert exactly 2 turns ran: one for event1, one drain for event2.
     assert turn_count == 2, f"exactly 2 turns must run (1 initial + 1 drain), got {turn_count}"
+    assert mock_deliver_outputs.await_count == 2, (
+        "a delivery exception on the first turn must be swallowed so the queued turn drains"
+    )
 
 
 async def test_orchestrate_first_mention_adds_eyes_reaction_before_turn(

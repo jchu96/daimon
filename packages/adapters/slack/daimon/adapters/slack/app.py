@@ -66,6 +66,7 @@ from daimon.adapters.slack.help import handle_help_command
 from daimon.adapters.slack.interactions import build_retry_handlers, resolve_web_client
 from daimon.adapters.slack.lifecycle import SlackTurnLifecycle
 from daimon.adapters.slack.memory import handle_memory_command
+from daimon.adapters.slack.output_delivery import deliver_session_outputs
 from daimon.adapters.slack.privacy_panel.actions import (
     handle_privacy_block_action,
     handle_privacy_command,
@@ -1287,6 +1288,23 @@ class SlackApp:
             )
         else:
             log.info("slack.turn.completed", thread_id=thread_id, session_id=outcome.ma_session_id)
+
+        try:
+            await deliver_session_outputs(
+                self.runtime.turn_deps.anthropic,
+                web_client,
+                session_id=outcome.ma_session_id,
+                channel_id=channel,
+                thread_ts=thread_id,
+                turn_started_at=turn_context.started_at,
+            )
+        except Exception as exc:  # noqa: BLE001 -- output delivery must never abort queue drain
+            log.warning(
+                "slack.output_delivery.unhandled_error",
+                session_id=outcome.ma_session_id,
+                thread_id=thread_id,
+                error=str(exc)[:300],
+            )
 
     async def drain_and_close(self, client: AsyncBaseSocketModeClient) -> None:
         """Graceful shutdown drain.

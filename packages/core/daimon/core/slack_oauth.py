@@ -33,6 +33,7 @@ SLACK_BOT_SCOPES: tuple[str, ...] = (
     "groups:history",
     "reactions:write",  # queued-mention reaction parity
     "files:read",  # attachments & vision: read event.files + fetch url_private
+    "files:write",  # post-turn delivery of session output artifacts
     "channels:read",  # channel tools: public channel metadata + membership checks
     "groups:read",  # channel tools: private channel metadata + membership checks
 )

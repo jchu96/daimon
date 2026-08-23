@@ -3,6 +3,17 @@
 This page documents how daimon's Slack adapter handles per-user access and
 what operators should understand about the resulting trust model.
 
+### Session output files
+
+Files an agent saves under `/mnt/session/outputs` are uploaded to the Slack
+thread after its turn completes. Delivery requires the `files:write` bot scope;
+adding a scope to an existing install requires re-running the install flow. The
+adapter uploads at most five files per turn and skips files larger than 20 MiB,
+logging delivery failures without blocking the completed turn. Delivery IDs
+are remembered only for the life of the adapter process; because there is no
+durable Slack delivery-receipt store, a restart can re-post a recent file that
+falls inside the clock-skew window.
+
 ### Per-user Slack access (optional)
 
 By default daimon reads only channels the bot is invited to. Members can

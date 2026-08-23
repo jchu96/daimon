@@ -66,6 +66,21 @@ def test_states_the_interactive_delivery_contract_not_only_the_headless_one() ->
     assert "Never" in block and "invoked from" in block, (
         "block must forbid send_message into the thread the turn was invoked from"
     )
+    assert "interactive exception is Discord file delivery" in block, (
+        "the Discord file path must be explicit about overriding the general send_message rule"
+    )
+    slack = block[block.index("On Slack") : block.index("On Discord")]
+    discord = block[block.index("On Discord") : block.index("Calling `read`")]
+    assert "/mnt/session/outputs IS the delivery path" in slack
+    assert "do NOT also" in slack and "send_message" in slack, (
+        "Slack guidance must prevent output-directory files from being sent twice"
+    )
+    assert "/mnt/session/outputs is NOT a delivery path" in discord
+    assert "create_file_upload_url" in discord and "send_message" in discord, (
+        "Discord guidance must preserve its explicit file-upload sequence"
+    )
+    assert "a FILE never does" not in block
+    assert "There is no way to attach a file to your reply" not in block
 
 
 def test_replaces_stale_block_preserving_user_body() -> None:
