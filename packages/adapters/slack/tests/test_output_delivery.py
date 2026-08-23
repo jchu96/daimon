@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import structlog
 import structlog.testing
@@ -108,6 +108,23 @@ async def test_empty_output_listing_is_a_no_op() -> None:
 
     anthropic_mock.beta.files.download.assert_not_awaited()
     web_mock.files_upload_v2.assert_not_awaited()
+
+
+async def test_retries_empty_output_listing_once_for_indexing_lag() -> None:
+    anthropic, web_client, anthropic_mock, web_mock = _clients([])
+    anthropic_mock.beta.files.list.side_effect = [
+        _FilePages([[]]),
+        _FilePages([[_file("F-LATE")]]),
+    ]
+
+    with patch(
+        "daimon.adapters.slack.output_delivery.asyncio.sleep", new_callable=AsyncMock
+    ) as sleep:
+        await _deliver(anthropic, web_client, session_id="session-index-lag")
+
+    assert anthropic_mock.beta.files.list.await_count == 2
+    sleep.assert_awaited_once_with(1.0)
+    web_mock.files_upload_v2.assert_awaited_once()
 
 
 async def test_missing_files_write_scope_posts_actionable_thread_message() -> None:

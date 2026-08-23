@@ -13,10 +13,13 @@ file as delivered and silently losing it.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
 import structlog
 from anthropic import AsyncAnthropic
+from anthropic.types.beta import FileMetadata
 from daimon.core.media.filenames import sanitize_title
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
@@ -26,10 +29,52 @@ log = structlog.get_logger(__name__)
 _MAX_FILES_PER_TURN = 5
 _MAX_BYTES_PER_FILE = 20 * 1024 * 1024
 _CLOCK_SLACK = timedelta(seconds=30)
+_INDEX_RETRY_DELAY_S = 1.0
 
 # Session-scoped listings include prior-turn artifacts. Only successful Slack
 # uploads count as delivered; age, size, cap, and transient failures do not.
 _delivered_file_ids: dict[str, set[str]] = {}
+
+
+async def _iter_session_files(
+    anthropic: AsyncAnthropic, *, session_id: str
+) -> AsyncIterator[FileMetadata]:
+    """List session files, retrying one empty result for MA indexing lag."""
+    for attempt in range(2):
+        try:
+            page = await anthropic.beta.files.list(
+                scope_id=session_id,
+                betas=["managed-agents-2026-04-01"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- post-turn delivery must degrade cleanly
+            log.warning(
+                "slack.output_delivery.list_failed",
+                session_id=session_id,
+                error=str(exc)[:300],
+            )
+            return
+
+        saw_file = False
+        try:
+            async for file in page:
+                saw_file = True
+                yield file
+        except Exception as exc:  # noqa: BLE001 -- pagination must degrade cleanly
+            log.warning(
+                "slack.output_delivery.pagination_failed",
+                session_id=session_id,
+                error=str(exc)[:300],
+            )
+            return
+
+        if saw_file or attempt == 1:
+            return
+        log.debug(
+            "slack.output_delivery.empty_listing_retry",
+            session_id=session_id,
+            delay_seconds=_INDEX_RETRY_DELAY_S,
+        )
+        await asyncio.sleep(_INDEX_RETRY_DELAY_S)
 
 
 async def deliver_session_outputs(
@@ -45,22 +90,9 @@ async def deliver_session_outputs(
     delivered = _delivered_file_ids.setdefault(session_id, set())
     cutoff = turn_started_at - _CLOCK_SLACK
 
-    try:
-        page = await anthropic.beta.files.list(
-            scope_id=session_id,
-            betas=["managed-agents-2026-04-01"],
-        )
-    except Exception as exc:  # noqa: BLE001 -- post-turn delivery must degrade cleanly
-        log.warning(
-            "slack.output_delivery.list_failed",
-            session_id=session_id,
-            error=str(exc)[:300],
-        )
-        return
-
     posted = 0
     try:
-        async for file in page:
+        async for file in _iter_session_files(anthropic, session_id=session_id):
             if file.id in delivered:
                 log.debug(
                     "slack.output_delivery.already_delivered",
