@@ -97,6 +97,7 @@ async def test_posts_each_file_once_into_the_thread() -> None:
         "filename": "F1.txt",
         "title": "F1.txt",
         "content": b"content:F1",
+        "content_type": "text/plain",
     }
     assert web_mock.files_upload_v2.await_args_list[1].kwargs["filename"] == "F2.txt"
 

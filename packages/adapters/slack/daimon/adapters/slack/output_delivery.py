@@ -142,6 +142,7 @@ async def deliver_session_outputs(
                     filename=safe_filename,
                     title=safe_filename,
                     content=content,
+                    content_type=file.mime_type,
                 )
             except SlackApiError as exc:
                 if exc.response.get("error") == "missing_scope":  # pyright: ignore[reportUnknownMemberType]
