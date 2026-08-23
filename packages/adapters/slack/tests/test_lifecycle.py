@@ -112,6 +112,8 @@ def _make_lifecycle(
     *,
     model_id: str = "claude-sonnet-4-6",
     agent_name: str = "test-agent",
+    living_card: bool = False,
+    living_card_actions_block: dict[str, Any] | None = None,
 ) -> tuple[SlackTurnLifecycle, asyncio.Event, dict[str, tuple[asyncio.Event, str]], list[str]]:
     """Create a SlackTurnLifecycle with recorder callables for registry operations.
 
@@ -140,6 +142,8 @@ def _make_lifecycle(
         model_id=model_id,
         register=register,
         deregister=deregister,
+        living_card=living_card,
+        living_card_actions_block=living_card_actions_block,
     )
     return lc, cancel, registered, deregistered
 
@@ -305,6 +309,39 @@ async def test_terminal_success_overflow_posts_and_widens_final_ts(
     overflow_posts = _post_count(fake_slack_web_client) - initial_posts
     assert overflow_posts >= 1, "overflow chunks must be posted as new chat.postMessage calls"
     assert lc.final_ts is not None, "final_ts must be set after overflow"
+
+
+async def test_living_card_flag_replaces_status_with_composed_card(
+    fake_slack_web_client: Any,
+) -> None:
+    """The opt-in path updates the existing status with one complete answer card."""
+    actions = {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": "helpful",
+                "text": {"type": "plain_text", "text": "Helpful"},
+                "value": "yes",
+            }
+        ],
+    }
+    lc, *_ = _make_lifecycle(
+        fake_slack_web_client,
+        living_card=True,
+        living_card_actions_block=actions,
+    )
+    await lc.on_sse_event(_thinking_event())
+
+    await lc.on_terminal_success(
+        TurnState(content=[TextBlock(kind="text", text="The composed answer.")])
+    )
+
+    blocks = _last_update_blocks(fake_slack_web_client)
+    assert blocks[0]["type"] == "header"
+    assert blocks[0]["text"]["text"] == "Answer · revision 1"
+    assert blocks[1]["text"]["text"] == "The composed answer."
+    assert blocks[-1] == actions, "terminal recomposition must retain configured actions"
 
 
 # ---------------------------------------------------------------------------

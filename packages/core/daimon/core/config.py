@@ -234,6 +234,14 @@ class SlackSettings(BaseModel):
             "scheduler process (8082) — all process groups share one host."
         ),
     )
+    living_card: bool = Field(
+        default=False,
+        description=(
+            "Experimental Slack answer delivery: compose one complete answer card and "
+            "replace it in place for later revisions. Disabled by default so the legacy "
+            "chunked answer path remains unchanged."
+        ),
+    )
     dev_allow_all_admin: bool = Field(
         default=False,
         description=(

@@ -58,6 +58,7 @@ def _make_lifecycle(fake: Any, clock: Any) -> SlackTurnLifecycle:
         model_id="claude-sonnet-4-6",
         register=lambda ts, ev, author_id: None,
         deregister=lambda ts: None,
+        living_card=False,
         clock=clock,
     )
 

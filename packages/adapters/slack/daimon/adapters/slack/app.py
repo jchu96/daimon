@@ -910,6 +910,10 @@ class SlackApp:
         No try/except — errors propagate to the listener boundary in
         ``_handle_app_mention``.
         """
+        slack_settings = self.runtime.settings.slack
+        assert slack_settings is not None, (
+            "SlackApp._run_thread_turn requires slack settings (entrypoint validates at boot)"
+        )
         # --- Stage one: admission (identity, config cascade, missing-config
         # bail, MA resolve/retrieve, balance gate, cap gate) -- D-01 admit(). ---
         try:
@@ -1136,6 +1140,7 @@ class SlackApp:
             model_id=_lc_model_id,
             register=self._register_cancel,
             deregister=self._deregister_cancel,
+            living_card=slack_settings.living_card,
         )
         lifecycle_holder: list[SlackTurnLifecycle] = [lifecycle]
 
@@ -1164,6 +1169,7 @@ class SlackApp:
                 model_id=_lc_model_id,
                 register=self._register_cancel,
                 deregister=self._deregister_cancel,
+                living_card=slack_settings.living_card,
             )
             lifecycle_holder[0] = new_lifecycle
             return new_lifecycle

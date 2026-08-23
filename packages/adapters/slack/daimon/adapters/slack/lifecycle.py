@@ -31,6 +31,7 @@ from anthropic.types import RawMessageStreamEvent
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
     BetaManagedAgentsSpanModelUsage,
 )
+from daimon.adapters.slack.answer_card import deliver_answer_card
 from daimon.adapters.slack.blockkit import EmbedEvent, State, TurnPhase, to_blocks, update
 from daimon.adapters.slack.mrkdwn import escape_mrkdwn_preserving_mentions
 from daimon.adapters.slack.split import split_for_slack_safe
@@ -86,6 +87,8 @@ class SlackTurnLifecycle:
         model_id: str,
         register: Callable[[str, asyncio.Event, str], None],
         deregister: Callable[[str], None],
+        living_card: bool = False,
+        living_card_actions_block: dict[str, Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client
@@ -96,6 +99,9 @@ class SlackTurnLifecycle:
         self._model_id = model_id
         self._register = register
         self._deregister = deregister
+        self._living_card = living_card
+        self._living_card_actions_block = living_card_actions_block
+        self._living_card_revision = 0
         self._clock = clock
         self._state: State = State(
             phase=TurnPhase.THINKING,
@@ -192,6 +198,22 @@ class SlackTurnLifecycle:
                 text=text,
             )
 
+    async def _deliver_living_card_revision(self, answer_text: str) -> None:
+        """Recompose and deliver the complete experimental answer card."""
+        self._living_card_revision += 1
+        previous_ts = self._status_ts
+        self._status_ts = await deliver_answer_card(
+            self._client,
+            channel=self._channel,
+            thread_ts=self._thread_ts,
+            answer_text=answer_text,
+            revision=self._living_card_revision,
+            message_ts=previous_ts,
+            actions_block=self._living_card_actions_block,
+        )
+        if previous_ts is None:
+            self._register(self._status_ts, self._cancel, self._author_id)
+
     async def _flush_terminal(self) -> None:
         """Unconditionally flush the terminal Block Kit surface, bypassing debounce.
 
@@ -238,6 +260,12 @@ class SlackTurnLifecycle:
                     await self._flush_terminal()
                 else:
                     await self._flush_cancelled()
+                self.final_ts = self._status_ts
+                return
+
+            if self._living_card:
+                self._terminal = True
+                await self._deliver_living_card_revision(final_text)
                 self.final_ts = self._status_ts
                 return
 

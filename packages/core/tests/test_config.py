@@ -463,6 +463,22 @@ def test_slack_settings_parsed_from_nested_env(monkeypatch: pytest.MonkeyPatch) 
     assert settings.slack.app_token.get_secret_value() == "xapp-test", (
         "app_token must parse from DAIMON_SLACK__APP_TOKEN"
     )
+    assert settings.slack.living_card is False, "experimental card delivery must default off"
+
+
+def test_slack_settings_living_card_parsed_from_nested_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAIMON_DATABASE__URL", "postgresql+asyncpg://u:p@h/d")
+    monkeypatch.setenv("DAIMON_ANTHROPIC__API_KEY", "sk-test")
+    monkeypatch.setenv("DAIMON_SLACK__SIGNING_SECRET", "s" * 32)
+    monkeypatch.setenv("DAIMON_SLACK__APP_TOKEN", "xapp-test")
+    monkeypatch.setenv("DAIMON_SLACK__LIVING_CARD", "true")
+
+    settings = load_settings(_env_file=None)
+
+    assert settings.slack is not None
+    assert settings.slack.living_card is True
 
 
 def test_slack_settings_health_port_defaults_to_8083(monkeypatch: pytest.MonkeyPatch) -> None:
