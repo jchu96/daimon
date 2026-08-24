@@ -29,8 +29,12 @@ from daimon.adapters.mcp.tools.discord import (
 from daimon.adapters.mcp.tools.slack._models import (
     SlackChannelRow,
     SlackMessageRow,
+    SlackParsedLink,
     SlackSearchResult,
     SlackThreadResult,
+)
+from daimon.adapters.mcp.tools.slack._parse_link import (
+    _slack_parse_link_impl,  # pyright: ignore[reportPrivateUsage]
 )
 from daimon.adapters.mcp.tools.slack._read import (
     _slack_get_message_impl,  # pyright: ignore[reportPrivateUsage]
@@ -53,7 +57,7 @@ def _slack_unsupported(tool_name: str) -> ToolError:
 
 
 def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def list_channels(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
     ) -> list[ChannelRow] | list[SlackChannelRow]:
@@ -63,7 +67,7 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             return await _slack_list_channels_impl(runtime, auth)
         return await _list_channels_impl(runtime, auth)
 
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def read_channel(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         channel_id: str,
@@ -78,7 +82,7 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             return await _slack_read_channel_impl(runtime, auth, channel_id=channel_id, limit=limit)
         return await _read_channel_impl(runtime, auth, channel_id=channel_id, limit=limit)
 
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def read_thread(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         thread_id: str,
@@ -98,7 +102,7 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             runtime, auth, thread_id=thread_id, limit=limit, before=before
         )
 
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def get_message(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         channel_id: str,
@@ -112,7 +116,7 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             )
         return await _get_message_impl(runtime, auth, channel_id=channel_id, message_id=message_id)
 
-    @mcp.tool
+    @mcp.tool(tags={"discord"})  # pyright: ignore[reportArgumentType]
     async def list_threads(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         channel_id: str,
@@ -126,26 +130,31 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             raise _slack_unsupported("list_threads")
         return await _list_threads_impl(runtime, auth, channel_id=channel_id)
 
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def parse_link(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         url: str,
-    ) -> ParsedLink:
-        """Extract IDs from a Discord URL.
+    ) -> ParsedLink | SlackParsedLink:
+        """Extract IDs from a channel or message link.
 
-        Supports discord.com, ptb.discord.com, and canary.discord.com URLs.
-
-        After parsing:
+        Discord: supports discord.com, ptb.discord.com, and
+        canary.discord.com URLs.
         - If link_type is "channel": use read_channel(channel_id)
         - If link_type is "message_or_thread": try read_thread(thread_id) first;
           if read_thread fails, it is a message: use get_message(channel_id, message_id)
+
+        Slack: supports a workspace permalink
+        (.../archives/<channel>/p<digits>). Returns channel_id, the dotted
+        message ts, and thread_ts when the link is a reply. Try
+        read_thread(thread_id=f"{channel_id}:{thread_ts or message_ts}")
+        first; if that fails, use get_message(channel_id, message_ts).
         """
         auth = await _auth(ctx)
         if auth.platform == "slack":
-            raise _slack_unsupported("parse_link")
+            return _slack_parse_link_impl(url)
         return _parse_link_impl(url, caller_guild_id=auth.external_id)
 
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def send_message(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         channel_id: str,
@@ -209,7 +218,7 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     _VALID_AUTHOR_TYPES = frozenset({"user", "bot", "webhook"})
     _VALID_HAS = frozenset({"image", "video", "file", "sticker", "embed", "link", "poll", "sound"})
 
-    @mcp.tool
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def search_messages(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         content: str | None = None,
@@ -227,7 +236,7 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         scoped to channel_ids, total_results is the exact count for those
         channels (you must be able to view them; they are rejected before
         searching). Unscoped searches report only the visible rows — the
-        guild-wide count is withheld because it includes channels you cannot
+        server-wide count is withheld because it includes channels you cannot
         view. Slack: only content + limit are supported (other filters are
         Discord-only), and 1:1 DM hits are only returned in a DM with daimon.
         """
