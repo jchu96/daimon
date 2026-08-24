@@ -41,6 +41,9 @@ from daimon.adapters.mcp.tools.slack._read import (
 from daimon.adapters.mcp.tools.slack._search import (
     _slack_search_messages_impl,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.slack._send import (
+    _slack_send_message_impl,  # pyright: ignore[reportPrivateUsage]
+)
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -149,12 +152,12 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         content: str,
         attachments: list[dict[str, str]] | None = None,
         file_handles: list[str] | None = None,
-    ) -> MessageRow:
-        """Post a message to a Discord channel.
+    ) -> MessageRow | SlackMessageRow:
+        """Post a message to a channel.
 
         For TEXT: only call this when the user explicitly asks you to send or
-        post something to Discord. Do NOT call it to share results, summaries,
-        or outputs unless the user specifically requested a Discord post.
+        post something to a channel. Do NOT call it to share results,
+        summaries, or outputs unless the user specifically requested a post.
         Deliver text output in your reply instead.
 
         For FILES that rule does not apply, because a reply cannot carry an
@@ -174,11 +177,26 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         To post a file you made in your sandbox, call
         ``create_file_upload_url`` first and PUT the bytes to the URL it
         returns — never base64 a file into a tool argument. Combined
-        cap of 10 attachments per message.
+        cap of 10 attachments per message. Both FILES paragraphs are
+        Discord-only for now — Slack file posting needs a scope this
+        install does not have.
+
+        Slack: ``channel_id`` may be ``channel_id:thread_ts`` (e.g.
+        ``C0123456789:1717171717.123456``) to post into a thread. Content is
+        sent as-is — nothing is escaped, so ``<@U…>`` mentions work — and is
+        capped at 12,000 characters. daimon must already be in the channel
+        (a member can run ``/invite @daimon``).
         """
         auth = await _auth(ctx)
         if auth.platform == "slack":
-            raise _slack_unsupported("send_message")
+            return await _slack_send_message_impl(
+                runtime,
+                auth,
+                channel_id=channel_id,
+                content=content,
+                attachments=attachments,
+                file_handles=file_handles,
+            )
         return await _send_message_impl(
             runtime,
             auth,

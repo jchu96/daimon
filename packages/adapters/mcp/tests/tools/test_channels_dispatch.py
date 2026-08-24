@@ -202,7 +202,6 @@ async def _seed_slack_bound_account(db_session: AsyncSession, *, workspace_id: s
     [
         ("list_threads", {"channel_id": "C_TEST"}),
         ("parse_link", {"url": "https://discord.com/channels/1/2"}),
-        ("send_message", {"channel_id": "C_TEST", "content": "hi"}),
     ],
 )
 async def test_slack_caller_calling_unsupported_tool_raises_own_name(
@@ -268,6 +267,49 @@ async def test_search_messages_slack_caller_no_longer_hits_unsupported_branch(
     )
     assert "slack tools require DAIMON_CRYPTO__KEYS" in output_text, (
         f"Slack caller's search_messages must hit the Slack-only crypto-keys error; "
+        f"got {output_text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_message_slack_caller_no_longer_hits_unsupported_branch(
+    db_session: AsyncSession,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """send_message used to be Slack-unsupported; it now routes to the Slack send
+    impl. With no DAIMON_CRYPTO__KEYS configured on the runtime, the Slack impl's
+    ``slack_web_client`` fails with a Slack-specific error the old "not supported
+    on Slack yet" branch could never produce — pinning that the dispatch now
+    reaches ``_slack_send_message_impl`` instead. Needs a linked PlatformPrincipal
+    (platform_user_id) since the send impl resolves slack identity before
+    touching crypto."""
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="slack-send-message")
+    account = await make_account(db_session, tenant=tenant)
+    await make_platform_principal(
+        db_session,
+        platform="slack",
+        external_id="U_SLACK_CALLER",
+        tenant=tenant,
+        account=account,
+    )
+    await db_session.commit()
+    token = mint_jwt(account_id=account.id, secret=_SECRET, now=dt.datetime.now(dt.UTC))
+    app = _make_app(sessionmaker)
+
+    call_result = await _call_tool(
+        app,
+        token=token,
+        tool_name="send_message",
+        arguments={"channel_id": "C_TEST", "content": "hi"},
+    )
+
+    assert call_result.get("isError") is True
+    output_text = _output_text(call_result)
+    assert "send_message is not supported on Slack yet" not in output_text, (
+        "send_message must no longer hit the Slack-unsupported branch"
+    )
+    assert "slack tools require DAIMON_CRYPTO__KEYS" in output_text, (
+        f"Slack caller's send_message must hit the Slack-only crypto-keys error; "
         f"got {output_text!r}"
     )
 
