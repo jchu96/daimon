@@ -2455,11 +2455,11 @@
     }),
     'send_message': dict({
       'description': '''
-        Post a message to a Discord channel.
+        Post a message to a channel.
         
         For TEXT: only call this when the user explicitly asks you to send or
-        post something to Discord. Do NOT call it to share results, summaries,
-        or outputs unless the user specifically requested a Discord post.
+        post something to a channel. Do NOT call it to share results,
+        summaries, or outputs unless the user specifically requested a post.
         Deliver text output in your reply instead.
         
         For FILES that rule does not apply, because a reply cannot carry an
@@ -2479,7 +2479,15 @@
         To post a file you made in your sandbox, call
         ``create_file_upload_url`` first and PUT the bytes to the URL it
         returns — never base64 a file into a tool argument. Combined
-        cap of 10 attachments per message.
+        cap of 10 attachments per message. Both FILES paragraphs are
+        Discord-only for now — Slack file posting needs a scope this
+        install does not have.
+        
+        Slack: ``channel_id`` may be ``channel_id:thread_ts`` (e.g.
+        ``C0123456789:1717171717.123456``) to post into a thread. Content is
+        sent as-is — nothing is escaped, so ``<@U…>`` mentions work — and is
+        capped at 12,000 characters. daimon must already be in the channel
+        (a member can run ``/invite @daimon``).
       ''',
       'parameters': dict({
         'additionalProperties': False,
