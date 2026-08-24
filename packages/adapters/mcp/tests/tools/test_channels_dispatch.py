@@ -122,6 +122,30 @@ async def _call_tool(
     return result.get("result", result)  # type: ignore[return-value]
 
 
+async def _list_tool_names(app: ASGIApp, *, token: str) -> list[str]:
+    """Initialize an MCP HTTP session and call tools/list; return tool names."""
+    headers = dict(_INIT_HEADERS)
+    headers["Authorization"] = f"Bearer {token}"
+    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
+    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        init_resp = await c.post("/mcp", json=_INIT_BODY, headers=headers)
+        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
+        session_id = init_resp.headers.get("mcp-session-id")
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+        body: dict[str, object] = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }
+        resp = await c.post("/mcp", json=body, headers=headers)
+        assert resp.status_code == 200, f"tools/list failed: {resp.text}"
+        result = _parse_jsonrpc_response(resp)
+    tools_payload = result.get("result", result)
+    return [t["name"] for t in tools_payload.get("tools", [])]  # type: ignore[union-attr]
+
+
 def _make_app(sessionmaker: async_sessionmaker[AsyncSession]) -> ASGIApp:
     return create_mcp_app(
         settings=Settings(
@@ -204,29 +228,41 @@ async def _seed_slack_bound_account(db_session: AsyncSession, *, workspace_id: s
         ("parse_link", {"url": "https://discord.com/channels/1/2"}),
     ],
 )
-async def test_slack_caller_calling_unsupported_tool_raises_own_name(
+async def test_slack_caller_tools_list_omits_discord_only_tool(
     db_session: AsyncSession,
     sessionmaker: async_sessionmaker[AsyncSession],
     tool_name: str,
     arguments: dict[str, object],
 ) -> None:
-    """A Slack caller invoking a Slack-unsupported registered tool gets a ToolError
-    naming that exact tool ("<tool_name> is not supported on Slack yet"), pinning
-    the per-site name literal in ``daimon.adapters.mcp.tools.channels``."""
+    """A Slack caller's tools/list no longer contains a discord-only-tagged
+    tool (see the tool-visibility quick task). Each tool's runtime gate
+    (channels.py's ``_slack_unsupported(...)`` branch) survives as
+    defense-in-depth against a transform regression, but a Slack caller can no
+    longer reach it through the registered surface at all: the tool is both
+    unlisted and uncallable, and a direct ``tools/call`` returns the
+    registry's own unknown-tool error, not the gate copy."""
     account_id = await _seed_slack_bound_account(
-        db_session, workspace_id=f"slack-unsupported-{tool_name}"
+        db_session, workspace_id=f"slack-hidden-{tool_name}"
     )
     token = mint_jwt(account_id=account_id, secret=_SECRET, now=dt.datetime.now(dt.UTC))
     app = _make_app(sessionmaker)
 
+    tool_names = await _list_tool_names(app, token=token)
+
+    assert tool_name not in tool_names, (
+        f"{tool_name} is discord-only tagged; a Slack caller must not see it"
+    )
+
     call_result = await _call_tool(app, token=token, tool_name=tool_name, arguments=arguments)
 
     assert call_result.get("isError") is True, (
-        f"{tool_name} must raise a ToolError for a Slack caller; got {call_result!r}"
+        f"a hidden tool must be uncallable, not just unlisted; got {call_result!r}"
     )
     output_text = _output_text(call_result)
-    assert f"{tool_name} is not supported on Slack yet" in output_text, (
-        f"expected {tool_name}'s own name in the Slack-unsupported message; got {output_text!r}"
+    assert f"{tool_name} is not supported on Slack yet" not in output_text, (
+        "a Slack caller calling a hidden tool must hit the registry's unknown-tool "
+        f"error, not the runtime gate copy (unreachable through the registered "
+        f"surface); got {output_text!r}"
     )
 
 
