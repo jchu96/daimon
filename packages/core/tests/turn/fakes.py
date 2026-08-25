@@ -158,6 +158,12 @@ class _FakeEventList:
 @dataclass
 class FakeSessionsBeta:
     events: FakeEventsResource = field(default_factory=FakeEventsResource)
+    retrieve_statuses: list[str] = field(default_factory=lambda: ["running", "running", "idle"])
+
+    async def retrieve(self, session_id: str) -> Any:
+        if not self.retrieve_statuses:
+            raise AssertionError("FakeSessionsBeta: no retrieve_statuses left")
+        return type("RetrievedSession", (), {"status": self.retrieve_statuses.pop(0)})()
 
 
 @dataclass
