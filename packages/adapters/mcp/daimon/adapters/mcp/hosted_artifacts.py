@@ -1,0 +1,318 @@
+"""Hosted-client chart delivery with embedded images and optional private URLs."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import datetime as dt
+import io
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+
+import structlog
+from anthropic import AsyncAnthropic
+from anthropic.types.beta.file_metadata import FileMetadata
+from daimon.core.artifacts import ArtifactStore, build_artifact_store
+from daimon.core.config import ArtifactsSettings
+from PIL import Image
+from pydantic import BaseModel
+
+from mcp.types import ImageContent
+
+_log = structlog.get_logger(__name__)
+
+_ALLOWED_SUFFIXES = {".jpeg", ".jpg", ".png", ".svg"}
+_MAX_BYTES = 10 * 1024 * 1024
+_MAX_CHARTS = 5
+_MAX_IMAGE_BLOCKS = 3
+_MAX_IMAGE_EDGE = 1000
+_MAX_IMAGE_BLOCK_ENCODED_BYTES = 400 * 1024
+_MAX_SCANNED = 200
+_CLOCK_SLACK = dt.timedelta(seconds=30)
+_HOSTED_DELIVERY_TIMEOUT_SECONDS = 60.0
+
+
+class ChartUrl(BaseModel):
+    """One time-bounded chart URL returned in a hosted tool result."""
+
+    model_config = {"frozen": True}
+
+    filename: str
+    url: str
+    expires_at: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class HostedChartDelivery:
+    """Text additions and structured chart content for one completed turn."""
+
+    message: str
+    chart_urls: tuple[ChartUrl, ...] = ()
+    image_blocks: tuple[ImageContent, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ChartOutput:
+    file_id: str
+    filename: str
+    size_bytes: int
+
+
+def _parse_created(value: object) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+    return None
+
+
+def _safe_filename(filename: str) -> str:
+    """Accept one bounded basename; model-authored paths never become object keys."""
+    if (
+        not filename
+        or len(filename) > 255
+        or filename != PurePosixPath(filename).name
+        or "\\" in filename
+        or filename in {".", ".."}
+    ):
+        raise ValueError("unsafe artifact filename")
+    return filename
+
+
+def _image_content_type(filename: str, content: bytes) -> str:
+    """Validate extension against a small magic-byte/media allowlist."""
+    suffix = PurePosixPath(filename).suffix.lower()
+    if suffix == ".png" and content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if suffix in {".jpg", ".jpeg"} and content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if suffix == ".svg":
+        prefix = content[:2048].lstrip().lower()
+        if prefix.startswith(b"<svg") or (prefix.startswith(b"<?xml") and b"<svg" in prefix):
+            return "image/svg+xml"
+    raise ValueError("artifact content does not match an allowed image type")
+
+
+def _markdown_label(filename: str) -> str:
+    bounded = filename.replace("\r", " ").replace("\n", " ")[:255]
+    return bounded.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _bounded_image_block(content: bytes, content_type: str) -> ImageContent | None:
+    """Downscale one raster and return an explicitly typed, bounded MCP block."""
+    if content_type not in {"image/png", "image/jpeg"}:
+        return None
+
+    with Image.open(io.BytesIO(content)) as source:
+        source.load()
+        image = source.copy()
+
+    image.thumbnail((_MAX_IMAGE_EDGE, _MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
+    output_format = "PNG" if content_type == "image/png" else "JPEG"
+    if output_format == "JPEG" and image.mode not in {"L", "RGB"}:
+        image = image.convert("RGB")
+
+    for _ in range(6):
+        buffer = io.BytesIO()
+        save_kwargs: dict[str, object] = {"optimize": True}
+        if output_format == "JPEG":
+            save_kwargs["quality"] = 82
+        image.save(buffer, format=output_format, **save_kwargs)
+        encoded = base64.b64encode(buffer.getvalue())
+        if len(encoded) <= _MAX_IMAGE_BLOCK_ENCODED_BYTES:
+            return ImageContent(
+                type="image",
+                data=encoded.decode("ascii"),
+                mimeType=content_type,
+            )
+        width, height = image.size
+        if max(width, height) <= 128:
+            break
+        image.thumbnail(
+            (max(1, int(width * 0.75)), max(1, int(height * 0.75))),
+            Image.Resampling.LANCZOS,
+        )
+    return None
+
+
+async def _discover_chart_outputs(
+    anthropic: AsyncAnthropic,
+    *,
+    session_id: str,
+    turn_started_at: dt.datetime,
+) -> tuple[_ChartOutput, ...]:
+    """Enumerate recent image outputs from the session's Files API scope."""
+    if turn_started_at.tzinfo is None:
+        turn_started_at = turn_started_at.replace(tzinfo=dt.UTC)
+    cutoff = turn_started_at - _CLOCK_SLACK
+    candidates: list[FileMetadata] = []
+    async for item in anthropic.beta.files.list(
+        scope_id=session_id,
+        betas=["managed-agents-2026-04-01"],
+    ):
+        candidates.append(item)
+        if len(candidates) >= _MAX_SCANNED:
+            break
+
+    outputs: list[_ChartOutput] = []
+    for item in candidates:
+        filename = item.filename or item.id
+        if PurePosixPath(filename).suffix.lower() not in _ALLOWED_SUFFIXES:
+            continue
+        created = _parse_created(item.created_at)
+        if created is not None and created < cutoff:
+            continue
+        outputs.append(_ChartOutput(file_id=item.id, filename=filename, size_bytes=item.size_bytes))
+        if len(outputs) >= _MAX_CHARTS:
+            break
+    return tuple(outputs)
+
+
+async def _deliver_hosted_charts_impl(
+    anthropic: AsyncAnthropic,
+    *,
+    settings: ArtifactsSettings | None,
+    tenant_id: str,
+    account_id: str,
+    session_id: str,
+    turn_started_at: dt.datetime,
+    message: str,
+    store: ArtifactStore | None = None,
+    log_failure_once: Callable[..., None],
+) -> HostedChartDelivery:
+    """Embed charts by default and add URLs only when storage is configured."""
+    try:
+        outputs = await _discover_chart_outputs(
+            anthropic,
+            session_id=session_id,
+            turn_started_at=turn_started_at,
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade-not-block boundary
+        log_failure_once(stage="discovery", key=None, exc=exc)
+        return HostedChartDelivery(message=message)
+
+    if not outputs:
+        return HostedChartDelivery(message=message)
+
+    url_store = store
+    if settings is not None and url_store is None:
+        try:
+            url_store = build_artifact_store(settings)
+        except Exception as exc:  # noqa: BLE001 — embedding remains available
+            log_failure_once(stage="storage_init", key=None, exc=exc)
+
+    lines: list[str] = []
+    chart_urls: list[ChartUrl] = []
+    image_blocks: list[ImageContent] = []
+    embed_images = settings is None or settings.embed_images
+    ttl_minutes = max(1, (settings.url_ttl_seconds + 59) // 60) if settings is not None else None
+
+    for output in outputs[:_MAX_CHARTS]:
+        key: str | None = None
+        try:
+            filename = _safe_filename(output.filename)
+            if output.size_bytes > _MAX_BYTES:
+                raise ValueError("artifact exceeds the per-chart byte limit")
+            response = await anthropic.beta.files.download(output.file_id)
+            content = await response.read()
+            if len(content) > _MAX_BYTES:
+                raise ValueError("artifact exceeds the per-chart byte limit")
+            content_type = _image_content_type(filename, content)
+        except Exception as exc:  # noqa: BLE001 — one chart cannot block the answer
+            log_failure_once(stage="download", key=None, exc=exc)
+            continue
+
+        if embed_images and len(image_blocks) < _MAX_IMAGE_BLOCKS:
+            try:
+                image_block = await asyncio.to_thread(_bounded_image_block, content, content_type)
+            except Exception as exc:  # noqa: BLE001 — optional URLs can still succeed
+                log_failure_once(stage="embed", key=None, exc=exc)
+            else:
+                if image_block is not None:
+                    image_blocks.append(image_block)
+
+        if settings is None or url_store is None:
+            continue
+
+        try:
+            key = f"tenant/{tenant_id}/account/{account_id}/session/{session_id}/{filename}"
+            stored = await url_store.upload_and_presign(
+                key=key,
+                content=content,
+                content_type=content_type,
+                ttl_seconds=settings.url_ttl_seconds,
+            )
+            chart_urls.append(
+                ChartUrl(
+                    filename=filename,
+                    url=stored.url,
+                    expires_at=stored.expires_at,
+                )
+            )
+            lines.append(
+                f"Chart: [{_markdown_label(filename)}]({stored.url}) — "
+                f"expires in ~{ttl_minutes} min"
+            )
+            _log.info(
+                "mcp.hosted_artifact.available",
+                key=key,
+                ttl_seconds=settings.url_ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 — embedding remains available
+            log_failure_once(stage="storage", key=key, exc=exc)
+
+    delivered_message = f"{message}\n\n" + "\n".join(lines) if lines else message
+    return HostedChartDelivery(
+        message=delivered_message,
+        chart_urls=tuple(chart_urls),
+        image_blocks=tuple(image_blocks),
+    )
+
+
+async def deliver_hosted_charts(
+    anthropic: AsyncAnthropic,
+    *,
+    settings: ArtifactsSettings | None,
+    tenant_id: str,
+    account_id: str,
+    session_id: str,
+    turn_started_at: dt.datetime,
+    message: str,
+    store: ArtifactStore | None = None,
+) -> HostedChartDelivery:
+    """Deliver bounded chart images and optional URLs without blocking text."""
+    logged_failure = False
+
+    def log_failure_once(*, stage: str, key: str | None, exc: Exception) -> None:
+        nonlocal logged_failure
+        if logged_failure:
+            return
+        logged_failure = True
+        _log.warning(
+            "mcp.hosted_artifact.unavailable",
+            stage=stage,
+            key=key,
+            error_type=type(exc).__name__,
+        )
+
+    try:
+        async with asyncio.timeout(_HOSTED_DELIVERY_TIMEOUT_SECONDS):
+            return await _deliver_hosted_charts_impl(
+                anthropic,
+                settings=settings,
+                tenant_id=tenant_id,
+                account_id=account_id,
+                session_id=session_id,
+                turn_started_at=turn_started_at,
+                message=message,
+                store=store,
+                log_failure_once=log_failure_once,
+            )
+    except TimeoutError as exc:
+        log_failure_once(stage="timeout", key=None, exc=exc)
+        return HostedChartDelivery(message=message)

@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from daimon.core.config import McpSettings, Settings, load_settings
+from daimon.core.config import ArtifactsSettings, McpSettings, Settings, load_settings
 from pydantic import HttpUrl, ValidationError
 
 
@@ -65,6 +65,62 @@ def test_load_settings_accepts_explicit_overrides_when_passed() -> None:
         }
     )
     assert settings.cli.local_user == "carol"
+
+
+def test_artifacts_settings_are_off_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DAIMON_DATABASE__URL", "postgresql+asyncpg://u:p@h/d")
+    monkeypatch.setenv("DAIMON_ANTHROPIC__API_KEY", "sk-test")
+
+    assert load_settings(_env_file=None).artifacts is None
+
+
+def test_artifacts_settings_parse_nested_env_with_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAIMON_DATABASE__URL", "postgresql+asyncpg://u:p@h/d")
+    monkeypatch.setenv("DAIMON_ANTHROPIC__API_KEY", "sk-test")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__ENDPOINT_URL", "https://bucket.example.test")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__BUCKET", "private-artifacts")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__ACCESS_KEY_ID", "access-key")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__SECRET_ACCESS_KEY", "secret-key")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__REGION", "auto")
+
+    artifacts = load_settings(_env_file=None).artifacts
+
+    assert isinstance(artifacts, ArtifactsSettings)
+    assert artifacts.bucket == "private-artifacts"
+    assert artifacts.region == "auto"
+    assert artifacts.url_ttl_seconds == 600
+    assert artifacts.embed_images is True
+
+
+def test_artifacts_image_embedding_can_be_disabled_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAIMON_DATABASE__URL", "postgresql+asyncpg://u:p@h/d")
+    monkeypatch.setenv("DAIMON_ANTHROPIC__API_KEY", "sk-test")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__ENDPOINT_URL", "https://bucket.example.test")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__BUCKET", "private-artifacts")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__ACCESS_KEY_ID", "access-key")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__SECRET_ACCESS_KEY", "secret-key")
+    monkeypatch.setenv("DAIMON_ARTIFACTS__EMBED_IMAGES", "false")
+
+    artifacts = load_settings(_env_file=None).artifacts
+
+    assert artifacts is not None
+    assert artifacts.embed_images is False
+
+
+@pytest.mark.parametrize("ttl", [0, 86_401])
+def test_artifacts_url_ttl_rejects_values_outside_bounds(ttl: int) -> None:
+    with pytest.raises(ValidationError):
+        ArtifactsSettings(
+            endpoint_url="https://bucket.example.test",
+            bucket="private-artifacts",
+            access_key_id="access-key",
+            secret_access_key="secret-key",
+            url_ttl_seconds=ttl,
+        )
 
 
 def test_mcp_settings_both_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
