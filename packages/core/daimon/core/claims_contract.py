@@ -18,7 +18,7 @@ ALLOWED_CLAIM_UNITS = frozenset({"usd", "pct", "count", "days", "mw"})
 CLAIM_UNIT_ALIASES = {"$": "usd", "%": "pct"}
 
 _REGISTRY_ID = re.compile(r"[a-z][a-z0-9_.-]*\Z")
-_RELATION_COLUMN = re.compile(r"(?:[a-z_][a-z0-9_]*\.){2}[a-z_][a-z0-9_]*\Z")
+_RELATION_COLUMN = re.compile(r"(?:[a-z_][a-z0-9_]*\.)+[a-z_][a-z0-9_]*\Z")
 _DECIMAL_TEXT = re.compile(r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)\Z")
 _NUMERIC_TOKEN = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 _NUMERIC_RANGE = re.compile(

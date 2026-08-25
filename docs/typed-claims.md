@@ -9,7 +9,7 @@ on presentation-sensitive regular expressions.
 Revenue was $7.57M for the period.
 
 ```claims
-[{"metric":"revenue","value":7571234,"unit":"usd","basis":"invoices","as_of":"2026-06-30","source":"semantic.revenue"}]
+[{"metric":"revenue","value":7571234,"unit":"usd","basis":"invoices","as_of":"2026-06-30","source":"invoices.total"}]
 ```
 ````
 
@@ -25,7 +25,9 @@ Unicode dashes and thin/non-breaking spaces are normalized, canonical units use
 a closed vocabulary, and formatted numeric strings are converted to exact
 decimals. Presentation-only keys are ignored.
 
-Renderers should call `strip_claims_blocks()` before showing an answer. The
-Slack adapter does this for every carrier, including malformed or non-trailing
-examples. Prose grading remains available for deployments that have not yet
-adopted typed claims.
+Core final and sealed-response extractors remove every carrier before returning
+human-facing text, including malformed or non-trailing examples. Discord,
+Slack, and headless consumers therefore share the same safe render boundary.
+Evaluation retains the raw answer separately for typed grading and audit.
+Prose grading remains available for deployments that have not yet adopted
+typed claims.

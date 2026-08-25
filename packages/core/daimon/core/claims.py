@@ -44,8 +44,8 @@ def parse_claims_block(text: str, *, registry: MeasureRegistry | None = None) ->
     trailing carrier with malformed JSON, a non-list payload, or an empty list
     raises :class:`ClaimsBlockError`. Schema-invalid rows and, when configured,
     unknown registry IDs are omitted and reported individually while valid
-    siblings remain available to graders and renderers. Render consumers must
-    separately call :func:`strip_claims_blocks` to remove every fence.
+    siblings remain available to graders. Core human-response extractors remove
+    every carrier before handing text to renderers.
     """
     matches = list(_CLAIMS_FENCE.finditer(text))
     if not matches:

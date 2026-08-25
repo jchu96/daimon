@@ -133,6 +133,19 @@ class TestExtractFinalResponse:
         ]
         assert extract_final_response(content) == ""
 
+    def test_claims_carrier_is_removed_from_human_response(self) -> None:
+        content: list[ContentBlock] = [
+            TextBlock(
+                kind="text",
+                text=(
+                    "Invoice total is $10.\n\n```claims\n"
+                    '[{"metric":"invoice_total","value":10}]\n```'
+                ),
+            )
+        ]
+
+        assert extract_final_response(content) == "Invoice total is $10."
+
 
 class TestExtractSealedResponses:
     def test_long_text_followed_by_tool_is_returned_with_index(self) -> None:
@@ -181,3 +194,15 @@ class TestExtractSealedResponses:
 
     def test_empty_content_returns_empty_list(self) -> None:
         assert extract_sealed_responses([], min_chars=500) == []
+
+    def test_claims_carrier_is_removed_from_sealed_response(self) -> None:
+        prose = "Invoice details. " * 40
+        content: list[ContentBlock] = [
+            TextBlock(
+                kind="text",
+                text=(f'{prose}\n\n```claims\n[{{"metric":"invoice_total","value":10}}]\n```'),
+            ),
+            ToolUseBlock(kind="tool_use", id="tu_1", type="agent.tool_use", name="read", input={}),
+        ]
+
+        assert extract_sealed_responses(content, min_chars=500) == [(0, prose.rstrip())]

@@ -322,7 +322,7 @@ async def test_terminal_success_strips_all_claims_fences(fake_slack_web_client: 
     answer = (
         'Example:\n```claims\n[{"metric":"example"}]\n```\n\n'
         "Supported total is 12 MW.\n"
-        '```claims\n[{"metric":"installed_mw","value":12}]\n```'
+        '```claims\n[{"metric":"invoice_total","value":12}]\n```'
     )
 
     await lc.on_terminal_success(TurnState(content=[TextBlock(kind="text", text=answer)]))

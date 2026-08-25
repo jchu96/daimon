@@ -22,6 +22,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_agent_tool_result_event i
 from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event import (
     StopReason,
 )
+from daimon.core.claims import strip_claims_blocks
 from daimon.core.errors import TurnError
 
 
@@ -109,8 +110,10 @@ def extract_final_response(content: list[ContentBlock]) -> str:
         if isinstance(block, ToolUseBlock):
             last_tool_idx = i
 
-    return "".join(
-        block.text for block in content[last_tool_idx + 1 :] if isinstance(block, TextBlock)
+    return strip_claims_blocks(
+        "".join(
+            block.text for block in content[last_tool_idx + 1 :] if isinstance(block, TextBlock)
+        )
     )
 
 
@@ -132,8 +135,11 @@ def extract_sealed_responses(
         if isinstance(block, ToolUseBlock):
             last_tool_idx = i
 
-    return [
-        (i, block.text)
-        for i, block in enumerate(content[:last_tool_idx])
-        if isinstance(block, TextBlock) and len(block.text) >= min_chars
-    ]
+    responses: list[tuple[int, str]] = []
+    for i, block in enumerate(content[:last_tool_idx]):
+        if not isinstance(block, TextBlock) or len(block.text) < min_chars:
+            continue
+        text = strip_claims_blocks(block.text)
+        if text:
+            responses.append((i, text))
+    return responses

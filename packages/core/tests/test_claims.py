@@ -98,7 +98,7 @@ def test_registry_membership_is_optional_and_isolated_per_row() -> None:
         (
             MeasureDefinition(
                 id="revenue",
-                source="semantic.revenue.amount",
+                source="invoices.total",
                 basis="invoices",
                 unit="usd",
             ),
@@ -197,7 +197,7 @@ def test_contract_generates_instruction_and_expands_placeholder() -> None:
 def test_measure_registry_validation_rejects_duplicate_or_malformed_definitions() -> None:
     valid = MeasureDefinition(
         id="revenue",
-        source="semantic.revenue.amount",
+        source="invoices.total",
         basis="invoices",
         unit="usd",
     )
@@ -210,7 +210,7 @@ def test_measure_registry_validation_rejects_duplicate_or_malformed_definitions(
                 (
                     MeasureDefinition(
                         id="revenue",
-                        source="revenue.amount",
+                        source="revenue",
                         basis="invoices",
                         unit="usd",
                     ),
