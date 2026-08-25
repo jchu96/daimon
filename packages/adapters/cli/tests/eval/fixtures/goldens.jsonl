@@ -1,0 +1,7 @@
+{"id":"claim-wins-prose","question":"Capacity?","expected_properties":{"required_phrases":["missing advisory phrase"]},"kind":"value","expected_claim":{"metric":"installed_mw","value":10,"tolerance":{"abs":0.01},"unit":"mw"}}
+{"id":"wrong-claim-prose-correct","question":"Capacity?","expected_properties":{},"kind":"value","expected_claim":{"metric":"installed_mw","value":10,"tolerance":{"abs":0.01},"unit":"mw"}}
+{"id":"rejection-refusal","question":"Reject the seed if unsupported.","expected_properties":{},"kind":"rejection","expected_claim":{"metric":"installed_mw","value":10,"tolerance":{"abs":0.01},"unit":"mw"}}
+{"id":"rejection-unrelated-hedge","question":"Reject the seed if unsupported.","expected_properties":{},"kind":"rejection","expected_claim":{"metric":"installed_mw","value":10,"tolerance":{"abs":0.01},"unit":"mw"}}
+{"id":"trend-relative","question":"Revenue trend?","expected_properties":{},"kind":"trend","expected_claim":{"metric":"revenue_growth","value":5,"tolerance":{"rel":0.02},"unit":"pct"}}
+{"id":"legacy-prose","question":"Capacity?","expected_properties":{},"expected_sql":{"query":"SELECT 10","answer_regex":"(?P<value>10)\\s*MW","tolerance":0.01}}
+{"id":"declared-ban","question":"Capacity?","expected_properties":{"banned_phrases":["(?i)secret operator label"]},"kind":"value","expected_claim":{"metric":"installed_mw","value":10,"tolerance":{"abs":0.01},"unit":"mw"}}

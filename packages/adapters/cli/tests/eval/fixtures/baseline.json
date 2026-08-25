@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "generated_at": "recorded fixture",
+  "cases": [
+    {
+      "id": "claim-wins-prose",
+      "answer_raw": "The supported total is 99 MW.\n\n```claims\n[{\"metric\":\"installed_mw\",\"value\":10,\"unit\":\"mw\",\"basis\":\"nameplate\",\"as_of\":null,\"source\":null}]\n```"
+    },
+    {
+      "id": "wrong-claim-prose-correct",
+      "answer_raw": "The supported total is 10 MW.\n\n```claims\n[{\"metric\":\"installed_mw\",\"value\":9,\"unit\":\"mw\",\"basis\":\"nameplate\",\"as_of\":null,\"source\":null}]\n```"
+    },
+    {
+      "id": "rejection-refusal",
+      "answer_raw": "I cannot confirm the seeded 10 MW value."
+    },
+    {
+      "id": "rejection-unrelated-hedge",
+      "answer_raw": "The unrelated cycle-time field cannot be computed."
+    },
+    {
+      "id": "trend-relative",
+      "answer_raw": "Revenue increased 5.05%.\n\n```claims\n[{\"metric\":\"revenue_growth\",\"value\":5.05,\"unit\":\"pct\",\"basis\":\"year over year\",\"as_of\":null,\"source\":null}]\n```"
+    },
+    {
+      "id": "legacy-prose",
+      "answer_raw": "The supported total is 10 MW."
+    },
+    {
+      "id": "declared-ban",
+      "answer_raw": "Secret operator label.\n\n```claims\n[{\"metric\":\"installed_mw\",\"value\":10,\"unit\":\"mw\",\"basis\":\"nameplate\",\"as_of\":null,\"source\":null}]\n```"
+    }
+  ]
+}

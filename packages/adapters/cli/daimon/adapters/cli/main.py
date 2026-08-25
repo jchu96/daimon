@@ -20,6 +20,7 @@ from daimon.adapters.cli.commands.sessions import sessions_app
 from daimon.adapters.cli.commands.skills import skills_app
 from daimon.adapters.cli.commands.smoke import smoke_command
 from daimon.adapters.cli.commands.tenants import tenants_app
+from daimon.adapters.cli.eval import eval_app
 from daimon.adapters.cli.run.command import run_command
 
 app = typer.Typer(help="Daimon CMA CLI")
@@ -36,6 +37,7 @@ app.add_typer(memory_app, name="memory")
 app.add_typer(notebook_app, name="notebook")
 app.add_typer(repo_bindings_app, name="repo-bindings")
 app.add_typer(routines_app, name="routines")
+app.add_typer(eval_app, name="eval")
 app.command("run")(run_command)
 app.command("smoke")(smoke_command)
 

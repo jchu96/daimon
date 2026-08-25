@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "runs": [
+    {
+      "id": "generic-contract",
+      "baseline": "baseline.json",
+      "suspect_labels": [],
+      "sql_results": {"legacy-prose": "10"},
+      "raw_source": {
+        "claim-wins-prose": "real_carrier",
+        "wrong-claim-prose-correct": "real_carrier",
+        "rejection-refusal": "real_carrier",
+        "rejection-unrelated-hedge": "real_carrier",
+        "trend-relative": "real_carrier",
+        "legacy-prose": "recorded",
+        "declared-ban": "real_carrier"
+      },
+      "contract_truth": {
+        "claim-wins-prose": {"color": "GREEN", "reason": "The typed claim is primary; a prose distractor cannot override it."},
+        "wrong-claim-prose-correct": {"color": "RED", "reason": "Matching prose cannot rescue a wrong typed claim."},
+        "rejection-refusal": {"color": "GREEN", "reason": "The refusal is explicitly bound to the seeded value."},
+        "rejection-unrelated-hedge": {"color": "RED", "reason": "An unrelated hedge is not a seed rejection."},
+        "trend-relative": {"color": "GREEN", "reason": "The typed trend is within relative tolerance."},
+        "legacy-prose": {"color": "GREEN", "reason": "Goldens without expected_claim retain prose fallback."},
+        "declared-ban": {"color": "RED", "reason": "An explicit ban remains gating even when the numeric claim is correct."}
+      },
+      "expected_verdicts": {
+        "claim-wins-prose": {"replay_completion": true, "numeric_recompute": true, "required_properties": false},
+        "wrong-claim-prose-correct": {"replay_completion": true, "numeric_recompute": false},
+        "rejection-refusal": {"replay_completion": true, "numeric_recompute": true},
+        "rejection-unrelated-hedge": {"replay_completion": true, "numeric_recompute": false},
+        "trend-relative": {"replay_completion": true, "numeric_recompute": true},
+        "legacy-prose": {"replay_completion": true, "numeric_recompute": true},
+        "declared-ban": {"replay_completion": true, "numeric_recompute": true, "banned_properties": false}
+      }
+    }
+  ]
+}

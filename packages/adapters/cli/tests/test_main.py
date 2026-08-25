@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 def test_root_app_help_lists_all_subapps() -> None:
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
-    for name in ("agents", "environments", "config", "defaults"):
+    for name in ("agents", "environments", "config", "defaults", "eval"):
         assert name in result.stdout
 
 
