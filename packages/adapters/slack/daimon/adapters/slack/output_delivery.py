@@ -1,195 +1,150 @@
-"""Best-effort delivery of Managed Agents session outputs to Slack.
+"""Slack delivery of Managed Agents session output files.
 
-The Managed Agents Files API contract is the boundary here: listing with the
-session ``scope_id`` is treated as the session's output collection, excluding
-uploads, credential resources, and files from the working directory. Daimon
-does not inspect the sandbox filesystem directly.
-
-Successful-delivery IDs are process-local because this adapter has no durable
-delivery-receipt repository. A process restart can therefore re-post a recent
-file inside the clock-skew window; the trade-off avoids marking an unposted
-file as delivered and silently losing it.
+Thin adapter over :func:`daimon.core.output_delivery.sweep_session_outputs`:
+it contributes the Slack poster, the oversize skip notice, and the
+degrade-not-block handling for the two workspace-wide error codes
+(``missing_scope``, ``storage_limit_reached``). Everything else — polling,
+the downloadable gate, post-then-delete ordering, per-file isolation — lives
+in the core engine.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from collections.abc import Awaitable, Callable
 
 import structlog
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import FileMetadata
-from daimon.core.media.filenames import sanitize_title
-from slack_sdk.errors import SlackApiError
+from daimon.core.media.filenames import display_filename_for, sanitize_title
+from daimon.core.output_delivery import (
+    MAX_BYTES_PER_FILE,
+    DeliverableFile,
+    OutputPostingUnavailable,
+    SkippedFile,
+    sweep_session_outputs,
+)
+from slack_sdk.errors import SlackApiError, SlackRequestError
 from slack_sdk.web.async_client import AsyncWebClient
 
 log = structlog.get_logger(__name__)
 
-_MAX_FILES_PER_TURN = 5
-_MAX_BYTES_PER_FILE = 20 * 1024 * 1024
-_CLOCK_SLACK = timedelta(seconds=30)
-_INDEX_RETRY_DELAY_S = 1.0
+_MIB = 1024 * 1024
 
-# Session-scoped listings include prior-turn artifacts. Only successful Slack
-# uploads count as delivered; age, size, cap, and transient failures do not.
-_delivered_file_ids: dict[str, set[str]] = {}
+# Workspace-wide, persistent failures: retrying per file (or per turn) is pure
+# noise, so these abort the sweep and produce one deduped notice per team.
+_ABORT_NOTICES: dict[str, str] = {
+    "missing_scope": (
+        "I couldn't attach the generated file because this app is missing the "
+        "`files:write` Slack scope. A workspace admin must add that scope and "
+        "reinstall daimon from the install link before file delivery can work."
+    ),
+    "storage_limit_reached": (
+        "I couldn't attach the generated file because this workspace has hit "
+        "its Slack file-storage limit. A workspace admin must free up space or "
+        "upgrade the plan before file delivery can work."
+    ),
+}
 
 
-async def _iter_session_files(
-    anthropic: AsyncAnthropic, *, session_id: str
-) -> AsyncIterator[FileMetadata]:
-    """List session files, retrying one empty result for MA indexing lag."""
-    for attempt in range(2):
+def _slack_error_code(err: SlackApiError | SlackRequestError) -> str:
+    """Read the API error code; a SlackRequestError (bytes-POST failure) has
+    no ``.response`` attribute, so it carries no code."""
+    if isinstance(err, SlackApiError):
+        return str(err.response.get("error", ""))  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # slack_sdk response is dict-like
+    return ""
+
+
+def _abort_code(exc: OutputPostingUnavailable) -> str:
+    """Re-derive the Slack error code from the abort's ``__cause__``."""
+    cause = exc.__cause__
+    if isinstance(cause, (SlackApiError, SlackRequestError)):
+        return _slack_error_code(cause)
+    return ""
+
+
+def _build_poster(
+    web_client: AsyncWebClient, *, channel_id: str, thread_ts: str
+) -> Callable[[DeliverableFile], Awaitable[None]]:
+    async def post(file: DeliverableFile) -> None:
+        display_name = display_filename_for(file.filename, file.mime_type)
         try:
-            page = await anthropic.beta.files.list(
-                scope_id=session_id,
-                betas=["managed-agents-2026-04-01"],
+            # No content_type kwarg: files_upload_v2 forwards it into the
+            # files.completeUploadExternal query string, where it is a silent
+            # no-op — Slack derives the preview from the filename extension.
+            await web_client.files_upload_v2(  # pyright: ignore[reportUnknownMemberType]  # slack_sdk **kwargs: Unknown
+                channel=channel_id,
+                thread_ts=thread_ts,
+                filename=display_name,
+                title=display_name,
+                content=file.content,
             )
-        except Exception as exc:  # noqa: BLE001 -- post-turn delivery must degrade cleanly
-            log.warning(
-                "slack.output_delivery.list_failed",
-                session_id=session_id,
-                error=str(exc)[:300],
-            )
-            return
+        except (SlackApiError, SlackRequestError) as err:
+            code = _slack_error_code(err)
+            if code in _ABORT_NOTICES:
+                raise OutputPostingUnavailable(code) from err
+            # Anything else — including every SlackRequestError — is a
+            # per-file failure the core engine isolates without deleting.
+            raise
 
-        saw_file = False
-        try:
-            async for file in page:
-                saw_file = True
-                yield file
-        except Exception as exc:  # noqa: BLE001 -- pagination must degrade cleanly
-            log.warning(
-                "slack.output_delivery.pagination_failed",
-                session_id=session_id,
-                error=str(exc)[:300],
-            )
-            return
+    return post
 
-        if saw_file or attempt == 1:
-            return
-        log.debug(
-            "slack.output_delivery.empty_listing_retry",
-            session_id=session_id,
-            delay_seconds=_INDEX_RETRY_DELAY_S,
+
+def _build_skip_notice(
+    web_client: AsyncWebClient, *, channel_id: str, thread_ts: str
+) -> Callable[[SkippedFile], Awaitable[None]]:
+    async def on_skip(skipped: SkippedFile) -> None:
+        size_mib = skipped.size_bytes / _MIB
+        limit_mib = MAX_BYTES_PER_FILE // _MIB
+        await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # slack_sdk **kwargs: Unknown
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=(
+                f"I couldn't attach `{sanitize_title(skipped.filename)}` — it is "
+                f"{size_mib:.1f} MiB, over the {limit_mib} MiB delivery limit."
+            ),
         )
-        await asyncio.sleep(_INDEX_RETRY_DELAY_S)
+
+    return on_skip
 
 
 async def deliver_session_outputs(
-    anthropic: AsyncAnthropic,
+    anthropic_client: AsyncAnthropic,
     web_client: AsyncWebClient,
     *,
     session_id: str,
     channel_id: str,
     thread_ts: str,
-    turn_started_at: datetime,
+    notice_keys: set[str],
+    team_id: str,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
-    """Upload output files created during this turn without failing the turn."""
-    delivered = _delivered_file_ids.setdefault(session_id, set())
-    cutoff = turn_started_at - _CLOCK_SLACK
+    """Sweep the session's outputs into the thread, degrading on abort codes.
 
-    posted = 0
+    ``notice_keys`` is the instance-level dedup set owned by ``SlackApp``,
+    keyed ``"{team_id}:{error_code}"`` — one abort notice per team per code
+    per process.
+    """
+    post = _build_poster(web_client, channel_id=channel_id, thread_ts=thread_ts)
+    on_skip = _build_skip_notice(web_client, channel_id=channel_id, thread_ts=thread_ts)
     try:
-        async for file in _iter_session_files(anthropic, session_id=session_id):
-            if file.id in delivered:
-                log.debug(
-                    "slack.output_delivery.already_delivered",
-                    session_id=session_id,
-                    file_id=file.id,
-                )
-                continue
-
-            created_at = file.created_at
-            if created_at.tzinfo is None and cutoff.tzinfo is not None:
-                created_at = created_at.replace(tzinfo=cutoff.tzinfo)
-            if created_at < cutoff:
-                log.debug(
-                    "slack.output_delivery.before_turn",
-                    session_id=session_id,
-                    file_id=file.id,
-                )
-                continue
-            if file.size_bytes > _MAX_BYTES_PER_FILE:
-                log.info(
-                    "slack.output_delivery.skipped_oversize",
-                    session_id=session_id,
-                    file_id=file.id,
-                    size_bytes=file.size_bytes,
-                    max_bytes=_MAX_BYTES_PER_FILE,
-                )
-                continue
-            if posted >= _MAX_FILES_PER_TURN:
-                log.info(
-                    "slack.output_delivery.cap_reached",
-                    session_id=session_id,
-                    max_files=_MAX_FILES_PER_TURN,
-                    next_file_id=file.id,
-                )
-                break
-
-            safe_filename = sanitize_title(file.filename)
-            try:
-                response = await anthropic.beta.files.download(
-                    file.id,
-                    betas=["managed-agents-2026-04-01"],
-                )
-                content = await response.read()
-                await web_client.files_upload_v2(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    filename=safe_filename,
-                    title=safe_filename,
-                    content=content,
-                    content_type=file.mime_type,
-                )
-            except SlackApiError as exc:
-                if exc.response.get("error") == "missing_scope":  # pyright: ignore[reportUnknownMemberType]
-                    log.warning(
-                        "slack.output_delivery.missing_scope",
-                        session_id=session_id,
-                        required_scope="files:write",
-                    )
-                    await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                        channel=channel_id,
-                        thread_ts=thread_ts,
-                        text=(
-                            "I couldn't attach the generated file because this app is missing "
-                            "the `files:write` Slack scope. A workspace admin must add that "
-                            "scope and reinstall daimon from the install link before file "
-                            "delivery can work."
-                        ),
-                    )
-                    return
-                log.warning(
-                    "slack.output_delivery.upload_failed",
-                    session_id=session_id,
-                    file_id=file.id,
-                    error=str(exc)[:300],
-                )
-                continue
-            except Exception as exc:  # noqa: BLE001 -- one bad file must not block the turn
-                log.warning(
-                    "slack.output_delivery.upload_failed",
-                    session_id=session_id,
-                    file_id=file.id,
-                    error=str(exc)[:300],
-                )
-                continue
-
-            delivered.add(file.id)
-            posted += 1
-            log.info(
-                "slack.output_delivery.posted",
-                session_id=session_id,
-                file_id=file.id,
-                filename=safe_filename,
-                size_bytes=file.size_bytes,
-            )
-    except Exception as exc:  # noqa: BLE001 -- pagination/metadata must degrade cleanly
-        log.warning(
-            "slack.output_delivery.pagination_failed",
-            session_id=session_id,
-            error=str(exc)[:300],
+        await sweep_session_outputs(
+            anthropic_client, session_id=session_id, post=post, on_skip=on_skip, sleep=sleep
         )
+    except OutputPostingUnavailable as exc:
+        code = _abort_code(exc)
+        log.warning(
+            "slack.output_delivery.unavailable",
+            session_id=session_id,
+            team_id=team_id,
+            code=code,
+        )
+        notice = _ABORT_NOTICES.get(code)
+        key = f"{team_id}:{code}"
+        if notice is None or key in notice_keys:
+            return
+        await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # slack_sdk **kwargs: Unknown
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=notice,
+        )
+        notice_keys.add(key)

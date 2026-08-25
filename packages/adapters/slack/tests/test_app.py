@@ -48,7 +48,7 @@ from daimon.core.stores.slack_bot_tokens import get_slack_bot_token, upsert_slac
 from daimon.core.stores.tenants import get_tenant
 from daimon.core.stores.thread_sessions import create_thread_session, get_live_thread_session
 from daimon.core.turn.posture import Billed, BillingPosture
-from daimon.core.turn.state import TextBlock, TurnState
+from daimon.core.turn.state import TextBlock, ToolUseBlock, TurnState
 from daimon.testing.ma import (
     _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]  # test-only
 )
@@ -597,8 +597,18 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
     app, _ = _make_orchestrate_app(db_session_factory)
 
     # fake_run_turn calls lifecycle.on_terminal_success so final_ts is set.
+    # The ToolUseBlock matters: the post-turn output sweep is gated on the
+    # turn having used a tool — a text-only TurnState would (correctly) skip
+    # the sweep and the delivery assertions below would fail for the wrong reason.
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
-        state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_first", type="agent.tool_use", name="bash", input={}
+                ),
+                TextBlock(kind="text", text="Hello!"),
+            ]
+        )
         await lifecycle.on_terminal_success(state)
         return state
 
@@ -689,6 +699,15 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
         assert cs_kwargs.get("agent_uuid") is not None, (
             "create_session must receive agent_uuid (per-agent vault key)"
         )
+        # The sweep is detached — drain background tasks before asserting on it.
+        # Terminates because _spawn's done-callback discards finished tasks, and
+        # also picks up a chained successor spawned during the gather.
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
         mock_deliver_outputs.assert_awaited_once()
         delivery_kwargs = mock_deliver_outputs.await_args.kwargs
         assert delivery_kwargs["session_id"] == "sess-first-001"
@@ -859,7 +878,15 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
         turn_count += 1
         if turn_count == 1:
             await first_turn_gate.wait()  # guaranteed suspension — event2 arrives here
-        state = TurnState(content=[TextBlock(kind="text", text="Coalesce response")])
+        # ToolUseBlock so the tool-use-gated output sweep runs for both turns.
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_coal", type="agent.tool_use", name="bash", input={}
+                ),
+                TextBlock(kind="text", text="Coalesce response"),
+            ]
+        )
         await lifecycle.on_terminal_success(state)
         return state
 
@@ -981,6 +1008,17 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
         # Wait for task1 to complete (it also drains the queue).
         await task1
 
+        # Drain the detached output sweeps before asserting on delivery calls.
+        # The sleep(0) yields so the tasks' call_soon-scheduled done-callbacks
+        # (the _bg_tasks discards) actually run — gather over already-done
+        # tasks completes without ever yielding to the event loop.
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
     # Assert ⌛ reaction was added.
     # reactions.add sends params as query string (url.path == "/api/reactions.add"),
     # so compare on path only — not the full URL which includes query params.
@@ -997,7 +1035,362 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
     # Assert exactly 2 turns ran: one for event1, one drain for event2.
     assert turn_count == 2, f"exactly 2 turns must run (1 initial + 1 drain), got {turn_count}"
     assert mock_deliver_outputs.await_count == 2, (
-        "a delivery exception on the first turn must be swallowed so the queued turn drains"
+        "a delivery failure is isolated inside a detached sweep task, so the "
+        "queued turn never waited for it and both turns still swept"
+    )
+
+
+async def test_run_thread_turn_text_only_turn_spawns_no_output_sweep(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A turn whose TurnState carries no ToolUseBlock spawns no sweep at all —
+    a text-only turn cannot have written a file."""
+    team_id = "T_SWEEP_GATE"
+    channel = "C_TEST"
+    thread_ts = "9000000020.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        state = TurnState(content=[TextBlock(kind="text", text="Just words.")])
+        await lifecycle.on_terminal_success(state)
+        return state
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_GATE",
+        "text": "<@U_BOT> hello",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch(
+            "daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock
+        ) as mock_deliver_outputs,
+    ):
+        mock_resolve_agent.return_value = "agent_sweep_id"
+        mock_resolve_env.return_value = "env_sweep_id"
+        mock_create_session.return_value = BetaManagedAgentsSession(
+            outcome_evaluations=[],
+            id="sess-gate-001",
+            agent=BetaManagedAgentsSessionAgent(
+                id="agent_sweep_id",
+                mcp_servers=[],
+                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+                name="test-agent",
+                skills=[],
+                tools=[],
+                type="agent",
+                version=1,
+            ),
+            created_at=datetime.now(UTC),
+            environment_id="env_sweep_id",
+            metadata={},
+            resources=[],
+            stats=BetaManagedAgentsSessionStats(),
+            status="idle",
+            type="session",
+            updated_at=datetime.now(UTC),
+            usage=BetaManagedAgentsSessionUsage(),
+            vault_ids=[],
+        )
+        mock_run_turn.side_effect = _fake_run_turn
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+
+        assert app._output_sweeps == {}, (  # pyright: ignore[reportPrivateUsage]
+            "a text-only turn must not register any output sweep"
+        )
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+        mock_deliver_outputs.assert_not_awaited()
+
+
+async def test_run_thread_turn_output_sweep_is_detached_from_turn_path(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """The turn path returns while the sweep is still running — the sweep is a
+    detached background task, not an inline await."""
+    team_id = "T_SWEEP_DETACH"
+    channel = "C_TEST"
+    thread_ts = "9000000021.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_det", type="agent.tool_use", name="bash", input={}
+                ),
+                TextBlock(kind="text", text="Done."),
+            ]
+        )
+        await lifecycle.on_terminal_success(state)
+        return state
+
+    gate = asyncio.Event()
+
+    async def _blocked_delivery(*args: Any, **kwargs: Any) -> None:
+        await gate.wait()
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_DETACH",
+        "text": "<@U_BOT> hello",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch(
+            "daimon.adapters.slack.app.deliver_session_outputs",
+            new_callable=AsyncMock,
+        ) as mock_deliver_outputs,
+    ):
+        mock_resolve_agent.return_value = "agent_sweep_id"
+        mock_resolve_env.return_value = "env_sweep_id"
+        mock_create_session.return_value = BetaManagedAgentsSession(
+            outcome_evaluations=[],
+            id="sess-detach-001",
+            agent=BetaManagedAgentsSessionAgent(
+                id="agent_sweep_id",
+                mcp_servers=[],
+                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+                name="test-agent",
+                skills=[],
+                tools=[],
+                type="agent",
+                version=1,
+            ),
+            created_at=datetime.now(UTC),
+            environment_id="env_sweep_id",
+            metadata={},
+            resources=[],
+            stats=BetaManagedAgentsSessionStats(),
+            status="idle",
+            type="session",
+            updated_at=datetime.now(UTC),
+            usage=BetaManagedAgentsSessionUsage(),
+            vault_ids=[],
+        )
+        mock_run_turn.side_effect = _fake_run_turn
+        mock_deliver_outputs.side_effect = _blocked_delivery
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+
+        # _orchestrate returned while the sweep is still blocked on the gate.
+        assert not gate.is_set(), "the gate must still be unset when the turn path returns"
+        sweeps = list(app._output_sweeps.values())  # pyright: ignore[reportPrivateUsage]
+        assert len(sweeps) == 1 and not sweeps[0].done(), (
+            "the sweep must still be running after _orchestrate returned — it is detached"
+        )
+
+        gate.set()
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+        mock_deliver_outputs.assert_awaited_once()
+
+
+async def test_run_thread_turn_two_turns_same_session_chain_sweeps_serially(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """Two turns on the same MA session never sweep concurrently — the second
+    sweep awaits the first, preserving the serial invariant post-then-delete
+    requires."""
+    team_id = "T_SWEEP_CHAIN"
+    channel = "C_TEST"
+    thread_ts = "9000000022.000001"
+    event_ts2 = "9000000022.000002"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_chain", type="agent.tool_use", name="bash", input={}
+                ),
+                TextBlock(kind="text", text="Chained."),
+            ]
+        )
+        await lifecycle.on_terminal_success(state)
+        return state
+
+    order: list[str] = []
+    release_events = [asyncio.Event(), asyncio.Event()]
+    delivery_calls = 0
+
+    async def _recording_delivery(*args: Any, **kwargs: Any) -> None:
+        nonlocal delivery_calls
+        delivery_calls += 1
+        call_number = delivery_calls
+        order.append(f"start:{call_number}")
+        await release_events[call_number - 1].wait()
+        order.append(f"end:{call_number}")
+
+    event1: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_CHAIN",
+        "text": "<@U_BOT> first",
+    }
+    event2: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": event_ts2,
+        "thread_ts": thread_ts,
+        "event_ts": event_ts2,
+        "channel": channel,
+        "user": "U_TEST_CHAIN",
+        "text": "<@U_BOT> second",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.prepare.get_live_thread_session", new_callable=AsyncMock
+        ) as mock_get_session,
+        patch("daimon.core.turn.prepare.create_thread_session", new_callable=AsyncMock),
+        patch("daimon.adapters.slack.app.update_watermark", new_callable=AsyncMock),
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch(
+            "daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock
+        ) as mock_deliver_outputs,
+    ):
+        mock_get_session.return_value = None
+        mock_resolve_agent.return_value = "agent_sweep_id"
+        mock_resolve_env.return_value = "env_sweep_id"
+        # Both turns land on the SAME MA session id — the chain key.
+        mock_create_session.return_value = BetaManagedAgentsSession(
+            outcome_evaluations=[],
+            id="sess-chain-001",
+            agent=BetaManagedAgentsSessionAgent(
+                id="agent_sweep_id",
+                mcp_servers=[],
+                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+                name="test-agent",
+                skills=[],
+                tools=[],
+                type="agent",
+                version=1,
+            ),
+            created_at=datetime.now(UTC),
+            environment_id="env_sweep_id",
+            metadata={},
+            resources=[],
+            stats=BetaManagedAgentsSessionStats(),
+            status="idle",
+            type="session",
+            updated_at=datetime.now(UTC),
+            usage=BetaManagedAgentsSessionUsage(),
+            vault_ids=[],
+        )
+        mock_run_turn.side_effect = _fake_run_turn
+        mock_deliver_outputs.side_effect = _recording_delivery
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event1,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+        await asyncio.sleep(0)  # let sweep 1 reach its release-event wait
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event2,
+            team_id=team_id,
+            channel=channel,
+            event_ts=event_ts2,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+        await asyncio.sleep(0)
+
+        release_events[0].set()
+        release_events[1].set()
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    assert order == ["start:1", "end:1", "start:2", "end:2"], (
+        f"the second sweep must never start before the first finished, got {order}"
     )
 
 

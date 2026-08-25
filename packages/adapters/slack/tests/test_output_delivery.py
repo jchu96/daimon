@@ -1,246 +1,538 @@
+"""Tests for the Slack output-delivery adapter.
+
+MA traffic runs through MARouter + build_fake_anthropic (httpx transport);
+Slack traffic runs through the aioresponses-backed ``fake_slack_web_client``
+fixture — the real slack_sdk request builder and response parser run for
+every call. No method-level mocks anywhere.
+"""
+
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+import re
+from datetime import UTC, datetime
+from typing import Any
 
-import structlog
-import structlog.testing
-from anthropic import AsyncAnthropic
+import httpx
 from anthropic.types.beta import FileMetadata
 from daimon.adapters.slack.output_delivery import deliver_session_outputs
-from slack_sdk.errors import SlackApiError
-from slack_sdk.web.async_client import AsyncWebClient
+from daimon.core.output_delivery import MAX_BYTES_PER_FILE
+from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
+from yarl import URL
 
-_TURN_STARTED = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
 
-
-class _FilePages:
-    """Small paginator fake that records which API pages were consumed."""
-
-    def __init__(self, pages: list[list[FileMetadata]]) -> None:
-        self.pages = pages
-        self.pages_visited = 0
-
-    def __aiter__(self) -> Any:
-        return self._items()
-
-    async def _items(self) -> Any:
-        for page in self.pages:
-            self.pages_visited += 1
-            for file in page:
-                yield file
+_GET_URL = re.compile(r"https://slack\.com/api/files\.getUploadURLExternal.*")
+_UPLOAD = re.compile(r"https://files\.slack\.com/upload/v1/.*")
+_COMPLETE = re.compile(r"https://slack\.com/api/files\.completeUploadExternal.*")
+_POST_MESSAGE_KEY = ("POST", URL("https://slack.com/api/chat.postMessage"))
 
 
-def _file(file_id: str, *, size_bytes: int = 10) -> FileMetadata:
-    return FileMetadata(
-        id=file_id,
-        created_at=_TURN_STARTED + timedelta(seconds=1),
-        filename=f"{file_id}.txt",
-        mime_type="text/plain",
-        size_bytes=size_bytes,
-        type="file",
-    )
+def _post_message_calls(mock: Any) -> list[Any]:
+    return list(mock.requests.get(_POST_MESSAGE_KEY, []))
 
 
-def _clients(
-    files: list[FileMetadata],
-    *,
-    upload_side_effect: Exception | None = None,
-) -> tuple[AsyncAnthropic, AsyncWebClient, Any, Any]:
-    anthropic_mock: Any = MagicMock(spec=AsyncAnthropic)
-    anthropic_mock.beta.files.list = AsyncMock(return_value=_FilePages([files]))
-
-    async def _download(file_id: str, **_: Any) -> Any:
-        return MagicMock(read=AsyncMock(return_value=f"content:{file_id}".encode()))
-
-    anthropic_mock.beta.files.download = AsyncMock(side_effect=_download)
-    web_mock: Any = MagicMock(spec=AsyncWebClient)
-    web_mock.files_upload_v2 = AsyncMock(side_effect=upload_side_effect)
-    web_mock.chat_postMessage = AsyncMock()
-    return (
-        cast(AsyncAnthropic, anthropic_mock),
-        cast(AsyncWebClient, web_mock),
-        anthropic_mock,
-        web_mock,
-    )
-
-
-async def _deliver(
-    anthropic: AsyncAnthropic,
-    web_client: AsyncWebClient,
-    *,
-    session_id: str,
-    turn_started_at: datetime = _TURN_STARTED,
+async def test_delivery_uploads_via_three_request_flow_without_content_type(
+    fake_slack_web_client: Any,
 ) -> None:
-    await deliver_session_outputs(
-        anthropic,
-        web_client,
-        session_id=session_id,
-        channel_id="C123",
-        thread_ts="171234.5678",
-        turn_started_at=turn_started_at,
+    """One downloadable file produces the 3-request upload flow in order, with
+    the display filename (extension derived from the mime) and no content_type
+    anywhere — files_upload_v2 would drop it into the completeUploadExternal
+    query string where it is a silent no-op."""
+    mock = fake_slack_web_client.mock
+    mock.post(
+        _GET_URL,
+        payload={
+            "ok": True,
+            "file_id": "F1",
+            "upload_url": "https://files.slack.com/upload/v1/ABC",
+        },
     )
+    mock.post(_UPLOAD, status=200, body="OK", content_type="text/plain")
+    mock.post(_COMPLETE, payload={"ok": True, "files": [{"id": "F1", "title": "report.txt"}]})
 
+    deletes: list[str] = []
 
-async def test_posts_each_file_once_into_the_thread() -> None:
-    anthropic, web_client, anthropic_mock, web_mock = _clients([_file("F1"), _file("F2")])
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deletes.append(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
 
-    await _deliver(anthropic, web_client, session_id="session-once")
-    await _deliver(anthropic, web_client, session_id="session-once")
-
-    assert anthropic_mock.beta.files.download.await_count == 2
-    assert web_mock.files_upload_v2.await_count == 2
-    assert web_mock.files_upload_v2.await_args_list[0].kwargs == {
-        "channel": "C123",
-        "thread_ts": "171234.5678",
-        "filename": "F1.txt",
-        "title": "F1.txt",
-        "content": b"content:F1",
-        "content_type": "text/plain",
-    }
-    assert web_mock.files_upload_v2.await_args_list[1].kwargs["filename"] == "F2.txt"
-
-
-async def test_empty_output_listing_is_a_no_op() -> None:
-    anthropic, web_client, anthropic_mock, web_mock = _clients([])
-
-    await _deliver(anthropic, web_client, session_id="session-empty")
-
-    anthropic_mock.beta.files.download.assert_not_awaited()
-    web_mock.files_upload_v2.assert_not_awaited()
-
-
-async def test_retries_empty_output_listing_once_for_indexing_lag() -> None:
-    anthropic, web_client, anthropic_mock, web_mock = _clients([])
-    anthropic_mock.beta.files.list.side_effect = [
-        _FilePages([[]]),
-        _FilePages([[_file("F-LATE")]]),
-    ]
-
-    with patch(
-        "daimon.adapters.slack.output_delivery.asyncio.sleep", new_callable=AsyncMock
-    ) as sleep:
-        await _deliver(anthropic, web_client, session_id="session-index-lag")
-
-    assert anthropic_mock.beta.files.list.await_count == 2
-    sleep.assert_awaited_once_with(1.0)
-    web_mock.files_upload_v2.assert_awaited_once()
-
-
-async def test_missing_files_write_scope_posts_actionable_thread_message() -> None:
-    missing_scope = SlackApiError(
-        message="missing_scope",
-        response={"ok": False, "error": "missing_scope", "needed": "files:write"},
-    )
-    anthropic, web_client, _, web_mock = _clients(
-        [_file("F-SCOPE-1"), _file("F-SCOPE-2")], upload_side_effect=missing_scope
-    )
-    capture = structlog.testing.LogCapture()
-    structlog.configure(processors=[capture])
-    try:
-        await _deliver(anthropic, web_client, session_id="session-missing-scope")
-    finally:
-        structlog.reset_defaults()
-
-    scope_events = [
-        event
-        for event in capture.entries
-        if event["event"] == "slack.output_delivery.missing_scope"
-    ]
-    assert len(scope_events) == 1
-    assert web_mock.files_upload_v2.await_count == 1, (
-        "missing files:write must stop later upload attempts after one warning"
-    )
-    web_mock.chat_postMessage.assert_awaited_once_with(
-        channel="C123",
-        thread_ts="171234.5678",
-        text=(
-            "I couldn't attach the generated file because this app is missing the "
-            "`files:write` Slack scope. A workspace admin must add that scope and "
-            "reinstall daimon from the install link before file delivery can work."
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_report",
+                    created_at=NOW,
+                    filename="report",
+                    mime_type="text/plain",
+                    size_bytes=11,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json")
+            ]
         ),
     )
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"hello world"),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
+    async def sleep(delay: float) -> None:
+        pass
 
-async def test_oversize_and_excess_files_are_bounded_and_logged() -> None:
-    files = [_file("F-BIG", size_bytes=20 * 1024 * 1024 + 1)] + [_file(f"F{i}") for i in range(6)]
-    anthropic, web_client, anthropic_mock, web_mock = _clients(files)
-    capture = structlog.testing.LogCapture()
-    structlog.configure(processors=[capture])
-    try:
-        await _deliver(anthropic, web_client, session_id="session-bounded")
-    finally:
-        structlog.reset_defaults()
+    await deliver_session_outputs(
+        anthropic_client,
+        fake_slack_web_client.client,
+        session_id="sesn_1",
+        channel_id="C1",
+        thread_ts="1.2",
+        notice_keys=set(),
+        team_id="T1",
+        sleep=sleep,
+    )
 
-    assert anthropic_mock.beta.files.download.await_count == 5
-    assert web_mock.files_upload_v2.await_count == 5
-    events = [event["event"] for event in capture.entries]
-    assert "slack.output_delivery.skipped_oversize" in events
-    assert "slack.output_delivery.cap_reached" in events
-
-
-async def test_one_upload_failure_is_logged_and_later_files_continue() -> None:
-    anthropic, web_client, _, web_mock = _clients([_file("F1"), _file("F2")])
-    web_mock.files_upload_v2.side_effect = [RuntimeError("upload failed"), None]
-    capture = structlog.testing.LogCapture()
-    structlog.configure(processors=[capture])
-    try:
-        await _deliver(anthropic, web_client, session_id="session-continue")
-    finally:
-        structlog.reset_defaults()
-
-    assert web_mock.files_upload_v2.await_count == 2
-    assert any(event["event"] == "slack.output_delivery.upload_failed" for event in capture.entries)
-
-
-async def test_auto_paginates_until_new_turn_files_on_second_page() -> None:
-    old_files = []
-    for index in range(20):
-        file = _file(f"F-OLD-{index}")
-        file.created_at = _TURN_STARTED - timedelta(minutes=5)
-        old_files.append(file)
-    new_files = [_file("F-NEW-1"), _file("F-NEW-2")]
-    anthropic, web_client, anthropic_mock, web_mock = _clients([])
-    pages = _FilePages([old_files, new_files])
-    anthropic_mock.beta.files.list.return_value = pages
-
-    await _deliver(anthropic, web_client, session_id="session-two-pages")
-
-    assert pages.pages_visited == 2
-    assert [call.args[0] for call in anthropic_mock.beta.files.download.await_args_list] == [
-        "F-NEW-1",
-        "F-NEW-2",
+    upload_keys = [
+        (method, url)
+        for (method, url) in mock.requests
+        if "getUploadURLExternal" in str(url)
+        or "files.slack.com" in str(url)
+        or "completeUploadExternal" in str(url)
     ]
-    assert web_mock.files_upload_v2.await_count == 2
+    assert [str(url.with_query(None)) for _, url in upload_keys] == [
+        "https://slack.com/api/files.getUploadURLExternal",
+        "https://files.slack.com/upload/v1/ABC",
+        "https://slack.com/api/files.completeUploadExternal",
+    ], "the upload must run the 3-request flow in order"
+
+    get_url_query = upload_keys[0][1].query
+    assert get_url_query.get("filename") == "report.txt", (
+        "the extensionless MA filename must gain its mime-derived extension"
+    )
+    for _, url in mock.requests:
+        assert "content_type" not in url.query, (
+            f"content_type must not appear in any request query, found in {url}"
+        )
+    assert deletes == ["file_report"], "the posted file's listing entry must be deleted"
 
 
-async def test_old_file_is_not_mistaken_for_already_delivered() -> None:
-    file = _file("F-OLD-THEN-ELIGIBLE")
-    file.created_at = _TURN_STARTED - timedelta(minutes=1)
-    anthropic, web_client, anthropic_mock, web_mock = _clients([file])
+async def test_delivery_posts_scope_notice_and_deletes_nothing_on_missing_scope(
+    fake_slack_web_client: Any,
+) -> None:
+    """missing_scope aborts the sweep: one actionable notice naming files:write,
+    no deletion, and the dedup key lands in notice_keys."""
+    mock = fake_slack_web_client.mock
+    mock.post(_GET_URL, payload={"ok": False, "error": "missing_scope"})
 
-    await _deliver(anthropic, web_client, session_id="session-old-not-delivered")
-    await _deliver(
-        anthropic,
-        web_client,
-        session_id="session-old-not-delivered",
-        turn_started_at=_TURN_STARTED - timedelta(minutes=2),
+    deletes: list[str] = []
+
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deletes.append(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_one",
+                    created_at=NOW,
+                    filename="chart.png",
+                    mime_type="image/png",
+                    size_bytes=9,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"png-bytes"),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    notice_keys: set[str] = set()
+    await deliver_session_outputs(
+        anthropic_client,
+        fake_slack_web_client.client,
+        session_id="sesn_1",
+        channel_id="C1",
+        thread_ts="1.2",
+        notice_keys=notice_keys,
+        team_id="T_SCOPE",
+        sleep=sleep,
     )
 
-    anthropic_mock.beta.files.download.assert_awaited_once_with(
-        "F-OLD-THEN-ELIGIBLE", betas=["managed-agents-2026-04-01"]
+    notices = _post_message_calls(mock)
+    assert len(notices) == 1, "exactly one in-thread notice must be posted"
+    assert "files:write" in str(notices[0].kwargs), "the notice must name the missing scope"
+    assert "reinstall" in str(notices[0].kwargs), "the notice must tell the admin to reinstall"
+    assert deletes == [], "an aborted sweep must delete nothing"
+    assert "T_SCOPE:missing_scope" in notice_keys, (
+        "the dedup key must be recorded after the notice posts"
     )
-    web_mock.files_upload_v2.assert_awaited_once()
 
 
-async def test_sanitizes_filename_and_title_before_upload() -> None:
-    file = _file("F-UNSAFE")
-    file.filename = "../../reports/Q3 forecast.csv"
-    anthropic, web_client, _, web_mock = _clients([file])
+async def test_delivery_posts_storage_notice_and_deletes_nothing_on_storage_limit(
+    fake_slack_web_client: Any,
+) -> None:
+    """storage_limit_reached aborts with its own copy — about storage, not
+    scopes — deletes nothing and records its dedup key."""
+    mock = fake_slack_web_client.mock
+    mock.post(_GET_URL, payload={"ok": False, "error": "storage_limit_reached"})
 
-    await _deliver(anthropic, web_client, session_id="session-safe-filename")
+    deletes: list[str] = []
 
-    upload = web_mock.files_upload_v2.await_args.kwargs
-    assert upload["filename"] == "reports_Q3_forecast.csv"
-    assert upload["title"] == "reports_Q3_forecast.csv"
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deletes.append(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_one",
+                    created_at=NOW,
+                    filename="report.csv",
+                    mime_type="text/csv",
+                    size_bytes=9,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"a,b\n1,2\n"),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    notice_keys: set[str] = set()
+    await deliver_session_outputs(
+        anthropic_client,
+        fake_slack_web_client.client,
+        session_id="sesn_1",
+        channel_id="C1",
+        thread_ts="1.2",
+        notice_keys=notice_keys,
+        team_id="T_STORE",
+        sleep=sleep,
+    )
+
+    notices = _post_message_calls(mock)
+    assert len(notices) == 1, "exactly one in-thread notice must be posted"
+    notice_text = str(notices[0].kwargs)
+    assert "file-storage limit" in notice_text, (
+        "the storage notice must be about the workspace being out of file storage"
+    )
+    assert "scope" not in notice_text, "the storage notice must not talk about scopes"
+    assert deletes == [], "an aborted sweep must delete nothing"
+    assert "T_STORE:storage_limit_reached" in notice_keys, (
+        "the dedup key must be recorded after the notice posts"
+    )
+
+
+async def test_delivery_posts_abort_notice_once_per_team_per_code(
+    fake_slack_web_client: Any,
+) -> None:
+    """A second delivery under the same abort code and team posts no second
+    notice — the shared notice_keys set dedups per team per code."""
+    mock = fake_slack_web_client.mock
+    mock.post(_GET_URL, payload={"ok": False, "error": "missing_scope"}, repeat=True)
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_one",
+                    created_at=NOW,
+                    filename="chart.png",
+                    mime_type="image/png",
+                    size_bytes=9,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"png-bytes"),
+    )
+    router.add(
+        "DELETE",
+        r"/v1/files/([^/]+)",
+        lambda request, match: httpx.Response(
+            200, json={"id": match.group(1), "type": "file_deleted"}
+        ),
+    )
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    notice_keys: set[str] = set()
+    for _ in range(2):
+        await deliver_session_outputs(
+            anthropic_client,
+            fake_slack_web_client.client,
+            session_id="sesn_1",
+            channel_id="C1",
+            thread_ts="1.2",
+            notice_keys=notice_keys,
+            team_id="T_ONCE",
+            sleep=sleep,
+        )
+
+    notices = _post_message_calls(mock)
+    assert len(notices) == 1, "the abort notice must be posted once per team per code"
+
+
+async def test_delivery_continues_after_bytes_post_failure_on_one_file(
+    fake_slack_web_client: Any,
+) -> None:
+    """A non-200 on the files.slack.com bytes POST raises SlackRequestError
+    (which has no .response): the failed file stays listed, the next file is
+    posted and deleted, and no notice is posted."""
+    mock = fake_slack_web_client.mock
+    mock.post(
+        _GET_URL,
+        payload={
+            "ok": True,
+            "file_id": "F1",
+            "upload_url": "https://files.slack.com/upload/v1/AAA",
+        },
+        repeat=True,
+    )
+    mock.post(_UPLOAD, status=500, body="nope", content_type="text/plain")
+    mock.post(_UPLOAD, status=200, body="OK", content_type="text/plain")
+    mock.post(_COMPLETE, payload={"ok": True, "files": [{"id": "F1", "title": "b.txt"}]})
+
+    deletes: list[str] = []
+
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deletes.append(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_first",
+                    created_at=NOW,
+                    filename="a.txt",
+                    mime_type="text/plain",
+                    size_bytes=3,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json"),
+                FileMetadata(
+                    id="file_second",
+                    created_at=NOW,
+                    filename="b.txt",
+                    mime_type="text/plain",
+                    size_bytes=3,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json"),
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"txt"),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    await deliver_session_outputs(
+        anthropic_client,
+        fake_slack_web_client.client,
+        session_id="sesn_1",
+        channel_id="C1",
+        thread_ts="1.2",
+        notice_keys=set(),
+        team_id="T1",
+        sleep=sleep,
+    )
+
+    assert deletes == ["file_second"], (
+        "only the successfully posted file may be deleted; the bytes-POST "
+        "failure must leave the first file listed"
+    )
+    assert _post_message_calls(mock) == [], "a per-file failure must not post any notice"
+
+
+async def test_delivery_continues_after_non_scope_api_error_on_one_file(
+    fake_slack_web_client: Any,
+) -> None:
+    """A non-abort Slack API error (file_upload_size_restricted) isolates to
+    one file: the second is posted and deleted, no notice, the first stays."""
+    mock = fake_slack_web_client.mock
+    mock.post(_GET_URL, payload={"ok": False, "error": "file_upload_size_restricted"})
+    mock.post(
+        _GET_URL,
+        payload={
+            "ok": True,
+            "file_id": "F2",
+            "upload_url": "https://files.slack.com/upload/v1/BBB",
+        },
+    )
+    mock.post(_UPLOAD, status=200, body="OK", content_type="text/plain")
+    mock.post(_COMPLETE, payload={"ok": True, "files": [{"id": "F2", "title": "b.txt"}]})
+
+    deletes: list[str] = []
+
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deletes.append(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_first",
+                    created_at=NOW,
+                    filename="a.txt",
+                    mime_type="text/plain",
+                    size_bytes=3,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json"),
+                FileMetadata(
+                    id="file_second",
+                    created_at=NOW,
+                    filename="b.txt",
+                    mime_type="text/plain",
+                    size_bytes=3,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json"),
+            ]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"txt"),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    await deliver_session_outputs(
+        anthropic_client,
+        fake_slack_web_client.client,
+        session_id="sesn_1",
+        channel_id="C1",
+        thread_ts="1.2",
+        notice_keys=set(),
+        team_id="T1",
+        sleep=sleep,
+    )
+
+    assert deletes == ["file_second"], (
+        "the restricted file must stay listed; only the posted file is deleted"
+    )
+    assert _post_message_calls(mock) == [], (
+        "file_upload_size_restricted is a per-file failure, not an abort notice"
+    )
+
+
+async def test_delivery_posts_oversize_notice_and_deletes_entry_without_upload(
+    fake_slack_web_client: Any,
+) -> None:
+    """An oversize file gets one in-thread notice naming the file and its size,
+    no upload requests at all, and its MA listing entry is deleted."""
+    mock = fake_slack_web_client.mock
+
+    deletes: list[str] = []
+
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deletes.append(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/files",
+        lambda request, match: list_response(
+            [
+                FileMetadata(
+                    id="file_big",
+                    created_at=NOW,
+                    filename="big data.bin",
+                    mime_type="application/octet-stream",
+                    size_bytes=MAX_BYTES_PER_FILE + 1,
+                    type="file",
+                    downloadable=True,
+                ).model_dump(mode="json")
+            ]
+        ),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    await deliver_session_outputs(
+        anthropic_client,
+        fake_slack_web_client.client,
+        session_id="sesn_1",
+        channel_id="C1",
+        thread_ts="1.2",
+        notice_keys=set(),
+        team_id="T1",
+        sleep=sleep,
+    )
+
+    notices = _post_message_calls(mock)
+    assert len(notices) == 1, "exactly one oversize notice must be posted"
+    notice_text = str(notices[0].kwargs)
+    assert "big_data.bin" in notice_text, "the notice must name the sanitized file"
+    assert "20 MiB" in notice_text, "the notice must quote the delivery limit"
+    upload_requests = [
+        url
+        for (_, url) in mock.requests
+        if "getUploadURLExternal" in str(url) or "files.slack.com" in str(url)
+    ]
+    assert upload_requests == [], "an oversize file must produce no upload requests at all"
+    assert deletes == ["file_big"], "the oversize entry must be deleted after the notice"
