@@ -70,7 +70,7 @@ from mcp.types import ToolAnnotations
 _CANCEL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
-    idempotentHint=True,
+    idempotentHint=False,
     openWorldHint=False,
 )
 
