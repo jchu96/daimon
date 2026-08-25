@@ -154,8 +154,10 @@ Optionally configure `DAIMON_ARTIFACTS__ENDPOINT_URL`,
 `DAIMON_ARTIFACTS__SECRET_ACCESS_KEY` to add short-lived presigned chart links.
 The storage boundary uses the vendor-neutral S3 API and works with services
 such as AWS S3, Cloudflare R2, MinIO, and Backblaze B2. Objects remain private;
-daimon never applies a public-read ACL. See `.env.example` for the optional
-region, URL lifetime, and image-embedding controls.
+daimon never applies a public-read ACL. Presigned URL expiry does not delete
+stored objects, so configure a bucket lifecycle rule for the retention period
+your deployment requires. See `.env.example` for the optional region, URL
+lifetime, and image-embedding controls.
 
 ### 2. Create the Discord application
 

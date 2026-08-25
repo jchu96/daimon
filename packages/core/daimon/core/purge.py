@@ -47,6 +47,8 @@ principal UUID. The orchestrator dispatches manually rather than via a unified
 Protocol — see RESEARCH.md A2.
 
 Deliberate carve-outs:
+- Hosted chart artifacts in operator-owned object storage are not deleted by
+  account purge; operators must enforce retention with a bucket lifecycle rule.
 - `usage_events` and `tenant_user_caps` rows are retained for billing integrity.
   Their `delete_all_for_user` helpers exist and are deliberately uncalled here.
 - Uploaded MA skill files (user_skills rows) are our DB ledger: the DB row is

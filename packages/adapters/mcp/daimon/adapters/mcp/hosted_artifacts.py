@@ -13,7 +13,6 @@ from pathlib import PurePosixPath
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta.file_metadata import FileMetadata
-from daimon.adapters.mcp.artifacts import build_artifact_store
 from daimon.core.artifacts import ArtifactStore
 from daimon.core.config import ArtifactsSettings
 from PIL import Image
@@ -173,7 +172,7 @@ async def _discover_chart_outputs(
         if PurePosixPath(filename).suffix.lower() not in _ALLOWED_SUFFIXES:
             continue
         created = _parse_created(item.created_at)
-        if created is not None and created < cutoff:
+        if created is None or created < cutoff:
             continue
         outputs.append(_ChartOutput(file_id=item.id, filename=filename, size_bytes=item.size_bytes))
         if len(outputs) >= _MAX_CHARTS:
@@ -191,7 +190,7 @@ async def _deliver_hosted_charts_impl(
     turn_started_at: dt.datetime,
     message: str,
     store: ArtifactStore | None = None,
-    log_failure_once: Callable[..., None],
+    record_failure: Callable[..., None],
 ) -> HostedChartDelivery:
     """Embed charts by default and add URLs only when storage is configured."""
     try:
@@ -201,18 +200,11 @@ async def _deliver_hosted_charts_impl(
             turn_started_at=turn_started_at,
         )
     except Exception as exc:  # noqa: BLE001 — degrade-not-block boundary
-        log_failure_once(stage="discovery", key=None, exc=exc)
+        record_failure(stage="discovery", key=None, exc=exc)
         return HostedChartDelivery(message=message)
 
     if not outputs:
         return HostedChartDelivery(message=message)
-
-    url_store = store
-    if settings is not None and url_store is None:
-        try:
-            url_store = build_artifact_store(settings)
-        except Exception as exc:  # noqa: BLE001 — embedding remains available
-            log_failure_once(stage="storage_init", key=None, exc=exc)
 
     lines: list[str] = []
     chart_urls: list[ChartUrl] = []
@@ -235,14 +227,14 @@ async def _deliver_hosted_charts_impl(
                 raise ValueError("artifact exceeds the per-chart byte limit")
             content_type = _image_content_type(filename, content)
         except Exception as exc:  # noqa: BLE001 — one chart cannot block the answer
-            log_failure_once(stage="download", key=None, exc=exc)
+            record_failure(stage="download", key=None, exc=exc)
             continue
 
         if embed_images and len(image_blocks) < _MAX_IMAGE_BLOCKS:
             try:
                 image_block = await asyncio.to_thread(_bounded_image_block, content, content_type)
             except Exception as exc:  # noqa: BLE001 — optional URLs can still succeed
-                log_failure_once(stage="embed", key=None, exc=exc)
+                record_failure(stage="embed", key=None, exc=exc)
             else:
                 if image_block is not None:
                     image_blocks.append(image_block)
@@ -259,12 +251,12 @@ async def _deliver_hosted_charts_impl(
                         content_type=content_type,
                     )
 
-        if settings is None or url_store is None:
+        if settings is None or store is None:
             continue
 
         try:
             key = f"tenant/{tenant_id}/account/{account_id}/session/{session_id}/{filename}"
-            stored = await url_store.upload_and_presign(
+            stored = await store.upload_and_presign(
                 key=key,
                 content=content,
                 content_type=content_type,
@@ -287,7 +279,7 @@ async def _deliver_hosted_charts_impl(
                 ttl_seconds=settings.url_ttl_seconds,
             )
         except Exception as exc:  # noqa: BLE001 — embedding remains available
-            log_failure_once(stage="storage", key=key, exc=exc)
+            record_failure(stage="storage", key=key, exc=exc)
 
     delivered_message = f"{message}\n\n" + "\n".join(lines) if lines else message
     return HostedChartDelivery(
@@ -309,23 +301,30 @@ async def deliver_hosted_charts(
     store: ArtifactStore | None = None,
 ) -> HostedChartDelivery:
     """Deliver bounded chart images and optional URLs without blocking text."""
-    logged_failure = False
+    failure_count = 0
+    first_failure: tuple[str, str | None, str] | None = None
 
-    def log_failure_once(*, stage: str, key: str | None, exc: Exception) -> None:
-        nonlocal logged_failure
-        if logged_failure:
+    def record_failure(*, stage: str, key: str | None, exc: Exception) -> None:
+        nonlocal failure_count, first_failure
+        failure_count += 1
+        if first_failure is None:
+            first_failure = (stage, key, type(exc).__name__)
+
+    def log_failure_summary() -> None:
+        if first_failure is None:
             return
-        logged_failure = True
+        stage, key, error_type = first_failure
         _log.warning(
             "mcp.hosted_artifact.unavailable",
             stage=stage,
             key=key,
-            error_type=type(exc).__name__,
+            error_type=error_type,
+            failure_count=failure_count,
         )
 
     try:
         async with asyncio.timeout(_HOSTED_DELIVERY_TIMEOUT_SECONDS):
-            return await _deliver_hosted_charts_impl(
+            result = await _deliver_hosted_charts_impl(
                 anthropic,
                 settings=settings,
                 tenant_id=tenant_id,
@@ -334,8 +333,10 @@ async def deliver_hosted_charts(
                 turn_started_at=turn_started_at,
                 message=message,
                 store=store,
-                log_failure_once=log_failure_once,
+                record_failure=record_failure,
             )
     except TimeoutError as exc:
-        log_failure_once(stage="timeout", key=None, exc=exc)
-        return HostedChartDelivery(message=message)
+        record_failure(stage="timeout", key=None, exc=exc)
+        result = HostedChartDelivery(message=message)
+    log_failure_summary()
+    return result

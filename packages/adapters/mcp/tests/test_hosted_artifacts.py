@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
+from anthropic.types.beta.file_metadata import FileMetadata
 from daimon.adapters.mcp.hosted_artifacts import (
     HostedChartDelivery,
     _ChartOutput,
@@ -104,14 +105,14 @@ def _file(
     created_at: dt.datetime,
     size_bytes: int = len(_PNG),
 ) -> dict[str, Any]:
-    return {
-        "id": file_id,
-        "type": "file",
-        "filename": filename,
-        "mime_type": "image/png",
-        "created_at": created_at.isoformat(),
-        "size_bytes": size_bytes,
-    }
+    return FileMetadata(
+        id=file_id,
+        type="file",
+        filename=filename,
+        mime_type="image/png",
+        created_at=created_at,
+        size_bytes=size_bytes,
+    ).model_dump(mode="json")
 
 
 async def test_embed_only_delivery_needs_no_artifact_settings() -> None:
@@ -318,6 +319,7 @@ async def test_invalid_outputs_fail_open_to_unchanged_text() -> None:
     assert result == HostedChartDelivery(message="Answer survives")
     assert transport.downloaded_ids == ["mismatch"]
     warning.assert_called_once()
+    assert warning.call_args.kwargs["failure_count"] == 2
 
 
 async def test_embedding_can_be_disabled_without_disabling_urls() -> None:
@@ -373,6 +375,7 @@ async def test_storage_failure_keeps_embed_only_result() -> None:
     assert len(result.image_blocks) == 1
     warning.assert_called_once()
     assert "https://" not in repr(warning.call_args)
+    assert warning.call_args.kwargs["failure_count"] == 1
 
 
 async def test_delivery_timeout_returns_text_unchanged() -> None:
@@ -401,6 +404,7 @@ async def test_delivery_timeout_returns_text_unchanged() -> None:
     assert result == HostedChartDelivery(message="Analysis survives")
     warning.assert_called_once()
     assert warning.call_args.kwargs["error_type"] == "TimeoutError"
+    assert warning.call_args.kwargs["failure_count"] == 1
 
 
 async def test_delivery_caps_each_turn_and_embeds_at_most_three_images() -> None:

@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from collections.abc import Callable
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 from urllib.parse import quote
 
+# Botocore does not ship inline type metadata for these runtime imports.
 from botocore.config import Config  # pyright: ignore[reportMissingTypeStubs]
 from botocore.session import Session  # pyright: ignore[reportMissingTypeStubs]
 from daimon.core.artifacts import ArtifactStore, StoredArtifact
@@ -84,11 +85,7 @@ class S3ArtifactStore:
 
 def build_artifact_store(settings: ArtifactsSettings) -> ArtifactStore:
     """Construct the production S3-compatible store from validated settings."""
-    create_client = cast(
-        Callable[..., Any],
-        Session().create_client,  # pyright: ignore[reportUnknownMemberType]
-    )
-    client = create_client(
+    client = Session().create_client(  # pyright: ignore[reportUnknownMemberType]  # botocore has no inline types
         "s3",
         endpoint_url=str(settings.endpoint_url).rstrip("/"),
         aws_access_key_id=settings.access_key_id.get_secret_value(),

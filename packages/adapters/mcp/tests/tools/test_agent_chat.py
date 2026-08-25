@@ -183,7 +183,7 @@ def _timed_event(
         id=event_id,
         type=event_type,
         content=content,
-        processed_at=processed_at,
+        processed_at=processed_at.isoformat().replace("+00:00", "Z"),
     )
 
 
@@ -594,6 +594,7 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
 async def test_ask_delivers_embedded_charts_without_artifact_settings() -> None:
     runtime = MagicMock()
     runtime.settings.artifacts = None
+    runtime.artifact_store = None
     auth = _auth()
     running = MagicMock(status="running")
     idle = MagicMock(status="idle")
@@ -654,12 +655,14 @@ async def test_ask_delivers_embedded_charts_without_artifact_settings() -> None:
         session_id="ses_ask001",
         turn_started_at=turn_started_at,
         message="Final answer",
+        store=None,
     )
 
 
 async def test_ask_timeout_preserves_the_resumable_handle() -> None:
     runtime = MagicMock()
     runtime.settings.artifacts = None
+    runtime.artifact_store = None
     auth = _auth()
     elapsed = 0.0
 
@@ -769,6 +772,7 @@ async def test_ask_tool_result_preserves_images_and_structured_urls() -> None:
 async def test_deliver_turn_charts_uses_newest_completed_turn_window() -> None:
     runtime = MagicMock()
     runtime.settings.artifacts = None
+    runtime.artifact_store = None
     auth = _auth()
     newer_user_at = dt.datetime(2026, 8, 25, 12, 30, tzinfo=dt.UTC)
     reply_at = dt.datetime(2026, 8, 25, 12, 20, tzinfo=dt.UTC)
@@ -836,6 +840,7 @@ async def test_deliver_turn_charts_uses_newest_completed_turn_window() -> None:
         session_id="ses_chart_turn",
         turn_started_at=turn_started_at,
         message="Final answer",
+        store=None,
     )
 
 
@@ -900,6 +905,7 @@ async def test_deliver_turn_charts_refuses_before_session_is_complete() -> None:
 async def test_deliver_turn_charts_falls_back_when_boundary_has_no_timestamp() -> None:
     runtime = MagicMock()
     runtime.settings.artifacts = None
+    runtime.artifact_store = None
     auth = _auth()
     session_created_at = dt.datetime(2026, 8, 25, 11, 0, tzinfo=dt.UTC)
     events = MagicMock(

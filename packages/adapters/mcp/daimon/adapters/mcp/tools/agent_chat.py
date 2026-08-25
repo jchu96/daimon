@@ -58,7 +58,6 @@ from daimon.adapters.mcp.tools._ctx import (
 from daimon.adapters.mcp.tools._pagination import Page
 from daimon.adapters.mcp.tools.sessions import SessionEventOut, SessionInfo
 from daimon.core.billing import BillingConfig
-from daimon.core.config import ArtifactsSettings
 from daimon.core.defaults.ma_index import find_environment_by_daimon_tag, list_agents_by_tenant
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import ScopeContext
@@ -405,18 +404,15 @@ async def _deliver_turn_charts_impl(
     if turn_started_at is None:
         raise ToolError(f"no completed turn boundary found for session {handle}")
 
-    configured_artifacts = getattr(getattr(runtime, "settings", None), "artifacts", None)
-    artifacts = (
-        configured_artifacts if isinstance(configured_artifacts, ArtifactsSettings) else None
-    )
     delivery = await deliver_hosted_charts(
         runtime.client,
-        settings=artifacts,
+        settings=runtime.settings.artifacts,
         tenant_id=str(auth.tenant_id),
         account_id=str(auth.account_id),
         session_id=handle,
         turn_started_at=turn_started_at,
         message=final_text,
+        store=runtime.artifact_store,
     )
     return AskResult(
         handle=handle,
@@ -464,22 +460,15 @@ async def _ask_impl(
                 page = events.next_page
 
             if final_text is not None:
-                configured_artifacts = getattr(
-                    getattr(runtime, "settings", None), "artifacts", None
-                )
-                artifacts = (
-                    configured_artifacts
-                    if isinstance(configured_artifacts, ArtifactsSettings)
-                    else None
-                )
                 delivery = await deliver_hosted_charts(
                     runtime.client,
-                    settings=artifacts,
+                    settings=runtime.settings.artifacts,
                     tenant_id=str(auth.tenant_id),
                     account_id=str(auth.account_id),
                     session_id=handle,
                     turn_started_at=turn_started_at,
                     message=final_text,
+                    store=runtime.artifact_store,
                 )
                 return AskResult(
                     handle=handle,

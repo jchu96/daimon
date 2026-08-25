@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import httpx
 import structlog
 from anthropic import AsyncAnthropic
+from daimon.adapters.mcp.artifacts import build_artifact_store
 from daimon.adapters.mcp.auth.verifier import DaimonJWTVerifier
 from daimon.adapters.mcp.checkout import billing_cancel, billing_success, build_checkout_route
 from daimon.adapters.mcp.middleware.ma_errors import MaErrorMiddleware
@@ -242,6 +243,11 @@ def create_mcp_app(
     )
 
     deployment_default = parse_deployment_default(effective_settings.defaults_root)
+    artifact_store = (
+        build_artifact_store(effective_settings.artifacts)
+        if effective_settings.artifacts is not None
+        else None
+    )
 
     runtime = McpRuntime(
         session_factory=effective_sessionmaker,
@@ -251,6 +257,7 @@ def create_mcp_app(
         gemini_client=gemini_client,
         notebook_rate_limiter=notebook_rate_limiter,
         fernet=fernet,
+        artifact_store=artifact_store,
     )
     agents.register_agent_tools(mcp, runtime)
     register_agent_removal_tools(mcp, runtime)
