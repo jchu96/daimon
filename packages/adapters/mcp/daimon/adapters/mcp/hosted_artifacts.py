@@ -104,9 +104,12 @@ def _markdown_label(filename: str) -> str:
     return bounded.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
+_RASTER_CONTENT_TYPES = frozenset({"image/png", "image/jpeg"})
+
+
 def _bounded_image_block(content: bytes, content_type: str) -> ImageContent | None:
     """Downscale one raster and return an explicitly typed, bounded MCP block."""
-    if content_type not in {"image/png", "image/jpeg"}:
+    if content_type not in _RASTER_CONTENT_TYPES:
         return None
 
     with Image.open(io.BytesIO(content)) as source:
@@ -243,11 +246,17 @@ async def _deliver_hosted_charts_impl(
             else:
                 if image_block is not None:
                     image_blocks.append(image_block)
-                else:
+                elif content_type in _RASTER_CONTENT_TYPES:
                     _log.warning(
                         "mcp.hosted_artifact.image_too_large",
                         filename=filename,
                         encoded_byte_cap=_MAX_IMAGE_BLOCK_ENCODED_BYTES,
+                    )
+                else:
+                    _log.debug(
+                        "mcp.hosted_artifact.image_not_embeddable",
+                        filename=filename,
+                        content_type=content_type,
                     )
 
         if settings is None or url_store is None:
