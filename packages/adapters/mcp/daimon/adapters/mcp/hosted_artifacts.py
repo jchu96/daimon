@@ -13,7 +13,8 @@ from pathlib import PurePosixPath
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta.file_metadata import FileMetadata
-from daimon.core.artifacts import ArtifactStore, build_artifact_store
+from daimon.adapters.mcp.artifacts import build_artifact_store
+from daimon.core.artifacts import ArtifactStore
 from daimon.core.config import ArtifactsSettings
 from PIL import Image
 from pydantic import BaseModel
@@ -159,6 +160,10 @@ async def _discover_chart_outputs(
         if len(candidates) >= _MAX_SCANNED:
             break
 
+    candidates.sort(
+        key=lambda item: _parse_created(item.created_at) or dt.datetime.min.replace(tzinfo=dt.UTC),
+        reverse=True,
+    )
     outputs: list[_ChartOutput] = []
     for item in candidates:
         filename = item.filename or item.id
@@ -218,7 +223,10 @@ async def _deliver_hosted_charts_impl(
             filename = _safe_filename(output.filename)
             if output.size_bytes > _MAX_BYTES:
                 raise ValueError("artifact exceeds the per-chart byte limit")
-            response = await anthropic.beta.files.download(output.file_id)
+            response = await anthropic.beta.files.download(
+                output.file_id,
+                betas=["managed-agents-2026-04-01"],
+            )
             content = await response.read()
             if len(content) > _MAX_BYTES:
                 raise ValueError("artifact exceeds the per-chart byte limit")
@@ -235,6 +243,12 @@ async def _deliver_hosted_charts_impl(
             else:
                 if image_block is not None:
                     image_blocks.append(image_block)
+                else:
+                    _log.warning(
+                        "mcp.hosted_artifact.image_too_large",
+                        filename=filename,
+                        encoded_byte_cap=_MAX_IMAGE_BLOCK_ENCODED_BYTES,
+                    )
 
         if settings is None or url_store is None:
             continue

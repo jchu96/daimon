@@ -676,6 +676,32 @@ async def test_ask_timeout_preserves_the_resumable_handle() -> None:
     list_events.assert_not_awaited()
 
 
+async def test_ask_surfaces_terminal_non_idle_status_without_waiting() -> None:
+    runtime = MagicMock()
+    auth = _auth()
+    sleep = AsyncMock()
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._start_turn_impl",
+            new=AsyncMock(return_value={"handle": "ses_terminated001"}),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(return_value=MagicMock(status="terminated")),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(),
+        ) as list_events,
+        pytest.raises(ToolError, match=r"terminal status 'terminated'.*ses_terminated001"),
+    ):
+        await _ask_impl(runtime, auth, "Question", sleep=sleep)
+
+    sleep.assert_not_awaited()
+    list_events.assert_not_awaited()
+
+
 async def test_ask_tool_result_preserves_images_and_structured_urls() -> None:
     image = ImageContent(type="image", data="cG5n", mimeType="image/png")
     chart = ChartUrl(

@@ -371,6 +371,11 @@ async def _ask_impl(
 
     while True:
         current = await _get_session_impl(runtime, auth, handle)
+        if current.status not in {"idle", "rescheduling", "running"}:
+            raise ToolError(
+                f"Daimon turn reached terminal status {current.status!r}; "
+                f"resume or inspect events with handle {handle}"
+            )
         if current.status == "idle":
             page: str | None = None
             final_text: str | None = None

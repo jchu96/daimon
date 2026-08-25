@@ -572,7 +572,8 @@ class Settings(BaseSettings):
     artifacts: ArtifactsSettings | None = Field(
         default=None,
         description=(
-            "Private S3-compatible artifact store. Hosted chart delivery is disabled when unset."
+            "Optional private S3-compatible store for presigned chart links. "
+            "Bounded image embeds still run when this is unset."
         ),
     )
     defaults_root: Path = Field(
