@@ -142,6 +142,16 @@ All four must be set before your first `docker compose` command:
 `${VAR:?...}` guards. You'll add the Discord bot token in step 2. `.env` is
 gitignored, so secrets never get committed.
 
+Hosted MCP clients receive bounded chart images directly from the Anthropic
+Files API; this embed-only path is enabled by default and needs no bucket.
+Optionally configure `DAIMON_ARTIFACTS__ENDPOINT_URL`,
+`DAIMON_ARTIFACTS__BUCKET`, `DAIMON_ARTIFACTS__ACCESS_KEY_ID`, and
+`DAIMON_ARTIFACTS__SECRET_ACCESS_KEY` to add short-lived presigned chart links.
+The storage boundary uses the vendor-neutral S3 API and works with services
+such as AWS S3, Cloudflare R2, MinIO, and Backblaze B2. Objects remain private;
+daimon never applies a public-read ACL. See `.env.example` for the optional
+region, URL lifetime, and image-embedding controls.
+
 ### 2. Create the Discord application
 
 1. Create an application in the

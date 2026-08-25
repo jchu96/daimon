@@ -14,6 +14,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2",
     "asyncpg>=0.29",
     "pydantic>=2.7",
+    "pillow>=11,<13",
     "sentry-sdk>=2.61",
     "discord.py>=2.7,<3",
     "aiohttp>=3.10",
