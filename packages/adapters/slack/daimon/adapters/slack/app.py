@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import time
 import uuid
 from collections.abc import Coroutine
@@ -66,6 +67,7 @@ from daimon.adapters.slack.help import handle_help_command
 from daimon.adapters.slack.interactions import build_retry_handlers, resolve_web_client
 from daimon.adapters.slack.lifecycle import SlackTurnLifecycle
 from daimon.adapters.slack.memory import handle_memory_command
+from daimon.adapters.slack.output_delivery import deliver_session_outputs
 from daimon.adapters.slack.privacy_panel.actions import (
     handle_privacy_block_action,
     handle_privacy_command,
@@ -111,6 +113,7 @@ from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import run_prepared_turn
+from daimon.core.turn.state import ToolUseBlock
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.async_client import AsyncBaseSocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -181,6 +184,10 @@ class SlackApp:
         self._bg_tasks: set[asyncio.Task[None]] = set()
         # Cancel registry: status_ts -> (cancel Event, author_id).
         self._cancel_registry: dict[str, tuple[asyncio.Event, str]] = {}
+        # Output-delivery abort-notice dedup, keyed "{team_id}:{error_code}".
+        self._delivery_notice_keys: set[str] = set()
+        # Chains output sweeps per MA session so two never overlap.
+        self._output_sweeps: dict[str, asyncio.Task[None]] = {}
         # Drain flag — set on SIGTERM; blocks new mention handling.
         self.draining: bool = False
 
@@ -191,6 +198,52 @@ class SlackApp:
         task.add_done_callback(self._bg_tasks.discard)
         task.add_done_callback(_log_bg_task_exception)
         return task
+
+    def _forget_output_sweep(self, session_id: str, task: asyncio.Task[None]) -> None:
+        """Done-callback: drop the chain entry only if it still points at ``task``."""
+        if self._output_sweeps.get(session_id) is task:
+            del self._output_sweeps[session_id]
+
+    async def _sweep_session_outputs(
+        self,
+        previous: asyncio.Task[None] | None,
+        web_client: AsyncWebClient,
+        *,
+        session_id: str,
+        channel_id: str,
+        thread_ts: str,
+        team_id: str,
+    ) -> None:
+        """Detached post-turn output sweep, chained per MA session.
+
+        Awaiting ``previous`` preserves the serial-sweep-per-session invariant
+        post-then-delete needs: two overlapping sweeps could both list a file
+        before either deletes it, double-posting with no crash anywhere.
+        """
+        if previous is not None:
+            # That task already logged its own failure; only its completion
+            # matters here. CancelledError is a BaseException and deliberately
+            # NOT suppressed — a SIGTERM cancellation propagates and correctly
+            # cancels this chained successor too.
+            with contextlib.suppress(Exception):
+                await previous
+        try:
+            await deliver_session_outputs(
+                self.runtime.turn_deps.anthropic,
+                web_client,
+                session_id=session_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                notice_keys=self._delivery_notice_keys,
+                team_id=team_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- named boundary: a sweep failure must never escape
+            log.warning(
+                "slack.output_delivery.unhandled_error",
+                session_id=session_id,
+                thread_id=thread_ts,
+                error=str(exc)[:300],
+            )
 
     async def on_request(
         self,
@@ -1287,6 +1340,30 @@ class SlackApp:
             )
         else:
             log.info("slack.turn.completed", thread_id=thread_id, session_id=outcome.ma_session_id)
+
+        # Detached output sweep. `outcome.ma_session_id` is the post-recovery
+        # session id, so outputs stranded in a dead session are not
+        # recoverable. A detached sweep is not counted by drain_and_close's
+        # `_processing` poll, so SIGTERM can kill one mid-flight —
+        # post-then-delete makes that self-healing (redelivered on the next
+        # turn's sweep, or double-posted inside the already-accepted
+        # post-then-delete crash window).
+        if not any(isinstance(block, ToolUseBlock) for block in outcome.state.content):
+            return
+        # Read the chain link synchronously, before spawning, so it cannot be lost.
+        previous = self._output_sweeps.get(outcome.ma_session_id)
+        task = self._spawn(
+            self._sweep_session_outputs(
+                previous,
+                web_client,
+                session_id=outcome.ma_session_id,
+                channel_id=channel,
+                thread_ts=thread_id,
+                team_id=team_id,
+            )
+        )
+        self._output_sweeps[outcome.ma_session_id] = task
+        task.add_done_callback(functools.partial(self._forget_output_sweep, outcome.ma_session_id))
 
     async def drain_and_close(self, client: AsyncBaseSocketModeClient) -> None:
         """Graceful shutdown drain.

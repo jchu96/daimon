@@ -66,6 +66,52 @@ def test_states_the_interactive_delivery_contract_not_only_the_headless_one() ->
     assert "Never" in block and "invoked from" in block, (
         "block must forbid send_message into the thread the turn was invoked from"
     )
+    assert "interactive exception is Discord file delivery" in block, (
+        "the Discord file path must be explicit about overriding the general send_message rule"
+    )
+    slack = block[block.index("On Slack") : block.index("On Discord")]
+    discord = block[block.index("On Discord") : block.index("Calling `read`")]
+    assert "/mnt/session/outputs IS the delivery path" in slack
+    assert "do NOT also" in slack and "send_message" in slack, (
+        "Slack guidance must prevent output-directory files from being sent twice"
+    )
+    assert "/mnt/session/outputs is NOT a delivery path" in discord
+    assert "create_file_upload_url" in discord and "send_message" in discord, (
+        "Discord guidance must preserve its explicit file-upload sequence"
+    )
+    assert "a FILE never does" not in block
+    assert "There is no way to attach a file to your reply" not in block
+
+
+def test_slack_guidance_states_output_write_discipline() -> None:
+    # The Slack outputs directory is snapshot-indexed by Managed Agents: the
+    # content is captured at first write, subdirectory paths flatten, and an
+    # rm-and-recreate removes the file from the listing entirely. Each of those
+    # facts needs its own line of guidance or agents will append, nest, and
+    # delete their way into silently undelivered files.
+    block = CREDENTIAL_GUIDANCE_BLOCK
+    slack = block[block.index("On Slack") : block.index("On Discord")]
+    assert "interactive turns only" in slack, (
+        "Slack guidance must scope delivery to interactive turns"
+    )
+    assert "a scheduled routine delivers nothing" in slack, (
+        "Slack guidance must say routines deliver nothing this way"
+    )
+    assert "once and complete" in slack and "never re-indexed" in slack, (
+        "Slack guidance must warn that appends after the first write are lost"
+    )
+    assert "flat, unique filenames" in slack and "flattened away" in slack, (
+        "Slack guidance must warn that subdirectories flatten and names collide"
+    )
+    assert "overwrite it in place" in slack and "never `rm`" in slack, (
+        "Slack guidance must say overwrite-to-revise, never rm-and-recreate"
+    )
+    assert "do NOT also call create_file_upload_url or send_message" in slack, (
+        "the duplicate-delivery warning must survive the additions"
+    )
+    assert "at most five files" not in block and "five files per turn" not in block, (
+        "the retired per-turn file-count cap must not be described anywhere"
+    )
 
 
 def test_replaces_stale_block_preserving_user_body() -> None:

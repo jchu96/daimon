@@ -57,6 +57,7 @@ oauth_config:
       - groups:history
       - reactions:write
       - files:read
+      - files:write
       - channels:read
       - groups:read
     # Requested only when a member opts in via "Connect Slack"; reads then run

@@ -3,6 +3,25 @@
 This page documents how daimon's Slack adapter handles per-user access and
 what operators should understand about the resulting trust model.
 
+### Session output files
+
+Files an agent saves under `/mnt/session/outputs` are uploaded to the Slack
+thread after an interactive turn completes (scheduled routines deliver
+nothing). Delivery runs in the background after the reply is posted — the
+adapter waits for Managed Agents to index newly written files, so files may
+arrive a few seconds after the reply. A successfully posted file is deleted
+from the session's file listing, so the listing only ever holds undelivered
+work and there is no delivery-receipt store to go stale. An interrupted
+delivery (a deploy restart mid-sweep) leaves the file listed and it goes out
+on the next turn; a crash between posting and deleting can re-post a file
+once. Files over 20 MiB are not delivered — the thread gets a short notice
+naming the file instead (Slack's own hard cap is far higher, but large files
+lose thread previews and the upload buffers the whole payload in memory), and
+0-byte files are skipped silently and logged. Delivery requires the
+`files:write` bot scope; adding a scope to an existing install requires
+re-running the install flow. A workspace that has hit its Slack file-storage
+limit gets one in-thread notice and no deliveries until space is freed.
+
 ### Per-user Slack access (optional)
 
 By default daimon reads only channels the bot is invited to. Members can

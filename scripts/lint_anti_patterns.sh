@@ -9,8 +9,17 @@
 #       inline.
 #   T2  model_construct(...) anywhere in the test tree — banned (skips
 #       Pydantic validation; produces silently-invalid objects).
-#   T3  AsyncMock(...) attached to client.beta.* — banned. Always go
-#       transport-level via httpx.MockTransport.
+#   T3  AsyncMock(...) attached to <any-receiver>.beta.* — banned. Always go
+#       transport-level via httpx.MockTransport. Receiver-agnostic: the old
+#       pattern anchored on a receiver literally named `client`, which let
+#       `anthropic_mock.beta.files.list = AsyncMock(...)` sail through.
+#       Residue: exactly two expressions are allowlisted — the
+#       agents.retrieve / environments.retrieve wirings on the bare
+#       AsyncMock() Discord runtime builders in test_bot.py,
+#       test_orchestration.py and test_bot_mention_routing.py. The exemption
+#       ends when those builders move to build_fake_anthropic (see the
+#       in-tree TODO in test_orchestration.py); any OTHER AsyncMock on a
+#       .beta.* attribute in those files still fails.
 #   T4  client.beta.{agents,environments}.list in production source — banned
 #       (cross-tenant leak). Allowlisted: ma_index.py, ma.py (filtered-list homes).
 #   T5  .beta.agents.create( outside the approved creation chokepoints — banned.
@@ -81,7 +90,16 @@ PROD_SEARCH_PATHS=(
 # implementation phase can grow this allow-list with intent.
 ALLOWLIST_T1=()  # MagicMock(id=...) for SDK shapes
 ALLOWLIST_T2=()  # model_construct
-ALLOWLIST_T3=()  # AsyncMock on client.beta.*
+# T3 residue: the Discord runtime builders wire two retrieves onto a bare
+# AsyncMock() client. Converting them to build_fake_anthropic is a real
+# migration of ~4,400 lines of Discord tests (TODO in test_orchestration.py);
+# out of scope for the Slack delivery work. Content-level entries (run_rule
+# filters full path:line:content strings with grep -vF), so ONLY these two
+# exact expressions are exempt — not the files, not the directory.
+ALLOWLIST_T3=(
+  'anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())'
+  'anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())'
+)
 ALLOWLIST_T4=("ma_index.py" "ma.py")  # the legitimate filtered-list homes
 # Approved agent-creation chokepoints: each guarantees the base agent_toolset
 # via dump_agent_spec or merge_default_agent_toolset.
@@ -252,10 +270,10 @@ run_rule "T2" \
   '\.model_construct\(' \
   ALLOWLIST_T2
 
-# T3: AsyncMock on client.beta.* methods.
+# T3: AsyncMock on any receiver's .beta.* methods (receiver-agnostic).
 run_rule "T3" \
-  "Banned: AsyncMock attached to client.beta.* methods" \
-  'client\.beta\.[a-zA-Z_.]+\s*=\s*AsyncMock' \
+  "Banned: AsyncMock attached to <any-receiver>.beta.* methods" \
+  '\.beta\.[a-zA-Z_.]+\s*=\s*AsyncMock' \
   ALLOWLIST_T3
 
 # T4: unfiltered agents/environments .list() in production source (cross-tenant leak).

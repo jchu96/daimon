@@ -88,6 +88,7 @@ source_modules = [
     "daimon.core.ma",
     "daimon.core.message_feedback",
     "daimon.core.observability",
+    "daimon.core.output_delivery",
     "daimon.core.privacy",
     "daimon.core.purge",
     "daimon.core.scope",
