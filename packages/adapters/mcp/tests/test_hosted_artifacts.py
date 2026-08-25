@@ -68,9 +68,11 @@ class _FilesTransport:
         self.content = content
         self.files = files
         self.downloaded_ids: list[str] = []
+        self.beta_headers: list[str] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/files":
+            self.beta_headers.append(request.headers.get("anthropic-beta", ""))
             return httpx.Response(200, json={"data": list(self.files), "has_more": False})
         prefix = "/v1/files/"
         suffix = "/content"
@@ -81,6 +83,7 @@ class _FilesTransport:
         ):
             file_id = request.url.path[len(prefix) : -len(suffix)]
             self.downloaded_ids.append(file_id)
+            self.beta_headers.append(request.headers.get("anthropic-beta", ""))
             return httpx.Response(200, content=self.content)
         raise AssertionError(f"unexpected Files API request: {request.method} {request.url.path}")
 
@@ -130,6 +133,8 @@ async def test_embed_only_delivery_needs_no_artifact_settings() -> None:
     assert result.chart_urls == ()
     assert len(result.image_blocks) == 1
     assert transport.downloaded_ids == ["current"]
+    assert len(transport.beta_headers) == 2
+    assert all("managed-agents-2026-04-01" in value for value in transport.beta_headers)
 
 
 async def test_configured_store_adds_presigned_link_and_structured_url() -> None:
@@ -224,6 +229,70 @@ async def test_discovery_filters_cutoff_and_suffix() -> None:
 
     assert len(result.image_blocks) == 1
     assert transport.downloaded_ids == ["current"]
+
+
+async def test_discovery_sorts_newest_first_before_chart_cap() -> None:
+    files = tuple(
+        _file(
+            f"file-{index}",
+            f"chart-{index}.png",
+            created_at=_NOW + dt.timedelta(seconds=index),
+        )
+        for index in range(6)
+    )
+    client, transport = _client(files=files)
+
+    result = await deliver_hosted_charts(
+        client,
+        settings=None,
+        tenant_id="tenant-1",
+        account_id="account-1",
+        session_id="session-1",
+        turn_started_at=_NOW,
+        message="Answer",
+    )
+
+    assert len(result.image_blocks) == 3
+    assert transport.downloaded_ids == [
+        "file-5",
+        "file-4",
+        "file-3",
+        "file-2",
+        "file-1",
+    ]
+
+
+async def test_unbounded_embed_logs_the_byte_cap_drop() -> None:
+    client, _transport = _client()
+    output = _ChartOutput(file_id="file-1", filename="dense.png", size_bytes=len(_PNG))
+
+    with (
+        patch(
+            "daimon.adapters.mcp.hosted_artifacts._discover_chart_outputs",
+            new=AsyncMock(return_value=(output,)),
+        ),
+        patch(
+            "daimon.adapters.mcp.hosted_artifacts._bounded_image_block",
+            return_value=None,
+        ),
+        patch("daimon.adapters.mcp.hosted_artifacts._log.warning") as warning,
+    ):
+        result = await deliver_hosted_charts(
+            client,
+            settings=None,
+            tenant_id="tenant-1",
+            account_id="account-1",
+            session_id="session-1",
+            turn_started_at=_NOW,
+            message="Answer survives",
+        )
+
+    assert result == HostedChartDelivery(message="Answer survives")
+    warning.assert_called_once_with(
+        "mcp.hosted_artifact.image_too_large",
+        filename="dense.png",
+        encoded_byte_cap=400 * 1024,
+    )
 
 
 async def test_invalid_outputs_fail_open_to_unchanged_text() -> None:

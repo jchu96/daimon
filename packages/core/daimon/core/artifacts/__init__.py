@@ -1,15 +1,8 @@
-"""Private artifact storage primitives."""
+"""Vendor-neutral artifact storage primitives."""
 
-from daimon.core.artifacts.store import (
-    ArtifactStore,
-    S3ArtifactStore,
-    StoredArtifact,
-    build_artifact_store,
-)
+from daimon.core.artifacts.store import ArtifactStore, StoredArtifact
 
 __all__ = [
     "ArtifactStore",
-    "S3ArtifactStore",
     "StoredArtifact",
-    "build_artifact_store",
 ]
