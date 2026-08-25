@@ -17,9 +17,12 @@ Pattern sequence for billing_topup block_action:
   4. get_or_create_platform_principal → account_id
   5. create_checkout(http_client, …) → url
   6. chat_postEphemeral with "<url|Complete payment>" link
+  7. On failure, views.update the open modal with a static "not configured" message
+     instead of leaving the dropdown silently dead
 
-Error boundary (S3): catches DaimonError | httpx.HTTPStatusError | SlackApiError
-at the handler level; logs + captures to Sentry. Never stripe.
+Error boundary (S3): catches DaimonError | httpx.HTTPStatusError | AssertionError |
+SlackApiError at the handler level; logs + captures to Sentry, then answers the open
+modal via views.update. Never stripe.
 """
 
 from __future__ import annotations
@@ -140,6 +143,8 @@ async def handle_topup_select(
     # channel comes from block_actions container (may be absent for modal actions)
     container: dict[str, Any] = payload.get("container") or {}
     channel: str = container.get("channel_id") or ""
+    view_info: dict[str, Any] = payload.get("view") or {}
+    view_id: str = str(view_info.get("id") or "")
 
     # Extract selected amount from the first action's selected_option value
     actions: list[dict[str, Any]] = payload.get("actions") or []
@@ -206,7 +211,7 @@ async def handle_topup_select(
             text=f"<{url}|Complete payment>",
         )
 
-    except (DaimonError, httpx.HTTPStatusError, SlackApiError) as exc:
+    except (DaimonError, httpx.HTTPStatusError, AssertionError, SlackApiError) as exc:
         log.error(
             "slack.billing_topup_failed",
             team_id=team_id,
@@ -214,3 +219,23 @@ async def handle_topup_select(
             exc_info=exc,
         )
         capture_exception_with_scope(exc)
+        await client.views_update(  # pyright: ignore[reportUnknownMemberType]
+            view_id=view_id,
+            view={
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Billing"},
+                "close": {"type": "plain_text", "text": "Close"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                "Payments aren't configured for this workspace. "
+                                "Ask an operator about a manual credit top-up."
+                            ),
+                        },
+                    }
+                ],
+            },
+        )
