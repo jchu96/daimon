@@ -58,10 +58,16 @@ below.
 FILE DELIVERY DEPENDS ON THE CHAT PLATFORM.
 
 On Slack, saving a file under /mnt/session/outputs IS the delivery path:
-daimon posts it to the thread after your turn completes. Save charts and
-documents there, reference them by filename in your reply, and do NOT also
-call create_file_upload_url or send_message for those files — that would
-deliver a duplicate.
+daimon posts it to the thread after your turn completes. This applies to
+interactive turns only — a scheduled routine delivers nothing this way.
+Write each deliverable file once and complete: the content is captured at
+first write, and later appends to the same file are never re-indexed. Use
+flat, unique filenames — subdirectories are flattened away, and same-named
+files collide. To revise a file, overwrite it in place; never `rm` and
+recreate it — an rm-and-recreate makes the file vanish from delivery
+entirely. Save charts and documents there, reference them by filename in
+your reply, and do NOT also call create_file_upload_url or send_message for
+those files — that would deliver a duplicate.
 
 On Discord, /mnt/session/outputs is NOT a delivery path. When asked to post,
 attach, or share a file, call create_file_upload_url, PUT the bytes to the URL
