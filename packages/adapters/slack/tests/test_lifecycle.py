@@ -290,6 +290,50 @@ async def test_terminal_success_replaces_status_in_place(fake_slack_web_client: 
     assert not _has_actions_block(blocks), "cancel button must be removed on terminal success"
 
 
+async def test_terminal_success_strips_claims_carrier(fake_slack_web_client: Any) -> None:
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.on_sse_event(_thinking_event())
+    state = TurnState(
+        content=[
+            TextBlock(
+                kind="text",
+                text=(
+                    "Revenue was $10.08M.\n\n"
+                    "```claims\n"
+                    '[{"metric":"revenue","value":10080000,"unit":"usd",'
+                    '"basis":"invoices","as_of":null,"source":null}]\n'
+                    "```"
+                ),
+            )
+        ]
+    )
+
+    await lc.on_terminal_success(state)
+
+    rendered = _block_text(_last_update_blocks(fake_slack_web_client))
+    assert "Revenue was $10.08M." in rendered
+    assert "```claims" not in rendered
+    assert '"metric"' not in rendered
+
+
+async def test_terminal_success_strips_all_claims_fences(fake_slack_web_client: Any) -> None:
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.on_sse_event(_thinking_event())
+    answer = (
+        'Example:\n```claims\n[{"metric":"example"}]\n```\n\n'
+        "Supported total is 12 MW.\n"
+        '```claims\n[{"metric":"installed_mw","value":12}]\n```'
+    )
+
+    await lc.on_terminal_success(TurnState(content=[TextBlock(kind="text", text=answer)]))
+
+    rendered = _block_text(_last_update_blocks(fake_slack_web_client))
+    assert "Example:" in rendered
+    assert "Supported total is 12 MW." in rendered
+    assert "```claims" not in rendered
+    assert '"metric"' not in rendered
+
+
 async def test_terminal_success_overflow_posts_and_widens_final_ts(
     fake_slack_web_client: Any,
 ) -> None:

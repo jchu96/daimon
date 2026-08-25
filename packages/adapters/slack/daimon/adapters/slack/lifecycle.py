@@ -34,6 +34,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
 from daimon.adapters.slack.blockkit import EmbedEvent, State, TurnPhase, to_blocks, update
 from daimon.adapters.slack.mrkdwn import escape_mrkdwn_preserving_mentions
 from daimon.adapters.slack.split import split_for_slack_safe
+from daimon.core.claims import strip_claims_blocks
 from daimon.core.pricing import MODEL_PRICING, cost_of, format_cost
 from daimon.core.turn.lifecycle import InterruptSource, ReconnectReason
 from daimon.core.turn.state import ToolUseBlock, TurnState, extract_final_response
@@ -245,7 +246,10 @@ class SlackTurnLifecycle:
         self._state = update(self._state, EmbedEvent(kind="done", label=""))
         self._apply_usage(state)
         try:
-            final_text = extract_final_response(state.content)
+            # Claims are a machine-readable carrier for evaluation and must not
+            # leak into the human-facing Slack answer. Strip every carrier,
+            # including malformed or non-trailing examples, before rendering.
+            final_text = strip_claims_blocks(extract_final_response(state.content))
             if not final_text:
                 # No final answer. A tool-only turn keeps the collapsed done
                 # footer; a truly empty turn (cancellation) shows "Turn

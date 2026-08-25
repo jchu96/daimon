@@ -53,6 +53,8 @@ whole team, in the thread — and hands back a notebook anyone can run.
 - CLI and MCP adapters sharing the same core turn pipeline
 - Tenant isolation enforced at the database `tenant_id` layer, so one shared
   Anthropic key can safely power every guild
+- Optional [typed final-answer claims](docs/typed-claims.md) let deployments
+  evaluate headline numbers without scraping formatted prose
 
 ## What you can ask it
 
