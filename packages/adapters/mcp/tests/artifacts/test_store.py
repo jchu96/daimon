@@ -52,6 +52,7 @@ async def test_s3_store_uploads_privately_and_honours_presigned_ttl() -> None:
         "Key": "tenant/t/account/a/session/s/chart.png",
         "Body": b"png-bytes",
         "ContentType": "image/png",
+        "ContentDisposition": "attachment; filename*=UTF-8''chart.png",
     }
     assert "ACL" not in client.put_kwargs
     assert client.presign_kwargs == {
@@ -59,11 +60,43 @@ async def test_s3_store_uploads_privately_and_honours_presigned_ttl() -> None:
         "Params": {
             "Bucket": "private-artifacts",
             "Key": "tenant/t/account/a/session/s/chart.png",
+            "ResponseContentDisposition": "attachment; filename*=UTF-8''chart.png",
+            "ResponseContentType": "image/png",
         },
         "ExpiresIn": 321,
     }
     assert stored.expires_at == now + dt.timedelta(seconds=321)
     assert stored.url.endswith("signature=secret")
+
+
+async def test_s3_store_forces_svg_download_as_octet_stream() -> None:
+    client = FakeS3Client()
+    store = S3ArtifactStore(client, bucket="private-artifacts")
+
+    await store.upload_and_presign(
+        key="tenant/t/account/a/session/s/chart report.svg",
+        content=b'<svg onload="alert(1)"></svg>',
+        content_type="image/svg+xml",
+        ttl_seconds=600,
+    )
+
+    assert client.put_kwargs == {
+        "Bucket": "private-artifacts",
+        "Key": "tenant/t/account/a/session/s/chart report.svg",
+        "Body": b'<svg onload="alert(1)"></svg>',
+        "ContentType": "image/svg+xml",
+        "ContentDisposition": "attachment; filename*=UTF-8''chart%20report.svg",
+    }
+    assert client.presign_kwargs == {
+        "client_method": "get_object",
+        "Params": {
+            "Bucket": "private-artifacts",
+            "Key": "tenant/t/account/a/session/s/chart report.svg",
+            "ResponseContentDisposition": "attachment; filename*=UTF-8''chart%20report.svg",
+            "ResponseContentType": "application/octet-stream",
+        },
+        "ExpiresIn": 600,
+    }
 
 
 async def test_production_store_presigns_with_virtual_host_and_sigv4() -> None:

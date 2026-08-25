@@ -1,4 +1,4 @@
-"""Agent-chat primitives plus bounded ``ask`` and read-only chart delivery.
+"""Agent-chat primitives plus bounded ``ask`` and completed-chart delivery.
 
 These tools are tagged ``"agent-chat"`` and hidden by default via the
 ``Visibility(False, tags={"agent-chat"})`` baseline in ``server.py``. They
@@ -31,7 +31,8 @@ Headless loop (primitives plus the bounded ``ask`` convenience tool):
   the final text plus bounded chart images and optional presigned links.
   Admission-gated, same as ``start_turn``.
 - ``deliver_turn_charts`` finds the newest completed reply and delivers charts
-  from that turn. Read-only, not gated.
+  from that turn. It performs a bounded artifact-store write when optional
+  link delivery is configured; it is not admission-gated.
 """
 
 from __future__ import annotations
@@ -522,8 +523,9 @@ def register_agent_chat_tools(
 
     ``start_turn``, ``continue_turn``, and ``ask`` run the shared
     ``_check_admission`` gate (the same balance/cap checks the media tools run)
-    before creating a session or sending an event; the five read tools stay on
-    the bare ``_auth``.
+    before creating a session or sending an event. The four read-only tools and
+    ``deliver_turn_charts`` stay on bare ``_auth``; the latter performs a
+    bounded artifact-store write when optional link delivery is configured.
     """
 
     @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]

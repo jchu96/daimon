@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 from collections.abc import Callable
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 
 from botocore.config import Config  # pyright: ignore[reportMissingTypeStubs]
 from botocore.session import Session  # pyright: ignore[reportMissingTypeStubs]
@@ -50,15 +51,26 @@ class S3ArtifactStore:
         """Upload without a public ACL, then sign only this object's GET."""
 
         def _store_and_sign() -> str:
+            basename = key.rsplit("/", maxsplit=1)[-1]
+            disposition = f"attachment; filename*=UTF-8''{quote(basename)}"
+            response_content_type = (
+                "application/octet-stream" if content_type == "image/svg+xml" else content_type
+            )
             self._client.put_object(
                 Bucket=self._bucket,
                 Key=key,
                 Body=content,
                 ContentType=content_type,
+                ContentDisposition=disposition,
             )
             return self._client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": self._bucket, "Key": key},
+                Params={
+                    "Bucket": self._bucket,
+                    "Key": key,
+                    "ResponseContentDisposition": disposition,
+                    "ResponseContentType": response_content_type,
+                },
                 ExpiresIn=ttl_seconds,
             )
 
