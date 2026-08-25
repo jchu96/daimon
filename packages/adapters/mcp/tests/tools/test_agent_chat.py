@@ -46,6 +46,7 @@ from daimon.adapters.mcp.tools.agent_chat import (
     _ask_impl,
     _ask_tool_result,
     _continue_turn_impl,
+    _deliver_turn_charts_impl,
     _describe_agent_impl,
     _get_session_impl,
     _list_events_impl,
@@ -53,6 +54,7 @@ from daimon.adapters.mcp.tools.agent_chat import (
     _start_turn_impl,
     register_agent_chat_tools,
 )
+from daimon.adapters.mcp.tools.sessions import SessionEventOut
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
@@ -167,6 +169,22 @@ def _make_agent_message_event(text: str) -> dict[str, Any]:
         "type": "agent.message",
         "content": [{"type": "text", "text": text}],
     }
+
+
+def _timed_event(
+    event_id: str,
+    event_type: str,
+    processed_at: dt.datetime,
+    *,
+    text: str | None = None,
+) -> SessionEventOut:
+    content = [{"type": "text", "text": text}] if text is not None else []
+    return SessionEventOut(
+        id=event_id,
+        type=event_type,
+        content=content,
+        processed_at=processed_at,
+    )
 
 
 def _make_thread_idle_event(*, stop_reason_type: str = "end_turn") -> dict[str, Any]:
@@ -326,6 +344,7 @@ async def test_narrowing_agent_id_claim_returns_only_agent_chat_tools() -> None:
         "list_my_sessions",
         "start_turn",
         "continue_turn",
+        "deliver_turn_charts",
         "get_my_session",
         "list_events",
     }
@@ -412,6 +431,7 @@ async def test_narrowing_lists_agent_chat_tools_through_bm25_search_transform() 
         "list_my_sessions",
         "start_turn",
         "continue_turn",
+        "deliver_turn_charts",
         "get_my_session",
         "list_events",
     }
@@ -746,6 +766,193 @@ async def test_ask_tool_result_preserves_images_and_structured_urls() -> None:
     assert embed_only.content[1] == image
 
 
+async def test_deliver_turn_charts_uses_newest_completed_turn_window() -> None:
+    runtime = MagicMock()
+    runtime.settings.artifacts = None
+    auth = _auth()
+    newer_user_at = dt.datetime(2026, 8, 25, 12, 30, tzinfo=dt.UTC)
+    reply_at = dt.datetime(2026, 8, 25, 12, 20, tzinfo=dt.UTC)
+    turn_started_at = dt.datetime(2026, 8, 25, 12, 10, tzinfo=dt.UTC)
+    pages = [
+        MagicMock(
+            items=[
+                _timed_event("sevt_next_turn", "user.message", newer_user_at),
+                _timed_event(
+                    "sevt_newest_reply",
+                    "agent.message",
+                    reply_at,
+                    text="Final answer",
+                ),
+            ],
+            next_page="older-events",
+        ),
+        MagicMock(
+            items=[_timed_event("sevt_turn_start", "user.message", turn_started_at)],
+            next_page=None,
+        ),
+    ]
+    image = ImageContent(type="image", data="cG5n", mimeType="image/png")
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    status="idle",
+                    created_at=dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC),
+                )
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(side_effect=pages),
+        ) as list_events,
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat.deliver_hosted_charts",
+            new=AsyncMock(
+                return_value=HostedChartDelivery(
+                    message="Final answer",
+                    image_blocks=(image,),
+                )
+            ),
+        ) as deliver,
+    ):
+        result = await _deliver_turn_charts_impl(runtime, auth, "ses_chart_turn")
+
+    assert result == AskResult(
+        handle="ses_chart_turn",
+        message="Final answer",
+        image_blocks=(image,),
+    )
+    assert list_events.await_args_list == [
+        ((runtime, auth, "ses_chart_turn", None, 100, "desc"), {}),
+        ((runtime, auth, "ses_chart_turn", "older-events", 100, "desc"), {}),
+    ]
+    deliver.assert_awaited_once_with(
+        runtime.client,
+        settings=None,
+        tenant_id=str(auth.tenant_id),
+        account_id=str(auth.account_id),
+        session_id="ses_chart_turn",
+        turn_started_at=turn_started_at,
+        message="Final answer",
+    )
+
+
+async def test_deliver_turn_charts_rejects_session_without_completed_reply() -> None:
+    runtime = MagicMock()
+    auth = _auth()
+    events = MagicMock(
+        items=[
+            _timed_event(
+                "sevt_user_only",
+                "user.message",
+                dt.datetime(2026, 8, 25, 12, 10, tzinfo=dt.UTC),
+            )
+        ],
+        next_page=None,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    status="idle",
+                    created_at=dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC),
+                )
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(return_value=events),
+        ),
+        pytest.raises(ToolError, match="no completed turn"),
+    ):
+        await _deliver_turn_charts_impl(runtime, auth, "ses_no_reply")
+
+
+async def test_deliver_turn_charts_refuses_before_session_is_complete() -> None:
+    runtime = MagicMock()
+    auth = _auth()
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    status="running",
+                    created_at=dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC),
+                )
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(),
+        ) as list_events,
+        pytest.raises(ToolError, match=r"'running'.*idle.*terminated"),
+    ):
+        await _deliver_turn_charts_impl(runtime, auth, "ses_running")
+
+    list_events.assert_not_awaited()
+
+
+async def test_deliver_turn_charts_falls_back_when_boundary_has_no_timestamp() -> None:
+    runtime = MagicMock()
+    runtime.settings.artifacts = None
+    auth = _auth()
+    session_created_at = dt.datetime(2026, 8, 25, 11, 0, tzinfo=dt.UTC)
+    events = MagicMock(
+        items=[
+            _timed_event(
+                "sevt_reply",
+                "agent.message",
+                dt.datetime(2026, 8, 25, 12, 20, tzinfo=dt.UTC),
+                text="Final answer",
+            ),
+            SessionEventOut(id="sevt_boundary", type="user.message", content=[]),
+        ],
+        next_page=None,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(status="terminated", created_at=session_created_at)
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(return_value=events),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat.deliver_hosted_charts",
+            new=AsyncMock(return_value=HostedChartDelivery(message="Final answer")),
+        ) as deliver,
+    ):
+        result = await _deliver_turn_charts_impl(runtime, auth, "ses_no_boundary_time")
+
+    assert result.message == "Final answer"
+    assert deliver.await_args.kwargs["turn_started_at"] == session_created_at
+
+
+async def test_deliver_turn_charts_is_not_annotated_read_only() -> None:
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response([]))
+    mcp = FastMCP(name="agent-chat-annotations")
+    register_agent_chat_tools(
+        mcp,
+        _runtime(build_fake_anthropic(router.dispatch)),
+        billing_config=None,
+    )
+
+    tool = await mcp.get_tool("deliver_turn_charts")
+
+    assert tool is not None
+    assert tool.annotations is None or tool.annotations.readOnlyHint is not True
+
+
 # ---------------------------------------------------------------------------
 # Test 2b: MPP-01 regression — env resolves from deployment_default alone
 # ---------------------------------------------------------------------------
@@ -1003,6 +1210,7 @@ async def test_agent_chat_tools_have_no_agent_id_parameter() -> None:
         "list_my_sessions",
         "start_turn",
         "continue_turn",
+        "deliver_turn_charts",
         "get_my_session",
         "list_events",
     }

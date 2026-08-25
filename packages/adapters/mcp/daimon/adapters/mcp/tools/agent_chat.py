@@ -1,4 +1,4 @@
-"""Agent-chat tools mirroring the CMA session/events API plus bounded ``ask``.
+"""Agent-chat primitives plus bounded ``ask`` and read-only chart delivery.
 
 These tools are tagged ``"agent-chat"`` and hidden by default via the
 ``Visibility(False, tags={"agent-chat"})`` baseline in ``server.py``. They
@@ -30,6 +30,8 @@ Headless loop (primitives plus the bounded ``ask`` convenience tool):
 - ``ask`` starts a turn, polls until idle for at most two minutes, and returns
   the final text plus bounded chart images and optional presigned links.
   Admission-gated, same as ``start_turn``.
+- ``deliver_turn_charts`` finds the newest completed reply and delivers charts
+  from that turn. Read-only, not gated.
 """
 
 from __future__ import annotations
@@ -352,6 +354,77 @@ def _agent_message_text(event: SessionEventOut) -> str | None:
     return text or None
 
 
+def _event_timestamp(event: SessionEventOut) -> dt.datetime | None:
+    """Read an event timestamp across current Managed Agents projections."""
+    value = getattr(event, "processed_at", None)
+    if value is None:
+        value = getattr(event, "created_at", None)
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+    return None
+
+
+async def _deliver_turn_charts_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    handle: str,
+) -> AskResult:
+    """Deliver the newest completed turn's text and charts without starting a turn."""
+    session = await _get_session_impl(runtime, auth, handle)
+    if session.status not in {"idle", "terminated"}:
+        raise ToolError(
+            f"session {handle} is {session.status!r}; deliver charts only after "
+            "get_my_session reports 'idle' or 'terminated'"
+        )
+
+    page: str | None = None
+    final_text: str | None = None
+    turn_started_at: dt.datetime | None = None
+    while True:
+        events = await _list_events_impl(runtime, auth, handle, page, 100, "desc")
+        for event in events.items:
+            if final_text is None:
+                final_text = _agent_message_text(event)
+                continue
+            if event.type == "user.message":
+                turn_started_at = _event_timestamp(event) or session.created_at
+                break
+        if turn_started_at is not None or events.next_page is None:
+            break
+        page = events.next_page
+
+    if final_text is None:
+        raise ToolError(f"no completed turn found for session {handle}")
+    if turn_started_at is None:
+        raise ToolError(f"no completed turn boundary found for session {handle}")
+
+    configured_artifacts = getattr(getattr(runtime, "settings", None), "artifacts", None)
+    artifacts = (
+        configured_artifacts if isinstance(configured_artifacts, ArtifactsSettings) else None
+    )
+    delivery = await deliver_hosted_charts(
+        runtime.client,
+        settings=artifacts,
+        tenant_id=str(auth.tenant_id),
+        account_id=str(auth.account_id),
+        session_id=handle,
+        turn_started_at=turn_started_at,
+        message=final_text,
+    )
+    return AskResult(
+        handle=handle,
+        message=delivery.message,
+        chart_urls=delivery.chart_urls,
+        image_blocks=delivery.image_blocks,
+    )
+
+
 async def _ask_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -439,6 +512,8 @@ def register_agent_chat_tools(
     The underlying surface mirrors the CMA session/events API, scoped to the
     caller's agent. ``ask`` composes the same primitives into one bounded
     hosted-client call and adds chart delivery after the session becomes idle.
+    ``deliver_turn_charts`` provides the same delivery for clients that poll
+    and read the primitives themselves.
 
     ``list_sessions``/``get_session`` are registered as ``list_my_sessions``/
     ``get_my_session`` to avoid a name collision with the tenant-scoped
@@ -447,7 +522,7 @@ def register_agent_chat_tools(
 
     ``start_turn``, ``continue_turn``, and ``ask`` run the shared
     ``_check_admission`` gate (the same balance/cap checks the media tools run)
-    before creating a session or sending an event; the four read tools stay on
+    before creating a session or sending an event; the five read tools stay on
     the bare ``_auth``.
     """
 
@@ -465,9 +540,9 @@ def register_agent_chat_tools(
     async def list_my_sessions(ctx: Context) -> list[SessionInfo]:  # pyright: ignore[reportUnusedFunction]
         """List this agent's sessions (id, status, title, timestamps).
 
-        ``id`` is the handle you pass to ``get_session``, ``list_events``, and
-        ``continue_turn``. Scoped to this agent only. No parameters — identity
-        is read from the token claim.
+        ``id`` is the handle you pass to ``get_session``, ``list_events``,
+        ``deliver_turn_charts``, and ``continue_turn``. Scoped to this agent
+        only. No parameters — identity is read from the token claim.
         """
         return await _list_sessions_impl(runtime, await _auth(ctx))
 
@@ -544,3 +619,19 @@ def register_agent_chat_tools(
         ``get_session`` reports the session is idle to read what the agent said.
         """
         return await _list_events_impl(runtime, await _auth(ctx), handle, page, limit, order)
+
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
+    async def deliver_turn_charts(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        handle: str,
+    ) -> AskResult:
+        """Return the newest completed reply with its chart images and optional links. Use
+        after ``get_my_session`` reports ``idle`` or ``terminated``; calls made
+        while a turn is running or rescheduling are refused. This tool does not
+        start a turn or send an event, but optional link delivery writes the
+        chart to the configured private artifact store. The handle must belong
+        to the agent in this token.
+        """
+        return _ask_tool_result(  # type: ignore[return-value]
+            await _deliver_turn_charts_impl(runtime, await _auth(ctx), handle)
+        )

@@ -144,6 +144,11 @@ gitignored, so secrets never get committed.
 
 Hosted MCP clients receive bounded chart images directly from the Anthropic
 Files API; this embed-only path is enabled by default and needs no bucket.
+Clients that orchestrate `start_turn`, `get_my_session`, and `list_events`
+themselves can call `deliver_turn_charts(handle)` after `get_my_session`
+reports `idle` or `terminated` to receive the same chart payload. Calls made
+while a turn is running or rescheduling are refused. When URL delivery is
+configured, this call writes the chart to the private artifact store.
 Optionally configure `DAIMON_ARTIFACTS__ENDPOINT_URL`,
 `DAIMON_ARTIFACTS__BUCKET`, `DAIMON_ARTIFACTS__ACCESS_KEY_ID`, and
 `DAIMON_ARTIFACTS__SECRET_ACCESS_KEY` to add short-lived presigned chart links.
