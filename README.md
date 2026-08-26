@@ -152,8 +152,10 @@ configured, this call writes the chart to the private artifact store.
 Optionally configure `DAIMON_ARTIFACTS__ENDPOINT_URL`,
 `DAIMON_ARTIFACTS__BUCKET`, `DAIMON_ARTIFACTS__ACCESS_KEY_ID`, and
 `DAIMON_ARTIFACTS__SECRET_ACCESS_KEY` to add short-lived presigned chart links.
-The storage boundary uses the vendor-neutral S3 API and works with services
-such as AWS S3, Cloudflare R2, MinIO, and Backblaze B2. Objects remain private;
+The storage boundary uses the vendor-neutral S3 API with SigV4 and
+virtual-hosted-style addressing; confirm that contract with your provider.
+Path-style-only endpoints, including default MinIO setups, are not supported.
+Objects remain private;
 daimon never applies a public-read ACL. Presigned URL expiry does not delete
 stored objects, so configure a bucket lifecycle rule for the retention period
 your deployment requires. See `.env.example` for the optional region, URL
