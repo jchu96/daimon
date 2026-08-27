@@ -365,6 +365,36 @@ async def test_read_channel_passes_before_cursor(monkeypatch: pytest.MonkeyPatch
     )
     assert [row.id for row in result.rows] == ["999"]
     assert str(seen_params.get("before")) == "1000"
+    assert result.next_before is None, "a short page means history is exhausted"
+    assert result.hint is None, "a hint on the last page would send the caller in a loop"
+
+
+@pytest.mark.parametrize(
+    "before",
+    ["not-an-id", "1_000", " 42 ", "+7", "-5", "١٢", "0", "9999999999999999999999999"],
+)
+async def test_read_channel_rejects_non_numeric_before(
+    monkeypatch: pytest.MonkeyPatch, before: str
+) -> None:
+    """Anything but an in-range decimal snowflake gets a ToolError, before any
+    REST call.
+
+    int() alone accepts "1_000" and " 42 " — which silently page from a
+    different message than written — and "-5", which Discord answers with an
+    unmapped 400. A 25-digit id is that same 400, and "0" returns an empty
+    page that reads as exhausted history.
+    """
+
+    async def handler(route: discord.http.Route, _kwargs: dict[str, Any]) -> Any:
+        raise AssertionError(
+            f"a bad cursor must fail before any REST call; got {route.method} {route.path}"
+        )
+
+    patch_discord_http(monkeypatch, handler)
+    with pytest.raises(ToolError, match="before must be a numeric discord message id"):
+        await _read_channel_impl(
+            _runtime_with_discord_token(), _auth(), channel_id="222", limit=50, before=before
+        )
 
 
 async def test_read_channel_bot_author_has_assistant_role(
