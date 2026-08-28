@@ -515,6 +515,38 @@ class BillingSettings(BaseModel):
     )
 
 
+class ArtifactsSettings(BaseModel):
+    """Optional private object storage for hosted-client artifacts."""
+
+    endpoint_url: HttpUrl = Field(
+        description="S3-compatible bucket endpoint; used for uploads and presigned GET URLs.",
+    )
+    bucket: str = Field(
+        min_length=1,
+        description="Private bucket name. Daimon never applies a public-read ACL.",
+    )
+    access_key_id: SecretStr = Field(description="S3-compatible access key id.")
+    secret_access_key: SecretStr = Field(description="S3-compatible secret access key.")
+    region: str = Field(
+        default="us-east-1",
+        min_length=1,
+        description="S3 signing region supplied by the bucket provider.",
+    )
+    url_ttl_seconds: int = Field(
+        default=600,
+        gt=0,
+        le=86_400,
+        description="Lifetime of each presigned artifact GET URL; defaults to ten minutes.",
+    )
+    embed_images: bool = Field(
+        default=True,
+        description=(
+            "Also return bounded MCP image blocks for model vision. Disable independently "
+            "when a hosted client cannot accept image content."
+        ),
+    )
+
+
 class Settings(BaseSettings):
     database: DatabaseSettings
     anthropic: AnthropicSettings
@@ -537,6 +569,13 @@ class Settings(BaseSettings):
     notebook: NotebookSettings = Field(default_factory=NotebookSettings)
     sentry: SentrySettings = Field(default_factory=SentrySettings)
     billing: BillingSettings = Field(default_factory=BillingSettings)
+    artifacts: ArtifactsSettings | None = Field(
+        default=None,
+        description=(
+            "Optional private S3-compatible store for presigned chart links. "
+            "Bounded image embeds still run when this is unset."
+        ),
+    )
     defaults_root: Path = Field(
         default_factory=lambda: Path("defaults"),
         description=(

@@ -142,6 +142,25 @@ All four must be set before your first `docker compose` command:
 `${VAR:?...}` guards. You'll add the Discord bot token in step 2. `.env` is
 gitignored, so secrets never get committed.
 
+Hosted MCP clients receive bounded chart images directly from the Anthropic
+Files API; this embed-only path is enabled by default and needs no bucket.
+Clients that orchestrate `start_turn`, `get_my_session`, and `list_events`
+themselves can call `deliver_turn_charts(handle)` after `get_my_session`
+reports `idle` or `terminated` to receive the same chart payload. Calls made
+while a turn is running or rescheduling are refused. When URL delivery is
+configured, this call writes the chart to the private artifact store.
+Optionally configure `DAIMON_ARTIFACTS__ENDPOINT_URL`,
+`DAIMON_ARTIFACTS__BUCKET`, `DAIMON_ARTIFACTS__ACCESS_KEY_ID`, and
+`DAIMON_ARTIFACTS__SECRET_ACCESS_KEY` to add short-lived presigned chart links.
+The storage boundary uses the vendor-neutral S3 API with SigV4 and
+virtual-hosted-style addressing; confirm that contract with your provider.
+Path-style-only endpoints, including default MinIO setups, are not supported.
+Objects remain private;
+daimon never applies a public-read ACL. Presigned URL expiry does not delete
+stored objects, so configure a bucket lifecycle rule for the retention period
+your deployment requires. See `.env.example` for the optional region, URL
+lifetime, and image-embedding controls.
+
 ### 2. Create the Discord application
 
 1. Create an application in the

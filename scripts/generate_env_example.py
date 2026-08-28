@@ -76,6 +76,7 @@ SECTION_TITLES: dict[str, str] = {
     "notebook": "Notebook Host",
     "sentry": "Sentry",
     "billing": "Billing Policy",
+    "artifacts": "Artifacts",
 }
 
 # The 7-key flat billing env vars consumed by billing.py:load_billing_config.

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 from anthropic import AsyncAnthropic
 from cryptography.fernet import MultiFernet
+from daimon.core.artifacts import ArtifactStore
 from daimon.core.config import Settings
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
@@ -27,3 +28,4 @@ class McpRuntime:
     gemini_client: genai.Client | None = None
     notebook_rate_limiter: RateLimiter | None = None
     fernet: MultiFernet | None = field(default=None)
+    artifact_store: ArtifactStore | None = field(default=None)

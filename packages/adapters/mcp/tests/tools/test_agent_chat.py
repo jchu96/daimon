@@ -1,13 +1,10 @@
-"""Tests for the agent-chat tool group.
-
-Surface is primitives-only (scoped to the caller's agent): describe_agent,
-list_sessions, start_turn, continue_turn, get_session, list_events.
+"""Tests for the scoped agent-chat primitives and bounded ``ask`` tool.
 
 Covers:
 1. Narrowing: with a derived-UUID agent_id claim, tools/list returns ONLY the
    agent-chat tools and excludes admin/CRUD tools like list_agents.
 2. Round-trip: start_turn returns a handle; get_session reports running→idle;
-   list_events exposes the agent.message transcript (primitives-only read).
+   list_events exposes the transcript, while ask folds the same flow.
 3. Isolation: a handle whose session agent is not the caller's agent — whether
    cross-tenant or a same-tenant sibling (WR-03) — raises
    ToolError("session not found"); list_sessions is scoped to the caller's agent.
@@ -19,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import re
 import uuid
@@ -31,6 +29,7 @@ import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsSession
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, Role
+from daimon.adapters.mcp.hosted_artifacts import ChartUrl, HostedChartDelivery
 from daimon.adapters.mcp.middleware.mcp_identity import (
     IdentityMiddleware,
     production_agent_id_resolver,
@@ -43,7 +42,11 @@ from daimon.adapters.mcp.middleware.mcp_identity import (
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.search_transform import AgentChatAwareBM25SearchTransform
 from daimon.adapters.mcp.tools.agent_chat import (
+    AskResult,
+    _ask_impl,
+    _ask_tool_result,
     _continue_turn_impl,
+    _deliver_turn_charts_impl,
     _describe_agent_impl,
     _get_session_impl,
     _list_events_impl,
@@ -51,6 +54,7 @@ from daimon.adapters.mcp.tools.agent_chat import (
     _start_turn_impl,
     register_agent_chat_tools,
 )
+from daimon.adapters.mcp.tools.sessions import SessionEventOut
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
@@ -68,6 +72,8 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.transforms import Visibility
 from fastmcp.server.transforms.search.base import serialize_tools_for_output_markdown
+from fastmcp.tools import ToolResult
+from mcp.types import ImageContent
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp, Message
 
@@ -163,6 +169,22 @@ def _make_agent_message_event(text: str) -> dict[str, Any]:
         "type": "agent.message",
         "content": [{"type": "text", "text": text}],
     }
+
+
+def _timed_event(
+    event_id: str,
+    event_type: str,
+    processed_at: dt.datetime,
+    *,
+    text: str | None = None,
+) -> SessionEventOut:
+    content = [{"type": "text", "text": text}] if text is not None else []
+    return SessionEventOut(
+        id=event_id,
+        type=event_type,
+        content=content,
+        processed_at=processed_at.isoformat().replace("+00:00", "Z"),
+    )
 
 
 def _make_thread_idle_event(*, stop_reason_type: str = "end_turn") -> dict[str, Any]:
@@ -262,12 +284,12 @@ async def _tools_list_via_http(app: ASGIApp, token: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Narrowing — agent_id-claim tools/list returns only four agent-chat tools
+# Test 1: Narrowing — agent_id-claim tools/list returns only agent-chat tools
 # ---------------------------------------------------------------------------
 
 
 async def test_narrowing_agent_id_claim_returns_only_agent_chat_tools() -> None:
-    """With an agent_id-claim token, tools/list returns ONLY the four agent-chat tools.
+    """With an agent_id-claim token, tools/list returns only agent-chat tools.
 
     Verifies that admin/CRUD tools are excluded from the visible set and that only
     describe_agent, start_turn, continue_turn, get_reply are returned.
@@ -317,10 +339,12 @@ async def test_narrowing_agent_id_claim_returns_only_agent_chat_tools() -> None:
     tool_names = await _tools_list_via_http(mcp.http_app(), token)
 
     expected = {
+        "ask",
         "describe_agent",
         "list_my_sessions",
         "start_turn",
         "continue_turn",
+        "deliver_turn_charts",
         "get_my_session",
         "list_events",
     }
@@ -382,7 +406,7 @@ def _full_stack_mcp(token: str, claims: dict[str, str]) -> FastMCP:
 
 
 async def test_narrowing_lists_agent_chat_tools_through_bm25_search_transform() -> None:
-    """A narrowed agent token's tools/list returns exactly the 6 agent-chat tools
+    """A narrowed agent token's tools/list returns exactly the agent-chat tools
     even with the BM25 search transform in the stack (issue #181).
 
     The stock BM25SearchTransform collapses the listing to synthetic
@@ -402,10 +426,12 @@ async def test_narrowing_lists_agent_chat_tools_through_bm25_search_transform() 
     tool_names = await _tools_list_via_http(_full_stack_mcp(token, claims).http_app(), token)
 
     expected = {
+        "ask",
         "describe_agent",
         "list_my_sessions",
         "start_turn",
         "continue_turn",
+        "deliver_turn_charts",
         "get_my_session",
         "list_events",
     }
@@ -563,6 +589,374 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
     assert "Hello from agent" in texts, (
         f"agent.message text should be readable from list_events; got {texts!r}"
     )
+
+
+async def test_ask_delivers_embedded_charts_without_artifact_settings() -> None:
+    runtime = MagicMock()
+    runtime.settings.artifacts = None
+    runtime.artifact_store = None
+    auth = _auth()
+    running = MagicMock(status="running")
+    idle = MagicMock(status="idle")
+    events = MagicMock(
+        items=[
+            MagicMock(
+                type="agent.message",
+                content=[{"type": "text", "text": "Final answer"}],
+            )
+        ],
+        next_page=None,
+    )
+    image = ImageContent(type="image", data="cG5n", mimeType="image/png")
+    turn_started_at = dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC)
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._start_turn_impl",
+            new=AsyncMock(return_value={"handle": "ses_ask001"}),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(side_effect=[running, idle]),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(return_value=events),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat.deliver_hosted_charts",
+            new=AsyncMock(
+                return_value=HostedChartDelivery(
+                    message="Final answer",
+                    image_blocks=(image,),
+                )
+            ),
+        ) as deliver,
+    ):
+        result = await _ask_impl(
+            runtime,
+            auth,
+            "Question",
+            sleep=AsyncMock(),
+            clock=lambda: 0.0,
+            now=lambda: turn_started_at,
+        )
+
+    assert result == AskResult(
+        handle="ses_ask001",
+        message="Final answer",
+        image_blocks=(image,),
+    )
+    deliver.assert_awaited_once_with(
+        runtime.client,
+        settings=None,
+        tenant_id=str(auth.tenant_id),
+        account_id=str(auth.account_id),
+        session_id="ses_ask001",
+        turn_started_at=turn_started_at,
+        message="Final answer",
+        store=None,
+    )
+
+
+async def test_ask_timeout_preserves_the_resumable_handle() -> None:
+    runtime = MagicMock()
+    runtime.settings.artifacts = None
+    runtime.artifact_store = None
+    auth = _auth()
+    elapsed = 0.0
+
+    async def advance(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._start_turn_impl",
+            new=AsyncMock(return_value={"handle": "ses_slow001"}),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(return_value=MagicMock(status="running")),
+        ) as get_session,
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(),
+        ) as list_events,
+        pytest.raises(ToolError, match=r"120 seconds.*ses_slow001"),
+    ):
+        await _ask_impl(
+            runtime,
+            auth,
+            "Slow question",
+            timeout_seconds=120.0,
+            poll_interval_seconds=60.0,
+            clock=lambda: elapsed,
+            sleep=advance,
+        )
+
+    assert get_session.await_count == 3
+    list_events.assert_not_awaited()
+
+
+async def test_ask_surfaces_terminal_non_idle_status_without_waiting() -> None:
+    runtime = MagicMock()
+    auth = _auth()
+    sleep = AsyncMock()
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._start_turn_impl",
+            new=AsyncMock(return_value={"handle": "ses_terminated001"}),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(return_value=MagicMock(status="terminated")),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(),
+        ) as list_events,
+        pytest.raises(ToolError, match=r"terminal status 'terminated'.*ses_terminated001"),
+    ):
+        await _ask_impl(runtime, auth, "Question", sleep=sleep)
+
+    sleep.assert_not_awaited()
+    list_events.assert_not_awaited()
+
+
+async def test_ask_tool_result_preserves_images_and_structured_urls() -> None:
+    image = ImageContent(type="image", data="cG5n", mimeType="image/png")
+    chart = ChartUrl(
+        filename="chart.png",
+        url="https://bucket.example.test/chart.png?signed=yes",
+        expires_at=dt.datetime(2026, 8, 25, 12, 10, tzinfo=dt.UTC),
+    )
+
+    result = _ask_tool_result(
+        AskResult(
+            handle="ses_ask001",
+            message="Answer with chart",
+            chart_urls=(chart,),
+            image_blocks=(image,),
+        )
+    )
+
+    assert isinstance(result, ToolResult)
+    assert result.content[0].model_dump(by_alias=True, exclude_none=True) == {
+        "type": "text",
+        "text": "Answer with chart",
+    }
+    assert result.content[1].model_dump(by_alias=True, exclude_none=True) == {
+        "type": "image",
+        "data": "cG5n",
+        "mimeType": "image/png",
+    }
+    assert result.structured_content is not None
+    assert result.structured_content["chart_urls"][0]["filename"] == "chart.png"
+    assert "image_blocks" not in result.structured_content
+
+    embed_only = _ask_tool_result(
+        AskResult(
+            handle="ses_ask002",
+            message="Answer with embedded chart",
+            image_blocks=(image,),
+        )
+    )
+    assert isinstance(embed_only, ToolResult)
+    assert embed_only.structured_content is not None
+    assert embed_only.structured_content["chart_urls"] == []
+    assert embed_only.content[1] == image
+
+
+async def test_deliver_turn_charts_uses_newest_completed_turn_window() -> None:
+    runtime = MagicMock()
+    runtime.settings.artifacts = None
+    runtime.artifact_store = None
+    auth = _auth()
+    newer_user_at = dt.datetime(2026, 8, 25, 12, 30, tzinfo=dt.UTC)
+    reply_at = dt.datetime(2026, 8, 25, 12, 20, tzinfo=dt.UTC)
+    turn_started_at = dt.datetime(2026, 8, 25, 12, 10, tzinfo=dt.UTC)
+    pages = [
+        MagicMock(
+            items=[
+                _timed_event("sevt_next_turn", "user.message", newer_user_at),
+                _timed_event(
+                    "sevt_newest_reply",
+                    "agent.message",
+                    reply_at,
+                    text="Final answer",
+                ),
+            ],
+            next_page="older-events",
+        ),
+        MagicMock(
+            items=[_timed_event("sevt_turn_start", "user.message", turn_started_at)],
+            next_page=None,
+        ),
+    ]
+    image = ImageContent(type="image", data="cG5n", mimeType="image/png")
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    status="idle",
+                    created_at=dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC),
+                )
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(side_effect=pages),
+        ) as list_events,
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat.deliver_hosted_charts",
+            new=AsyncMock(
+                return_value=HostedChartDelivery(
+                    message="Final answer",
+                    image_blocks=(image,),
+                )
+            ),
+        ) as deliver,
+    ):
+        result = await _deliver_turn_charts_impl(runtime, auth, "ses_chart_turn")
+
+    assert result == AskResult(
+        handle="ses_chart_turn",
+        message="Final answer",
+        image_blocks=(image,),
+    )
+    assert list_events.await_args_list == [
+        ((runtime, auth, "ses_chart_turn", None, 100, "desc"), {}),
+        ((runtime, auth, "ses_chart_turn", "older-events", 100, "desc"), {}),
+    ]
+    deliver.assert_awaited_once_with(
+        runtime.client,
+        settings=None,
+        tenant_id=str(auth.tenant_id),
+        account_id=str(auth.account_id),
+        session_id="ses_chart_turn",
+        turn_started_at=turn_started_at,
+        message="Final answer",
+        store=None,
+    )
+
+
+async def test_deliver_turn_charts_rejects_session_without_completed_reply() -> None:
+    runtime = MagicMock()
+    auth = _auth()
+    events = MagicMock(
+        items=[
+            _timed_event(
+                "sevt_user_only",
+                "user.message",
+                dt.datetime(2026, 8, 25, 12, 10, tzinfo=dt.UTC),
+            )
+        ],
+        next_page=None,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    status="idle",
+                    created_at=dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC),
+                )
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(return_value=events),
+        ),
+        pytest.raises(ToolError, match="no completed turn"),
+    ):
+        await _deliver_turn_charts_impl(runtime, auth, "ses_no_reply")
+
+
+async def test_deliver_turn_charts_refuses_before_session_is_complete() -> None:
+    runtime = MagicMock()
+    auth = _auth()
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    status="running",
+                    created_at=dt.datetime(2026, 8, 25, 12, 0, tzinfo=dt.UTC),
+                )
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(),
+        ) as list_events,
+        pytest.raises(ToolError, match=r"'running'.*idle.*terminated"),
+    ):
+        await _deliver_turn_charts_impl(runtime, auth, "ses_running")
+
+    list_events.assert_not_awaited()
+
+
+async def test_deliver_turn_charts_falls_back_when_boundary_has_no_timestamp() -> None:
+    runtime = MagicMock()
+    runtime.settings.artifacts = None
+    runtime.artifact_store = None
+    auth = _auth()
+    session_created_at = dt.datetime(2026, 8, 25, 11, 0, tzinfo=dt.UTC)
+    events = MagicMock(
+        items=[
+            _timed_event(
+                "sevt_reply",
+                "agent.message",
+                dt.datetime(2026, 8, 25, 12, 20, tzinfo=dt.UTC),
+                text="Final answer",
+            ),
+            SessionEventOut(id="sevt_boundary", type="user.message", content=[]),
+        ],
+        next_page=None,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._get_session_impl",
+            new=AsyncMock(
+                return_value=MagicMock(status="terminated", created_at=session_created_at)
+            ),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat._list_events_impl",
+            new=AsyncMock(return_value=events),
+        ),
+        patch(
+            "daimon.adapters.mcp.tools.agent_chat.deliver_hosted_charts",
+            new=AsyncMock(return_value=HostedChartDelivery(message="Final answer")),
+        ) as deliver,
+    ):
+        result = await _deliver_turn_charts_impl(runtime, auth, "ses_no_boundary_time")
+
+    assert result.message == "Final answer"
+    assert deliver.await_args.kwargs["turn_started_at"] == session_created_at
+
+
+async def test_deliver_turn_charts_is_not_annotated_read_only() -> None:
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response([]))
+    mcp = FastMCP(name="agent-chat-annotations")
+    register_agent_chat_tools(
+        mcp,
+        _runtime(build_fake_anthropic(router.dispatch)),
+        billing_config=None,
+    )
+
+    tool = await mcp.get_tool("deliver_turn_charts")
+
+    assert tool is not None
+    assert tool.annotations is None or tool.annotations.readOnlyHint is not True
 
 
 # ---------------------------------------------------------------------------
@@ -817,10 +1211,12 @@ async def test_agent_chat_tools_have_no_agent_id_parameter() -> None:
     register_agent_chat_tools(mcp, runtime, billing_config=None)
 
     agent_chat_names = {
+        "ask",
         "describe_agent",
         "list_my_sessions",
         "start_turn",
         "continue_turn",
+        "deliver_turn_charts",
         "get_my_session",
         "list_events",
     }
@@ -1087,15 +1483,16 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
 
 
 # ---------------------------------------------------------------------------
-# Test 5: admission — start_turn refuses an over-balance tenant before touching MA
+# Test 5: admission — turn-creating tools refuse before touching MA
 # ---------------------------------------------------------------------------
 
 
-async def test_start_turn_refuses_over_balance_tenant_before_creating_session(
+@pytest.mark.parametrize("tool_name", ["start_turn", "ask"])
+async def test_turn_tools_refuse_over_balance_tenant_before_creating_session(
     db_session_factory: async_sessionmaker[AsyncSession],
+    tool_name: str,
 ) -> None:
-    """start_turn on a tenant with no credit raises the terminal billing refusal
-    and never creates an MA session.
+    """Turn-creating tools refuse a tenant with no credit before touching MA.
 
     Drives the tool through the real closure (tools/call over HTTP, not the
     impl) with a claims token that carries platform_user_id so the gate's
@@ -1144,14 +1541,12 @@ async def test_start_turn_refuses_over_balance_tenant_before_creating_session(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
         new=AsyncMock(),
     ) as mock_create_session:
-        result = await _call_tool_via_http(
-            mcp.http_app(), token, "start_turn", {"message": "hello"}
-        )
+        result = await _call_tool_via_http(mcp.http_app(), token, tool_name, {"message": "hello"})
 
     payload = result.get("result", result)
     assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
     assert payload.get("isError"), (
-        f"start_turn should refuse an over-balance tenant; got {payload!r}"
+        f"{tool_name} should refuse an over-balance tenant; got {payload!r}"
     )
     content = str(payload.get("content"))
     assert "TERMINAL ERROR" in content, f"refusal should be a TERMINAL ERROR; got {content!r}"

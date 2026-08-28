@@ -36,6 +36,27 @@
         'type': 'object',
       }),
     }),
+    'ask': dict({
+      'description': '''
+        Ask one question and wait for the final answer and any chart images. Starts a
+        persistent turn, waits up to about 120 seconds for idle, and
+        returns the final text plus a resumable handle. Chart images are
+        embedded by default; short-lived download links are added when private
+        artifact storage is configured.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'message': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'message',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'attach_mcp_server': dict({
       'description': '''
         Attach a no-auth MCP server to an agent.
@@ -1221,6 +1242,28 @@
         'type': 'object',
       }),
     }),
+    'deliver_turn_charts': dict({
+      'description': '''
+        Return the newest completed reply with its chart images and optional links. Use
+        after ``get_my_session`` reports ``idle`` or ``terminated``; calls made
+        while a turn is running or rescheduling are refused. This tool does not
+        start a turn or send an event, but optional link delivery writes the
+        chart to the configured private artifact store. The handle must belong
+        to the agent in this token.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'handle': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'handle',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'describe_agent': dict({
       'description': '''
         Describe the agent associated with this MCP token.
@@ -1661,9 +1704,9 @@
       'description': '''
         List this agent's sessions (id, status, title, timestamps).
         
-        ``id`` is the handle you pass to ``get_session``, ``list_events``, and
-        ``continue_turn``. Scoped to this agent only. No parameters — identity
-        is read from the token claim.
+        ``id`` is the handle you pass to ``get_session``, ``list_events``,
+        ``deliver_turn_charts``, and ``continue_turn``. Scoped to this agent
+        only. No parameters — identity is read from the token claim.
       ''',
       'parameters': dict({
         'additionalProperties': False,

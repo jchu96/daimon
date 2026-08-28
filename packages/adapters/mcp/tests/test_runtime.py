@@ -21,6 +21,7 @@ def test_mcp_runtime_is_frozen_dataclass_with_required_fields() -> None:
         "gemini_client",
         "notebook_rate_limiter",
         "fernet",
+        "artifact_store",
     }, (
         "McpRuntime exposes core collaborators + deployment_default + optional media-tool slots + fernet"
     )
@@ -57,3 +58,4 @@ def test_mcp_runtime_optional_fields_default_to_none() -> None:
         deployment_default=DeploymentDefault(),
     )
     assert rt.gemini_client is None
+    assert rt.artifact_store is None

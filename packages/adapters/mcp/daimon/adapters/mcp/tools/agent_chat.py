@@ -1,6 +1,4 @@
-"""Agent-chat tool group — primitives mirroring the CMA session/events API,
-scoped to one agent: describe_agent, list_sessions, start_turn, continue_turn,
-get_session, list_events.
+"""Agent-chat primitives plus bounded ``ask`` and completed-chart delivery.
 
 These tools are tagged ``"agent-chat"`` and hidden by default via the
 ``Visibility(False, tags={"agent-chat"})`` baseline in ``server.py``. They
@@ -13,7 +11,7 @@ confused-deputy attacks where a caller claims to be a different agent. Every
 session-handle tool re-derives the session agent's UUID and rejects handles
 that aren't this agent's (cross-tenant AND same-tenant cross-agent, WR-03).
 
-Headless loop (primitives-only — no folded/auto-allow ``get_reply``):
+Headless loop (primitives plus the bounded ``ask`` convenience tool):
 - ``start_turn`` creates a persistent MA session (via
   ``daimon.core.sessions.create_session`` for vault/repo/env parity) and sends
   the first message; returns ``{"handle": <session_id>}``. Admission-gated:
@@ -29,10 +27,20 @@ Headless loop (primitives-only — no folded/auto-allow ``get_reply``):
   Read-only, not gated.
 - ``list_sessions`` enumerates this agent's sessions for resume. Read-only,
   not gated.
+- ``ask`` starts a turn, polls until idle for at most two minutes, and returns
+  the final text plus bounded chart images and optional presigned links.
+  Admission-gated, same as ``start_turn``.
+- ``deliver_turn_charts`` finds the newest completed reply and delivers charts
+  from that turn. It performs a bounded artifact-store write when optional
+  link delivery is configured; it is not admission-gated.
 """
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
+from collections.abc import Awaitable, Callable
+from time import monotonic
 from typing import Any, Literal
 
 from anthropic.types.beta import (
@@ -41,6 +49,7 @@ from anthropic.types.beta import (
     BetaManagedAgentsSession,
 )
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
+from daimon.adapters.mcp.hosted_artifacts import ChartUrl, deliver_hosted_charts
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
@@ -57,7 +66,10 @@ from daimon.core.stores.agent_repo_binding import get_binding
 from daimon.core.stores.scoped_config_read import resolve
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel
+from fastmcp.tools import ToolResult
+from pydantic import BaseModel, Field
+
+from mcp.types import ImageContent, TextContent
 
 
 class AgentDescription(BaseModel):
@@ -70,6 +82,27 @@ class AgentDescription(BaseModel):
     skill_names: list[str]
     repo_url: str | None
     environment_name: str | None
+
+
+class AskResult(BaseModel):
+    """Final text, chart capabilities, and resumable handle returned by ``ask``."""
+
+    model_config = {"frozen": True}
+
+    handle: str
+    message: str
+    chart_urls: tuple[ChartUrl, ...] = ()
+    image_blocks: tuple[ImageContent, ...] = Field(default=(), exclude=True, repr=False)
+
+
+def _ask_tool_result(result: AskResult) -> AskResult | ToolResult:
+    """Add model-visible images while preserving the structured ask payload."""
+    if not result.chart_urls and not result.image_blocks:
+        return result
+    return ToolResult(
+        content=[TextContent(type="text", text=result.message), *result.image_blocks],
+        structured_content=result.model_dump(mode="json"),
+    )
 
 
 async def _resolve_environment_name(
@@ -309,6 +342,150 @@ async def _list_events_impl(
     )
 
 
+def _agent_message_text(event: SessionEventOut) -> str | None:
+    """Fold the text blocks from one ``agent.message`` event."""
+    if event.type != "agent.message":
+        return None
+    text = "\n".join(
+        str(block["text"])
+        for block in (event.content or [])
+        if block.get("type") == "text" and block.get("text") is not None
+    )
+    return text or None
+
+
+def _event_timestamp(event: SessionEventOut) -> dt.datetime | None:
+    """Read an event timestamp across current Managed Agents projections."""
+    value = getattr(event, "processed_at", None)
+    if value is None:
+        value = getattr(event, "created_at", None)
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+    return None
+
+
+async def _deliver_turn_charts_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    handle: str,
+) -> AskResult:
+    """Deliver the newest completed turn's text and charts without starting a turn."""
+    session = await _get_session_impl(runtime, auth, handle)
+    if session.status not in {"idle", "terminated"}:
+        raise ToolError(
+            f"session {handle} is {session.status!r}; deliver charts only after "
+            "get_my_session reports 'idle' or 'terminated'"
+        )
+
+    page: str | None = None
+    final_text: str | None = None
+    turn_started_at: dt.datetime | None = None
+    while True:
+        events = await _list_events_impl(runtime, auth, handle, page, 100, "desc")
+        for event in events.items:
+            if final_text is None:
+                final_text = _agent_message_text(event)
+                continue
+            if event.type == "user.message":
+                turn_started_at = _event_timestamp(event) or session.created_at
+                break
+        if turn_started_at is not None or events.next_page is None:
+            break
+        page = events.next_page
+
+    if final_text is None:
+        raise ToolError(f"no completed turn found for session {handle}")
+    if turn_started_at is None:
+        raise ToolError(f"no completed turn boundary found for session {handle}")
+
+    delivery = await deliver_hosted_charts(
+        runtime.client,
+        settings=runtime.settings.artifacts,
+        tenant_id=str(auth.tenant_id),
+        account_id=str(auth.account_id),
+        session_id=handle,
+        turn_started_at=turn_started_at,
+        message=final_text,
+        store=runtime.artifact_store,
+    )
+    return AskResult(
+        handle=handle,
+        message=delivery.message,
+        chart_urls=delivery.chart_urls,
+        image_blocks=delivery.image_blocks,
+    )
+
+
+async def _ask_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    message: str,
+    *,
+    timeout_seconds: float = 120.0,
+    poll_interval_seconds: float = 1.0,
+    clock: Callable[[], float] = monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+) -> AskResult:
+    """Start a turn, wait boundedly for idle, and return its final reply."""
+    turn_started_at = now()
+    started = await _start_turn_impl(runtime, auth, message)
+    handle = started["handle"]
+    deadline = clock() + timeout_seconds
+
+    while True:
+        current = await _get_session_impl(runtime, auth, handle)
+        if current.status not in {"idle", "rescheduling", "running"}:
+            raise ToolError(
+                f"Daimon turn reached terminal status {current.status!r}; "
+                f"resume or inspect events with handle {handle}"
+            )
+        if current.status == "idle":
+            page: str | None = None
+            final_text: str | None = None
+            while True:
+                events = await _list_events_impl(runtime, auth, handle, page, 100, "desc")
+                for event in events.items:
+                    final_text = _agent_message_text(event)
+                    if final_text is not None:
+                        break
+                if final_text is not None or events.next_page is None:
+                    break
+                page = events.next_page
+
+            if final_text is not None:
+                delivery = await deliver_hosted_charts(
+                    runtime.client,
+                    settings=runtime.settings.artifacts,
+                    tenant_id=str(auth.tenant_id),
+                    account_id=str(auth.account_id),
+                    session_id=handle,
+                    turn_started_at=turn_started_at,
+                    message=final_text,
+                    store=runtime.artifact_store,
+                )
+                return AskResult(
+                    handle=handle,
+                    message=delivery.message,
+                    chart_urls=delivery.chart_urls,
+                    image_blocks=delivery.image_blocks,
+                )
+
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise ToolError(
+                f"Daimon turn did not become idle with a reply within "
+                f"{timeout_seconds:g} seconds; resume with handle {handle}"
+            )
+        await sleep(min(poll_interval_seconds, remaining))
+
+
 def register_agent_chat_tools(
     mcp: FastMCP,
     runtime: McpRuntime,
@@ -322,22 +499,22 @@ def register_agent_chat_tools(
     hides them by default, and the middleware narrowing reveals them when the
     token carries a valid ``agent_id`` claim.
 
-    Surface is primitives-only (mirrors the CMA session/events API, scoped to
-    the caller's agent): describe_agent, list_sessions, start_turn,
-    continue_turn, get_session, list_events. There is no folded/auto-allow
-    ``get_reply`` — agents are created ``permission_policy=always_allow``
-    (``specs.py``), so a session runs to idle without confirmations and the
-    caller reads the reply from ``list_events`` (the ``agent.message`` events).
+    The underlying surface mirrors the CMA session/events API, scoped to the
+    caller's agent. ``ask`` composes the same primitives into one bounded
+    hosted-client call and adds chart delivery after the session becomes idle.
+    ``deliver_turn_charts`` provides the same delivery for clients that poll
+    and read the primitives themselves.
 
     ``list_sessions``/``get_session`` are registered as ``list_my_sessions``/
     ``get_my_session`` to avoid a name collision with the tenant-scoped
     operator tools of the same name (the headless caller only ever sees this
     agent-chat set, so the "my" prefix is harmless and reads as agent-scoped).
 
-    ``start_turn`` and ``continue_turn`` run the shared ``_check_admission``
-    gate (the same balance/cap checks the media tools run) before creating a
-    session or sending an event; the four read tools stay on the bare
-    ``_auth``.
+    ``start_turn``, ``continue_turn``, and ``ask`` run the shared
+    ``_check_admission`` gate (the same balance/cap checks the media tools run)
+    before creating a session or sending an event. The four read-only tools and
+    ``deliver_turn_charts`` stay on bare ``_auth``; the latter performs a
+    bounded artifact-store write when optional link delivery is configured.
     """
 
     @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
@@ -354,9 +531,9 @@ def register_agent_chat_tools(
     async def list_my_sessions(ctx: Context) -> list[SessionInfo]:  # pyright: ignore[reportUnusedFunction]
         """List this agent's sessions (id, status, title, timestamps).
 
-        ``id`` is the handle you pass to ``get_session``, ``list_events``, and
-        ``continue_turn``. Scoped to this agent only. No parameters — identity
-        is read from the token claim.
+        ``id`` is the handle you pass to ``get_session``, ``list_events``,
+        ``deliver_turn_charts``, and ``continue_turn``. Scoped to this agent
+        only. No parameters — identity is read from the token claim.
         """
         return await _list_sessions_impl(runtime, await _auth(ctx))
 
@@ -375,6 +552,24 @@ def register_agent_chat_tools(
             tool_name="start_turn",
         )
         return await _start_turn_impl(runtime, auth, message)
+
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
+    async def ask(ctx: Context, message: str) -> AskResult:  # pyright: ignore[reportUnusedFunction]
+        """Ask one question and wait for the final answer and any chart images. Starts a
+        persistent turn, waits up to about 120 seconds for idle, and
+        returns the final text plus a resumable handle. Chart images are
+        embedded by default; short-lived download links are added when private
+        artifact storage is configured.
+        """
+        auth = await _check_admission(
+            ctx,
+            sessionmaker=runtime.session_factory,
+            billing_config=billing_config,
+            tool_name="ask",
+        )
+        return _ask_tool_result(  # type: ignore[return-value]
+            await _ask_impl(runtime, auth, message)
+        )
 
     @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
     async def continue_turn(ctx: Context, handle: str, message: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -415,3 +610,19 @@ def register_agent_chat_tools(
         ``get_session`` reports the session is idle to read what the agent said.
         """
         return await _list_events_impl(runtime, await _auth(ctx), handle, page, limit, order)
+
+    @mcp.tool(tags={"agent-chat"})  # pyright: ignore[reportArgumentType]
+    async def deliver_turn_charts(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        handle: str,
+    ) -> AskResult:
+        """Return the newest completed reply with its chart images and optional links. Use
+        after ``get_my_session`` reports ``idle`` or ``terminated``; calls made
+        while a turn is running or rescheduling are refused. This tool does not
+        start a turn or send an event, but optional link delivery writes the
+        chart to the configured private artifact store. The handle must belong
+        to the agent in this token.
+        """
+        return _ask_tool_result(  # type: ignore[return-value]
+            await _deliver_turn_charts_impl(runtime, await _auth(ctx), handle)
+        )

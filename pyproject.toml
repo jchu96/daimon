@@ -76,6 +76,7 @@ name = "ORM module is private to stores and defaults"
 type = "forbidden"
 source_modules = [
     "daimon.adapters",
+    "daimon.core.artifacts",
     "daimon.core.broker",
     "daimon.core.config",
     "daimon.core.constants",
