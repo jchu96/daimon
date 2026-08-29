@@ -135,6 +135,31 @@ class SlackTurnLifecycle:
         self._terminal: bool = False
         self.final_ts: str | None = None
 
+    @property
+    def status_ts(self) -> str | None:
+        """The ts of the status message this lifecycle is rendering into, or
+        None if nothing has been posted yet.
+
+        Public so the caller can record the turn marker (message ts, channel,
+        started_at) as soon as the card exists; nothing else should need it.
+        """
+        return self._status_ts
+
+    async def post_initial(self) -> None:
+        """Post the initial status card immediately, before session setup.
+
+        Called before session binding so the user gets instant feedback and
+        the Cancel button exists before the first SSE event -- MA
+        sessions.create plus the history replay and image download that
+        follow can hold for minutes. Runs before the turn starts (and
+        therefore before any render tick exists), so this is the one place
+        that deliberately flushes directly instead of waiting on an SSE
+        event. The cancel registration rides this first post via
+        _maybe_flush's first-post branch, so Cancel is live before the first
+        SSE event rather than after it.
+        """
+        await self._maybe_flush()
+
     async def on_sse_event(self, event: RawMessageStreamEvent) -> None:
         embed_event = _map_sse_event(event)
         if embed_event is None:

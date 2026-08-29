@@ -243,6 +243,41 @@ async def test_first_flush_registers_status_ts(fake_slack_web_client: Any) -> No
 
 
 # ---------------------------------------------------------------------------
+# post_initial() / status_ts
+# ---------------------------------------------------------------------------
+
+
+async def test_post_initial_posts_the_card_and_registers_cancel_before_any_sse_event(
+    fake_slack_web_client: Any,
+) -> None:
+    """post_initial() alone posts the card and registers Cancel, with no prior SSE event."""
+    lc, cancel, registered, _ = _make_lifecycle(fake_slack_web_client)
+
+    await lc.post_initial()
+
+    assert _post_count(fake_slack_web_client) == 1, (
+        "post_initial() must post exactly one chat.postMessage with no SSE event required"
+    )
+    assert lc.status_ts == CHAT_OK_PAYLOAD["ts"], (
+        "status_ts must reflect the ts returned by the post"
+    )
+    assert len(registered) == 1, (
+        "the Cancel button must exist before the first SSE event, not after it"
+    )
+    ts, (reg_event, reg_author) = next(iter(registered.items()))
+    assert ts == lc.status_ts, "registered ts must match status_ts"
+    assert reg_event is cancel, "registered cancel event must be the one injected at construction"
+    assert reg_author == "U_AUTHOR", "registered author_id must match the constructor arg"
+
+
+async def test_status_ts_is_none_before_anything_is_posted(fake_slack_web_client: Any) -> None:
+    """A freshly constructed lifecycle reports status_ts as None."""
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+
+    assert lc.status_ts is None, "status_ts must be None before anything has been posted"
+
+
+# ---------------------------------------------------------------------------
 # Task 1: Usage footer
 # ---------------------------------------------------------------------------
 
