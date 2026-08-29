@@ -20,6 +20,7 @@ from daimon.core.stores.thread_sessions import (
     create_thread_session,
     get_latest_thread_session,
     get_live_thread_session,
+    get_thread_session_by_id,
     list_orphaned_turns,
     mark_dead,
     mark_turn_active,
@@ -497,3 +498,84 @@ async def test_orphan_listing_is_scoped_to_one_platform(
         "each adapter reaps only its own platform's turns"
     )
     assert len(await list_orphaned_turns(db_session, platform="slack")) == 1
+
+
+async def test_slack_marked_turn_lists_back_with_its_channel(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    """A Slack message is addressed by (channel, ts); the sweep needs the channel."""
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000100",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_sweep",
+    )
+
+    await mark_turn_active(
+        db_session,
+        id=row.id,
+        active_turn_message_id="1700000000.000200",
+        active_turn_channel_id="C_SWEEP",
+        now=datetime.now(UTC),
+    )
+
+    orphans = await list_orphaned_turns(db_session, platform="slack")
+    assert [o.active_turn_channel_id for o in orphans] == ["C_SWEEP"], (
+        "the sweep cannot address a Slack message with chat_update without its channel"
+    )
+
+
+async def test_mark_turn_active_without_channel_defaults_to_none(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    """Discord's call site passes no channel; a Discord message id is globally addressable."""
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="discord-no-channel",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_discord_no_channel",
+    )
+
+    await mark_turn_active(
+        db_session, id=row.id, active_turn_message_id="msg-99", now=datetime.now(UTC)
+    )
+
+    orphans = await list_orphaned_turns(db_session, platform="discord")
+    assert orphans[0].active_turn_channel_id is None, (
+        "omitting the channel kwarg must store NULL, the correct reading for Discord"
+    )
+
+
+async def test_clear_active_turn_nulls_all_three_marker_columns(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000300",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_clear",
+    )
+    await mark_turn_active(
+        db_session,
+        id=row.id,
+        active_turn_message_id="1700000000.000400",
+        active_turn_channel_id="C_CLEAR",
+        now=datetime.now(UTC),
+    )
+
+    await clear_active_turn(db_session, id=row.id)
+
+    cleared = await get_thread_session_by_id(db_session, id=row.id)
+    assert cleared is not None, "the row itself must survive a clear, only the marker is reset"
+    assert cleared.active_turn_message_id is None, "cleared rows carry no dead message id"
+    assert cleared.active_turn_started_at is None, "cleared rows carry no dead start time"
+    assert cleared.active_turn_channel_id is None, "cleared rows carry no dead channel id"

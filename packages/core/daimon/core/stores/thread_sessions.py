@@ -157,17 +157,27 @@ async def mark_turn_active(
     id: _uuid.UUID,
     active_turn_message_id: str,
     now: datetime,
+    active_turn_channel_id: str | None = None,
 ) -> None:
     """Record that a turn is running and which message is rendering it.
 
     Written once the embed exists and the mapping row is known. The pair is
     what lets a restarted process find embeds it can never finish -- the
     process holding them is gone, and nothing else knows they were mid-flight.
+
+    active_turn_channel_id is optional because a Discord message id is
+    globally addressable on its own, while a Slack message is identified by
+    (channel, ts). A caller that omits it stores NULL, which is the correct
+    reading for Discord.
     """
     await session.execute(
         update(ThreadSession)
         .where(ThreadSession.id == id)
-        .values(active_turn_message_id=active_turn_message_id, active_turn_started_at=now)
+        .values(
+            active_turn_message_id=active_turn_message_id,
+            active_turn_started_at=now,
+            active_turn_channel_id=active_turn_channel_id,
+        )
     )
     await session.flush()
 
@@ -177,11 +187,19 @@ async def clear_active_turn(
     *,
     id: _uuid.UUID,
 ) -> None:
-    """Clear the in-flight marker. Call on every terminal path, including failure."""
+    """Clear the in-flight marker. Call on every terminal path, including failure.
+
+    All three marker columns are cleared together so a cleared row carries no
+    dead channel id.
+    """
     await session.execute(
         update(ThreadSession)
         .where(ThreadSession.id == id)
-        .values(active_turn_message_id=None, active_turn_started_at=None)
+        .values(
+            active_turn_message_id=None,
+            active_turn_started_at=None,
+            active_turn_channel_id=None,
+        )
     )
     await session.flush()
 
