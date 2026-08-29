@@ -55,6 +55,7 @@ from daimon.core.pending_file_sweeper import sweep_pending_file_deletes
 from daimon.core.pricing import MODEL_PRICING
 from daimon.core.scheduler import FireFn, run_one_tick
 from daimon.core.scope import DeploymentDefault
+from daimon.core.slack_event_dedup_sweep import sweep_expired_slack_event_dedup
 from daimon.core.stores.domain import RoutineRow
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.routines import record_result, update_routine_agent_id
@@ -324,6 +325,18 @@ async def _sweep_wizard_sessions(sm: async_sessionmaker[AsyncSession]) -> None:
         log.exception("scheduler.wizard_sweep.failed")
 
 
+async def _sweep_slack_event_dedup(sm: async_sessionmaker[AsyncSession]) -> None:
+    """Prune aged slack_event_dedup rows once. Boundary catch: a sweep
+    failure must not kill the scheduler loop — the next tick retries.
+
+    No `anthropic.APIError` in the catch: this sweep makes no upstream call.
+    """
+    try:
+        await sweep_expired_slack_event_dedup(sm, now=datetime.now(UTC))
+    except SQLAlchemyError:
+        log.exception("scheduler.slack_event_dedup_sweep.failed")
+
+
 def _validate_mcp_settings(settings: Settings) -> None:
     """Single-tenant deployments require both ``settings.mcp.jwt_secret`` and
     ``settings.mcp.public_url`` so each routine fire can bind the daimon-mcp
@@ -442,6 +455,7 @@ async def run(
             await _sweep_pending_files(client, sm)
             await _sweep_headless_usage(client, sm, markup=settings.billing.markup)
             await _sweep_wizard_sessions(sm)
+            await _sweep_slack_event_dedup(sm)
             return 0
 
         while not stop_event.is_set():
@@ -457,6 +471,7 @@ async def run(
             await _sweep_pending_files(client, sm)
             await _sweep_headless_usage(client, sm, markup=settings.billing.markup)
             await _sweep_wizard_sessions(sm)
+            await _sweep_slack_event_dedup(sm)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop_event.wait(), timeout=scheduler_settings.tick_interval_s
