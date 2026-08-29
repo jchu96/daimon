@@ -1091,8 +1091,12 @@ class SlackEventDedup(Base):
     event key. Dedup MUST be on this key, NOT envelope_id: reconnect redelivers
     the same logical event with a NEW envelope_id.
 
-    Unbounded for v1 (rows are tiny, no pruning job, no TTL, no delete
-    cost on the ack path).
+    Rows are pruned by age on a schedule: `daimon.core.slack_event_dedup_sweep`
+    deletes rows older than a 7-day retention window on every scheduler tick
+    (D-05). The ack path still pays no delete cost — pruning is out-of-band,
+    never per-turn (D-04). The window is chosen to outlive Slack's own
+    redelivery schedule by a wide margin, so a prune can never re-admit a
+    duplicate event.
 
     Private to `daimon.core.stores.**` per the import-linter ORM contract.
     """
