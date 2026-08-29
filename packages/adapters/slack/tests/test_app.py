@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import pathlib
@@ -25,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import httpx
+import pytest
 import structlog.testing
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
@@ -3919,3 +3921,176 @@ async def test_orchestrate_tenant_cap_when_in_thread_sheds_in_thread(
         "an in-thread shed must be announced in that thread, not at channel root"
     )
     mock_run_turn.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+
+
+# ---------------------------------------------------------------------------
+# Ceiling breach releases both concurrency slots (D-06, plan 20-06)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ceiling_phase", ["bind", "pump"])
+async def test_ceiling_breach_releases_tenant_slot_and_thread_flag(
+    ceiling_phase: str,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A ceiling breach must release BOTH concurrency slots -- the per-tenant
+    in-flight count and the per-thread processing flag -- on both control-flow
+    paths that reach _orchestrate's finally (app.py:1081-1084): the
+    bind-phase raise (prepare.py:255-265, which unwinds through
+    _orchestrate's try -- it has no except) and the pump-phase return
+    (run.py:355-372, which falls out the bottom normally instead of raising).
+
+    Reading app._inflight alone is a weak assertion -- it would pass a
+    _release_inflight that decrements without popping the key at zero. The
+    assertion that actually retires the design doc's "three wedged threads
+    freeze the whole workspace" concern is behavioural: with
+    max_concurrent_turns_per_tenant=1, a SECOND mention on the SAME tenant
+    must be ADMITTED (not shed) once the first mention's ceilinged turn has
+    unwound.
+
+    Both mentions are driven through _handle_app_mention, not _orchestrate
+    directly -- _orchestrate's finally has no except, so the bind-phase raise
+    propagates straight out of it, making "after _orchestrate returns, assert
+    ..." unreachable on that leg. _handle_app_mention's boundary catches
+    DaimonError (TurnError is one), so both legs return normally from the
+    same call shape and the assertions below are written once.
+
+    Why the design doc's concern no longer holds: the cap is an in-process
+    dict[uuid.UUID, int] (app.py:196) that a process crash resets to zero, so
+    "three wedged threads freeze the whole workspace" was only ever true for
+    an in-process wedge -- and the core turn ceiling (TURN_CEILING_S, 45
+    minutes) now bounds an in-process wedge identically on both adapters.
+    """
+    from daimon.core.turn.ceiling import ceiling_error
+
+    team_id = f"T_CEILING_RELEASE_{ceiling_phase.upper()}"
+    channel = "C_TEST"
+    thread_ts_1 = "9000000046.000001"
+    thread_ts_2 = "9000000046.000002"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    await upsert_slack_bot_token(
+        db_session,
+        team_id=team_id,
+        encrypted_token=encrypt_token(fernet, "xoxb-ceiling-release"),
+    )
+    await db_session.flush()
+
+    app, _ = _make_orchestrate_app(
+        db_session_factory, max_concurrent_turns_per_tenant=1, crypto_key=fernet_key
+    )
+
+    def _make_event(thread_ts: str) -> dict[str, Any]:
+        return {
+            "type": "app_mention",
+            "channel": channel,
+            "event_ts": thread_ts,
+            "ts": thread_ts,
+            "thread_ts": thread_ts,
+            "user": "U_CEILING_RELEASE",
+            "text": "<@U_BOT> hello",
+        }
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-ceiling-release-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    async def _sleepy_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        await asyncio.sleep(5.0)
+        return TurnState(content=[])
+
+    with contextlib.ExitStack() as stack:
+        mock_resolve_agent = stack.enter_context(
+            patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+        )
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env = stack.enter_context(
+            patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+        )
+        mock_resolve_env.return_value = "env_test_id"
+
+        if ceiling_phase == "bind":
+            mock_bind_session = stack.enter_context(
+                patch("daimon.adapters.slack.app.bind_session", new_callable=AsyncMock)
+            )
+            mock_bind_session.side_effect = ceiling_error()
+        else:
+            mock_create_session = stack.enter_context(
+                patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+            )
+            mock_create_session.return_value = _fake_session
+            mock_turn_deadline = stack.enter_context(
+                patch("daimon.adapters.slack.app.turn_deadline")
+            )
+            mock_turn_deadline.side_effect = lambda *, now, **_: now + timedelta(seconds=2)
+            mock_run_turn = stack.enter_context(
+                patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+            )
+            mock_run_turn.side_effect = _sleepy_run_turn
+
+        # First mention breaches the ceiling on the parametrized phase.
+        await app._handle_app_mention(  # pyright: ignore[reportPrivateUsage]
+            _make_event(thread_ts_1), team_id=team_id
+        )
+
+        assert tenant_id not in app._inflight, (  # pyright: ignore[reportPrivateUsage]
+            "a ceiling breach must POP the tenant's in-flight key at zero, not "
+            "merely decrement it to zero -- _release_inflight's own contract"
+        )
+        assert thread_ts_1 not in app._processing, (  # pyright: ignore[reportPrivateUsage]
+            "a ceiling breach must discard the per-thread processing flag"
+        )
+
+        # Second mention on the SAME tenant -- the behavioural assertion that
+        # actually retires the design doc's concern.
+        with structlog.testing.capture_logs() as captured:
+            await app._handle_app_mention(  # pyright: ignore[reportPrivateUsage]
+                _make_event(thread_ts_2), team_id=team_id
+            )
+
+    shed_logs = [c for c in captured if c.get("event") == "turn.skipped.concurrency_shed"]
+    assert shed_logs == [], (
+        "a second mention on the same tenant must be ADMITTED after a ceiling "
+        "breach releases the slot, not shed as if the tenant were still saturated"
+    )
+    shed_ephemeral = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == URL("https://slack.com/api/chat.postEphemeral")
+        for req in reqs
+        if "too many chats in flight" in req.kwargs["json"].get("text", "")
+    ]
+    assert shed_ephemeral == [], (
+        "the second mention must not receive the concurrency-shed ephemeral notice"
+    )
+    assert tenant_id not in app._inflight  # pyright: ignore[reportPrivateUsage]
+    assert thread_ts_2 not in app._processing  # pyright: ignore[reportPrivateUsage]
