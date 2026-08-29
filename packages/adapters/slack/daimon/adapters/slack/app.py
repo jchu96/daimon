@@ -113,7 +113,11 @@ from daimon.core.stores.slack_turn_contexts import (
     delete_slack_turn_context,
 )
 from daimon.core.stores.slack_user_tokens import get_slack_user_token
-from daimon.core.stores.thread_sessions import mark_turn_active, update_watermark
+from daimon.core.stores.thread_sessions import (
+    clear_active_turn,
+    mark_turn_active,
+    update_watermark,
+)
 from daimon.core.turn import turn_deadline
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.gating import should_admit_turn
@@ -1246,273 +1250,330 @@ class SlackApp:
         # not merely before run_prepared_turn (D-01/D-02).
         await lifecycle.post_initial()
 
-        # One shared ceiling deadline for THIS turn, computed once the clock
-        # starts (D-03/D-04): right after admission passes, not before --
-        # admit() itself is deliberately outside the ceiling. Passed as the
-        # SAME value to both bind_session and run_prepared_turn below rather
-        # than letting each default its own `deadline=None` window -- the
-        # fail-safe default exists so no caller is ever unbounded, but a
-        # caller that makes BOTH calls would otherwise get two independent
-        # ~45-minute budgets (bind, then run) instead of one shared one.
-        #
-        # This budget does NOT cover the interstitial Slack-API work below
-        # (build_context_xml / build_delta_xml thread-history replay,
-        # download_as_image_blocks) or the create_slack_turn_context write --
-        # all of that is adapter-owned I/O, neither bounded nor cancelled by
-        # the deadline, and runs to completion regardless. That is deliberate,
-        # not an oversight: it means the interstitial CONSUMES the shared
-        # budget rather than getting a window of its own, so a slow history
-        # replay leaves the pump less than the full ceiling, and an
-        # interstitial that outruns the deadline entirely makes
-        # run_prepared_turn fail immediately at its first await with a
-        # ceiling TurnError. Bounding the interstitial itself is separate,
-        # deferred work.
-        turn_deadline_at = turn_deadline(now=datetime.now(UTC))
+        # Mapping-row ids the turn marker has been written against, tracked
+        # from here rather than built inline in the finally below: unlike
+        # Discord (whose try opens after bind_session, so `prepared` is bound
+        # on every path that reaches its finally), this outer try opens BEFORE
+        # bind_session, so neither `prepared` nor `outcome` is guaranteed bound
+        # at the finally. The accumulator is bound on every path instead.
+        _marker_mapping_ids: set[uuid.UUID] = set()
 
-        # --- Stage two: bind_session (find-or-create, mapping write,
-        # recorder binding) -- D-01 bind_session(). Slack has no
-        # per_caller_thread_sessions equivalent: session_account_id is always
-        # the admitted caller's account, and threads always pre-exist. ---
-        prepared = await bind_session(
-            self.runtime.turn_deps,
-            admission,
-            tenant_id=tenant_id,
-            platform="slack",
-            external_user_id=str(event.get("user") or ""),
-            thread_id=thread_id,
-            session_account_id=admission.account_id,
-            reuse_existing=True,
-            deadline=turn_deadline_at,
-        )
-        ma_session_id = prepared.ma_session_id
-        watermark = prepared.watermark
-        reused = prepared.reused
-
-        # Turn marker: message ts + channel + start time, written as soon as
-        # the mapping row is known and the card exists (D-03). Slack passes
-        # active_turn_channel_id where Discord does not -- a Slack message is
-        # addressed by (channel, ts), so a boot sweep cannot call chat_update
-        # to repair a wedged card without the channel (D-08).
-        if prepared.mapping_id is not None and lifecycle.status_ts is not None:
-            async with self.runtime.sessionmaker() as _at_session:
-                await mark_turn_active(
-                    _at_session,
-                    id=prepared.mapping_id,
-                    active_turn_message_id=lifecycle.status_ts,
-                    active_turn_channel_id=channel,
-                    now=datetime.now(UTC),
-                )
-                await _at_session.commit()
-
-        log.info(
-            "slack.session.ready",
-            session_id=ma_session_id,
-            thread_id=thread_id,
-            reused=reused,
-            watermark=watermark,
-        )
-
-        # --- Build user message ---
-        proxy_base = self.runtime.settings.mcp.app_root_url
-        proxy_secret = (
-            self.runtime.settings.mcp.jwt_secret.get_secret_value()
-            if self.runtime.settings.mcp.jwt_secret is not None
-            else None
-        )
-        now_i = int(time.time())
-        # None when the proxy is unconfigured — no signing secret to mint URLs with.
-        proxy_ctx = (
-            ProxyUrlContext(public_url=proxy_base, secret=proxy_secret, team_id=team_id, now=now_i)
-            if proxy_base is not None and proxy_secret is not None
-            else None
-        )
-
-        user_text = (
-            content_override if content_override is not None else str(event.get("text") or "")
-        )
-        author_id = str(event.get("user") or "")
-        if not reused:
-            # First turn: replay thread history (one Slack page from the root).
-            user_message = await build_context_xml(
-                web_client,
-                channel=channel,
-                thread_ts=thread_id,
-                user_query=user_text,
-                author_id=author_id,
-                proxy=proxy_ctx,
-            )
-        elif watermark is not None:
-            # Continuation: replay only messages since the last watermark.
-            user_message = await build_delta_xml(
-                web_client,
-                channel=channel,
-                thread_ts=thread_id,
-                watermark_ts=watermark,
-                user_query=user_text,
-                author_id=author_id,
-                proxy=proxy_ctx,
-            )
-        else:
-            # Reused session with no watermark (prior turn's final_ts was None).
-            # The MA session already holds prior context; replay only the new query.
-            user_message = user_text
-
-        # --- Attachments & vision ---
-        files = files or []
-        trigger_images = [f for f in files if is_vision_image(f)]
-        data_files = [f for f in files if not is_vision_image(f)]
-
-        image_blocks, images_skipped = await download_as_image_blocks(
-            trigger_images, token=web_client.token or "", http_client=self.runtime.http_client
-        )
-        skipped_ids = {f["id"] for f, _ in images_skipped}
-        inlined = [f for f in trigger_images if f["id"] not in skipped_ids]
-
-        synthetic_prefix = ""
-        if proxy_ctx is not None:
-            synthetic_prefix = "\n".join(
-                part
-                for part in (
-                    build_attachment_url_prefix(data_files, proxy_ctx),
-                    build_image_url_prefix(inlined, proxy_ctx),
-                    build_skipped_image_prefix(images_skipped, proxy_ctx),
-                )
-                if part
-            )
-            if synthetic_prefix:
-                user_message = synthetic_prefix + "\n" + user_message
-
-            # Only claim the images were "linked" when the proxy is configured —
-            # that's the branch that actually minted fetchable URLs into the prefix.
-            if images_skipped:
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel,
-                    thread_ts=thread_id,
-                    text=(
-                        "Some images couldn't be inlined — I've linked them for the agent to "
-                        "fetch instead: "
-                        + ", ".join(f"`{f['name']}` ({r})" for f, r in images_skipped)
-                    ),
-                )
-
-        # --- Run the turn (D-08/D-09/D-10: run_prepared_turn owns the driver
-        # call and the one-shot dead-session recovery cycle). lifecycle and
-        # lifecycle_holder were constructed above, before bind_session. ---
-        log.info(
-            "slack.turn.started",
-            thread_id=thread_id,
-            session_id=ma_session_id,
-            reused=reused,
-        )
-
-        async def _reseed_user_message() -> str:
-            """Full history re-seed for the recreated session (dead-session recovery)."""
-            full_message = await build_context_xml(
-                web_client,
-                channel=channel,
-                thread_ts=thread_id,
-                user_query=user_text,
-                author_id=author_id,
-                proxy=proxy_ctx,
-            )
-            if synthetic_prefix:
-                full_message = synthetic_prefix + "\n" + full_message
-            return full_message
-
-        def _recovery_lifecycle(cancel: asyncio.Event) -> TurnLifecycle:
-            new_lifecycle = SlackTurnLifecycle(
-                client=web_client,
-                channel=channel,
-                thread_ts=thread_id,
-                cancel=cancel,
-                author_id=str(event.get("user") or ""),
-                agent_name=_lc_agent_name,
-                model_id=_lc_model_id,
-                register=self._register_cancel,
-                deregister=self._deregister_cancel,
-            )
-            lifecycle_holder[0] = new_lifecycle
-            return new_lifecycle
-
-        async with self.runtime.sessionmaker() as s:
-            turn_context = await create_slack_turn_context(
-                s,
-                tenant_id=tenant_id,
-                account_id=admission.account_id,
-                channel_id=channel,
-                thread_ts=thread_id,
-                started_at=datetime.now(tz=UTC),
-            )
-            await s.commit()
+        # Outer bookkeeping try/finally -- registry hygiene and marker hygiene
+        # only. It renders nothing, posts nothing, collapses nothing, and adds
+        # no error handling: `_handle_app_mention`'s boundary catch keeps
+        # handling every failure exactly as it does today. It exists because
+        # post_initial() now runs before bind_session, so a raise from the
+        # bind, the history replay, the image download, or the turn-context
+        # write below would otherwise strand a live-looking Cancel registry
+        # entry and a turn marker for the life of the process. The stale card
+        # left behind by such a failure is deliberately NOT collapsed here --
+        # exact Discord parity, and the boundary catch already posts an
+        # in-thread failure notice with a request id (D-07, and the previous
+        # phase's D-08: render through the existing generic error path, no
+        # Slack-specific copy). The clear runs on any exception, not just the
+        # happy path, and covers BOTH prepared.mapping_id and
+        # outcome.mapping_id because recovery moves the turn to a new mapping
+        # row and leaves the marker on the old one, still pointing at the same
+        # message -- a ceiling breach is not a special case here either:
+        # run_prepared_turn already marked the active mapping dead and returns
+        # a normal RunOutcome, so it takes this same path. _deregister_cancel
+        # is pop(ts, None), so the double call after on_terminal_success's own
+        # finally is harmless; the observable effect is that a Cancel click on
+        # a card left behind by a bind-phase failure now gets the honest
+        # "already finished" ephemeral instead of silently setting a dead
+        # Event. A marker-clear failure must not mask the turn's own outcome,
+        # which is why each clear below is individually suppressed on
+        # SQLAlchemyError -- a missed clear is recovered by the next boot sweep.
         try:
-            outcome = await run_prepared_turn(
+            # One shared ceiling deadline for THIS turn, computed once the clock
+            # starts (D-03/D-04): right after admission passes, not before --
+            # admit() itself is deliberately outside the ceiling. Passed as the
+            # SAME value to both bind_session and run_prepared_turn below rather
+            # than letting each default its own `deadline=None` window -- the
+            # fail-safe default exists so no caller is ever unbounded, but a
+            # caller that makes BOTH calls would otherwise get two independent
+            # ~45-minute budgets (bind, then run) instead of one shared one.
+            #
+            # This budget does NOT cover the interstitial Slack-API work below
+            # (build_context_xml / build_delta_xml thread-history replay,
+            # download_as_image_blocks) or the create_slack_turn_context write --
+            # all of that is adapter-owned I/O, neither bounded nor cancelled by
+            # the deadline, and runs to completion regardless. That is deliberate,
+            # not an oversight: it means the interstitial CONSUMES the shared
+            # budget rather than getting a window of its own, so a slow history
+            # replay leaves the pump less than the full ceiling, and an
+            # interstitial that outruns the deadline entirely makes
+            # run_prepared_turn fail immediately at its first await with a
+            # ceiling TurnError. Bounding the interstitial itself is separate,
+            # deferred work.
+            turn_deadline_at = turn_deadline(now=datetime.now(UTC))
+
+            # --- Stage two: bind_session (find-or-create, mapping write,
+            # recorder binding) -- D-01 bind_session(). Slack has no
+            # per_caller_thread_sessions equivalent: session_account_id is always
+            # the admitted caller's account, and threads always pre-exist. ---
+            prepared = await bind_session(
                 self.runtime.turn_deps,
-                prepared,
+                admission,
                 tenant_id=tenant_id,
                 platform="slack",
-                thread_id=thread_id,
                 external_user_id=str(event.get("user") or ""),
-                user_message=user_message,
-                lifecycle=lifecycle,
-                cancel=cancel_event,
-                reseed_user_message=_reseed_user_message,
-                recovery_lifecycle=_recovery_lifecycle,
-                image_blocks=image_blocks or None,
-                render_interval_s=2.0,
+                thread_id=thread_id,
+                session_account_id=admission.account_id,
+                reuse_existing=True,
                 deadline=turn_deadline_at,
             )
-        finally:
-            # Leak-policy bookkeeping only — a delete failure must not mask the
-            # turn's own outcome; stale rows age out via the reader-side TTL.
-            with contextlib.suppress(SQLAlchemyError):
-                async with self.runtime.sessionmaker() as s:
-                    await delete_slack_turn_context(s, id=turn_context.id)
-                    await s.commit()
+            ma_session_id = prepared.ma_session_id
+            watermark = prepared.watermark
+            reused = prepared.reused
 
-        mapping_id = outcome.mapping_id
-        final_lifecycle = lifecycle_holder[0]
+            # Turn marker: message ts + channel + start time, written as soon as
+            # the mapping row is known and the card exists (D-03). Slack passes
+            # active_turn_channel_id where Discord does not -- a Slack message is
+            # addressed by (channel, ts), so a boot sweep cannot call chat_update
+            # to repair a wedged card without the channel (D-08).
+            if prepared.mapping_id is not None and lifecycle.status_ts is not None:
+                async with self.runtime.sessionmaker() as _at_session:
+                    await mark_turn_active(
+                        _at_session,
+                        id=prepared.mapping_id,
+                        active_turn_message_id=lifecycle.status_ts,
+                        active_turn_channel_id=channel,
+                        now=datetime.now(UTC),
+                    )
+                    await _at_session.commit()
+                _marker_mapping_ids.add(prepared.mapping_id)
 
-        # --- Watermark --- Preserves Slack's original gate exactly (unconditional
-        # on final_ts, no state.error branch) -- Discord's inline sequence had an
-        # error-vs-success split here, but that is NOT one of SPEC Req 7's four
-        # named behaviour changes, so it is not introduced for Slack either.
-        if mapping_id is not None and final_lifecycle.final_ts is not None:
+            log.info(
+                "slack.session.ready",
+                session_id=ma_session_id,
+                thread_id=thread_id,
+                reused=reused,
+                watermark=watermark,
+            )
+
+            # --- Build user message ---
+            proxy_base = self.runtime.settings.mcp.app_root_url
+            proxy_secret = (
+                self.runtime.settings.mcp.jwt_secret.get_secret_value()
+                if self.runtime.settings.mcp.jwt_secret is not None
+                else None
+            )
+            now_i = int(time.time())
+            # None when the proxy is unconfigured — no signing secret to mint URLs with.
+            proxy_ctx = (
+                ProxyUrlContext(
+                    public_url=proxy_base, secret=proxy_secret, team_id=team_id, now=now_i
+                )
+                if proxy_base is not None and proxy_secret is not None
+                else None
+            )
+
+            user_text = (
+                content_override if content_override is not None else str(event.get("text") or "")
+            )
+            author_id = str(event.get("user") or "")
+            if not reused:
+                # First turn: replay thread history (one Slack page from the root).
+                user_message = await build_context_xml(
+                    web_client,
+                    channel=channel,
+                    thread_ts=thread_id,
+                    user_query=user_text,
+                    author_id=author_id,
+                    proxy=proxy_ctx,
+                )
+            elif watermark is not None:
+                # Continuation: replay only messages since the last watermark.
+                user_message = await build_delta_xml(
+                    web_client,
+                    channel=channel,
+                    thread_ts=thread_id,
+                    watermark_ts=watermark,
+                    user_query=user_text,
+                    author_id=author_id,
+                    proxy=proxy_ctx,
+                )
+            else:
+                # Reused session with no watermark (prior turn's final_ts was None).
+                # The MA session already holds prior context; replay only the new query.
+                user_message = user_text
+
+            # --- Attachments & vision ---
+            files = files or []
+            trigger_images = [f for f in files if is_vision_image(f)]
+            data_files = [f for f in files if not is_vision_image(f)]
+
+            image_blocks, images_skipped = await download_as_image_blocks(
+                trigger_images, token=web_client.token or "", http_client=self.runtime.http_client
+            )
+            skipped_ids = {f["id"] for f, _ in images_skipped}
+            inlined = [f for f in trigger_images if f["id"] not in skipped_ids]
+
+            synthetic_prefix = ""
+            if proxy_ctx is not None:
+                synthetic_prefix = "\n".join(
+                    part
+                    for part in (
+                        build_attachment_url_prefix(data_files, proxy_ctx),
+                        build_image_url_prefix(inlined, proxy_ctx),
+                        build_skipped_image_prefix(images_skipped, proxy_ctx),
+                    )
+                    if part
+                )
+                if synthetic_prefix:
+                    user_message = synthetic_prefix + "\n" + user_message
+
+                # Only claim the images were "linked" when the proxy is configured —
+                # that's the branch that actually minted fetchable URLs into the prefix.
+                if images_skipped:
+                    await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                        channel=channel,
+                        thread_ts=thread_id,
+                        text=(
+                            "Some images couldn't be inlined — I've linked them for the agent to "
+                            "fetch instead: "
+                            + ", ".join(f"`{f['name']}` ({r})" for f, r in images_skipped)
+                        ),
+                    )
+
+            # --- Run the turn (D-08/D-09/D-10: run_prepared_turn owns the driver
+            # call and the one-shot dead-session recovery cycle). lifecycle and
+            # lifecycle_holder were constructed above, before bind_session. ---
+            log.info(
+                "slack.turn.started",
+                thread_id=thread_id,
+                session_id=ma_session_id,
+                reused=reused,
+            )
+
+            async def _reseed_user_message() -> str:
+                """Full history re-seed for the recreated session (dead-session recovery)."""
+                full_message = await build_context_xml(
+                    web_client,
+                    channel=channel,
+                    thread_ts=thread_id,
+                    user_query=user_text,
+                    author_id=author_id,
+                    proxy=proxy_ctx,
+                )
+                if synthetic_prefix:
+                    full_message = synthetic_prefix + "\n" + full_message
+                return full_message
+
+            def _recovery_lifecycle(cancel: asyncio.Event) -> TurnLifecycle:
+                new_lifecycle = SlackTurnLifecycle(
+                    client=web_client,
+                    channel=channel,
+                    thread_ts=thread_id,
+                    cancel=cancel,
+                    author_id=str(event.get("user") or ""),
+                    agent_name=_lc_agent_name,
+                    model_id=_lc_model_id,
+                    register=self._register_cancel,
+                    deregister=self._deregister_cancel,
+                )
+                lifecycle_holder[0] = new_lifecycle
+                return new_lifecycle
+
             async with self.runtime.sessionmaker() as s:
-                await update_watermark(
-                    s, id=mapping_id, watermark_message_id=final_lifecycle.final_ts
+                turn_context = await create_slack_turn_context(
+                    s,
+                    tenant_id=tenant_id,
+                    account_id=admission.account_id,
+                    channel_id=channel,
+                    thread_ts=thread_id,
+                    started_at=datetime.now(tz=UTC),
                 )
                 await s.commit()
-            log.info(
-                "slack.watermark.updated",
-                thread_id=thread_id,
-                watermark=final_lifecycle.final_ts,
-            )
-        else:
-            log.info("slack.turn.completed", thread_id=thread_id, session_id=outcome.ma_session_id)
+            try:
+                outcome = await run_prepared_turn(
+                    self.runtime.turn_deps,
+                    prepared,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    thread_id=thread_id,
+                    external_user_id=str(event.get("user") or ""),
+                    user_message=user_message,
+                    lifecycle=lifecycle,
+                    cancel=cancel_event,
+                    reseed_user_message=_reseed_user_message,
+                    recovery_lifecycle=_recovery_lifecycle,
+                    image_blocks=image_blocks or None,
+                    render_interval_s=2.0,
+                    deadline=turn_deadline_at,
+                )
+            finally:
+                # Leak-policy bookkeeping only — a delete failure must not mask the
+                # turn's own outcome; stale rows age out via the reader-side TTL.
+                with contextlib.suppress(SQLAlchemyError):
+                    async with self.runtime.sessionmaker() as s:
+                        await delete_slack_turn_context(s, id=turn_context.id)
+                        await s.commit()
 
-        # Detached output sweep. `outcome.ma_session_id` is the post-recovery
-        # session id, so outputs stranded in a dead session are not
-        # recoverable. A detached sweep is not counted by drain_and_close's
-        # `_processing` poll, so SIGTERM can kill one mid-flight —
-        # post-then-delete makes that self-healing (redelivered on the next
-        # turn's sweep, or double-posted inside the already-accepted
-        # post-then-delete crash window).
-        if not any(isinstance(block, ToolUseBlock) for block in outcome.state.content):
-            return
-        # Read the chain link synchronously, before spawning, so it cannot be lost.
-        previous = self._output_sweeps.get(outcome.ma_session_id)
-        task = self._spawn(
-            self._sweep_session_outputs(
-                previous,
-                web_client,
-                session_id=outcome.ma_session_id,
-                channel_id=channel,
-                thread_ts=thread_id,
-                team_id=team_id,
+            if outcome.mapping_id is not None:
+                _marker_mapping_ids.add(outcome.mapping_id)
+
+            mapping_id = outcome.mapping_id
+            final_lifecycle = lifecycle_holder[0]
+
+            # --- Watermark --- Preserves Slack's original gate exactly (unconditional
+            # on final_ts, no state.error branch) -- Discord's inline sequence had an
+            # error-vs-success split here, but that is NOT one of SPEC Req 7's four
+            # named behaviour changes, so it is not introduced for Slack either.
+            if mapping_id is not None and final_lifecycle.final_ts is not None:
+                async with self.runtime.sessionmaker() as s:
+                    await update_watermark(
+                        s, id=mapping_id, watermark_message_id=final_lifecycle.final_ts
+                    )
+                    await s.commit()
+                log.info(
+                    "slack.watermark.updated",
+                    thread_id=thread_id,
+                    watermark=final_lifecycle.final_ts,
+                )
+            else:
+                log.info(
+                    "slack.turn.completed", thread_id=thread_id, session_id=outcome.ma_session_id
+                )
+
+            # Detached output sweep. `outcome.ma_session_id` is the post-recovery
+            # session id, so outputs stranded in a dead session are not
+            # recoverable. A detached sweep is not counted by drain_and_close's
+            # `_processing` poll, so SIGTERM can kill one mid-flight —
+            # post-then-delete makes that self-healing (redelivered on the next
+            # turn's sweep, or double-posted inside the already-accepted
+            # post-then-delete crash window).
+            if not any(isinstance(block, ToolUseBlock) for block in outcome.state.content):
+                return
+            # Read the chain link synchronously, before spawning, so it cannot be lost.
+            previous = self._output_sweeps.get(outcome.ma_session_id)
+            task = self._spawn(
+                self._sweep_session_outputs(
+                    previous,
+                    web_client,
+                    session_id=outcome.ma_session_id,
+                    channel_id=channel,
+                    thread_ts=thread_id,
+                    team_id=team_id,
+                )
             )
-        )
-        self._output_sweeps[outcome.ma_session_id] = task
-        task.add_done_callback(functools.partial(self._forget_output_sweep, outcome.ma_session_id))
+            self._output_sweeps[outcome.ma_session_id] = task
+            task.add_done_callback(
+                functools.partial(self._forget_output_sweep, outcome.ma_session_id)
+            )
+        finally:
+            # Bookkeeping only -- see the comment above the try. Deregister
+            # first (idempotent pop), then clear the marker on every mapping
+            # row it could be stranded on, each id suppressed independently
+            # so one failed clear cannot skip the other row.
+            if lifecycle.status_ts is not None:
+                self._deregister_cancel(lifecycle.status_ts)
+            for _marker_id in _marker_mapping_ids:
+                with contextlib.suppress(SQLAlchemyError):
+                    async with self.runtime.sessionmaker() as _clear_session:
+                        await clear_active_turn(_clear_session, id=_marker_id)
+                        await _clear_session.commit()
 
     async def drain_and_close(self, client: AsyncBaseSocketModeClient) -> None:
         """Graceful shutdown drain.
