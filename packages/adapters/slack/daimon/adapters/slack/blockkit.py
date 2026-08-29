@@ -141,6 +141,13 @@ _PHASE_TITLE: dict[TurnPhase, str] = {
 
 _TERMINAL_PHASES = frozenset({TurnPhase.DONE, TurnPhase.ERROR})
 
+# Copy is byte-identical to the Discord adapter's orphan-retirement embed: the
+# two adapters must say the same thing about the same event (D-09).
+INTERRUPTED_NOTICE: str = (
+    f"{_EMOJI_CROSS} This turn was interrupted by a restart and cannot be "
+    "resumed. Nothing was lost on your side — mention me again to retry."
+)
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
@@ -306,3 +313,18 @@ def to_blocks(state: State, *, now: float | None) -> list[dict[str, Any]]:
     )
 
     return blocks
+
+
+def to_interrupted_blocks() -> list[dict[str, Any]]:
+    """Render the frozen status card a boot sweep leaves behind.
+
+    Deliberately NOT ``to_blocks(State(phase=TurnPhase.ERROR, ...))``: a fresh
+    boot process has the DB row and nothing else -- no agent name, no usage,
+    no monotonic start -- so the terminal collapse would render an empty
+    agent field and a misleading "0s · 0 in / 0 out" for a turn that may have
+    run 40 minutes.
+
+    Takes no arguments and emits no ``actions`` block, so the Cancel button is
+    gone by construction -- there is no live turn left to cancel.
+    """
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": INTERRUPTED_NOTICE}}]
