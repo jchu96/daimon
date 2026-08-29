@@ -178,6 +178,7 @@ class ThreadSessionRow(BaseModel):
     updated_at: datetime
     active_turn_message_id: str | None = None
     active_turn_started_at: datetime | None = None
+    active_turn_channel_id: str | None = None
 
 
 class GitHubOauthStateRow(BaseModel):

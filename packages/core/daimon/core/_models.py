@@ -315,11 +315,14 @@ class ThreadSession(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'live'"))
     # Set while a turn is running, cleared when it reaches a terminal state.
     # Distinct from `status`, which is about the session mapping and stays
-    # 'live' on every healthy thread forever.
+    # 'live' on every healthy thread forever. Slack needs the channel because a
+    # Slack message is addressed by (channel, ts); Discord leaves it NULL since
+    # a Discord message id is globally addressable on its own.
     active_turn_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     active_turn_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    active_turn_channel_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
