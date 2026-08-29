@@ -15,6 +15,15 @@ Design decisions:
   locked by live-workspace probe).
 - text= always passed alongside blocks= to satisfy Slack's notification
   fallback requirement (Pitfall 3).
+- The Block Kit flush rides the render tick (`on_render`), not `on_sse_event`:
+  the driver awaits `on_sse_event` inline in its consume loop, so a debounced
+  `chat.update` living there would stall read-timeout detection and deaden
+  Cancel for as long as a rate-limited edit's Retry-After wait. `on_render`
+  runs on a separate render task, so the same stall now only delays a render
+  tick. First-update latency is at most one render tick (~2s); the 5.0s
+  debounce already dominated flush timing and is unchanged; terminal flushes
+  (`_flush_terminal`/`_flush_cancelled`) and `post_initial` are unaffected —
+  they bypass both the debounce and the render path.
 """
 
 from __future__ import annotations
@@ -161,11 +170,15 @@ class SlackTurnLifecycle:
         await self._maybe_flush()
 
     async def on_sse_event(self, event: RawMessageStreamEvent) -> None:
+        # Cheap local tap per the hardened TurnLifecycle contract (D-12):
+        # the pump awaits this hook inline, so it stays a local reducer
+        # call only. The Block Kit flush (chat-API I/O) rides the render
+        # tick instead, where a slow or rate-limited chat.update only
+        # delays the render task, never the consume loop.
         embed_event = _map_sse_event(event)
         if embed_event is None:
             return
         self._state = update(self._state, embed_event)
-        await self._maybe_flush()
 
     async def _maybe_flush(self) -> None:
         """Post or update the status message, subject to debounce. No-op after terminal."""
@@ -398,7 +411,12 @@ class SlackTurnLifecycle:
                 self._deregister(self._status_ts)
 
     async def on_render(self, state: TurnState) -> None:
-        """No-op — Block Kit state is driven by SSE events, not render ticks."""
+        """Sole delivery path (D-12). `state` is unused: Slack's card is
+        driven by its own Block Kit `State` folded in `on_sse_event` — this
+        hook is the tick that delivers it."""
+        if self._terminal:
+            return
+        await self._maybe_flush()
 
     async def on_reconnect(self, reason: ReconnectReason) -> None:
         pass
