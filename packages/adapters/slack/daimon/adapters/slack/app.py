@@ -113,7 +113,7 @@ from daimon.core.stores.slack_turn_contexts import (
     delete_slack_turn_context,
 )
 from daimon.core.stores.slack_user_tokens import get_slack_user_token
-from daimon.core.stores.thread_sessions import update_watermark
+from daimon.core.stores.thread_sessions import mark_turn_active, update_watermark
 from daimon.core.turn import turn_deadline
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.gating import should_admit_turn
@@ -1105,7 +1105,15 @@ class SlackApp:
         content_override: str | None = None,
         files: list[SlackFile] | None = None,
     ) -> None:
-        """Turn body: principal → MA session find-or-create → context build → turn → watermark.
+        """Turn body: admission → card+Cancel → bind_session → marker → context → turn → watermark.
+
+        Immediately after admission, the lifecycle is constructed and its
+        status card + Cancel registration are posted (``post_initial()``, D-01/D-02)
+        -- before ``bind_session``, since MA ``sessions.create`` plus the
+        interstitial history replay and image download below can hold for
+        minutes and the user must see something first. Once ``bind_session``
+        returns, the turn marker (message ts, channel, start time) is written
+        against the mapping row (D-03).
 
         On first mention for a thread: creates a new MA session + ``thread_sessions``
         row, replays thread history via ``build_context_xml`` (one Slack page).
@@ -1214,6 +1222,30 @@ class SlackApp:
         _lc_agent_name: str = agent.name
         _lc_model_id: str = agent.model.id
 
+        # lifecycle_holder tracks whichever SlackTurnLifecycle actually
+        # completed the turn -- recovery_lifecycle rebuilds a fresh one against
+        # the recreated session, and the watermark write further down must read
+        # final_ts off THAT lifecycle, not the pre-recovery one.
+        cancel_event = asyncio.Event()
+        lifecycle = SlackTurnLifecycle(
+            client=web_client,
+            channel=channel,
+            thread_ts=thread_id,
+            cancel=cancel_event,
+            author_id=str(event.get("user") or ""),
+            agent_name=_lc_agent_name,
+            model_id=_lc_model_id,
+            register=self._register_cancel,
+            deregister=self._deregister_cancel,
+        )
+        lifecycle_holder: list[SlackTurnLifecycle] = [lifecycle]
+
+        # Post the status card and register Cancel BEFORE bind_session --
+        # MA sessions.create plus the history replay and image download below
+        # can hold for minutes, and the card must exist before all of that,
+        # not merely before run_prepared_turn (D-01/D-02).
+        await lifecycle.post_initial()
+
         # One shared ceiling deadline for THIS turn, computed once the clock
         # starts (D-03/D-04): right after admission passes, not before --
         # admit() itself is deliberately outside the ceiling. Passed as the
@@ -1255,6 +1287,23 @@ class SlackApp:
         ma_session_id = prepared.ma_session_id
         watermark = prepared.watermark
         reused = prepared.reused
+
+        # Turn marker: message ts + channel + start time, written as soon as
+        # the mapping row is known and the card exists (D-03). Slack passes
+        # active_turn_channel_id where Discord does not -- a Slack message is
+        # addressed by (channel, ts), so a boot sweep cannot call chat_update
+        # to repair a wedged card without the channel (D-08).
+        if prepared.mapping_id is not None and lifecycle.status_ts is not None:
+            async with self.runtime.sessionmaker() as _at_session:
+                await mark_turn_active(
+                    _at_session,
+                    id=prepared.mapping_id,
+                    active_turn_message_id=lifecycle.status_ts,
+                    active_turn_channel_id=channel,
+                    now=datetime.now(UTC),
+                )
+                await _at_session.commit()
+
         log.info(
             "slack.session.ready",
             session_id=ma_session_id,
@@ -1347,30 +1396,14 @@ class SlackApp:
                 )
 
         # --- Run the turn (D-08/D-09/D-10: run_prepared_turn owns the driver
-        # call and the one-shot dead-session recovery cycle). ---
-        # lifecycle_holder tracks whichever SlackTurnLifecycle actually
-        # completed the turn -- recovery_lifecycle rebuilds a fresh one against
-        # the recreated session, and the watermark write below must read
-        # final_ts off THAT lifecycle, not the pre-recovery one.
+        # call and the one-shot dead-session recovery cycle). lifecycle and
+        # lifecycle_holder were constructed above, before bind_session. ---
         log.info(
             "slack.turn.started",
             thread_id=thread_id,
             session_id=ma_session_id,
             reused=reused,
         )
-        cancel_event = asyncio.Event()
-        lifecycle = SlackTurnLifecycle(
-            client=web_client,
-            channel=channel,
-            thread_ts=thread_id,
-            cancel=cancel_event,
-            author_id=str(event.get("user") or ""),
-            agent_name=_lc_agent_name,
-            model_id=_lc_model_id,
-            register=self._register_cancel,
-            deregister=self._deregister_cancel,
-        )
-        lifecycle_holder: list[SlackTurnLifecycle] = [lifecycle]
 
         async def _reseed_user_message() -> str:
             """Full history re-seed for the recreated session (dead-session recovery)."""
