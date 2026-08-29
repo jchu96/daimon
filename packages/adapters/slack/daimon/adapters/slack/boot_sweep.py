@@ -23,29 +23,55 @@ Deliberately NOT ported from Discord's sweep:
   post into (the app can only speak where it was invited), and the OAuth
   success page is the install-feedback surface. The sweep is silent; logs
   are the operator surface.
+
+The module's second half, ``retire_orphaned_turns``, is boot-time orphan-turn
+retirement: on every process start it lays to rest every Slack turn whose
+render loop died with the previous container, editing the frozen status card
+in place and clearing the turn marker. It shares this module with the
+reconcile sweep above only because both are boot-time jobs for the Slack
+worker -- the two halves have disjoint dependencies, disjoint tables, and no
+call into one another.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 import anthropic as _anthropic
 import structlog
 from anthropic import AsyncAnthropic
+from cryptography.fernet import InvalidToken
+from daimon.adapters.slack.blockkit import to_interrupted_blocks
+from daimon.adapters.slack.interactions import resolve_web_client
+from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.provisioning import reconcile_tenant_defaults
 from daimon.core.defaults.report import compose_failure_reason
 from daimon.core.errors import DaimonError
 from daimon.core.scope import DeploymentDefault
+from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.tenants import list_tenants_by_platform, set_provision_status
+from daimon.core.stores.thread_sessions import clear_active_turn, list_orphaned_turns
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 log = structlog.get_logger()
 
 _SWEEP_CONCURRENCY = 2
+
+# Slack's notification-fallback requirement (blocks= always ships with text=).
+_INTERRUPTED_FALLBACK_TEXT = "This turn was interrupted by a restart."
+
+# Everything a chat.update can raise. Mirrors lifecycle.py's _SLACK_SEND_ERRORS
+# exactly -- no error-code branching, the same posture the rest of the Slack
+# adapter takes on every send.
+_SLACK_UPDATE_ERRORS = (SlackApiError, aiohttp.ClientError, TimeoutError)
 
 
 async def run_boot_sweep(
@@ -183,3 +209,119 @@ async def _record_failure(
             )
     except SQLAlchemyError:
         log.exception("slack.boot_sweep_status_flip_failed", tenant_id=str(tenant_id))
+
+
+async def retire_orphaned_turns(runtime: SlackRuntime, *, now: datetime) -> None:
+    """Lay to rest every Slack turn whose render loop died with the previous
+    process, editing its frozen status card in place and clearing its marker.
+
+    A turn's render loop lives in the process that started it, so a deploy
+    mid-turn freezes the status card on "thinking" forever while MA completes
+    and bills the answer server-side. The user sees a spinner that never
+    stops and has no way to tell it is dead. Marking it honestly is cheap;
+    a lameduck drain story that avoids this in the first place is not.
+
+    Builds its own per-tenant AsyncWebClient rather than taking one as a
+    dependency: unlike Discord's single deployment-wide bot token, Slack's
+    token is per-workspace, decrypted per use via ``resolve_web_client``, and
+    never cached (STURN-03). Rows are grouped by tenant so a workspace with
+    several wedged threads decrypts once, not once per row.
+
+    An unreachable tenant -- an uninstalled workspace (no token row), a
+    Fernet key rotated out from under a stored token, or a tenant absent from
+    the platform listing -- still has every one of its rows cleared. So does
+    a legacy row with no channel (every orphan already in production before
+    this shipped, since the column is new, nullable, and unbackfilled) and a
+    row whose card edit fails for any reason (deleted message, archived
+    channel, revoked token). Otherwise an unreachable or already-gone card
+    would be retried on every single boot forever (D-10).
+
+    No once-per-process guard (D-15, superseding D-10's letter): this
+    function lives in a module of free functions with no ``self``, so a guard
+    would need module-level mutable state, which ``guideline:architecture``
+    rule 3 ("no global state") forbids. It is also structurally unnecessary
+    here -- the spawn site in ``__main__.py`` is a straight-line statement
+    inside ``main()``, and Socket Mode reconnects are handled entirely inside
+    ``SocketModeClient`` (``connect()`` starts ``monitor_current_session``,
+    which reconnects on its own tasks); ``main()``'s body never re-executes,
+    so this function cannot run twice in one process. If this sweep is ever
+    moved onto a reconnect-driven hook (an event handler that genuinely
+    re-fires, the way Discord's ``on_ready`` does), the guard becomes
+    mandatory again -- a marker set by the process that is currently running
+    is a live turn, not an orphan.
+
+    Accepted, undefended race (parity with Discord): a mention landing on the
+    same thread between the ``list_orphaned_turns`` read and the
+    ``clear_active_turn`` write would have its fresh marker cleared by this
+    sweep. The window requires a full admission plus an MA ``sessions.create``
+    to complete inside one row's ``chat_update``. Discord has the identical
+    race and accepts it; a compare-and-clear ``clear_active_turn`` would
+    change a core store shared with Discord for a race neither adapter has
+    ever observed.
+    """
+    async with runtime.sessionmaker() as session:
+        orphans = await list_orphaned_turns(session, platform="slack")
+    if not orphans:
+        return
+    log.info("slack.turn.orphans_found", count=len(orphans))
+
+    tenants = await list_tenants_by_platform(runtime.sessionmaker, platform="slack")
+    team_id_by_tenant = {t.id: t.external_id for t in tenants}
+
+    by_tenant: dict[uuid.UUID, list[ThreadSessionRow]] = {}
+    for row in orphans:
+        by_tenant.setdefault(row.tenant_id, []).append(row)
+
+    for tenant_id, rows in by_tenant.items():
+        client: AsyncWebClient | None = None
+        team_id = team_id_by_tenant.get(tenant_id)
+        if team_id is not None:
+            try:
+                client = await resolve_web_client(runtime, team_id=team_id)
+            except (InvalidToken, SQLAlchemyError) as err:
+                # Per-tenant supervisor boundary -- mirrors _seed_tenant_defaults:
+                # one tenant's bad key must not stop the sweep over its siblings.
+                log.warning(
+                    "slack.turn.orphan_token_unusable", tenant_id=str(tenant_id), error=str(err)
+                )
+        if client is None:
+            # Uninstalled workspace, or a key we can no longer decrypt with.
+            # Not an error -- an uninstalled workspace is a normal outcome
+            # (app.py:837-839 treats a missing token row the same way). Still
+            # clear below so these rows are not retried forever.
+            log.info(
+                "slack.turn.orphan_tenant_unreachable", tenant_id=str(tenant_id), rows=len(rows)
+            )
+
+        for row in rows:
+            channel_id = row.active_turn_channel_id
+            message_id = row.active_turn_message_id
+            if client is not None and channel_id is not None and message_id is not None:
+                try:
+                    await client.chat_update(  # pyright: ignore[reportUnknownMemberType]
+                        channel=channel_id,
+                        ts=message_id,
+                        blocks=to_interrupted_blocks(),
+                        text=_INTERRUPTED_FALLBACK_TEXT,
+                    )
+                    log.info(
+                        "slack.turn.orphan_retired",
+                        thread_id=row.thread_id,
+                        channel_id=row.active_turn_channel_id,
+                        status_ts=row.active_turn_message_id,
+                        # How long the user stared at a spinner -- after a
+                        # crash this is the only surviving trace, since the
+                        # turn's own logs died with its container.
+                        frozen_for_s=(
+                            (now - row.active_turn_started_at).total_seconds()
+                            if row.active_turn_started_at is not None
+                            else None
+                        ),
+                    )
+                except _SLACK_UPDATE_ERRORS as err:
+                    log.warning(
+                        "slack.turn.orphan_retire_failed", thread_id=row.thread_id, error=str(err)
+                    )
+            async with runtime.sessionmaker() as session:
+                await clear_active_turn(session, id=row.id)
+                await session.commit()
