@@ -1330,8 +1330,8 @@ class SlackApp:
             # Turn marker: message ts + channel + start time, written as soon as
             # the mapping row is known and the card exists (D-03). Slack passes
             # active_turn_channel_id where Discord does not -- a Slack message is
-            # addressed by (channel, ts), so a boot sweep cannot call chat_update
-            # to repair a wedged card without the channel (D-08).
+            # addressed by (channel, ts), so a boot sweep cannot repair a wedged
+            # card without the channel to address the update call (D-08).
             if prepared.mapping_id is not None and lifecycle.status_ts is not None:
                 async with self.runtime.sessionmaker() as _at_session:
                     await mark_turn_active(
