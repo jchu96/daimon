@@ -18,7 +18,7 @@ import re
 import re as _re
 import uuid
 from collections.abc import Callable, Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2847,6 +2847,156 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
     body = failure_posts[0].kwargs["json"]
     assert body["channel"] == channel
     assert body["thread_ts"] == thread_ts, "the failure notice must land in the mention's thread"
+
+
+async def test_run_thread_turn_pump_phase_ceiling_renders_terminal_error_in_thread(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A pump-phase ceiling breach -- a TimeoutError inside run_prepared_turn's
+    own asyncio.wait_for, raised AFTER bind_session has already returned --
+    does NOT raise out of run_prepared_turn. It marks the mapping row dead,
+    calls lifecycle.on_terminal_failure directly (guarded by its own
+    try/except so a broken render hook cannot mask the ceiling error), and
+    returns a RunOutcome carrying state.error.kind == "ceiling". So this test
+    asserts a rendered terminal error card in-thread, not a boundary catch --
+    the bind-phase counterpart (raised from bind_session, unwinding through
+    _handle_app_mention's boundary) is already pinned above at
+    test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_mention.
+
+    A globally-past deadline cannot be used to force this breach:
+    _run_thread_turn threads ONE shared deadline into both bind_session and
+    run_prepared_turn, and remaining_s clamps to a small positive floor, so a
+    past deadline would breach at bind_session's own asyncio.wait_for before
+    run_prepared_turn is ever reached -- that would silently re-test the
+    bind-phase path instead of this one. Instead: turn_deadline is patched to
+    return a near-future deadline (2s -- survivable by the mocked bind) and
+    run_turn is patched to sleep past it (5s). The patch target is
+    daimon.core.turn.run.run_turn -- the module that IMPORTS the name and is
+    the one run_prepared_turn actually calls -- not the defining module
+    (daimon.core.turn's driver submodule); patching that one would rebind a
+    name nobody reads and the pump would never sleep.
+
+    Two pre-existing Slack behaviours a reader will trip on here, left alone
+    on purpose (not this plan's job to "fix"): Slack's watermark gate has no
+    state.error branch (unlike Discord's), so this breach DOES write a
+    watermark onto the row mark_dead just set to status='dead' -- functionally
+    inert, since dead rows are excluded from get_live_thread_session; and
+    on_terminal_failure sets final_ts to the status ts on its normal flush
+    path, which is why that watermark write fires at all.
+    """
+    from daimon.core.turn.ceiling import CEILING_MESSAGE
+
+    team_id = "T_PUMP_CEILING"
+    channel = "C_TEST"
+    thread_ts = "9000000045.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-pump-ceiling-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_PUMP_CEILING",
+        "text": "<@U_BOT> hello",
+    }
+
+    async def _sleepy_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        await asyncio.sleep(5.0)
+        return TurnState(content=[TextBlock(kind="text", text="too late")])
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.adapters.slack.app.turn_deadline") as mock_turn_deadline,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.return_value = _fake_session
+        mock_turn_deadline.side_effect = lambda *, now, **_: now + timedelta(seconds=2)
+        mock_run_turn.side_effect = _sleepy_run_turn
+
+        # No exception must escape -- the pump-phase breach returns a
+        # RunOutcome rather than raising.
+        await app._run_thread_turn(  # pyright: ignore[reportPrivateUsage]
+            event,
+            channel=channel,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+            thread_id=thread_ts,
+            team_id=team_id,
+        )
+
+    update_calls = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == URL("https://slack.com/api/chat.update")
+        for req in reqs
+    ]
+    assert update_calls, (
+        "the pump-phase breach must render through chat.update against the "
+        "status card post_initial() already established -- not a new post"
+    )
+    last_blocks = update_calls[-1].kwargs["json"]["blocks"]
+    rendered_text = " ".join(
+        element.get("text", "")
+        for block in last_blocks
+        for element in block.get("elements", [block])
+        if isinstance(element, dict)
+    )
+    assert "❌" in rendered_text, "a ceiling breach must render the terminal error emoji"
+    assert CEILING_MESSAGE in rendered_text, (
+        "the rendered card must carry the shared CEILING_MESSAGE text -- no new "
+        "Slack-specific ceiling copy may be introduced (D-07)"
+    )
+
+    async with db_session_factory() as s:
+        orphaned = await list_orphaned_turns(s, platform="slack")
+    assert orphaned == [], (
+        "a ceilinged turn must not be swept as an orphan on the next boot -- the "
+        "marker must be cleared even though run_prepared_turn returns rather than raises"
+    )
 
 
 # ---------------------------------------------------------------------------
