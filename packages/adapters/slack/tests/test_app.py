@@ -3438,6 +3438,251 @@ async def test_marker_is_written_with_channel_before_the_turn_runs(
     )
 
 
+async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A Slack turn that recovers from a dead session keeps rendering into the
+    card it started with, instead of abandoning it for a second, untracked one.
+
+    Drives one dead-session-recovery scenario through the real adapter
+    boundary and pins four properties from a single set of observations taken
+    mid-recovery (inside the second run_turn call):
+
+    1. One card. Exactly one chat.postMessage happens across the whole turn --
+       the count observed mid-recovery is already 1, and it never grows.
+    2. The marker addresses the live card. The one row list_orphaned_turns
+       would return mid-recovery has active_turn_message_id/channel equal to
+       the card the recovered turn is rendering into, not the abandoned first
+       card -- this is what a restarted process would find and repair.
+    3. The terminal render lands there. The recovered turn's answer is
+       chat.update'd onto that same card.
+    4. Cancel is rebound. The registry entry for that card's ts is bound to
+       the SECOND run_turn call's cancel Event (identity, not equality), and
+       the author id is unchanged, so a Cancel click during recovery stops
+       the turn that is actually running and is still refused for anyone but
+       the author.
+
+    The Slack API fake returns a constant ts for every chat.postMessage, so a
+    second card would be indistinguishable from the first by ts alone -- the
+    postMessage COUNT is what proves adoption. Weakening assertion 1 to a ts
+    comparison would make this test pass against the pre-adoption code.
+    """
+    import anthropic as _anthropic
+    from daimon.core.errors import TurnError
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_RECOVERED_TURN"
+    channel = "C_TEST"
+    thread_ts = "9000000050.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    async with db_session_factory() as s:
+        await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_RECOVER"
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    _now = datetime.now(UTC)
+
+    def _fake_session(session_id: str) -> BetaManagedAgentsSession:
+        return BetaManagedAgentsSession(
+            outcome_evaluations=[],
+            id=session_id,
+            agent=BetaManagedAgentsSessionAgent(
+                id="agent_test_id",
+                mcp_servers=[],
+                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+                name="test-agent",
+                skills=[],
+                tools=[],
+                type="agent",
+                version=1,
+            ),
+            created_at=_now,
+            environment_id="env_test_id",
+            metadata={},
+            resources=[],
+            stats=BetaManagedAgentsSessionStats(),
+            status="idle",
+            type="session",
+            updated_at=_now,
+            usage=BetaManagedAgentsSessionUsage(),
+            vault_ids=[],
+        )
+
+    first_session = _fake_session("sess-recover-first-001")
+    recovered_session = _fake_session("sess-recover-second-002")
+
+    # A real 404 APIStatusError behind a real httpx.Response -- the dead-session
+    # signature the recovery cycle recognizes and recovers from.
+    fake_request = MagicMock(spec=httpx.Request)
+    fake_response = httpx.Response(404, json={"type": "not_found_error", "message": "gone"})
+    fake_response.request = fake_request
+    dead_cause = _anthropic.APIStatusError(
+        "Session not found", response=fake_response, body={"type": "not_found_error"}
+    )
+    dead_state = TurnState(
+        error=TurnError(kind="upstream", message="Session not found", cause=dead_cause)
+    )
+    _ANSWER = "Recovered turn answer, distinctive marker qzx91."
+    success_state = TurnState(content=[TextBlock(kind="text", text=_ANSWER)])
+
+    post_url = URL("https://slack.com/api/chat.postMessage")
+    update_url = URL("https://slack.com/api/chat.update")
+
+    def _post_count() -> int:
+        return sum(
+            len(reqs)
+            for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+            if url == post_url
+        )
+
+    observed: dict[str, Any] = {}
+
+    async def _fake_run_turn(
+        *, lifecycle: Any, session_id: str, cancel: asyncio.Event, **kwargs: Any
+    ) -> TurnState:
+        if session_id == first_session.id:
+            observed["first_lifecycle"] = lifecycle
+            observed["first_cancel"] = cancel
+            # The deferred wrapper withholds this -- it must not render yet.
+            await lifecycle.on_terminal_failure(dead_state, dead_cause)
+            return dead_state
+
+        assert session_id == recovered_session.id, (
+            f"run_turn must be called only for the two known sessions, got {session_id}"
+        )
+        # Observations taken BEFORE any hook on the recovery lifecycle, so they
+        # reflect state while the recovered turn is actually in flight.
+        observed["post_count_mid_recovery"] = _post_count()
+        observed["status_ts"] = lifecycle.status_ts
+        observed["registry"] = dict(app._cancel_registry)  # pyright: ignore[reportPrivateUsage]
+        observed["second_cancel"] = cancel
+        async with db_session_factory() as s:
+            observed["orphans_mid_recovery"] = await list_orphaned_turns(s, platform="slack")
+        await lifecycle.on_terminal_success(success_state)
+        return success_state
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_RECOVER",
+        "text": "<@U_BOT> hello",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock),
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.side_effect = [first_session, recovered_session]
+        mock_run_turn.side_effect = _fake_run_turn
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    # Non-vacuity: recovery must actually have run.
+    assert mock_run_turn.call_count == 2, "run_turn must be called twice: dead + recovered"
+    second_call_kwargs = mock_run_turn.call_args_list[1].kwargs
+    assert second_call_kwargs["session_id"] == recovered_session.id, (
+        "the second run_turn call must run against the recovered session"
+    )
+
+    # 1. One card.
+    assert observed["post_count_mid_recovery"] == 1, (
+        "mid-recovery, exactly one status card must have been posted -- a "
+        "recovered turn must not post a second card before anything else runs"
+    )
+    assert _post_count() == 1, (
+        "a recovered turn must not post a second status card, because nothing "
+        "would ever finalise the first one and the database marker would "
+        "address a card nobody is rendering into"
+    )
+
+    # 2. The marker addresses the live card.
+    orphans_mid_recovery = observed["orphans_mid_recovery"]
+    assert len(orphans_mid_recovery) == 1, (
+        "exactly one orphan-eligible row must exist while the recovered turn runs"
+    )
+    mid_row = orphans_mid_recovery[0]
+    assert mid_row.active_turn_message_id == observed["status_ts"], (
+        "the marker a restarted process would find must address the card the "
+        "recovered turn is rendering into"
+    )
+    assert mid_row.active_turn_channel_id == channel, (
+        "the marker's channel must equal the mention's channel"
+    )
+
+    # 3. The terminal render lands there.
+    update_calls = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == update_url
+        for req in reqs
+    ]
+    assert update_calls, "the recovered turn's terminal success must chat.update"
+    last_update_body = update_calls[-1].kwargs["json"]
+    assert last_update_body["ts"] == observed["status_ts"], (
+        "the card the user has been watching is the one that ends up carrying "
+        "the answer, so nothing is left showing a running turn"
+    )
+    rendered_text = json.dumps(last_update_body.get("blocks", []))
+    assert _ANSWER in rendered_text, "the recovered turn's answer must land on the adopted card"
+
+    # 4. Cancel is rebound.
+    registry = observed["registry"]
+    assert observed["status_ts"] in registry, (
+        "the adopted card's ts must have a cancel registry entry during recovery"
+    )
+    rebound_event, rebound_author = registry[observed["status_ts"]]
+    assert rebound_event is observed["second_cancel"], (
+        "a Cancel click during a recovered turn must stop the turn that is "
+        "actually running -- the registry entry must be the SECOND call's Event"
+    )
+    assert rebound_event is not observed["first_cancel"], (
+        "the registry entry must no longer be bound to the first attempt's Event"
+    )
+    assert rebound_author == "U_TEST_RECOVER", "the rebind must not change who is allowed to cancel"
+
+    # Final state: both mapping rows must end the turn unmarked.
+    async with db_session_factory() as s:
+        final_orphans = await list_orphaned_turns(s, platform="slack")
+    assert final_orphans == [], (
+        "both the dead pre-recovery row and the post-recovery row must end the turn unmarked"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cancel registry: block_actions routing + author gate
 # ---------------------------------------------------------------------------
