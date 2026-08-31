@@ -152,6 +152,7 @@ def _make_lifecycle(
     *,
     model_id: str = "claude-sonnet-4-6",
     agent_name: str = "test-agent",
+    adopt_status_ts: str | None = None,
 ) -> tuple[SlackTurnLifecycle, asyncio.Event, dict[str, tuple[asyncio.Event, str]], list[str]]:
     """Create a SlackTurnLifecycle with recorder callables for registry operations.
 
@@ -180,6 +181,7 @@ def _make_lifecycle(
         model_id=model_id,
         register=register,
         deregister=deregister,
+        adopt_status_ts=adopt_status_ts,
     )
     return lc, cancel, registered, deregistered
 
@@ -278,6 +280,124 @@ async def test_first_flush_registers_status_ts(fake_slack_web_client: Any) -> No
     await lc.on_render(TurnState())
 
     assert len(registered) == 1, "a debounced render-tick update must not add a second registration"
+
+
+# ---------------------------------------------------------------------------
+# Adopting construction path (dead-session recovery): the caller hands over
+# the pre-recovery card's ts instead of letting the lifecycle post a new one.
+# ---------------------------------------------------------------------------
+
+_ADOPTED_TS = "1111.1"
+
+
+async def test_status_ts_reports_the_adopted_ts_before_anything_is_posted(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle reports the adopted ts with no chat-API I/O.
+
+    The caller can read status_ts immediately after construction, before
+    the turn has rendered anything at all.
+    """
+    lc, *_ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    assert lc.status_ts == _ADOPTED_TS, "status_ts must report the adopted ts immediately"
+    assert _post_count(fake_slack_web_client) == 0, (
+        "reading status_ts on an adopting lifecycle must not perform any chat-API I/O"
+    )
+
+
+async def test_an_adopting_lifecycle_updates_the_adopted_card_instead_of_posting_a_new_one(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle's first flush updates the adopted card, not a new one.
+
+    A recovered turn must not leave a second card behind: nothing would ever
+    finalise it, and the marker written against the pre-recovery mapping row
+    would address a card nobody is rendering into.
+    """
+    lc, *_ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+
+    assert _post_count(fake_slack_web_client) == 0, (
+        "a recovered turn must not post a second status card"
+    )
+    assert _update_count(fake_slack_web_client) == 1, (
+        "an adopting lifecycle's first render tick must update, not post"
+    )
+    calls = fake_slack_web_client.mock.requests.get(("POST", _UPDATE_URL), [])
+    body = calls[-1].kwargs["json"]
+    assert body["ts"] == _ADOPTED_TS, "the update must target the adopted ts"
+    assert body["channel"] == "C_TEST", "the update must target the constructor's channel"
+
+
+async def test_an_adopting_lifecycles_first_render_tick_updates_without_waiting_out_the_debounce(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle's first render tick updates immediately, no debounce wait.
+
+    The debounce clock starts already satisfied against a monotonic clock, so
+    the very first flush after construction updates with no wait -- this test
+    pins that consequence with no debounce-window backdating of its own. If a
+    future change seeds the debounce clock from `time.monotonic()` at
+    construction instead of leaving it at its zero value, this goes red.
+    """
+    lc, *_ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+
+    assert _update_count(fake_slack_web_client) == 1, (
+        "the first render tick on an adopting lifecycle must update immediately, "
+        "with no debounce wait -- if a future change seeds the debounce clock from "
+        "time.monotonic() at construction, this must fail"
+    )
+
+
+async def test_an_adopting_lifecycle_registers_no_cancel_entry_of_its_own(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle never registers a cancel entry of its own.
+
+    It never takes the first-post branch that registers -- the caller
+    handing over the ts owns rebinding the registry entry.
+    """
+    lc, _, registered, _ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+
+    assert registered == {}, (
+        "an adopting lifecycle must not register anything -- the caller rebinds"
+    )
+
+
+async def test_a_terminal_success_on_an_adopting_lifecycle_replaces_the_adopted_card(
+    fake_slack_web_client: Any,
+) -> None:
+    """The terminal render on an adopting lifecycle lands on the adopted card.
+
+    This is the assertion that the answer ends up on the card the user has
+    been watching, not on a second, freshly-posted one.
+    """
+    lc, _, _registered, deregistered = _make_lifecycle(
+        fake_slack_web_client, adopt_status_ts=_ADOPTED_TS
+    )
+
+    state = TurnState(content=[TextBlock(kind="text", text="The answer is 42.")])
+    await lc.on_terminal_success(state)
+
+    assert _post_count(fake_slack_web_client) == 0, "a single chunk needs no overflow post"
+    calls = fake_slack_web_client.mock.requests.get(("POST", _UPDATE_URL), [])
+    assert calls, "terminal success on an adopting lifecycle must chat.update"
+    body = calls[-1].kwargs["json"]
+    assert body["ts"] == _ADOPTED_TS, "the terminal render must target the adopted ts"
+    assert "The answer is 42." in _block_text(body["blocks"]), (
+        "the answer must land on the adopted card, the one the user has been watching"
+    )
+    assert lc.final_ts == _ADOPTED_TS, "final_ts must equal the adopted ts"
+    assert deregistered == [_ADOPTED_TS], "the adopted ts must be deregistered on terminal success"
 
 
 # ---------------------------------------------------------------------------
