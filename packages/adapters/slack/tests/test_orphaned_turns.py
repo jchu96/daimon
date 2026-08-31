@@ -7,7 +7,9 @@ spawned once from a straight-line statement in ``main()`` and cannot run
 twice in one process, see boot_sweep.py's docstring). It is replaced by two
 cases unique to Slack's per-tenant token model: an uninstalled workspace
 (no bot-token row) and a legacy row with no channel (every orphan already in
-production before the channel column shipped).
+production before the channel column shipped). A further case covers the
+sweep's own compare-and-clear: a marker rewritten mid-sweep, by a turn
+admitted while the sweep was still running, must survive it.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from daimon.core.stores.thread_sessions import (
 )
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .conftest import CHAT_OK_PAYLOAD
 
 _NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
 _UPDATE_URL = yarl.URL("https://slack.com/api/chat.update")
@@ -215,4 +219,72 @@ async def test_sweep_one_tenants_missing_token_does_not_stop_the_next_tenants_ed
     )
     assert await list_orphaned_turns(db_session, platform="slack") == [], (
         "both tenants' rows must clear regardless of which one was reachable"
+    )
+
+
+async def test_sweep_leaves_a_marker_that_moved_while_the_sweep_was_running(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A marker rewritten between the sweep's read and its clear must survive.
+
+    The sweep's orphan list is a snapshot taken once, up front. A marker
+    rewritten after that snapshot belongs to a turn a live process now owns
+    -- clearing it here would leave that turn unprotected against a second
+    crash, with no future sweep able to find it. This drives the interleave
+    through a callback on the fake Slack transport rather than patching the
+    sweep or the store: the fake is transport-level by construction, and a
+    patch-based interleave would prove nothing about the real code path.
+    """
+    fernet_key = Fernet.generate_key().decode()
+    row_id = await _seed_orphan(
+        db_session_factory,
+        fernet_key,
+        team_id="T_MOVED",
+        channel_id="C_MOVED",
+        message_id="3333.3",
+    )
+
+    async def _admit_a_fresh_turn_mid_sweep(url: yarl.URL, **kwargs: object) -> None:
+        # Fires from inside the sweep's own chat_update -- the exact window
+        # between the orphan read and the clear. Models a mention admitted
+        # while the sweep was still working: a live process writes a new
+        # marker on the same row before the sweep gets to clear it.
+        async with db_session_factory() as session:
+            await mark_turn_active(
+                session,
+                id=row_id,
+                active_turn_message_id="4444.4",
+                active_turn_channel_id="C_MOVED",
+                now=_NOW,
+            )
+            await session.commit()
+
+    fake_slack_web_client.mock.clear()
+    fake_slack_web_client.mock.post(  # pyright: ignore[reportUnknownMemberType]
+        str(_UPDATE_URL),
+        payload=CHAT_OK_PAYLOAD,
+        callback=_admit_a_fresh_turn_mid_sweep,
+        repeat=True,
+    )
+    runtime = _build_runtime(fernet_key, db_session_factory)
+
+    await retire_orphaned_turns(runtime, now=_NOW)
+
+    update_calls = fake_slack_web_client.mock.requests.get(("POST", _UPDATE_URL), [])
+    assert len(update_calls) == 1, "exactly one chat.update for the one seeded orphan"
+    assert update_calls[0].kwargs["json"]["ts"] == "3333.3", (
+        "the sweep must edit the ts it read at sweep start -- the frozen card, never the live one"
+    )
+
+    orphans = await list_orphaned_turns(db_session, platform="slack")
+    assert [o.id for o in orphans] == [row_id], (
+        "a marker written after the sweep's read belongs to a live turn and must survive the sweep"
+    )
+    assert orphans[0].active_turn_message_id == "4444.4", (
+        "the surviving marker must be the one the mid-sweep turn wrote, not the sweep's stale read"
+    )
+    assert orphans[0].active_turn_channel_id == "C_MOVED", (
+        "the conditional clear must null nothing at all here, not partially clear the row"
     )
