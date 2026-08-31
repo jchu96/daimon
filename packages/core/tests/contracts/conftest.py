@@ -26,6 +26,7 @@ from daimon.core.config import Settings
 from daimon.core.ma import delete_entire_workspace_for_testing
 from daimon.core.skill_zip import build_skill_zip
 from daimon.testing.ma import _require_api_key
+from daimon.testing.workspace_sentinel import require_disposable_workspace
 
 # Each test module in this package must set:
 #   pytestmark = pytest.mark.contract
@@ -42,6 +43,7 @@ async def anthropic_client() -> AsyncAnthropic:
 @pytest_asyncio.fixture(scope="module", autouse=True)
 async def _cleanup(anthropic_client: AsyncAnthropic) -> AsyncIterator[None]:  # pyright: ignore[reportUnusedFunction]
     """Module-scoped cleanup: delete all workspace resources before and after."""
+    await require_disposable_workspace(anthropic_client)
     await delete_entire_workspace_for_testing(
         anthropic_client, i_understand_this_destroys_all_tenants=True
     )
