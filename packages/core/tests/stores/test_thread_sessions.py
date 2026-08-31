@@ -17,6 +17,7 @@ from daimon.core._models import ThreadSession
 from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
+    clear_active_turn_if_message_id,
     create_thread_session,
     get_latest_thread_session,
     get_live_thread_session,
@@ -579,3 +580,162 @@ async def test_clear_active_turn_nulls_all_three_marker_columns(
     assert cleared.active_turn_message_id is None, "cleared rows carry no dead message id"
     assert cleared.active_turn_started_at is None, "cleared rows carry no dead start time"
     assert cleared.active_turn_channel_id is None, "cleared rows carry no dead channel id"
+
+
+async def test_clear_active_turn_if_message_id_clears_when_the_marker_still_matches(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000500",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_conditional_match",
+    )
+    await mark_turn_active(
+        db_session,
+        id=row.id,
+        active_turn_message_id="5555.1",
+        active_turn_channel_id="C_MATCH",
+        now=datetime.now(UTC),
+    )
+
+    cleared = await clear_active_turn_if_message_id(
+        db_session, id=row.id, expected_message_id="5555.1"
+    )
+
+    assert cleared is True, "a marker that still names the caller's read must clear"
+    fetched = await get_thread_session_by_id(db_session, id=row.id)
+    assert fetched is not None, "the row itself must survive a clear"
+    assert fetched.active_turn_message_id is None, "a matched clear must null the message id"
+    assert fetched.active_turn_started_at is None, "a matched clear must null the start time"
+    assert fetched.active_turn_channel_id is None, "a matched clear must null the channel id"
+    assert await list_orphaned_turns(db_session, platform="slack") == [], (
+        "a cleared row must not be reported as an orphan"
+    )
+
+
+async def test_clear_active_turn_if_message_id_leaves_a_marker_that_moved(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000600",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_conditional_moved",
+    )
+    await mark_turn_active(
+        db_session,
+        id=row.id,
+        active_turn_message_id="6666.1",
+        active_turn_channel_id="C_FIRST",
+        now=datetime.now(UTC),
+    )
+    await mark_turn_active(
+        db_session,
+        id=row.id,
+        active_turn_message_id="6666.2",
+        active_turn_channel_id="C_SECOND",
+        now=datetime.now(UTC),
+    )
+
+    cleared = await clear_active_turn_if_message_id(
+        db_session, id=row.id, expected_message_id="6666.1"
+    )
+
+    assert cleared is False, (
+        "a marker written after the caller's read belongs to a live turn and must survive"
+    )
+    orphans = await list_orphaned_turns(db_session, platform="slack")
+    assert [o.id for o in orphans] == [row.id], "the row must still be listed as an orphan"
+    assert orphans[0].active_turn_message_id == "6666.2", (
+        "the second mark's message id must still be in place, untouched by the stale clear"
+    )
+    assert orphans[0].active_turn_channel_id == "C_SECOND", (
+        "the second mark's channel id must still be in place, untouched by the stale clear"
+    )
+
+
+async def test_clear_active_turn_if_message_id_is_a_no_op_on_an_already_cleared_row(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000700",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_conditional_already_cleared",
+    )
+    await mark_turn_active(
+        db_session,
+        id=row.id,
+        active_turn_message_id="7777.1",
+        active_turn_channel_id="C_ALREADY",
+        now=datetime.now(UTC),
+    )
+    await clear_active_turn(db_session, id=row.id)
+
+    cleared = await clear_active_turn_if_message_id(
+        db_session, id=row.id, expected_message_id="7777.1"
+    )
+
+    assert cleared is False, "a NULL marker never equals a string, so this must not raise or match"
+
+
+async def test_clear_active_turn_if_message_id_never_touches_another_row(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    first = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000800",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_conditional_row_a",
+    )
+    second = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id="1700000000.000900",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_slack_conditional_row_b",
+    )
+    await mark_turn_active(
+        db_session,
+        id=first.id,
+        active_turn_message_id="8888.1",
+        active_turn_channel_id="C_ROW_A",
+        now=datetime.now(UTC),
+    )
+    await mark_turn_active(
+        db_session,
+        id=second.id,
+        active_turn_message_id="8888.1",
+        active_turn_channel_id="C_ROW_B",
+        now=datetime.now(UTC),
+    )
+
+    cleared = await clear_active_turn_if_message_id(
+        db_session, id=first.id, expected_message_id="8888.1"
+    )
+
+    assert cleared is True, "the named row, which genuinely matches, must clear"
+    orphans = await list_orphaned_turns(db_session, platform="slack")
+    assert [o.id for o in orphans] == [second.id], (
+        "the other row, sharing the same message id, must be untouched"
+    )
+    assert orphans[0].active_turn_message_id == "8888.1", (
+        "a colliding message id on a different row must not be nulled by the named row's clear"
+    )
+    assert orphans[0].active_turn_channel_id == "C_ROW_B", (
+        "the other row's channel id must also survive untouched"
+    )
