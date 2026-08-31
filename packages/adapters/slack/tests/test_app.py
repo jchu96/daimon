@@ -2799,9 +2799,9 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
     -- no exception escapes the background task. The status card now posts
     BEFORE `bind_session`, so a bind-phase ceiling breach leaves
     exactly two posts in the thread: the status card first, then the
-    boundary's in-thread failure notice last. Pins that plan 19-03's new
-    ceiling raise site lands in Slack's existing boundary with zero new
-    adapter error-handling code (T-19-10-C). Reuses
+    boundary's in-thread failure notice last. Pins that the core ceiling
+    raise site lands in Slack's existing boundary with zero new
+    adapter error-handling code. Reuses
     `test_handle_app_mention_failure_posts_error_into_thread`'s harness
     shape/assertions rather than inventing a second one.
     """
