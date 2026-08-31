@@ -227,7 +227,7 @@ async def retire_orphaned_turns(runtime: SlackRuntime, *, now: datetime) -> None
     Builds its own per-tenant AsyncWebClient rather than taking one as a
     dependency: unlike Discord's single deployment-wide bot token, Slack's
     token is per-workspace, decrypted per use via ``resolve_web_client``, and
-    never cached (STURN-03). Rows are grouped by tenant so a workspace with
+    never cached. Rows are grouped by tenant so a workspace with
     several wedged threads decrypts once, not once per row.
 
     An unreachable tenant -- an uninstalled workspace (no token row), a
