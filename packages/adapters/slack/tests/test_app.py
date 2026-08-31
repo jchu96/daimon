@@ -46,6 +46,7 @@ from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.stores import tenant_ledger, usage_events
+from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token, upsert_slack_bot_token
 from daimon.core.stores.tenants import get_tenant
@@ -1452,11 +1453,22 @@ async def test_run_thread_turn_two_turns_same_session_chain_sweeps_serially(
         ) as mock_deliver_outputs,
     ):
         mock_get_session.return_value = None
-        # A real UUID, not a bare AsyncMock attribute -- the turn marker
-        # write/clear (mark_turn_active/clear_active_turn) now reads
-        # prepared.mapping_id and issues a real DB UPDATE against it.
-        fake_thread_session_row = MagicMock()
-        fake_thread_session_row.id = uuid.uuid4()
+        # The patched store returns the same validated Pydantic type the real
+        # store returns, so a field the production code reads is a real value
+        # or a loud failure, never an auto-generated mock attribute.
+        now = datetime.now(UTC)
+        fake_thread_session_row = ThreadSessionRow(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            platform="slack",
+            thread_id=thread_ts,
+            account_id=uuid.uuid4(),
+            ma_session_id="sess-chain-001",
+            watermark_message_id=None,
+            status="live",
+            created_at=now,
+            updated_at=now,
+        )
         mock_create_ts.return_value = fake_thread_session_row
         mock_resolve_agent.return_value = "agent_sweep_id"
         mock_resolve_env.return_value = "env_sweep_id"
