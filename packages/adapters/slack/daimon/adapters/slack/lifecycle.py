@@ -24,6 +24,13 @@ Design decisions:
   debounce already dominated flush timing and is unchanged; terminal flushes
   (`_flush_terminal`/`_flush_cancelled`) and `post_initial` are unaffected —
   they bypass both the debounce and the render path.
+- `adopt_status_ts` (dead-session recovery only) seeds `_status_ts` before
+  anything is posted, with three mechanical consequences: the first
+  `_maybe_flush` takes the update branch, never the post branch; `_last_flush`
+  starts at `0.0` against a `time.monotonic` clock, so the debounce is already
+  satisfied and the first render tick updates with no wait; and `_register` is
+  therefore never called, so the caller handing over the ts owns rebinding the
+  cancel registry entry to the new cancel Event.
 """
 
 from __future__ import annotations
@@ -124,6 +131,7 @@ class SlackTurnLifecycle:
         register: Callable[[str, asyncio.Event, str], None],
         deregister: Callable[[str], None],
         clock: Callable[[], float] = time.monotonic,
+        adopt_status_ts: str | None = None,
     ) -> None:
         self._client = client
         self._channel = channel
@@ -139,7 +147,16 @@ class SlackTurnLifecycle:
             agent_name=agent_name,
             started_at=self._clock(),
         )
-        self._status_ts: str | None = None
+        # Seeded only by dead-session recovery, which hands over the card the
+        # failed attempt already posted. Without this the recovery lifecycle
+        # posts a SECOND card, and the first one is never finalised — the turn
+        # driver withholds the failed attempt's terminal hook while a recovery
+        # is in flight, so on a successful recovery nothing ever collapses card
+        # one and it sits on "thinking" beside the answer. The turn marker
+        # written against the pre-recovery mapping row addresses the adopted
+        # card, so a restarted process repairs the card the user is actually
+        # watching rather than an abandoned one.
+        self._status_ts: str | None = adopt_status_ts
         self._last_flush: float = 0.0
         self._terminal: bool = False
         self.final_ts: str | None = None

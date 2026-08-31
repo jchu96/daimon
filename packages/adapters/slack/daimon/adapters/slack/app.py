@@ -1273,8 +1273,10 @@ class SlackApp:
         # Slack-specific copy). The clear runs on any exception, not just the
         # happy path, and covers BOTH prepared.mapping_id and
         # outcome.mapping_id because recovery moves the turn to a new mapping
-        # row and leaves the marker on the old one, still pointing at the same
-        # message -- a ceiling breach is not a special case here either:
+        # row and leaves the marker on the old one -- sufficient because
+        # _recovery_lifecycle adopts the pre-recovery card, so the marker left
+        # on the old mapping row still addresses the card being rendered into.
+        # A ceiling breach is not a special case here either:
         # run_prepared_turn already marked the active mapping dead and returns
         # a normal RunOutcome, so it takes this same path. _deregister_cancel
         # is pop(ts, None), so the double call after on_terminal_success's own
@@ -1472,8 +1474,21 @@ class SlackApp:
                     model_id=_lc_model_id,
                     register=self._register_cancel,
                     deregister=self._deregister_cancel,
+                    # Take over the failed attempt's card so it is edited into
+                    # this turn's answer rather than left standing beside a
+                    # second, successful card.
+                    adopt_status_ts=lifecycle.status_ts,
                 )
                 lifecycle_holder[0] = new_lifecycle
+                # An adopting lifecycle never posts, so it never re-registers
+                # itself -- the entry left by the original post is still bound
+                # to the first attempt's Event, and a click on the adopted card
+                # must stop the turn that is actually running. This rebind is a
+                # plain dict assignment, so re-registering the same key
+                # overwrites in place, and it lands before the recovery turn's
+                # first flush, not after it.
+                if lifecycle.status_ts is not None:
+                    self._register_cancel(lifecycle.status_ts, cancel, str(event.get("user") or ""))
                 return new_lifecycle
 
             async with self.runtime.sessionmaker() as s:
