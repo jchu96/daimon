@@ -142,7 +142,7 @@ _PHASE_TITLE: dict[TurnPhase, str] = {
 _TERMINAL_PHASES = frozenset({TurnPhase.DONE, TurnPhase.ERROR})
 
 # Copy is byte-identical to the Discord adapter's orphan-retirement embed: the
-# two adapters must say the same thing about the same event (D-09).
+# two adapters must say the same thing about the same event.
 INTERRUPTED_NOTICE: str = (
     f"{_EMOJI_CROSS} This turn was interrupted by a restart and cannot be "
     "resumed. Nothing was lost on your side — mention me again to retry."

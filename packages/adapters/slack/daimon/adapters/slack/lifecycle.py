@@ -187,7 +187,7 @@ class SlackTurnLifecycle:
         await self._maybe_flush()
 
     async def on_sse_event(self, event: RawMessageStreamEvent) -> None:
-        # Cheap local tap per the hardened TurnLifecycle contract (D-12):
+        # Cheap local tap per the hardened TurnLifecycle contract:
         # the pump awaits this hook inline, so it stays a local reducer
         # call only. The Block Kit flush (chat-API I/O) rides the render
         # tick instead, where a slow or rate-limited chat.update only
@@ -428,7 +428,7 @@ class SlackTurnLifecycle:
                 self._deregister(self._status_ts)
 
     async def on_render(self, state: TurnState) -> None:
-        """Sole delivery path (D-12). `state` is unused: Slack's card is
+        """Sole delivery path. `state` is unused: Slack's card is
         driven by its own Block Kit `State` folded in `on_sse_event` — this
         hook is the tick that delivers it."""
         if self._terminal:

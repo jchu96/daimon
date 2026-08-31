@@ -1112,12 +1112,12 @@ class SlackApp:
         """Turn body: admission → card+Cancel → bind_session → marker → context → turn → watermark.
 
         Immediately after admission, the lifecycle is constructed and its
-        status card + Cancel registration are posted (``post_initial()``, D-01/D-02)
+        status card + Cancel registration are posted (``post_initial()``)
         -- before ``bind_session``, since MA ``sessions.create`` plus the
         interstitial history replay and image download below can hold for
         minutes and the user must see something first. Once ``bind_session``
         returns, the turn marker (message ts, channel, start time) is written
-        against the mapping row (D-03).
+        against the mapping row.
 
         On first mention for a thread: creates a new MA session + ``thread_sessions``
         row, replays thread history via ``build_context_xml`` (one Slack page).
@@ -1247,7 +1247,7 @@ class SlackApp:
         # Post the status card and register Cancel BEFORE bind_session --
         # MA sessions.create plus the history replay and image download below
         # can hold for minutes, and the card must exist before all of that,
-        # not merely before run_prepared_turn (D-01/D-02).
+        # not merely before run_prepared_turn.
         await lifecycle.post_initial()
 
         # Mapping-row ids the turn marker has been written against, tracked
@@ -1268,12 +1268,12 @@ class SlackApp:
         # entry and a turn marker for the life of the process. The stale card
         # left behind by such a failure is deliberately NOT collapsed here --
         # exact Discord parity, and the boundary catch already posts an
-        # in-thread failure notice with a request id (D-07, and the previous
-        # phase's D-08: render through the existing generic error path, no
-        # Slack-specific copy). The clear runs on any exception, not just the
-        # happy path, and covers BOTH prepared.mapping_id and
-        # outcome.mapping_id because recovery moves the turn to a new mapping
-        # row and leaves the marker on the old one -- sufficient because
+        # in-thread failure notice with a request id (rendered through the
+        # existing generic error path, no Slack-specific copy). The clear
+        # runs on any exception, not just the happy path, and covers BOTH
+        # prepared.mapping_id and outcome.mapping_id because recovery moves
+        # the turn to a new mapping row and leaves the marker on the old
+        # one -- sufficient because
         # _recovery_lifecycle adopts the pre-recovery card, so the marker left
         # on the old mapping row still addresses the card being rendered into.
         # A ceiling breach is not a special case here either:
@@ -1330,10 +1330,10 @@ class SlackApp:
             reused = prepared.reused
 
             # Turn marker: message ts + channel + start time, written as soon as
-            # the mapping row is known and the card exists (D-03). Slack passes
+            # the mapping row is known and the card exists. Slack passes
             # active_turn_channel_id where Discord does not -- a Slack message is
             # addressed by (channel, ts), so a boot sweep cannot repair a wedged
-            # card without the channel to address the update call (D-08).
+            # card without the channel to address the update call.
             if prepared.mapping_id is not None and lifecycle.status_ts is not None:
                 async with self.runtime.sessionmaker() as _at_session:
                     await mark_turn_active(

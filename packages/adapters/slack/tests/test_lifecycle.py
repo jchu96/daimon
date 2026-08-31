@@ -4,17 +4,17 @@ Behavioral assertions — grouped by phase:
 
 Task 1 (debounce / registry / usage):
   - on_sse_event alone performs zero chat.postMessage and zero chat.update;
-    the following on_render posts immediately (D-12: flush rides the render
+    the following on_render posts immediately (flush rides the render
     tick, not the SSE consume path).
   - Two events plus two on_render ticks within 5s trigger NO chat.update
     (debounce window).
   - Events plus an on_render tick after 5s trigger exactly one chat.update
     (debounce elapsed).
-  - The first flush's registration rides post_initial() (D-02); a later
+  - The first flush's registration rides post_initial(); a later
     render-tick update does not re-register.
   - _apply_usage folds usage_totals into merged usage_in / usage_out / cost_str.
 
-on_render error propagation (D-12):
+on_render error propagation:
   - A failing chat.update surfaces out of on_render unswallowed -- the
     driver's per-tick render error policy is what handles it.
   - on_sse_event never raises for the identical scenario -- it performs no I/O.
@@ -196,7 +196,7 @@ async def test_on_sse_event_performs_no_io_then_on_render_posts_immediately(
 ) -> None:
     """on_sse_event alone performs zero chat-API I/O; a following on_render posts.
 
-    The flush moved off the SSE consume path (D-12): folding an event is a
+    The flush moved off the SSE consume path: folding an event is a
     local reducer call only, and the first chat.postMessage now happens on
     the next render tick.
     """
@@ -260,7 +260,7 @@ async def test_event_after_debounce_triggers_update(fake_slack_web_client: Any) 
 
 
 async def test_first_flush_registers_status_ts(fake_slack_web_client: Any) -> None:
-    """The first flush's registration rides post_initial() (D-02); a later
+    """The first flush's registration rides post_initial(); a later
     render-tick update must not re-register."""
     lc, cancel, registered, _ = _make_lifecycle(fake_slack_web_client)
 

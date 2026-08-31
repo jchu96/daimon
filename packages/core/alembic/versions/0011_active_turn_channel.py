@@ -12,7 +12,7 @@ Discord, not just at migration time -- a Discord message id is globally
 addressable, so the Discord adapter never writes this column and its rows stay
 NULL for the life of the table.
 
-First-boot consequence (D-08): a Slack orphan row that already exists when
+First-boot consequence: a Slack orphan row that already exists when
 this migration lands carries NULL in this column too, since it predates the
 column entirely. The boot sweep must clear that row without attempting a
 `chat_update` call -- there is no channel to address.

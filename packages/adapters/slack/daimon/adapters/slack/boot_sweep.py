@@ -237,11 +237,11 @@ async def retire_orphaned_turns(runtime: SlackRuntime, *, now: datetime) -> None
     this shipped, since the column is new, nullable, and unbackfilled) and a
     row whose card edit fails for any reason (deleted message, archived
     channel, revoked token). Otherwise an unreachable or already-gone card
-    would be retried on every single boot forever (D-10).
+    would be retried on every single boot forever.
 
-    No once-per-process guard (D-15, superseding D-10's letter): this
-    function lives in a module of free functions with no ``self``, so a guard
-    would need module-level mutable state, which ``guideline:architecture``
+    No once-per-process guard: this function lives in a module of free
+    functions with no ``self``, so a guard would need module-level mutable
+    state, which ``guideline:architecture``
     rule 3 ("no global state") forbids. It is also structurally unnecessary
     here -- the spawn site in ``__main__.py`` is a straight-line statement
     inside ``main()``, and Socket Mode reconnects are handled entirely inside

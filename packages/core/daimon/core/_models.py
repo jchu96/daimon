@@ -1092,9 +1092,9 @@ class SlackEventDedup(Base):
     the same logical event with a NEW envelope_id.
 
     Rows are pruned by age on a schedule: `daimon.core.slack_event_dedup_sweep`
-    deletes rows older than a 7-day retention window on every scheduler tick
-    (D-05). The ack path still pays no delete cost — pruning is out-of-band,
-    never per-turn (D-04). The window is chosen to outlive Slack's own
+    deletes rows older than a 7-day retention window on every scheduler tick.
+    The ack path still pays no delete cost — pruning is out-of-band,
+    never per-turn. The window is chosen to outlive Slack's own
     redelivery schedule by a wide margin, so a prune can never re-admit a
     duplicate event.
 

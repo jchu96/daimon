@@ -2797,7 +2797,7 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
     """A `bind_session` ceiling breach (D-03/D-10) must surface through
     Slack's EXISTING generic `DaimonError` boundary in `_handle_app_mention`
     -- no exception escapes the background task. The status card now posts
-    BEFORE `bind_session` (D-02), so a bind-phase ceiling breach leaves
+    BEFORE `bind_session`, so a bind-phase ceiling breach leaves
     exactly two posts in the thread: the status card first, then the
     boundary's in-thread failure notice last. Pins that plan 19-03's new
     ceiling raise site lands in Slack's existing boundary with zero new
@@ -2863,7 +2863,7 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
         for req in reqs
     ]
     assert len(posts) == 2, (
-        "the status card posts before bind_session (D-02); a bind-phase ceiling "
+        "the status card posts before bind_session; a bind-phase ceiling "
         "breach must leave exactly two posts -- the card, then the failure notice"
     )
     first_body = posts[0].kwargs["json"]
@@ -3016,7 +3016,7 @@ async def test_run_thread_turn_pump_phase_ceiling_renders_terminal_error_in_thre
     assert "❌" in rendered_text, "a ceiling breach must render the terminal error emoji"
     assert CEILING_MESSAGE in rendered_text, (
         "the rendered card must carry the shared CEILING_MESSAGE text -- no new "
-        "Slack-specific ceiling copy may be introduced (D-07)"
+        "Slack-specific ceiling copy may be introduced"
     )
 
     async with db_session_factory() as s:
@@ -4195,7 +4195,7 @@ async def test_orchestrate_tenant_cap_when_in_thread_sheds_in_thread(
 
 
 # ---------------------------------------------------------------------------
-# Ceiling breach releases both concurrency slots (D-06, plan 20-06)
+# Ceiling breach releases both concurrency slots
 # ---------------------------------------------------------------------------
 
 

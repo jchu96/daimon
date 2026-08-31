@@ -129,7 +129,7 @@ async def test_sweep_edits_the_frozen_card_and_clears_the_marker(
     )
 
     post_calls = fake_slack_web_client.mock.requests.get(("POST", _POST_URL), [])
-    assert not post_calls, "D-09: the sweep edits in place, it never posts a new message"
+    assert not post_calls, "the sweep edits in place, it never posts a new message"
 
     assert await list_orphaned_turns(db_session, platform="slack") == [], (
         "a retired turn must not be retired again on the next boot"

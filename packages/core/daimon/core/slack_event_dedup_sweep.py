@@ -1,4 +1,4 @@
-"""Prune aged rows from the slack_event_dedup admission gate (D-05).
+"""Prune aged rows from the slack_event_dedup admission gate.
 
 A `slack_event_dedup` row exists only to suppress redelivery of an event
 Socket Mode has not yet been acked for. Slack's documented base retry
@@ -10,10 +10,10 @@ pessimistic 24-hour bound and roughly 1700x the actual ~6-minute one — it
 also doubles as a one-week forensic trail for "did we ever receive that
 event?". `_RETENTION` is a module constant, not a setting: `.env.example` is
 generated from the Settings models, and a knob with a 1700x margin is not
-worth that churn (D-05).
+worth that churn.
 
 Deleting a row here never recovers a crashed turn — pruning is deliberately
-out-of-band from any turn path, never per-turn (D-04).
+out-of-band from any turn path, never per-turn.
 
 Shell-only: opens one session, delegates the delete to the store's
 select-keys-then-delete helper, commits, and logs the count. `now` is
