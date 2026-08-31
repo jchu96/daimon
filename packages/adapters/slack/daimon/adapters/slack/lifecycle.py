@@ -15,6 +15,22 @@ Design decisions:
   locked by live-workspace probe).
 - text= always passed alongside blocks= to satisfy Slack's notification
   fallback requirement (Pitfall 3).
+- The Block Kit flush rides the render tick (`on_render`), not `on_sse_event`:
+  the driver awaits `on_sse_event` inline in its consume loop, so a debounced
+  `chat.update` living there would stall read-timeout detection and deaden
+  Cancel for as long as a rate-limited edit's Retry-After wait. `on_render`
+  runs on a separate render task, so the same stall now only delays a render
+  tick. First-update latency is at most one render tick (~2s); the 5.0s
+  debounce already dominated flush timing and is unchanged; terminal flushes
+  (`_flush_terminal`/`_flush_cancelled`) and `post_initial` are unaffected —
+  they bypass both the debounce and the render path.
+- `adopt_status_ts` (dead-session recovery only) seeds `_status_ts` before
+  anything is posted, with three mechanical consequences: the first
+  `_maybe_flush` takes the update branch, never the post branch; `_last_flush`
+  starts at `0.0` against a `time.monotonic` clock, so the debounce is already
+  satisfied and the first render tick updates with no wait; and `_register` is
+  therefore never called, so the caller handing over the ts owns rebinding the
+  cancel registry entry to the new cancel Event.
 """
 
 from __future__ import annotations
@@ -115,6 +131,7 @@ class SlackTurnLifecycle:
         register: Callable[[str, asyncio.Event, str], None],
         deregister: Callable[[str], None],
         clock: Callable[[], float] = time.monotonic,
+        adopt_status_ts: str | None = None,
     ) -> None:
         self._client = client
         self._channel = channel
@@ -130,17 +147,55 @@ class SlackTurnLifecycle:
             agent_name=agent_name,
             started_at=self._clock(),
         )
-        self._status_ts: str | None = None
+        # Seeded only by dead-session recovery, which hands over the card the
+        # failed attempt already posted. Without this the recovery lifecycle
+        # posts a SECOND card, and the first one is never finalised — the turn
+        # driver withholds the failed attempt's terminal hook while a recovery
+        # is in flight, so on a successful recovery nothing ever collapses card
+        # one and it sits on "thinking" beside the answer. The turn marker
+        # written against the pre-recovery mapping row addresses the adopted
+        # card, so a restarted process repairs the card the user is actually
+        # watching rather than an abandoned one.
+        self._status_ts: str | None = adopt_status_ts
         self._last_flush: float = 0.0
         self._terminal: bool = False
         self.final_ts: str | None = None
 
+    @property
+    def status_ts(self) -> str | None:
+        """The ts of the status message this lifecycle is rendering into, or
+        None if nothing has been posted yet.
+
+        Public so the caller can record the turn marker (message ts, channel,
+        started_at) as soon as the card exists; nothing else should need it.
+        """
+        return self._status_ts
+
+    async def post_initial(self) -> None:
+        """Post the initial status card immediately, before session setup.
+
+        Called before session binding so the user gets instant feedback and
+        the Cancel button exists before the first SSE event -- MA
+        sessions.create plus the history replay and image download that
+        follow can hold for minutes. Runs before the turn starts (and
+        therefore before any render tick exists), so this is the one place
+        that deliberately flushes directly instead of waiting on an SSE
+        event. The cancel registration rides this first post via
+        _maybe_flush's first-post branch, so Cancel is live before the first
+        SSE event rather than after it.
+        """
+        await self._maybe_flush()
+
     async def on_sse_event(self, event: RawMessageStreamEvent) -> None:
+        # Cheap local tap per the hardened TurnLifecycle contract:
+        # the pump awaits this hook inline, so it stays a local reducer
+        # call only. The Block Kit flush (chat-API I/O) rides the render
+        # tick instead, where a slow or rate-limited chat.update only
+        # delays the render task, never the consume loop.
         embed_event = _map_sse_event(event)
         if embed_event is None:
             return
         self._state = update(self._state, embed_event)
-        await self._maybe_flush()
 
     async def _maybe_flush(self) -> None:
         """Post or update the status message, subject to debounce. No-op after terminal."""
@@ -373,7 +428,12 @@ class SlackTurnLifecycle:
                 self._deregister(self._status_ts)
 
     async def on_render(self, state: TurnState) -> None:
-        """No-op — Block Kit state is driven by SSE events, not render ticks."""
+        """Sole delivery path. `state` is unused: Slack's card is
+        driven by its own Block Kit `State` folded in `on_sse_event` — this
+        hook is the tick that delivers it."""
+        if self._terminal:
+            return
+        await self._maybe_flush()
 
     async def on_reconnect(self, reason: ReconnectReason) -> None:
         pass

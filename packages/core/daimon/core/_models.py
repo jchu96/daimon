@@ -315,11 +315,14 @@ class ThreadSession(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'live'"))
     # Set while a turn is running, cleared when it reaches a terminal state.
     # Distinct from `status`, which is about the session mapping and stays
-    # 'live' on every healthy thread forever.
+    # 'live' on every healthy thread forever. Slack needs the channel because a
+    # Slack message is addressed by (channel, ts); Discord leaves it NULL since
+    # a Discord message id is globally addressable on its own.
     active_turn_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     active_turn_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    active_turn_channel_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1088,8 +1091,12 @@ class SlackEventDedup(Base):
     event key. Dedup MUST be on this key, NOT envelope_id: reconnect redelivers
     the same logical event with a NEW envelope_id.
 
-    Unbounded for v1 (rows are tiny, no pruning job, no TTL, no delete
-    cost on the ack path).
+    Rows are pruned by age on a schedule: `daimon.core.slack_event_dedup_sweep`
+    deletes rows older than a 7-day retention window on every scheduler tick.
+    The ack path still pays no delete cost — pruning is out-of-band,
+    never per-turn. The window is chosen to outlive Slack's own
+    redelivery schedule by a wide margin, so a prune can never re-admit a
+    duplicate event.
 
     Private to `daimon.core.stores.**` per the import-linter ORM contract.
     """

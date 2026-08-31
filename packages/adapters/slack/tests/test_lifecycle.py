@@ -3,11 +3,21 @@
 Behavioral assertions — grouped by phase:
 
 Task 1 (debounce / registry / usage):
-  - First SSE event triggers exactly one chat.postMessage and zero chat.update.
-  - Second SSE event within 5s triggers NO chat.update (debounce window).
-  - SSE event after 5s triggers exactly one chat.update (debounce elapsed).
-  - First flush registers status_ts in the injected registry as (cancel Event, author_id).
+  - on_sse_event alone performs zero chat.postMessage and zero chat.update;
+    the following on_render posts immediately (flush rides the render
+    tick, not the SSE consume path).
+  - Two events plus two on_render ticks within 5s trigger NO chat.update
+    (debounce window).
+  - Events plus an on_render tick after 5s trigger exactly one chat.update
+    (debounce elapsed).
+  - The first flush's registration rides post_initial(); a later
+    render-tick update does not re-register.
   - _apply_usage folds usage_totals into merged usage_in / usage_out / cost_str.
+
+on_render error propagation:
+  - A failing chat.update surfaces out of on_render unswallowed -- the
+    driver's per-tick render error policy is what handles it.
+  - on_sse_event never raises for the identical scenario -- it performs no I/O.
 
 Task 2 (terminal paths — replace-in-place, overflow, collapse, failure, deregister):
   - on_terminal_success with text replaces status message in place (chat.update on status_ts).
@@ -142,6 +152,7 @@ def _make_lifecycle(
     *,
     model_id: str = "claude-sonnet-4-6",
     agent_name: str = "test-agent",
+    adopt_status_ts: str | None = None,
 ) -> tuple[SlackTurnLifecycle, asyncio.Event, dict[str, tuple[asyncio.Event, str]], list[str]]:
     """Create a SlackTurnLifecycle with recorder callables for registry operations.
 
@@ -170,6 +181,7 @@ def _make_lifecycle(
         model_id=model_id,
         register=register,
         deregister=deregister,
+        adopt_status_ts=adopt_status_ts,
     )
     return lc, cancel, registered, deregistered
 
@@ -179,42 +191,62 @@ def _make_lifecycle(
 # ---------------------------------------------------------------------------
 
 
-async def test_first_sse_event_posts_immediately(fake_slack_web_client: Any) -> None:
-    """First SSE event triggers exactly one chat.postMessage and zero chat.update."""
+async def test_on_sse_event_performs_no_io_then_on_render_posts_immediately(
+    fake_slack_web_client: Any,
+) -> None:
+    """on_sse_event alone performs zero chat-API I/O; a following on_render posts.
+
+    The flush moved off the SSE consume path: folding an event is a
+    local reducer call only, and the first chat.postMessage now happens on
+    the next render tick.
+    """
     lc, *_ = _make_lifecycle(fake_slack_web_client)
 
     await lc.on_sse_event(_thinking_event())
 
-    assert _post_count(fake_slack_web_client) == 1, (
-        "first SSE event must trigger exactly one chat.postMessage (immediate flush)"
+    assert _post_count(fake_slack_web_client) == 0, (
+        "on_sse_event must perform zero chat.postMessage — the flush rides the render tick"
     )
     assert _update_count(fake_slack_web_client) == 0, (
-        "no chat.update on the first event — status message not yet established"
+        "on_sse_event must perform zero chat.update — no I/O on the SSE consume path"
+    )
+
+    await lc.on_render(TurnState())
+
+    assert _post_count(fake_slack_web_client) == 1, (
+        "the following render tick must trigger exactly one chat.postMessage (immediate flush)"
+    )
+    assert _update_count(fake_slack_web_client) == 0, (
+        "no chat.update on the first flush — status message not yet established"
     )
 
 
 async def test_second_event_within_debounce_no_update(fake_slack_web_client: Any) -> None:
-    """Second SSE event within 5s of the first triggers NO chat.update (debounce window)."""
+    """Two events plus two on_render ticks inside the debounce window produce one post, no update."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
 
     await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())  # first render tick — immediate post, no debounce
     await lc.on_sse_event(_tool_event())  # within debounce window (no time elapsed)
+    await lc.on_render(TurnState())  # second render tick — still within debounce
 
     assert _post_count(fake_slack_web_client) == 1, (
-        "second event within debounce must not post a new message"
+        "second render tick within debounce must not post a new message"
     )
     assert _update_count(fake_slack_web_client) == 0, "no chat.update within the 5s debounce window"
 
 
 async def test_event_after_debounce_triggers_update(fake_slack_web_client: Any) -> None:
-    """SSE event after 5s debounce window triggers exactly one chat.update."""
+    """SSE events plus an on_render tick past the debounce window trigger one chat.update."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
 
-    await lc.on_sse_event(_thinking_event())  # initial post
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())  # initial post
     # Backdate _last_flush to simulate 6s elapsed (established idiom from Discord tests)
     lc._last_flush = time.monotonic() - 6.0  # pyright: ignore[reportPrivateUsage]  # backdating debounce
 
     await lc.on_sse_event(_tool_event())
+    await lc.on_render(TurnState())
 
     assert _post_count(fake_slack_web_client) == 1, "debounced update must NOT post a new message"
     assert _update_count(fake_slack_web_client) == 1, (
@@ -228,18 +260,229 @@ async def test_event_after_debounce_triggers_update(fake_slack_web_client: Any) 
 
 
 async def test_first_flush_registers_status_ts(fake_slack_web_client: Any) -> None:
-    """First flush registers status_ts with (cancel Event, author_id) in the registry."""
+    """The first flush's registration rides post_initial(); a later
+    render-tick update must not re-register."""
     lc, cancel, registered, _ = _make_lifecycle(fake_slack_web_client)
 
-    await lc.on_sse_event(_thinking_event())
+    await lc.post_initial()
 
-    assert len(registered) == 1, "exactly one registration after the first flush"
+    assert len(registered) == 1, "exactly one registration after post_initial()'s first flush"
     ts, (reg_event, reg_author) = next(iter(registered.items()))
     assert ts == "1000000000.000001", (
         "registered ts must match the ts from the chat.postMessage response"
     )
     assert reg_event is cancel, "registered cancel event must be the one injected at construction"
     assert reg_author == "U_AUTHOR", "registered author_id must match the constructor arg"
+
+    # A later render-tick update (debounce elapsed) must not add a second registration.
+    await lc.on_sse_event(_thinking_event())
+    lc._last_flush = time.monotonic() - 6.0  # pyright: ignore[reportPrivateUsage]  # backdating debounce
+    await lc.on_render(TurnState())
+
+    assert len(registered) == 1, "a debounced render-tick update must not add a second registration"
+
+
+# ---------------------------------------------------------------------------
+# Adopting construction path (dead-session recovery): the caller hands over
+# the pre-recovery card's ts instead of letting the lifecycle post a new one.
+# ---------------------------------------------------------------------------
+
+_ADOPTED_TS = "1111.1"
+
+
+async def test_status_ts_reports_the_adopted_ts_before_anything_is_posted(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle reports the adopted ts with no chat-API I/O.
+
+    The caller can read status_ts immediately after construction, before
+    the turn has rendered anything at all.
+    """
+    lc, *_ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    assert lc.status_ts == _ADOPTED_TS, "status_ts must report the adopted ts immediately"
+    assert _post_count(fake_slack_web_client) == 0, (
+        "reading status_ts on an adopting lifecycle must not perform any chat-API I/O"
+    )
+
+
+async def test_an_adopting_lifecycle_updates_the_adopted_card_instead_of_posting_a_new_one(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle's first flush updates the adopted card, not a new one.
+
+    A recovered turn must not leave a second card behind: nothing would ever
+    finalise it, and the marker written against the pre-recovery mapping row
+    would address a card nobody is rendering into.
+    """
+    lc, *_ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+
+    assert _post_count(fake_slack_web_client) == 0, (
+        "a recovered turn must not post a second status card"
+    )
+    assert _update_count(fake_slack_web_client) == 1, (
+        "an adopting lifecycle's first render tick must update, not post"
+    )
+    calls = fake_slack_web_client.mock.requests.get(("POST", _UPDATE_URL), [])
+    body = calls[-1].kwargs["json"]
+    assert body["ts"] == _ADOPTED_TS, "the update must target the adopted ts"
+    assert body["channel"] == "C_TEST", "the update must target the constructor's channel"
+
+
+async def test_an_adopting_lifecycles_first_render_tick_updates_without_waiting_out_the_debounce(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle's first render tick updates immediately, no debounce wait.
+
+    The debounce clock starts already satisfied against a monotonic clock, so
+    the very first flush after construction updates with no wait -- this test
+    pins that consequence with no debounce-window backdating of its own. If a
+    future change seeds the debounce clock from `time.monotonic()` at
+    construction instead of leaving it at its zero value, this goes red.
+    """
+    lc, *_ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+
+    assert _update_count(fake_slack_web_client) == 1, (
+        "the first render tick on an adopting lifecycle must update immediately, "
+        "with no debounce wait -- if a future change seeds the debounce clock from "
+        "time.monotonic() at construction, this must fail"
+    )
+
+
+async def test_an_adopting_lifecycle_registers_no_cancel_entry_of_its_own(
+    fake_slack_web_client: Any,
+) -> None:
+    """An adopting lifecycle never registers a cancel entry of its own.
+
+    It never takes the first-post branch that registers -- the caller
+    handing over the ts owns rebinding the registry entry.
+    """
+    lc, _, registered, _ = _make_lifecycle(fake_slack_web_client, adopt_status_ts=_ADOPTED_TS)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+
+    assert registered == {}, (
+        "an adopting lifecycle must not register anything -- the caller rebinds"
+    )
+
+
+async def test_a_terminal_success_on_an_adopting_lifecycle_replaces_the_adopted_card(
+    fake_slack_web_client: Any,
+) -> None:
+    """The terminal render on an adopting lifecycle lands on the adopted card.
+
+    This is the assertion that the answer ends up on the card the user has
+    been watching, not on a second, freshly-posted one.
+    """
+    lc, _, _registered, deregistered = _make_lifecycle(
+        fake_slack_web_client, adopt_status_ts=_ADOPTED_TS
+    )
+
+    state = TurnState(content=[TextBlock(kind="text", text="The answer is 42.")])
+    await lc.on_terminal_success(state)
+
+    assert _post_count(fake_slack_web_client) == 0, "a single chunk needs no overflow post"
+    calls = fake_slack_web_client.mock.requests.get(("POST", _UPDATE_URL), [])
+    assert calls, "terminal success on an adopting lifecycle must chat.update"
+    body = calls[-1].kwargs["json"]
+    assert body["ts"] == _ADOPTED_TS, "the terminal render must target the adopted ts"
+    assert "The answer is 42." in _block_text(body["blocks"]), (
+        "the answer must land on the adopted card, the one the user has been watching"
+    )
+    assert lc.final_ts == _ADOPTED_TS, "final_ts must equal the adopted ts"
+    assert deregistered == [_ADOPTED_TS], "the adopted ts must be deregistered on terminal success"
+
+
+# ---------------------------------------------------------------------------
+# on_render must not swallow adapter failures -- the driver's per-tick
+# render error policy is what handles them.
+# ---------------------------------------------------------------------------
+
+
+async def test_raising_chat_update_propagates_out_of_on_render(
+    fake_slack_web_client: Any,
+) -> None:
+    """A rate-limited/failing chat.update surfaces out of on_render -- the
+    adapter does not swallow it, so the driver's per-tick policy handles it."""
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())  # first post — no update yet, succeeds
+    lc._last_flush = time.monotonic() - 6.0  # pyright: ignore[reportPrivateUsage]  # backdating debounce
+    await lc.on_sse_event(_tool_event())
+
+    _reset_slack_responses(fake_slack_web_client)
+    fake_slack_web_client.mock.post(  # pyright: ignore[reportUnknownMemberType]
+        str(_UPDATE_URL),
+        payload={"ok": False, "error": "ratelimited"},
+    )
+
+    with pytest.raises(SlackApiError):
+        await lc.on_render(TurnState())
+
+
+async def test_on_sse_event_never_raises_for_the_same_scenario(
+    fake_slack_web_client: Any,
+) -> None:
+    """The cheap local tap performs no I/O, so a failing chat.update never
+    reaches it -- only the render tick can hit that failure."""
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+
+    await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
+    lc._last_flush = time.monotonic() - 6.0  # pyright: ignore[reportPrivateUsage]  # backdating debounce
+
+    _reset_slack_responses(fake_slack_web_client)
+    fake_slack_web_client.mock.post(  # pyright: ignore[reportUnknownMemberType]
+        str(_UPDATE_URL),
+        payload={"ok": False, "error": "ratelimited"},
+    )
+
+    # Does not raise even though the next render tick would hit the failing
+    # update -- on_sse_event performs no I/O at all.
+    await lc.on_sse_event(_tool_event())
+
+
+# ---------------------------------------------------------------------------
+# post_initial() / status_ts
+# ---------------------------------------------------------------------------
+
+
+async def test_post_initial_posts_the_card_and_registers_cancel_before_any_sse_event(
+    fake_slack_web_client: Any,
+) -> None:
+    """post_initial() alone posts the card and registers Cancel, with no prior SSE event."""
+    lc, cancel, registered, _ = _make_lifecycle(fake_slack_web_client)
+
+    await lc.post_initial()
+
+    assert _post_count(fake_slack_web_client) == 1, (
+        "post_initial() must post exactly one chat.postMessage with no SSE event required"
+    )
+    assert lc.status_ts == CHAT_OK_PAYLOAD["ts"], (
+        "status_ts must reflect the ts returned by the post"
+    )
+    assert len(registered) == 1, (
+        "the Cancel button must exist before the first SSE event, not after it"
+    )
+    ts, (reg_event, reg_author) = next(iter(registered.items()))
+    assert ts == lc.status_ts, "registered ts must match status_ts"
+    assert reg_event is cancel, "registered cancel event must be the one injected at construction"
+    assert reg_author == "U_AUTHOR", "registered author_id must match the constructor arg"
+
+
+async def test_status_ts_is_none_before_anything_is_posted(fake_slack_web_client: Any) -> None:
+    """A freshly constructed lifecycle reports status_ts as None."""
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+
+    assert lc.status_ts is None, "status_ts must be None before anything has been posted"
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +541,8 @@ async def test_terminal_success_replaces_status_in_place(fake_slack_web_client: 
     First chunk is placed via chat.update (not a new chat.postMessage), so final_ts = status_ts.
     """
     lc, *_ = _make_lifecycle(fake_slack_web_client)
-    await lc.on_sse_event(_thinking_event())  # initial post (1 postMessage)
+    await lc.post_initial()  # initial post (1 postMessage)
+    await lc.on_sse_event(_thinking_event())  # folds the thinking trail entry, no flush
 
     state = TurnState(content=[TextBlock(kind="text", text="The answer is 42.")])
     await lc.on_terminal_success(state)
@@ -327,6 +571,7 @@ async def test_terminal_success_overflow_posts_and_widens_final_ts(
 ) -> None:
     """Long text splits into overflow chunks posted via chat.postMessage; final_ts = LAST ts."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
     initial_posts = _post_count(fake_slack_web_client)
 
@@ -352,6 +597,7 @@ async def test_terminal_success_bounds_notification_text_on_long_answers(
     notifications, so it must never grow with the answer.
     """
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     long_text = "y" * 24000  # forces chunks at the 11800 block limit
@@ -392,6 +638,7 @@ async def test_terminal_success_tool_only_leaves_collapsed_done(
 ) -> None:
     """Tool-only turn (no final text after last ToolUseBlock) leaves the collapsed done; no overflow."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
     initial_posts = _post_count(fake_slack_web_client)
 
@@ -425,6 +672,7 @@ async def test_terminal_success_empty_content_shows_turn_cancelled(
 ) -> None:
     """Empty content (no blocks) triggers a chat.update with 'Turn cancelled.'."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState()  # completely empty
@@ -450,6 +698,7 @@ async def test_terminal_success_empty_content_shows_turn_cancelled(
 async def test_terminal_failure_does_not_raise(fake_slack_web_client: Any) -> None:
     """on_terminal_failure updates/posts error state and does NOT raise."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState()
@@ -476,6 +725,7 @@ async def test_deregister_called_in_terminal_success_finally(
 ) -> None:
     """deregister is invoked for status_ts in the on_terminal_success finally block."""
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(content=[TextBlock(kind="text", text="Hello.")])
@@ -490,6 +740,7 @@ async def test_deregister_called_in_terminal_failure_finally(
 ) -> None:
     """deregister is invoked for status_ts in the on_terminal_failure finally block."""
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState()
@@ -548,6 +799,7 @@ async def test_terminal_success_flush_failure_repairs_status_message(
     """
     _stage_flush_failure_then_repair_ok(fake_slack_web_client, error="msg_too_long")
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(content=[TextBlock(kind="text", text="The answer is 42.")])
@@ -586,6 +838,7 @@ async def test_terminal_success_swallows_repair_failure(
         repeat=True,
     )
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(content=[TextBlock(kind="text", text="Hello.")])
@@ -651,6 +904,7 @@ async def test_terminal_success_overflow_failure_keeps_replaced_answer(
         repeat=True,
     )
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     long_text = "x" * 24000  # forces overflow chunks past the first update
@@ -674,6 +928,7 @@ async def test_terminal_failure_flush_failure_repairs_status_message(
     """on_terminal_failure's own flush failure gets the same repair treatment."""
     _stage_flush_failure_then_repair_ok(fake_slack_web_client, error="msg_too_long")
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     await lc.on_terminal_failure(TurnState(), RuntimeError("upstream blew up"))
@@ -715,6 +970,7 @@ async def test_terminal_success_transport_error_repairs_and_does_not_raise(
         repeat=True,
     )
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(content=[TextBlock(kind="text", text="Hello.")])
@@ -748,6 +1004,7 @@ async def test_terminal_failure_transport_error_in_flush_and_repair_does_not_rai
         repeat=True,
     )
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     await lc.on_terminal_failure(TurnState(), RuntimeError("upstream blew up"))
@@ -765,6 +1022,7 @@ async def test_terminal_success_cancelled_collapse_repair_does_not_claim_an_answ
     """
     _stage_flush_failure_then_repair_ok(fake_slack_web_client, error="ratelimited")
     lc, _, _registered, deregistered = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     await lc.on_terminal_success(TurnState())  # empty content — cancelled path
@@ -790,6 +1048,7 @@ async def test_terminal_success_flush_failure_reaches_sentry(
     monkeypatch.setattr(lifecycle_mod, "capture_exception_with_scope", captured.append)
     _stage_flush_failure_then_repair_ok(fake_slack_web_client, error="msg_too_long")
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(content=[TextBlock(kind="text", text="Hello.")])
@@ -825,6 +1084,7 @@ async def test_lifecycle_satisfies_turn_lifecycle_protocol(fake_slack_web_client
 async def test_terminal_success_appends_feedback_buttons(fake_slack_web_client: Any) -> None:
     """An answered turn carries the 👍/👎 vote buttons on the final message."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(content=[TextBlock(kind="text", text="The answer is 42.")])
@@ -845,6 +1105,7 @@ async def test_overflow_puts_feedback_buttons_on_last_chunk_only(
     message_id keys the same message the watermark does.
     """
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     long_text = "x" * 24000  # three chunks at _SLACK_LIMIT=11800
@@ -869,6 +1130,7 @@ async def test_overflow_puts_feedback_buttons_on_last_chunk_only(
 async def test_tool_only_turn_gets_no_feedback_buttons(fake_slack_web_client: Any) -> None:
     """A turn with no final answer text must not invite feedback on it."""
     lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
 
     state = TurnState(

@@ -26,6 +26,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
 from daimon.adapters.scheduler.main import (
     _build_fire,  # pyright: ignore[reportPrivateUsage]  # test seam for balance gate + debit binding
     _CapsAdapter,  # pyright: ignore[reportPrivateUsage]  # named test seam for cap wiring
+    _sweep_slack_event_dedup,  # pyright: ignore[reportPrivateUsage]  # test seam for the slack_event_dedup sweep wrapper
     _sweep_wizard_sessions,  # pyright: ignore[reportPrivateUsage]  # test seam for the wizard sweep wrapper
     _validate_mcp_settings,  # pyright: ignore[reportPrivateUsage]  # boot-validation seam
 )
@@ -790,4 +791,45 @@ async def test_sweep_wizard_sessions_forwards_sessionmaker_and_returns_cleanly(
 
     assert captured_sm == [db_session_factory], (
         "wrapper must forward the injected sessionmaker to the core sweep unchanged"
+    )
+
+
+async def test_sweep_slack_event_dedup_swallows_sqlalchemy_error(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A SQLAlchemyError from the core sweep must not propagate — the wrapper's
+    named boundary catch exists so a DB hiccup cannot kill the scheduler loop."""
+    with unittest.mock.patch(
+        "daimon.adapters.scheduler.main.sweep_expired_slack_event_dedup",
+        side_effect=SQLAlchemyError("boom"),
+    ):
+        await _sweep_slack_event_dedup(db_session_factory)  # must not raise
+
+
+async def test_sweep_slack_event_dedup_forwards_sessionmaker_and_returns_cleanly(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Happy path: the wrapper forwards the injected sessionmaker to the core
+    sweep and passes a timezone-aware `now`."""
+    captured_sm: list[async_sessionmaker[AsyncSession]] = []
+    captured_now: list[datetime] = []
+
+    async def fake_sweep(
+        sm: async_sessionmaker[AsyncSession], *, now: datetime, limit: int = 500
+    ) -> int:
+        captured_sm.append(sm)
+        captured_now.append(now)
+        return 0
+
+    with unittest.mock.patch(
+        "daimon.adapters.scheduler.main.sweep_expired_slack_event_dedup",
+        side_effect=fake_sweep,
+    ):
+        await _sweep_slack_event_dedup(db_session_factory)
+
+    assert captured_sm == [db_session_factory], (
+        "wrapper must forward the injected sessionmaker to the core sweep unchanged"
+    )
+    assert captured_now[0].tzinfo is not None, (
+        "wrapper must pass a timezone-aware `now` to the core sweep"
     )

@@ -76,8 +76,10 @@ async def test_thinking_tool_then_success_sequence(
     clock = _make_clock([100.0, 100.0, 106.0, 116.0])
     lc = _make_lifecycle(fake_slack_web_client, clock)
 
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
     await lc.on_sse_event(_tool_use_event("Bash"))
+    await lc.on_render(TurnState())
 
     state = TurnState(
         content=[TextBlock(kind="text", text="Here is the answer.")],
@@ -102,7 +104,9 @@ async def test_terminal_failure_sequence(
     clock = _make_clock([100.0, 100.0, 112.0])
     lc = _make_lifecycle(fake_slack_web_client, clock)
 
+    await lc.post_initial()
     await lc.on_sse_event(_thinking_event())
+    await lc.on_render(TurnState())
 
     state = TurnState(
         usage_totals=UsageTotals(

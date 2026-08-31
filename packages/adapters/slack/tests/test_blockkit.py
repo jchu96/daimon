@@ -21,6 +21,7 @@ from daimon.adapters.slack.blockkit import (
     TurnPhase,
     _fmt_tokens,
     to_blocks,
+    to_interrupted_blocks,
     update,
 )
 
@@ -263,3 +264,36 @@ class TestToBlocks:
         assert _fmt_tokens(1500) == "1.5k", "1500 humanizes to 1.5k"
         assert _fmt_tokens(0) == "0", "zero renders as 0"
         assert _fmt_tokens(12000) == "12k", "whole-thousand strips trailing .0"
+
+
+# ---------------------------------------------------------------------------
+# to_interrupted_blocks() -- the boot sweep's frozen-card renderer
+# ---------------------------------------------------------------------------
+
+
+class TestToInterruptedBlocks:
+    def test_returns_exactly_one_section_block_with_mrkdwn_text(self) -> None:
+        blocks = to_interrupted_blocks()
+        assert len(blocks) == 1, "the frozen card is a single block, nothing else"
+        assert blocks[0]["type"] == "section", (
+            "the house pattern for a whole-card notice is section"
+        )
+        assert blocks[0]["text"]["type"] == "mrkdwn", "notice text must be mrkdwn"
+
+    def test_no_block_is_an_actions_block(self) -> None:
+        blocks = to_interrupted_blocks()
+        action_blocks = _find_blocks_by_type(blocks, "actions")
+        assert not action_blocks, "a dead turn must not offer a Cancel button"
+
+    def test_notice_text_is_character_identical_to_discord_copy(self) -> None:
+        # Literal, not imported from the Discord adapter -- import-linter's
+        # independence contract forbids cross-adapter imports, and the point
+        # of this test is that the two hand-kept literals stay in sync.
+        discord_copy = (
+            "❌ This turn was interrupted by a restart and cannot be "
+            "resumed. Nothing was lost on your side — mention me again to retry."
+        )
+        blocks = to_interrupted_blocks()
+        assert blocks[0]["text"]["text"] == discord_copy, (
+            "Slack's retirement copy must be byte-identical to Discord's"
+        )

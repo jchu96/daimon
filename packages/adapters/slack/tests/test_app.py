@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import pathlib
@@ -18,13 +19,14 @@ import re
 import re as _re
 import uuid
 from collections.abc import Callable, Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import httpx
+import pytest
 import structlog.testing
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
@@ -44,10 +46,15 @@ from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.stores import tenant_ledger, usage_events
+from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token, upsert_slack_bot_token
 from daimon.core.stores.tenants import get_tenant
-from daimon.core.stores.thread_sessions import create_thread_session, get_live_thread_session
+from daimon.core.stores.thread_sessions import (
+    create_thread_session,
+    get_live_thread_session,
+    list_orphaned_turns,
+)
 from daimon.core.turn.posture import Billed, BillingPosture
 from daimon.core.turn.state import TextBlock, ToolUseBlock, TurnState
 from daimon.testing.ma import (
@@ -1113,8 +1120,22 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
     # in test_orchestrate_first_turn_*).
     fake_principal = MagicMock()
     fake_principal.account_id = uuid.uuid4()
-    fake_row = MagicMock()
-    fake_row.id = uuid.uuid4()
+    # The patched store returns the same validated Pydantic type the real
+    # store returns, so a field the production code reads is a real value
+    # or a loud failure, never an auto-generated mock attribute.
+    now = datetime.now(UTC)
+    fake_thread_session_row = ThreadSessionRow(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id=thread_ts,
+        account_id=uuid.uuid4(),
+        ma_session_id="sess-coalesce-001",
+        watermark_message_id=None,
+        status="live",
+        created_at=now,
+        updated_at=now,
+    )
 
     with (
         patch(
@@ -1144,7 +1165,7 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
     ):
         mock_principal.return_value = fake_principal
         mock_get_session.return_value = None  # simulate new thread each time
-        mock_create_ts.return_value = fake_row
+        mock_create_ts.return_value = fake_thread_session_row
         mock_resolve_agent.return_value = "agent_coalesce_id"
         mock_resolve_env.return_value = "env_coalesce_id"
         _now_c = datetime.now(UTC)
@@ -2047,7 +2068,9 @@ async def test_run_thread_turn_two_turns_same_session_chain_sweeps_serially(
         patch(
             "daimon.core.turn.prepare.get_live_thread_session", new_callable=AsyncMock
         ) as mock_get_session,
-        patch("daimon.core.turn.prepare.create_thread_session", new_callable=AsyncMock),
+        patch(
+            "daimon.core.turn.prepare.create_thread_session", new_callable=AsyncMock
+        ) as mock_create_ts,
         patch("daimon.adapters.slack.app.update_watermark", new_callable=AsyncMock),
         patch(
             "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
@@ -2064,6 +2087,23 @@ async def test_run_thread_turn_two_turns_same_session_chain_sweeps_serially(
         ) as mock_deliver_outputs,
     ):
         mock_get_session.return_value = None
+        # The patched store returns the same validated Pydantic type the real
+        # store returns, so a field the production code reads is a real value
+        # or a loud failure, never an auto-generated mock attribute.
+        now = datetime.now(UTC)
+        fake_thread_session_row = ThreadSessionRow(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            platform="slack",
+            thread_id=thread_ts,
+            account_id=uuid.uuid4(),
+            ma_session_id="sess-chain-001",
+            watermark_message_id=None,
+            status="live",
+            created_at=now,
+            updated_at=now,
+        )
+        mock_create_ts.return_value = fake_thread_session_row
         mock_resolve_agent.return_value = "agent_sweep_id"
         mock_resolve_env.return_value = "env_sweep_id"
         # Both turns land on the SAME MA session id — the chain key.
@@ -3376,10 +3416,12 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
 ) -> None:
     """A `bind_session` ceiling breach (D-03/D-10) must surface through
     Slack's EXISTING generic `DaimonError` boundary in `_handle_app_mention`
-    -- exactly one in-thread failure message is posted and no exception
-    escapes the background task. Pins that plan 19-03's new ceiling raise
-    site lands in Slack's existing boundary with zero new adapter
-    error-handling code (T-19-10-C). Reuses
+    -- no exception escapes the background task. The status card now posts
+    BEFORE `bind_session`, so a bind-phase ceiling breach leaves
+    exactly two posts in the thread: the status card first, then the
+    boundary's in-thread failure notice last. Pins that the core ceiling
+    raise site lands in Slack's existing boundary with zero new
+    adapter error-handling code. Reuses
     `test_handle_app_mention_failure_posts_error_into_thread`'s harness
     shape/assertions rather than inventing a second one.
     """
@@ -3440,12 +3482,851 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
         if url == URL("https://slack.com/api/chat.postMessage")
         for req in reqs
     ]
-    assert len(posts) == 1, (
-        "a bind-phase ceiling breach must post exactly one in-thread failure message"
+    assert len(posts) == 2, (
+        "the status card posts before bind_session; a bind-phase ceiling "
+        "breach must leave exactly two posts -- the card, then the failure notice"
     )
-    body = posts[0].kwargs["json"]
+    first_body = posts[0].kwargs["json"]
+    assert "rid:" not in first_body.get("text", ""), (
+        "the FIRST post must be the pre-bind status card, not the failure notice"
+    )
+    failure_posts = [p for p in posts if "rid:" in p.kwargs["json"].get("text", "")]
+    assert len(failure_posts) == 1, "exactly one post must be the boundary's failure notice"
+    body = failure_posts[0].kwargs["json"]
     assert body["channel"] == channel
     assert body["thread_ts"] == thread_ts, "the failure notice must land in the mention's thread"
+
+
+async def test_run_thread_turn_pump_phase_ceiling_renders_terminal_error_in_thread(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A pump-phase ceiling breach -- a TimeoutError inside run_prepared_turn's
+    own asyncio.wait_for, raised AFTER bind_session has already returned --
+    does NOT raise out of run_prepared_turn. It marks the mapping row dead,
+    calls lifecycle.on_terminal_failure directly (guarded by its own
+    try/except so a broken render hook cannot mask the ceiling error), and
+    returns a RunOutcome carrying state.error.kind == "ceiling". So this test
+    asserts a rendered terminal error card in-thread, not a boundary catch --
+    the bind-phase counterpart (raised from bind_session, unwinding through
+    _handle_app_mention's boundary) is already pinned above at
+    test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_mention.
+
+    A globally-past deadline cannot be used to force this breach:
+    _run_thread_turn threads ONE shared deadline into both bind_session and
+    run_prepared_turn, and remaining_s clamps to a small positive floor, so a
+    past deadline would breach at bind_session's own asyncio.wait_for before
+    run_prepared_turn is ever reached -- that would silently re-test the
+    bind-phase path instead of this one. Instead: turn_deadline is patched to
+    return a near-future deadline (2s -- survivable by the mocked bind) and
+    run_turn is patched to sleep past it (5s). The patch target is
+    daimon.core.turn.run.run_turn -- the module that IMPORTS the name and is
+    the one run_prepared_turn actually calls -- not the defining module
+    (daimon.core.turn's driver submodule); patching that one would rebind a
+    name nobody reads and the pump would never sleep.
+
+    Two pre-existing Slack behaviours a reader will trip on here, left alone
+    on purpose (not this plan's job to "fix"): Slack's watermark gate has no
+    state.error branch (unlike Discord's), so this breach DOES write a
+    watermark onto the row mark_dead just set to status='dead' -- functionally
+    inert, since dead rows are excluded from get_live_thread_session; and
+    on_terminal_failure sets final_ts to the status ts on its normal flush
+    path, which is why that watermark write fires at all.
+    """
+    from daimon.core.turn.ceiling import CEILING_MESSAGE
+
+    team_id = "T_PUMP_CEILING"
+    channel = "C_TEST"
+    thread_ts = "9000000045.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-pump-ceiling-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_PUMP_CEILING",
+        "text": "<@U_BOT> hello",
+    }
+
+    async def _sleepy_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        await asyncio.sleep(5.0)
+        return TurnState(content=[TextBlock(kind="text", text="too late")])
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.adapters.slack.app.turn_deadline") as mock_turn_deadline,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.return_value = _fake_session
+        mock_turn_deadline.side_effect = lambda *, now, **_: now + timedelta(seconds=2)
+        mock_run_turn.side_effect = _sleepy_run_turn
+
+        # No exception must escape -- the pump-phase breach returns a
+        # RunOutcome rather than raising.
+        await app._run_thread_turn(  # pyright: ignore[reportPrivateUsage]
+            event,
+            channel=channel,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+            thread_id=thread_ts,
+            team_id=team_id,
+        )
+
+    update_calls = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == URL("https://slack.com/api/chat.update")
+        for req in reqs
+    ]
+    assert update_calls, (
+        "the pump-phase breach must render through chat.update against the "
+        "status card post_initial() already established -- not a new post"
+    )
+    last_blocks = update_calls[-1].kwargs["json"]["blocks"]
+    rendered_text = " ".join(
+        element.get("text", "")
+        for block in last_blocks
+        for element in block.get("elements", [block])
+        if isinstance(element, dict)
+    )
+    assert "❌" in rendered_text, "a ceiling breach must render the terminal error emoji"
+    assert CEILING_MESSAGE in rendered_text, (
+        "the rendered card must carry the shared CEILING_MESSAGE text -- no new "
+        "Slack-specific ceiling copy may be introduced"
+    )
+
+    async with db_session_factory() as s:
+        orphaned = await list_orphaned_turns(s, platform="slack")
+    assert orphaned == [], (
+        "a ceilinged turn must not be swept as an orphan on the next boot -- the "
+        "marker must be cleared even though run_prepared_turn returns rather than raises"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Turn marker + cancel-registry bookkeeping across the pre-bind stretch (20-02)
+# ---------------------------------------------------------------------------
+
+
+async def test_bind_phase_failure_leaves_no_cancel_registry_entry(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A card left behind by a bind-phase failure must not keep a live Cancel
+    entry for the life of the process -- the outer bookkeeping finally opens
+    at post_initial(), before bind_session, so it still runs on this path."""
+    from daimon.core.turn.ceiling import ceiling_error
+
+    team_id = "T_BIND_FAIL_CANCEL"
+    channel = "C_TEST"
+    thread_ts = "9000000042.000001"
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+
+    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    await upsert_slack_bot_token(
+        db_session,
+        team_id=team_id,
+        encrypted_token=encrypt_token(fernet, "xoxb-bind-fail"),
+    )
+    await db_session.flush()
+
+    app, _ = _make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "channel": channel,
+        "event_ts": thread_ts,
+        "ts": thread_ts,
+        "thread_ts": thread_ts,
+        "user": "U_AUTHOR_BIND_FAIL",
+        "text": "<@U_BOT> hello",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
+        ) as mock_over_balance,
+        patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch(
+            "daimon.adapters.slack.app.bind_session", new_callable=AsyncMock
+        ) as mock_bind_session,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_over_balance.return_value = False
+        mock_over_cap.return_value = False
+        mock_bind_session.side_effect = ceiling_error()
+
+        await app._handle_app_mention(event, team_id=team_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert app._cancel_registry == {}, (  # pyright: ignore[reportPrivateUsage]
+        "a card left behind by a bind-phase failure must not keep a live Cancel "
+        "entry -- the outer finally must deregister it even though bind_session "
+        "never returned"
+    )
+
+
+async def test_interstitial_failure_clears_the_marker_and_the_cancel_registry(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A failure AFTER bind_session succeeds (so the marker IS written) but
+    BEFORE run_prepared_turn -- the stretch the inner finally cannot reach --
+    must still clear both the marker and the cancel-registry entry. This is
+    the path that fails if the outer try is placed too low (e.g. only around
+    run_prepared_turn, matching the inner finally instead of opening at
+    post_initial()). Drives through _handle_app_mention (not _orchestrate
+    directly) so the assertion also proves no exception escapes the real
+    listener boundary."""
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_INTERSTITIAL_FAIL"
+    channel = "C_TEST"
+    thread_ts = "9000000043.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    await upsert_slack_bot_token(
+        db_session,
+        team_id=team_id,
+        encrypted_token=encrypt_token(fernet, "xoxb-interstitial"),
+    )
+    await db_session.flush()
+    async with db_session_factory() as s:
+        await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_INTERSTITIAL"
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-interstitial-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_INTERSTITIAL",
+        "text": "<@U_BOT> hello",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch(
+            "daimon.adapters.slack.app.download_as_image_blocks", new_callable=AsyncMock
+        ) as mock_download_images,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.return_value = _fake_session
+        mock_download_images.side_effect = SlackApiError("down", MagicMock())
+
+        # No exception must escape -- the real listener boundary in
+        # _handle_app_mention handles it.
+        await app._handle_app_mention(event, team_id=team_id)  # pyright: ignore[reportPrivateUsage]
+
+    mock_run_turn.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+    assert app._cancel_registry == {}, (  # pyright: ignore[reportPrivateUsage]
+        "an interstitial failure between bind_session and run_prepared_turn "
+        "must still drop the cancel-registry entry"
+    )
+    async with db_session_factory() as s:
+        orphaned = await list_orphaned_turns(s, platform="slack")
+    assert orphaned == [], (
+        "an interstitial failure between bind_session and run_prepared_turn must "
+        "still clear the turn marker -- otherwise a boot sweep would find a wedged "
+        "card for a turn that already unwound to the boundary catch"
+    )
+
+
+async def test_run_thread_turn_clears_the_active_turn_marker_on_success(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """On the success path, the outer finally clears the marker it wrote --
+    no row is left behind for a boot sweep to (wrongly) treat as wedged."""
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_MARKER_CLEAR_SUCCESS"
+    channel = "C_TEST"
+    thread_ts = "9000000044.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    async with db_session_factory() as s:
+        pre_principal = await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_MARKER_CLEAR"
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_marker", type="agent.tool_use", name="bash", input={}
+                ),
+                TextBlock(kind="text", text="Done."),
+            ]
+        )
+        await lifecycle.on_terminal_success(state)
+        return state
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_MARKER_CLEAR",
+        "text": "<@U_BOT> hello",
+    }
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-marker-clear-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock),
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.return_value = _fake_session
+        mock_run_turn.side_effect = _fake_run_turn
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    async with db_session_factory() as s:
+        orphaned = await list_orphaned_turns(s, platform="slack")
+        row = await get_live_thread_session(
+            s,
+            tenant_id=tenant_id,
+            platform="slack",
+            thread_id=thread_ts,
+            account_id=pre_principal.account_id,
+        )
+
+    assert orphaned == [], "the marker must be cleared on the success path"
+    assert row is not None
+    assert row.active_turn_channel_id is None, (
+        "active_turn_channel_id must be nulled alongside the rest of the marker on success"
+    )
+
+
+async def test_marker_is_written_with_channel_before_the_turn_runs(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """The turn marker (message ts + channel) is visible in the DB WHILE the
+    turn is running -- inspected from inside the fake run_turn, patched at
+    daimon.core.turn.run.run_turn (the name run_prepared_turn actually reads;
+    patching daimon.core.turn.driver.run_turn would rebind a name nothing
+    reads and the fake would never run)."""
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_MARKER_MID_TURN"
+    channel = "C_TEST"
+    thread_ts = "9000000045.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    async with db_session_factory() as s:
+        pre_principal = await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_MARKER_MID"
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    observed: dict[str, Any] = {}
+
+    async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        # Inspect DB state WHILE the turn is running -- before any terminal
+        # hook has a chance to clear the marker.
+        async with db_session_factory() as s:
+            row = await get_live_thread_session(
+                s,
+                tenant_id=tenant_id,
+                platform="slack",
+                thread_id=thread_ts,
+                account_id=pre_principal.account_id,
+            )
+        assert row is not None
+        observed["active_turn_message_id"] = row.active_turn_message_id
+        observed["active_turn_channel_id"] = row.active_turn_channel_id
+
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_mid", type="agent.tool_use", name="bash", input={}
+                ),
+                TextBlock(kind="text", text="Mid-turn."),
+            ]
+        )
+        await lifecycle.on_terminal_success(state)
+        return state
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_MARKER_MID",
+        "text": "<@U_BOT> hello",
+    }
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-marker-mid-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock),
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.return_value = _fake_session
+        mock_run_turn.side_effect = _fake_run_turn
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    assert observed["active_turn_message_id"] == "1000000000.000001", (
+        "the marker's message ts must equal the status card's ts while the turn runs"
+    )
+    assert observed["active_turn_channel_id"] == channel, (
+        "the marker's channel must equal the mention's channel while the turn runs"
+    )
+
+
+async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A Slack turn that recovers from a dead session keeps rendering into the
+    card it started with, instead of abandoning it for a second, untracked one.
+
+    Drives one dead-session-recovery scenario through the real adapter
+    boundary and pins four properties from a single set of observations taken
+    mid-recovery (inside the second run_turn call):
+
+    1. One card. Exactly one chat.postMessage happens across the whole turn --
+       the count observed mid-recovery is already 1, and it never grows.
+    2. The marker addresses the live card. The one row list_orphaned_turns
+       would return mid-recovery has active_turn_message_id/channel equal to
+       the card the recovered turn is rendering into, not the abandoned first
+       card -- this is what a restarted process would find and repair.
+    3. The terminal render lands there. The recovered turn's answer is
+       chat.update'd onto that same card.
+    4. Cancel is rebound. The registry entry for that card's ts is bound to
+       the SECOND run_turn call's cancel Event (identity, not equality), and
+       the author id is unchanged, so a Cancel click during recovery stops
+       the turn that is actually running and is still refused for anyone but
+       the author.
+
+    The Slack API fake returns a constant ts for every chat.postMessage, so a
+    second card would be indistinguishable from the first by ts alone -- the
+    postMessage COUNT is what proves adoption. Weakening assertion 1 to a ts
+    comparison would make this test pass against the pre-adoption code.
+    """
+    import anthropic as _anthropic
+    from daimon.core.errors import TurnError
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    team_id = "T_RECOVERED_TURN"
+    channel = "C_TEST"
+    thread_ts = "9000000050.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    async with db_session_factory() as s:
+        await get_or_create_platform_principal(
+            s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_RECOVER"
+        )
+        await s.commit()
+
+    app, _ = _make_orchestrate_app(db_session_factory)
+
+    _now = datetime.now(UTC)
+
+    def _fake_session(session_id: str) -> BetaManagedAgentsSession:
+        return BetaManagedAgentsSession(
+            outcome_evaluations=[],
+            id=session_id,
+            agent=BetaManagedAgentsSessionAgent(
+                id="agent_test_id",
+                mcp_servers=[],
+                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+                name="test-agent",
+                skills=[],
+                tools=[],
+                type="agent",
+                version=1,
+            ),
+            created_at=_now,
+            environment_id="env_test_id",
+            metadata={},
+            resources=[],
+            stats=BetaManagedAgentsSessionStats(),
+            status="idle",
+            type="session",
+            updated_at=_now,
+            usage=BetaManagedAgentsSessionUsage(),
+            vault_ids=[],
+        )
+
+    first_session = _fake_session("sess-recover-first-001")
+    recovered_session = _fake_session("sess-recover-second-002")
+
+    # A real 404 APIStatusError behind a real httpx.Response -- the dead-session
+    # signature the recovery cycle recognizes and recovers from.
+    fake_request = MagicMock(spec=httpx.Request)
+    fake_response = httpx.Response(404, json={"type": "not_found_error", "message": "gone"})
+    fake_response.request = fake_request
+    dead_cause = _anthropic.APIStatusError(
+        "Session not found", response=fake_response, body={"type": "not_found_error"}
+    )
+    dead_state = TurnState(
+        error=TurnError(kind="upstream", message="Session not found", cause=dead_cause)
+    )
+    _ANSWER = "Recovered turn answer, distinctive marker qzx91."
+    success_state = TurnState(content=[TextBlock(kind="text", text=_ANSWER)])
+
+    post_url = URL("https://slack.com/api/chat.postMessage")
+    update_url = URL("https://slack.com/api/chat.update")
+
+    def _post_count() -> int:
+        return sum(
+            len(reqs)
+            for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+            if url == post_url
+        )
+
+    observed: dict[str, Any] = {}
+
+    async def _fake_run_turn(
+        *, lifecycle: Any, session_id: str, cancel: asyncio.Event, **kwargs: Any
+    ) -> TurnState:
+        if session_id == first_session.id:
+            observed["first_lifecycle"] = lifecycle
+            observed["first_cancel"] = cancel
+            # The deferred wrapper withholds this -- it must not render yet.
+            await lifecycle.on_terminal_failure(dead_state, dead_cause)
+            return dead_state
+
+        assert session_id == recovered_session.id, (
+            f"run_turn must be called only for the two known sessions, got {session_id}"
+        )
+        # Observations taken BEFORE any hook on the recovery lifecycle, so they
+        # reflect state while the recovered turn is actually in flight.
+        observed["post_count_mid_recovery"] = _post_count()
+        observed["status_ts"] = lifecycle.status_ts
+        observed["registry"] = dict(app._cancel_registry)  # pyright: ignore[reportPrivateUsage]
+        observed["second_cancel"] = cancel
+        async with db_session_factory() as s:
+            observed["orphans_mid_recovery"] = await list_orphaned_turns(s, platform="slack")
+        await lifecycle.on_terminal_success(success_state)
+        return success_state
+
+    event: dict[str, Any] = {
+        "type": "app_mention",
+        "ts": thread_ts,
+        "event_ts": thread_ts,
+        "channel": channel,
+        "user": "U_TEST_RECOVER",
+        "text": "<@U_BOT> hello",
+    }
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.prepare.create_session", new_callable=AsyncMock
+        ) as mock_create_session,
+        patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock) as mock_run_turn,
+        patch("daimon.adapters.slack.app.deliver_session_outputs", new_callable=AsyncMock),
+    ):
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env.return_value = "env_test_id"
+        mock_create_session.side_effect = [first_session, recovered_session]
+        mock_run_turn.side_effect = _fake_run_turn
+
+        await app._orchestrate(  # pyright: ignore[reportPrivateUsage]
+            event,
+            team_id=team_id,
+            channel=channel,
+            event_ts=thread_ts,
+            web_client=fake_slack_web_client.client,
+            tenant_id=tenant_id,
+        )
+        while app._bg_tasks:  # pyright: ignore[reportPrivateUsage]
+            await asyncio.gather(
+                *list(app._bg_tasks),  # pyright: ignore[reportPrivateUsage]
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+    # Non-vacuity: recovery must actually have run.
+    assert mock_run_turn.call_count == 2, "run_turn must be called twice: dead + recovered"
+    second_call_kwargs = mock_run_turn.call_args_list[1].kwargs
+    assert second_call_kwargs["session_id"] == recovered_session.id, (
+        "the second run_turn call must run against the recovered session"
+    )
+
+    # 1. One card.
+    assert observed["post_count_mid_recovery"] == 1, (
+        "mid-recovery, exactly one status card must have been posted -- a "
+        "recovered turn must not post a second card before anything else runs"
+    )
+    assert _post_count() == 1, (
+        "a recovered turn must not post a second status card, because nothing "
+        "would ever finalise the first one and the database marker would "
+        "address a card nobody is rendering into"
+    )
+
+    # 2. The marker addresses the live card.
+    orphans_mid_recovery = observed["orphans_mid_recovery"]
+    assert len(orphans_mid_recovery) == 1, (
+        "exactly one orphan-eligible row must exist while the recovered turn runs"
+    )
+    mid_row = orphans_mid_recovery[0]
+    assert mid_row.active_turn_message_id == observed["status_ts"], (
+        "the marker a restarted process would find must address the card the "
+        "recovered turn is rendering into"
+    )
+    assert mid_row.active_turn_channel_id == channel, (
+        "the marker's channel must equal the mention's channel"
+    )
+
+    # 3. The terminal render lands there.
+    update_calls = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == update_url
+        for req in reqs
+    ]
+    assert update_calls, "the recovered turn's terminal success must chat.update"
+    last_update_body = update_calls[-1].kwargs["json"]
+    assert last_update_body["ts"] == observed["status_ts"], (
+        "the card the user has been watching is the one that ends up carrying "
+        "the answer, so nothing is left showing a running turn"
+    )
+    rendered_text = json.dumps(last_update_body.get("blocks", []))
+    assert _ANSWER in rendered_text, "the recovered turn's answer must land on the adopted card"
+
+    # 4. Cancel is rebound.
+    registry = observed["registry"]
+    assert observed["status_ts"] in registry, (
+        "the adopted card's ts must have a cancel registry entry during recovery"
+    )
+    rebound_event, rebound_author = registry[observed["status_ts"]]
+    assert rebound_event is observed["second_cancel"], (
+        "a Cancel click during a recovered turn must stop the turn that is "
+        "actually running -- the registry entry must be the SECOND call's Event"
+    )
+    assert rebound_event is not observed["first_cancel"], (
+        "the registry entry must no longer be bound to the first attempt's Event"
+    )
+    assert rebound_author == "U_TEST_RECOVER", "the rebind must not change who is allowed to cancel"
+
+    # Final state: both mapping rows must end the turn unmarked.
+    async with db_session_factory() as s:
+        final_orphans = await list_orphaned_turns(s, platform="slack")
+    assert final_orphans == [], (
+        "both the dead pre-recovery row and the post-recovery row must end the turn unmarked"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3931,3 +4812,176 @@ async def test_orchestrate_tenant_cap_when_in_thread_sheds_in_thread(
         "an in-thread shed must be announced in that thread, not at channel root"
     )
     mock_run_turn.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
+
+
+# ---------------------------------------------------------------------------
+# Ceiling breach releases both concurrency slots
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ceiling_phase", ["bind", "pump"])
+async def test_ceiling_breach_releases_tenant_slot_and_thread_flag(
+    ceiling_phase: str,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A ceiling breach must release BOTH concurrency slots -- the per-tenant
+    in-flight count and the per-thread processing flag -- on both control-flow
+    paths that reach _orchestrate's finally (app.py:1081-1084): the
+    bind-phase raise (prepare.py:255-265, which unwinds through
+    _orchestrate's try -- it has no except) and the pump-phase return
+    (run.py:355-372, which falls out the bottom normally instead of raising).
+
+    Reading app._inflight alone is a weak assertion -- it would pass a
+    _release_inflight that decrements without popping the key at zero. The
+    assertion that actually retires the design doc's "three wedged threads
+    freeze the whole workspace" concern is behavioural: with
+    max_concurrent_turns_per_tenant=1, a SECOND mention on the SAME tenant
+    must be ADMITTED (not shed) once the first mention's ceilinged turn has
+    unwound.
+
+    Both mentions are driven through _handle_app_mention, not _orchestrate
+    directly -- _orchestrate's finally has no except, so the bind-phase raise
+    propagates straight out of it, making "after _orchestrate returns, assert
+    ..." unreachable on that leg. _handle_app_mention's boundary catches
+    DaimonError (TurnError is one), so both legs return normally from the
+    same call shape and the assertions below are written once.
+
+    Why the design doc's concern no longer holds: the cap is an in-process
+    dict[uuid.UUID, int] (app.py:196) that a process crash resets to zero, so
+    "three wedged threads freeze the whole workspace" was only ever true for
+    an in-process wedge -- and the core turn ceiling (TURN_CEILING_S, 45
+    minutes) now bounds an in-process wedge identically on both adapters.
+    """
+    from daimon.core.turn.ceiling import ceiling_error
+
+    team_id = f"T_CEILING_RELEASE_{ceiling_phase.upper()}"
+    channel = "C_TEST"
+    thread_ts_1 = "9000000046.000001"
+    thread_ts_2 = "9000000046.000002"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    fernet_key = Fernet.generate_key().decode()
+    fernet = build_multifernet((fernet_key,))
+
+    await provision_tenant(
+        db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
+    )
+    await upsert_slack_bot_token(
+        db_session,
+        team_id=team_id,
+        encrypted_token=encrypt_token(fernet, "xoxb-ceiling-release"),
+    )
+    await db_session.flush()
+
+    app, _ = _make_orchestrate_app(
+        db_session_factory, max_concurrent_turns_per_tenant=1, crypto_key=fernet_key
+    )
+
+    def _make_event(thread_ts: str) -> dict[str, Any]:
+        return {
+            "type": "app_mention",
+            "channel": channel,
+            "event_ts": thread_ts,
+            "ts": thread_ts,
+            "thread_ts": thread_ts,
+            "user": "U_CEILING_RELEASE",
+            "text": "<@U_BOT> hello",
+        }
+
+    _now = datetime.now(UTC)
+    _fake_session = BetaManagedAgentsSession(
+        outcome_evaluations=[],
+        id="sess-ceiling-release-001",
+        agent=BetaManagedAgentsSessionAgent(
+            id="agent_test_id",
+            mcp_servers=[],
+            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            name="test-agent",
+            skills=[],
+            tools=[],
+            type="agent",
+            version=1,
+        ),
+        created_at=_now,
+        environment_id="env_test_id",
+        metadata={},
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        type="session",
+        updated_at=_now,
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=[],
+    )
+
+    async def _sleepy_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
+        await asyncio.sleep(5.0)
+        return TurnState(content=[])
+
+    with contextlib.ExitStack() as stack:
+        mock_resolve_agent = stack.enter_context(
+            patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+        )
+        mock_resolve_agent.return_value = "agent_test_id"
+        mock_resolve_env = stack.enter_context(
+            patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+        )
+        mock_resolve_env.return_value = "env_test_id"
+
+        if ceiling_phase == "bind":
+            mock_bind_session = stack.enter_context(
+                patch("daimon.adapters.slack.app.bind_session", new_callable=AsyncMock)
+            )
+            mock_bind_session.side_effect = ceiling_error()
+        else:
+            mock_create_session = stack.enter_context(
+                patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
+            )
+            mock_create_session.return_value = _fake_session
+            mock_turn_deadline = stack.enter_context(
+                patch("daimon.adapters.slack.app.turn_deadline")
+            )
+            mock_turn_deadline.side_effect = lambda *, now, **_: now + timedelta(seconds=2)
+            mock_run_turn = stack.enter_context(
+                patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
+            )
+            mock_run_turn.side_effect = _sleepy_run_turn
+
+        # First mention breaches the ceiling on the parametrized phase.
+        await app._handle_app_mention(  # pyright: ignore[reportPrivateUsage]
+            _make_event(thread_ts_1), team_id=team_id
+        )
+
+        assert tenant_id not in app._inflight, (  # pyright: ignore[reportPrivateUsage]
+            "a ceiling breach must POP the tenant's in-flight key at zero, not "
+            "merely decrement it to zero -- _release_inflight's own contract"
+        )
+        assert thread_ts_1 not in app._processing, (  # pyright: ignore[reportPrivateUsage]
+            "a ceiling breach must discard the per-thread processing flag"
+        )
+
+        # Second mention on the SAME tenant -- the behavioural assertion that
+        # actually retires the design doc's concern.
+        with structlog.testing.capture_logs() as captured:
+            await app._handle_app_mention(  # pyright: ignore[reportPrivateUsage]
+                _make_event(thread_ts_2), team_id=team_id
+            )
+
+    shed_logs = [c for c in captured if c.get("event") == "turn.skipped.concurrency_shed"]
+    assert shed_logs == [], (
+        "a second mention on the same tenant must be ADMITTED after a ceiling "
+        "breach releases the slot, not shed as if the tenant were still saturated"
+    )
+    shed_ephemeral = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == URL("https://slack.com/api/chat.postEphemeral")
+        for req in reqs
+        if "too many chats in flight" in req.kwargs["json"].get("text", "")
+    ]
+    assert shed_ephemeral == [], (
+        "the second mention must not receive the concurrency-shed ephemeral notice"
+    )
+    assert tenant_id not in app._inflight  # pyright: ignore[reportPrivateUsage]
+    assert thread_ts_2 not in app._processing  # pyright: ignore[reportPrivateUsage]

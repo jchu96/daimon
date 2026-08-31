@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import uuid as _uuid
 from datetime import datetime
+from typing import Any, cast
 
 from daimon.core._models import ThreadSession
 from daimon.core.stores.domain import ThreadSessionRow
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -157,17 +159,27 @@ async def mark_turn_active(
     id: _uuid.UUID,
     active_turn_message_id: str,
     now: datetime,
+    active_turn_channel_id: str | None = None,
 ) -> None:
     """Record that a turn is running and which message is rendering it.
 
     Written once the embed exists and the mapping row is known. The pair is
     what lets a restarted process find embeds it can never finish -- the
     process holding them is gone, and nothing else knows they were mid-flight.
+
+    active_turn_channel_id is optional because a Discord message id is
+    globally addressable on its own, while a Slack message is identified by
+    (channel, ts). A caller that omits it stores NULL, which is the correct
+    reading for Discord.
     """
     await session.execute(
         update(ThreadSession)
         .where(ThreadSession.id == id)
-        .values(active_turn_message_id=active_turn_message_id, active_turn_started_at=now)
+        .values(
+            active_turn_message_id=active_turn_message_id,
+            active_turn_started_at=now,
+            active_turn_channel_id=active_turn_channel_id,
+        )
     )
     await session.flush()
 
@@ -177,13 +189,63 @@ async def clear_active_turn(
     *,
     id: _uuid.UUID,
 ) -> None:
-    """Clear the in-flight marker. Call on every terminal path, including failure."""
+    """Clear the in-flight marker. Call on every terminal path, including failure.
+
+    All three marker columns are cleared together so a cleared row carries no
+    dead channel id.
+    """
     await session.execute(
         update(ThreadSession)
         .where(ThreadSession.id == id)
-        .values(active_turn_message_id=None, active_turn_started_at=None)
+        .values(
+            active_turn_message_id=None,
+            active_turn_started_at=None,
+            active_turn_channel_id=None,
+        )
     )
     await session.flush()
+
+
+async def clear_active_turn_if_message_id(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+    expected_message_id: str,
+) -> bool:
+    """Clear the in-flight marker only if it still names the message the caller
+    read earlier. Returns whether it cleared.
+
+    For a reader that snapshotted the marker at some point in the past -- the
+    boot sweep -- and must not clobber a marker written since that snapshot.
+    `clear_active_turn` above stays unconditional and is still the right call
+    for callers that OWN the row: a turn's own terminal path wrote the marker
+    itself and is entitled to clear it outright, no comparison needed.
+
+    A `False` return is safe, not merely tolerated: the marker no longer
+    matching means a live process wrote a new one after the caller's read, and
+    that process will clear it on its own terminal path -- or crash, in which
+    case the next boot's sweep finds it. A skip can never strand a row. A NULL
+    marker never equals a string either, so a row that was already cleared
+    also returns `False` rather than raising.
+
+    The id predicate confines the write to the one row the caller named, so
+    two rows that happen to carry the same message id cannot be crossed.
+    """
+    result = await session.execute(
+        update(ThreadSession)
+        .where(
+            ThreadSession.id == id,
+            ThreadSession.active_turn_message_id == expected_message_id,
+        )
+        .values(
+            active_turn_message_id=None,
+            active_turn_started_at=None,
+            active_turn_channel_id=None,
+        )
+    )
+    rowcount = cast(CursorResult[Any], result).rowcount
+    await session.flush()
+    return rowcount == 1
 
 
 async def list_orphaned_turns(

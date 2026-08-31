@@ -106,11 +106,13 @@ async def _mirror_cancel(cancel: asyncio.Event, fresh_cancel: asyncio.Event) -> 
     duration of the recovery turn (D-07(b)).
 
     The adapters' recovery lifecycles rebind their cancel affordance to
-    `fresh_cancel` (Discord's new `CancelView`, Slack's re-registration), but
-    only once their next flush lands -- a click on the ORIGINAL affordance in
-    the window between `fresh_cancel` being created and that rebind landing
-    would otherwise set an event nothing is watching. This task closes that
-    window (and also covers any future adapter that forgets to rebind).
+    `fresh_cancel`: Discord's new `CancelView` lands with the recovery
+    lifecycle's next flush, while the Slack adapter re-registers the adopted
+    card's entry eagerly, at construction -- a click on the ORIGINAL
+    affordance in the window between `fresh_cancel` being created and
+    whichever rebind lands would otherwise set an event nothing is watching.
+    This task closes that window (and also covers any future adapter that
+    forgets to rebind).
     """
     await cancel.wait()
     fresh_cancel.set()
