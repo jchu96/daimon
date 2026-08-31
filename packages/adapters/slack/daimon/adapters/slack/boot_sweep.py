@@ -55,7 +55,10 @@ from daimon.core.errors import DaimonError
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.tenants import list_tenants_by_platform, set_provision_status
-from daimon.core.stores.thread_sessions import clear_active_turn, list_orphaned_turns
+from daimon.core.stores.thread_sessions import (
+    clear_active_turn_if_message_id,
+    list_orphaned_turns,
+)
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.exc import SQLAlchemyError
@@ -250,14 +253,45 @@ async def retire_orphaned_turns(runtime: SlackRuntime, *, now: datetime) -> None
     mandatory again -- a marker set by the process that is currently running
     is a live turn, not an orphan.
 
-    Accepted, undefended race (parity with Discord): a mention landing on the
-    same thread between the ``list_orphaned_turns`` read and the
-    ``clear_active_turn`` write would have its fresh marker cleared by this
-    sweep. The window requires a full admission plus an MA ``sessions.create``
-    to complete inside one row's ``chat_update``. Discord has the identical
-    race and accepts it; a compare-and-clear ``clear_active_turn`` would
-    change a core store shared with Discord for a race neither adapter has
-    ever observed.
+    This function also assumes ONE Slack adapter process. With two
+    overlapping instances -- a rolling deploy that starts the new process
+    before the old one has stopped -- it would retire the sibling's genuinely
+    live turns, because a marker set by another live process is
+    indistinguishable from one left behind by a crash. The compare-and-clear
+    below narrows this but does not remove it: a sibling's turn whose marker
+    has not changed since this function's read still matches the predicate.
+    Gate on an owner id before scaling this service out.
+
+    The actual race: ``list_orphaned_turns`` is read ONCE up front, for every
+    tenant, and the per-tenant, per-row loop that follows is fully sequential
+    with live ``chat_update`` calls and no concurrency bound -- unlike the
+    reconcile half of this module, which runs at a bounded semaphore. So the
+    window between a given row's read and its clear scales with total sweep duration,
+    not with one row's edit latency; a row late in a large sweep is exposed
+    longest, which is exactly the fleet-wide-crash case this function exists
+    for. Socket Mode dispatch is already live before the sweep task is created:
+    the listener is registered and the client connected before
+    ``asyncio.create_task`` schedules this coroutine, so a mention can be in
+    flight before this function gets its first scheduling opportunity.
+
+    The card edit itself was never the unsafe half. The ``chat_update`` below
+    targets the ts read at sweep start, and a newly admitted turn posts a NEW
+    card at a NEW ts before its own marker is written -- so the ts this
+    function holds always names the genuinely frozen card, never the live
+    one. Even when the new turn reuses the same mapping row, the edit lands
+    on the dead card and the clear below then correctly skips.
+
+    What the clear does about the exposure above: it is now predicated on the
+    marker still naming the message this function read, so a marker written
+    since the read survives. A skip is self-healing -- the process that wrote
+    it clears it on its own terminal path, or crashes and is swept on the
+    next boot.
+
+    The boot ordering was deliberately NOT changed to close the window
+    described above: completing this sweep before ``client.connect()`` would
+    diverge from the Discord adapter, whose sweep also runs after connect,
+    and would delay event acceptance by the sweep's duration. The
+    compare-and-clear makes the window harmless instead of absent.
     """
     async with runtime.sessionmaker() as session:
         orphans = await list_orphaned_turns(session, platform="slack")
@@ -294,9 +328,16 @@ async def retire_orphaned_turns(runtime: SlackRuntime, *, now: datetime) -> None
             )
 
         for row in rows:
-            channel_id = row.active_turn_channel_id
             message_id = row.active_turn_message_id
-            if client is not None and channel_id is not None and message_id is not None:
+            if message_id is None:  # pragma: no cover - list_orphaned_turns filters this out
+                # list_orphaned_turns only ever returns rows whose
+                # active_turn_message_id IS NOT NULL -- this narrows the Pydantic
+                # model's str | None honestly rather than asserting or casting
+                # past it. A row with no marker is not an orphan, so skipping it
+                # here leaks nothing.
+                continue
+            channel_id = row.active_turn_channel_id
+            if client is not None and channel_id is not None:
                 try:
                     await client.chat_update(  # pyright: ignore[reportUnknownMemberType]
                         channel=channel_id,
@@ -323,5 +364,18 @@ async def retire_orphaned_turns(runtime: SlackRuntime, *, now: datetime) -> None
                         "slack.turn.orphan_retire_failed", thread_id=row.thread_id, error=str(err)
                     )
             async with runtime.sessionmaker() as session:
-                await clear_active_turn(session, id=row.id)
+                cleared = await clear_active_turn_if_message_id(
+                    session, id=row.id, expected_message_id=message_id
+                )
                 await session.commit()
+            if not cleared:
+                # The marker moved between this sweep's read and this row's
+                # clear -- a live process wrote it after the read, so it owns
+                # the row now and will clear it on its own terminal path, or
+                # crash and be picked up by the next boot's sweep. Not a
+                # warning: this is the compare-and-clear working as intended.
+                log.info(
+                    "slack.turn.orphan_marker_moved",
+                    thread_id=row.thread_id,
+                    message_id=message_id,
+                )
