@@ -1033,8 +1033,22 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
     # in test_orchestrate_first_turn_*).
     fake_principal = MagicMock()
     fake_principal.account_id = uuid.uuid4()
-    fake_row = MagicMock()
-    fake_row.id = uuid.uuid4()
+    # The patched store returns the same validated Pydantic type the real
+    # store returns, so a field the production code reads is a real value
+    # or a loud failure, never an auto-generated mock attribute.
+    now = datetime.now(UTC)
+    fake_thread_session_row = ThreadSessionRow(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        platform="slack",
+        thread_id=thread_ts,
+        account_id=uuid.uuid4(),
+        ma_session_id="sess-coalesce-001",
+        watermark_message_id=None,
+        status="live",
+        created_at=now,
+        updated_at=now,
+    )
 
     with (
         patch(
@@ -1064,7 +1078,7 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
     ):
         mock_principal.return_value = fake_principal
         mock_get_session.return_value = None  # simulate new thread each time
-        mock_create_ts.return_value = fake_row
+        mock_create_ts.return_value = fake_thread_session_row
         mock_resolve_agent.return_value = "agent_coalesce_id"
         mock_resolve_env.return_value = "env_coalesce_id"
         _now_c = datetime.now(UTC)
