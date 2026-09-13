@@ -149,6 +149,14 @@ def _build_dead_session_router(tenant_id_str: str) -> MARouter:
         rf"/v1/sessions/{_DEAD_SESSION_ID}/events/stream",
         lambda req, _m: not_found_response("session gone"),
     )
+    # ... and retrieving it 404s too: the pre-continuity row carries no record
+    # of what its session was running, so the bind tries to read it. A gone
+    # session leaves that to the recovery cycle below rather than failing.
+    router.add(
+        "GET",
+        rf"/v1/sessions/{_DEAD_SESSION_ID}",
+        lambda req, _m: not_found_response("session gone"),
+    )
     # Recreated session: events.send + SSE stream succeed.
     router.add(
         "POST",

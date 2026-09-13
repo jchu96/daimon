@@ -63,7 +63,7 @@ from daimon.testing.ma import (
 from daimon.testing.ma import (
     _environment_response as _environment_response,  # pyright: ignore[reportPrivateUsage]  # test-only
 )
-from daimon.testing.ma import build_fake_anthropic
+from daimon.testing.ma import build_fake_anthropic, session_response
 from pydantic import SecretStr
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -82,8 +82,10 @@ def _make_agent_env_handler() -> Callable[[httpx.Request], httpx.Response]:
     """Minimal httpx.MockTransport handler for MA agent/environment retrieves.
 
     Handles GET /v1/agents/{id} and GET /v1/environments/{id} — the two
-    endpoints called by _run_thread_turn when creating a new MA session.
-    Raises AssertionError for any other path so unexpected calls are visible.
+    endpoints called by _run_thread_turn when creating a new MA session —
+    plus GET /v1/sessions/{id}, which a reused session with no recorded
+    configuration is read through. Raises AssertionError for any other path
+    so unexpected calls are visible.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -95,6 +97,11 @@ def _make_agent_env_handler() -> Callable[[httpx.Request], httpx.Response]:
         if m and request.method == "GET":
             env = _environment_response(environment_id=m.group("id"))
             return httpx.Response(200, json=env.model_dump(mode="json"))
+        m = _re.match(r"^/v1/sessions/(?P<id>[^/]+)$", path)
+        if m and request.method == "GET":
+            # A mapping row seeded without a recorded configuration makes the
+            # bind read its session once to learn which model it runs.
+            return session_response(session_id=m.group("id"))
         raise AssertionError(f"_make_agent_env_handler: unhandled {request.method} {path}")
 
     return handler

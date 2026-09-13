@@ -78,9 +78,13 @@ async def test_session_identity_preserves_mapping_and_watermark(
             "destination is the resolved responder"
         )
     else:
-        assert await check_session_agent(
+        identity = await check_session_agent(
             anthropic, db_session_factory, mapping=mapping, responder_ma_agent_id=destination
-        ), "same agent can reuse its workspace"
+        )
+        assert identity.session_exists, "same agent can reuse its workspace"
+        assert (identity.observed is not None) is legacy, (
+            "the retrieved session is handed back exactly when a retrieve happened"
+        )
     db_session.expire_all()
     retained = await get_thread_session_by_id(db_session, id=mapping.id)
     assert retained is not None, "mismatch must not delete a mapping"
@@ -107,9 +111,11 @@ async def test_missing_legacy_session_remains_separate_from_upstream_failure(
         )
     )
     if status == 404:
-        assert not await check_session_agent(
+        identity = await check_session_agent(
             client, db_session_factory, mapping=mapping, responder_ma_agent_id="agent_new"
-        ), "missing session goes to existing recovery path"
+        )
+        assert not identity.session_exists, "missing session goes to existing recovery path"
+        assert identity.observed is None, "a missing session yields no observed session"
     else:
         with pytest.raises(InternalServerError):
             await check_session_agent(

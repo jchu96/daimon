@@ -178,6 +178,15 @@ def _build_router(
     router.add("GET", r"/v1/agents/[^/]+", lambda req, _m: httpx.Response(200, json=agent_item))
     router.add("GET", r"/v1/environments", lambda req, _m: list_response([env_item]))
     router.add("GET", r"/v1/environments/[^/]+", lambda req, _m: httpx.Response(200, json=env_item))
+
+    def _handle_session_retrieve(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        # A mapping row written before sessions recorded their configuration
+        # makes the bind read the session once, to learn what it is running.
+        return httpx.Response(
+            200, json=_make_fake_session(session_id=match["session_id"]).model_dump(mode="json")
+        )
+
+    router.add("GET", r"/v1/sessions/(?P<session_id>[^/]+)", _handle_session_retrieve)
     router.add("POST", r"/v1/sessions/(?P<session_id>[^/]+)/events", _handle_send_events)
     router.add("GET", r"/v1/sessions/(?P<session_id>[^/]+)/events/stream", _handle_stream)
     return router

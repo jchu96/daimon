@@ -13,8 +13,15 @@ from pathlib import Path
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
+from anthropic.types.beta import (
+    BetaEnvironment,
+    BetaManagedAgentsAgent,
+    BetaManagedAgentsSession,
+)
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
+from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
+from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
+from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
@@ -30,8 +37,21 @@ from daimon.core.github_credentials import build_multifernet
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
-from daimon.core.stores import usage_events
-from daimon.core.stores.thread_sessions import get_live_thread_session
+from daimon.core.session_snapshot import (
+    SessionSnapshot,
+    fingerprint_identity,
+    fingerprint_mutable,
+    hash_mcp_servers,
+    hash_skills,
+    hash_tools,
+)
+from daimon.core.stores import tenant_ledger, usage_events
+from daimon.core.stores.domain import AccountRow, TenantRow, ThreadSessionRow
+from daimon.core.stores.thread_sessions import (
+    create_thread_session,
+    get_live_thread_session,
+    get_thread_session_by_id,
+)
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.prepare import PreparedTurn, bind_session
@@ -53,14 +73,20 @@ from daimon.testing.factories import (  # isort: skip
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
 
-def _agent(*, agent_id: str, tenant_id: uuid.UUID, name: str = "daimon") -> BetaManagedAgentsAgent:
+def _agent(
+    *,
+    agent_id: str,
+    tenant_id: uuid.UUID,
+    name: str = "daimon",
+    model_id: str = "claude-sonnet-4-6",
+) -> BetaManagedAgentsAgent:
     now = datetime.now(UTC)
     return BetaManagedAgentsAgent(
         id=agent_id,
         type="agent",
         name=name,
         version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        model=BetaManagedAgentsModelConfig(id=model_id, speed="standard"),
         system=None,
         description=None,
         metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
@@ -96,6 +122,60 @@ def _admission(
         agent=agent,
         environment=env,
         config=ResolvedConfig(agent_name="daimon", environment_name="default"),
+    )
+
+
+def _snapshot(*, ma_agent_id: str, model_id: str, environment_id: str = "env_1") -> SessionSnapshot:
+    """The configuration a session created from `_agent`/`_env` would freeze."""
+    return SessionSnapshot(
+        ma_agent_id=ma_agent_id,
+        model_id=model_id,
+        system_sha256=None,
+        skills_sha256=hash_skills([]),
+        environment_id=environment_id,
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id=None,
+        vault_id=None,
+        tools_sha256=hash_tools([]),
+        mcp_servers_sha256=hash_mcp_servers([]),
+        env_sha256=None,
+        agent_version=1,
+        agent_name="daimon",
+    )
+
+
+async def _make_snapshotted_thread_session(
+    session: AsyncSession,
+    *,
+    tenant: TenantRow,
+    account: AccountRow,
+    thread_id: str,
+    ma_session_id: str,
+    ma_agent_id: str,
+    model_id: str = "claude-sonnet-4-6",
+    watermark_message_id: str | None = None,
+) -> ThreadSessionRow:
+    """A live mapping row that already records what its session runs.
+
+    `make_thread_session` writes the pre-continuity shape (no
+    `effective_config`), which now costs a backfilling `sessions.retrieve` on
+    reuse. Tests about anything else use this instead, so their routers stay
+    about the thing they test.
+    """
+    snapshot = _snapshot(ma_agent_id=ma_agent_id, model_id=model_id)
+    return await create_thread_session(
+        session,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id=thread_id,
+        account_id=account.id,
+        ma_session_id=ma_session_id,
+        ma_agent_id=ma_agent_id,
+        watermark_message_id=watermark_message_id,
+        effective_config=snapshot,
+        identity_fingerprint=fingerprint_identity(snapshot),
+        mutable_fingerprint=fingerprint_mutable(snapshot),
     )
 
 
@@ -176,11 +256,10 @@ async def test_bind_session_reuses_live_row_when_reuse_existing_true_and_row_exi
 ) -> None:
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
-    row = await make_thread_session(
+    row = await _make_snapshotted_thread_session(
         db_session,
         tenant=tenant,
         account=account,
-        platform="discord",
         thread_id="thread-1",
         ma_session_id="sess_existing",
         ma_agent_id="ag_1",
@@ -381,11 +460,10 @@ async def test_bind_session_syncs_agent_mcp_credential_into_a_reused_session_vau
     nothing and their live session picks it up on the next turn."""
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
-    await make_thread_session(
+    await _make_snapshotted_thread_session(
         db_session,
         tenant=tenant,
         account=account,
-        platform="discord",
         thread_id="thread-reuse-mcp",
         ma_session_id="sess_live",
         ma_agent_id="ag_reuse",
@@ -521,11 +599,10 @@ async def test_bind_session_reuse_skips_mcp_sync_when_agent_has_no_stored_creden
     """The common case pays one indexed query and touches MA not at all."""
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
-    await make_thread_session(
+    await _make_snapshotted_thread_session(
         db_session,
         tenant=tenant,
         account=account,
-        platform="discord",
         thread_id="thread-reuse-plain",
         ma_session_id="sess_live",
         ma_agent_id="ag_plain",
@@ -651,11 +728,10 @@ async def test_bind_session_reuse_path_raises_ceiling_error_when_deadline_alread
 ) -> None:
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
-    await make_thread_session(
+    await _make_snapshotted_thread_session(
         db_session,
         tenant=tenant,
         account=account,
-        platform="discord",
         thread_id="thread-ceiling-reuse",
         ma_session_id="sess_existing",
         ma_agent_id="ag_1",
@@ -761,3 +837,252 @@ async def test_bind_session_with_generous_explicit_deadline_matches_no_deadline_
     assert prepared.watermark is None
     assert prepared.mapping_id is not None
     assert prepared.ma_session_id == "sess_1"
+
+
+async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_model_changed_after_create(  # noqa: E501
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The live defect this wave closes: an MA session executes the agent it
+    froze at creation, so a session created while the agent was on sonnet keeps
+    running sonnet after the agent is moved to opus. Billing the agent's
+    CURRENT model would price that turn at opus rates for work done at sonnet
+    rates."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await _make_snapshotted_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        thread_id="thread-model-changed",
+        ma_session_id="sess_frozen_on_sonnet",
+        ma_agent_id="ag_1",
+        model_id="claude-sonnet-4-6",
+    )
+    await db_session.commit()
+
+    router = MARouter()
+
+    def _explode(request: httpx.Request, _match: object) -> httpx.Response:
+        raise AssertionError(f"no MA call expected, got {request.method} {request.url.path}")
+
+    router.add("POST", r"/v1/sessions", _explode)
+    router.add("GET", r"/v1/sessions/.*", _explode)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    # The responder agent has since been moved to opus.
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id, model_id="claude-opus-5")
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+
+    prepared = await bind_session(
+        deps,
+        admission,
+        tenant_id=tenant.id,
+        platform="discord",
+        external_user_id="user-1",
+        thread_id="thread-model-changed",
+        session_account_id=account.id,
+        reuse_existing=True,
+    )
+
+    assert prepared.reused is True, "this must be the reuse path"
+
+    event = BetaManagedAgentsSpanModelRequestEndEvent(
+        id="evt_1",
+        is_error=False,
+        model_request_start_id="start_1",
+        model_usage=BetaManagedAgentsSpanModelUsage(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        processed_at=datetime.now(UTC),
+        type="span.model_request_end",
+    )
+    await prepared._record(event=event)  # pyright: ignore[reportPrivateUsage]
+
+    async with db_session_factory() as s:
+        rows = await usage_events.list_for_tenant(s, tenant_id=tenant.id)
+        entries = await tenant_ledger.list_for_tenant(s, tenant_id=tenant.id)
+    assert [row.model for row in rows] == ["claude-sonnet-4-6"], (
+        "usage must record the model the reused session actually runs, not the agent's new one"
+    )
+    debits = [entry.delta_usd for entry in entries if entry.reason == "turn_debit"]
+    assert debits == [Decimal("-3.000000")], (
+        "1M input tokens must be debited at the sonnet rate the session ran, not opus's"
+    )
+
+
+async def test_fresh_session_records_a_snapshot_with_fingerprints(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The snapshot comes from what `sessions.create` returned — the authority
+    on what the session will execute — not from the agent we asked for."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    router = _router_with_session_create(session_bodies=session_bodies)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    # The router's created session reports sonnet whatever we ask for, so an
+    # opus agent here proves the recorded model is read off the response.
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id, model_id="claude-opus-5")
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+
+    prepared = await bind_session(
+        deps,
+        admission,
+        tenant_id=tenant.id,
+        platform="discord",
+        external_user_id="user-1",
+        thread_id="thread-fresh-snapshot",
+        session_account_id=account.id,
+        reuse_existing=True,
+    )
+
+    assert prepared.reused is False, "this must be the fresh-session path"
+    async with db_session_factory() as s:
+        live = await get_live_thread_session(
+            s,
+            tenant_id=tenant.id,
+            platform="discord",
+            thread_id="thread-fresh-snapshot",
+            account_id=account.id,
+        )
+    assert live is not None, "the fresh session must leave a live mapping row"
+    snapshot = live.effective_config
+    assert snapshot is not None, "a fresh session must record the configuration it froze"
+    assert snapshot.model_id == "claude-sonnet-4-6", (
+        "the recorded model must be the created session's, not the agent's current one"
+    )
+    assert snapshot.ma_agent_id == "ag_1", "the snapshot must name the agent the session froze"
+    assert snapshot.environment_id == "env_1", "the snapshot must record the session's environment"
+    assert live.identity_fingerprint == fingerprint_identity(snapshot), (
+        "the stored identity fingerprint must be the one this snapshot hashes to"
+    )
+    assert live.mutable_fingerprint == fingerprint_mutable(snapshot), (
+        "the stored mutable fingerprint must be the one this snapshot hashes to"
+    )
+
+
+@pytest.mark.parametrize("legacy_ma_agent_id", [None, "ag_1"])
+async def test_legacy_row_without_snapshot_is_backfilled_with_one_retrieve(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    legacy_ma_agent_id: str | None,
+) -> None:
+    """A row written before continuity has no snapshot, so the session is read
+    once and the snapshot persisted. Both legacy shapes cost ONE read: with no
+    `ma_agent_id` the identity check already fetched the session and hands it
+    over; with one, this is the only fetch."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-legacy",
+        ma_session_id="sess_legacy",
+        ma_agent_id=legacy_ma_agent_id,
+    )
+    await db_session.commit()
+    assert row.effective_config is None, "the legacy shape is a row with no recorded configuration"
+
+    now = datetime.now(UTC)
+    observed = BetaManagedAgentsSession(
+        id="sess_legacy",
+        type="session",
+        agent=BetaManagedAgentsSessionAgent(
+            id="ag_1",
+            type="agent",
+            name="daimon",
+            version=3,
+            model=BetaManagedAgentsModelConfig(id="claude-haiku-4-5"),
+            mcp_servers=[],
+            skills=[],
+            tools=[],
+            system=None,
+        ),
+        created_at=now,
+        updated_at=now,
+        environment_id="env_legacy",
+        metadata={},
+        outcome_evaluations=[],
+        resources=[],
+        stats=BetaManagedAgentsSessionStats(),
+        status="idle",
+        usage=BetaManagedAgentsSessionUsage(),
+        vault_ids=["vlt_legacy"],
+    )
+    retrieves: list[str] = []
+
+    def _retrieve(request: httpx.Request, _match: object) -> httpx.Response:
+        retrieves.append(request.url.path)
+        return httpx.Response(200, json=observed.model_dump(mode="json"))
+
+    def _explode(request: httpx.Request, _match: object) -> httpx.Response:
+        raise AssertionError(f"unexpected MA call: {request.method} {request.url.path}")
+
+    router = MARouter()
+    router.add("GET", r"/v1/sessions/sess_legacy", _retrieve)
+    router.add("POST", r"/v1/sessions", _explode)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id, model_id="claude-opus-5")
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+
+    prepared = await bind_session(
+        deps,
+        admission,
+        tenant_id=tenant.id,
+        platform="discord",
+        external_user_id="user-1",
+        thread_id="thread-legacy",
+        session_account_id=account.id,
+        reuse_existing=True,
+    )
+
+    assert prepared.reused is True, "a legacy row is still reused"
+    assert len(retrieves) == 1, "a legacy row must cost exactly one sessions.retrieve"
+
+    async with db_session_factory() as s:
+        backfilled = await get_thread_session_by_id(s, id=row.id)
+    assert backfilled is not None, "the backfill must not replace the row"
+    snapshot = backfilled.effective_config
+    assert snapshot is not None, "the retrieved configuration must be persisted on the row"
+    assert snapshot.model_id == "claude-haiku-4-5", (
+        "the backfilled model must be the session's own, not the agent's current one"
+    )
+    assert snapshot.environment_id == "env_legacy", "the backfill records the session's environment"
+    assert snapshot.vault_id == "vlt_legacy", "the backfill records the session's vault"
+    assert backfilled.identity_fingerprint == fingerprint_identity(snapshot), (
+        "the backfill must store the identity fingerprint alongside the snapshot"
+    )
+    assert backfilled.mutable_fingerprint == fingerprint_mutable(snapshot), (
+        "the backfill must store the mutable fingerprint alongside the snapshot"
+    )
+
+    event = BetaManagedAgentsSpanModelRequestEndEvent(
+        id="evt_legacy",
+        is_error=False,
+        model_request_start_id="start_1",
+        model_usage=BetaManagedAgentsSpanModelUsage(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        processed_at=datetime.now(UTC),
+        type="span.model_request_end",
+    )
+    await prepared._record(event=event)  # pyright: ignore[reportPrivateUsage]
+    async with db_session_factory() as s:
+        rows = await usage_events.list_for_tenant(s, tenant_id=tenant.id)
+    assert [usage.model for usage in rows] == ["claude-haiku-4-5"], (
+        "a backfilled row must bill the model the session was found to be running"
+    )
