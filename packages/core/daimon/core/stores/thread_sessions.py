@@ -27,7 +27,8 @@ from datetime import datetime
 from typing import Any, cast
 
 from daimon.core._models import ThreadSession
-from daimon.core.stores.domain import ThreadSessionRow
+from daimon.core.session_snapshot import SessionSnapshot
+from daimon.core.stores.domain import ThreadSessionRow, TransferKind
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -112,6 +113,12 @@ async def create_thread_session(
     ma_agent_id: str | None = None,
     watermark_message_id: str | None = None,
     created_at: datetime | None = None,
+    effective_config: SessionSnapshot | None = None,
+    identity_fingerprint: str | None = None,
+    mutable_fingerprint: str | None = None,
+    predecessor_id: _uuid.UUID | None = None,
+    transfer_file_id: str | None = None,
+    transfer_kind: TransferKind | None = None,
 ) -> ThreadSessionRow:
     """Insert a new thread-session mapping row and return the Pydantic domain type.
 
@@ -121,6 +128,12 @@ async def create_thread_session(
     The optional `created_at` kwarg is provided so tests can control ordering
     deterministically for newest-row-wins assertions. When None, the DB
     server_default (now()) applies.
+
+    `effective_config` is the configuration the freshly created MA session
+    froze, with its two fingerprints; omitting it writes a row that reads as
+    "configuration unknown", which is exactly what every pre-continuity row is.
+    `predecessor_id`, `transfer_file_id` and `transfer_kind` are set only when
+    this row replaces an earlier session and carries its work forward.
     """
     kwargs: dict[str, object] = {
         "tenant_id": tenant_id,
@@ -130,6 +143,14 @@ async def create_thread_session(
         "ma_session_id": ma_session_id,
         "ma_agent_id": ma_agent_id,
         "watermark_message_id": watermark_message_id,
+        "effective_config": (
+            None if effective_config is None else effective_config.model_dump(mode="json")
+        ),
+        "identity_fingerprint": identity_fingerprint,
+        "mutable_fingerprint": mutable_fingerprint,
+        "predecessor_id": predecessor_id,
+        "transfer_file_id": transfer_file_id,
+        "transfer_kind": transfer_kind,
     }
     if created_at is not None:
         kwargs["created_at"] = created_at
@@ -313,5 +334,56 @@ async def update_agent_identity(session: AsyncSession, *, id: _uuid.UUID, ma_age
     """Record the identity observed on MA without replacing session history."""
     await session.execute(
         update(ThreadSession).where(ThreadSession.id == id).values(ma_agent_id=ma_agent_id)
+    )
+    await session.flush()
+
+
+async def record_snapshot(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+    snapshot: SessionSnapshot,
+    identity_fingerprint: str,
+    mutable_fingerprint: str,
+) -> None:
+    """Persist the configuration this session is running, with both fingerprints.
+
+    Written on create and again when a legacy row is backfilled from a
+    `sessions.retrieve`. Both fingerprints are supplied by the caller rather
+    than computed here: the store does not import hashing logic, and a caller
+    that compared fingerprints already has them.
+    """
+    await session.execute(
+        update(ThreadSession)
+        .where(ThreadSession.id == id)
+        .values(
+            effective_config=snapshot.model_dump(mode="json"),
+            identity_fingerprint=identity_fingerprint,
+            mutable_fingerprint=mutable_fingerprint,
+        )
+    )
+    await session.flush()
+
+
+async def update_mutable_fingerprint(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+    snapshot: SessionSnapshot,
+    mutable_fingerprint: str,
+) -> None:
+    """Record an in-place refresh: new mutable axis, same session, same identity.
+
+    `identity_fingerprint` is deliberately left alone — an in-place update that
+    moved the identity axis would be a bug, and overwriting it here would hide
+    that the row no longer describes the session MA is running.
+    """
+    await session.execute(
+        update(ThreadSession)
+        .where(ThreadSession.id == id)
+        .values(
+            effective_config=snapshot.model_dump(mode="json"),
+            mutable_fingerprint=mutable_fingerprint,
+        )
     )
     await session.flush()

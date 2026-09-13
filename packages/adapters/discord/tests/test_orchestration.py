@@ -31,6 +31,12 @@ from daimon.core.config import McpSettings, ThreadNamingSettings
 from daimon.core.ma_resolver import ResolverCache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig, ScopeContext
+from daimon.core.session_snapshot import (
+    SessionSnapshot,
+    fingerprint_identity,
+    fingerprint_mutable,
+    snapshot_from_created_session,
+)
 from daimon.core.stores import tenant_ledger
 from daimon.core.turn.deps import TurnDeps
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -63,6 +69,18 @@ def _make_fake_session(session_id: str = "sess_test") -> BetaManagedAgentsSessio
         usage=BetaManagedAgentsSessionUsage(),
         vault_ids=[],
         outcome_evaluations=[],
+    )
+
+
+def _snapshot_of(session: BetaManagedAgentsSession) -> SessionSnapshot:
+    """The configuration a mapping row records for the session it maps to.
+
+    A row seeded without one reads as pre-continuity and makes the bind read
+    the session from MA, which these tests' bare `AsyncMock` client cannot
+    answer.
+    """
+    return snapshot_from_created_session(
+        session, env_sha256=None, env_file_id=None, repo_token_issued_at=None, vault_id=None
     )
 
 
@@ -1562,6 +1580,7 @@ class TestSessionReuse:
         existing_session_id = "sesn_existing_001"
         watermark_msg_id = "111222333"
         async with db_session_factory() as seed_session:
+            snapshot = _snapshot_of(_make_fake_session(existing_session_id))
             await create_thread_session(
                 seed_session,
                 ma_agent_id="ag_test",
@@ -1571,6 +1590,9 @@ class TestSessionReuse:
                 account_id=principal.account_id,
                 ma_session_id=existing_session_id,
                 watermark_message_id=watermark_msg_id,
+                effective_config=snapshot,
+                identity_fingerprint=fingerprint_identity(snapshot),
+                mutable_fingerprint=fingerprint_mutable(snapshot),
             )
             await seed_session.commit()
 
@@ -1720,6 +1742,7 @@ class TestSessionReuse:
         # Seed a live row for the thread.
         old_session_id = "sesn_old_dead_001"
         async with db_session_factory() as seed_session:
+            snapshot = _snapshot_of(_make_fake_session(old_session_id))
             await create_thread_session(
                 seed_session,
                 ma_agent_id="ag_test",
@@ -1729,6 +1752,9 @@ class TestSessionReuse:
                 account_id=principal.account_id,
                 ma_session_id=old_session_id,
                 watermark_message_id="100",
+                effective_config=snapshot,
+                identity_fingerprint=fingerprint_identity(snapshot),
+                mutable_fingerprint=fingerprint_mutable(snapshot),
             )
             await seed_session.commit()
 

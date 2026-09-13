@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from daimon.core._models import ThreadAgentBinding
 from daimon.core.errors import DaimonError
 from daimon.core.scope import DeploymentDefault, ScopeContext
 from daimon.core.stores.accounts import delete_account
@@ -174,3 +175,88 @@ async def test_binding_location_is_unique_and_tenant_scoped(db_session: AsyncSes
                 responder_ma_agent_id="agent_other",
                 responder_name="other",
             )
+
+
+async def test_a_handoff_binding_is_accepted_alongside_setup_bindings(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+
+    binding = await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+        responder_ma_agent_id="agent_stats",
+        responder_name="stats-bot",
+        kind="handoff",
+    )
+
+    assert binding.kind == "handoff", (
+        "an ordinary thread may record that its task was handed to another agent"
+    )
+    fetched = await get_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+    )
+    assert fetched is not None and fetched.responder_ma_agent_id == "agent_stats", (
+        "the handoff binding is what later turns read to find the responder"
+    )
+
+
+async def test_an_unknown_binding_kind_is_refused_by_the_database(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    db_session.add(
+        ThreadAgentBinding(
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="channel",
+            thread_id="bogus-thread",
+            kind="bogus",
+            responder_ma_agent_id="agent_stats",
+            responder_name="stats-bot",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
+async def test_listing_setups_never_surfaces_a_handoff_binding(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="setup-thread",
+        responder_ma_agent_id="agent_daimon",
+        responder_name="daimon",
+    )
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="handoff-thread",
+        responder_ma_agent_id="agent_stats",
+        responder_name="stats-bot",
+        kind="handoff",
+    )
+
+    listed = await list_active_bindings(
+        db_session, tenant_id=tenant.id, platform="discord", parent_channel_id="channel"
+    )
+
+    assert [row.thread_id for row in listed] == ["setup-thread"], (
+        "a handed-over ordinary thread is not a setup conversation and must not be listed as one"
+    )

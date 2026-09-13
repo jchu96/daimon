@@ -270,7 +270,7 @@ async def run_prepared_turn(
                 await mark_dead(session, id=mapping_id)
                 await session.commit()
 
-            new_session_id, new_mapping_id = await create_fresh_session(
+            fresh = await create_fresh_session(
                 deps,
                 prepared.admission,
                 tenant_id=tenant_id,
@@ -278,16 +278,20 @@ async def run_prepared_turn(
                 thread_id=thread_id,
                 session_account_id=prepared.session_account_id,
             )
+            new_session_id = fresh.ma_session_id
+            new_mapping_id = fresh.mapping_id
             active_session_id_cell[0] = new_session_id
             active_mapping_id_cell[0] = new_mapping_id
             recovered_cell[0] = True
 
+            # Bill the REPLACEMENT's own model: it froze the responder agent as
+            # it stands now, which need not be what the dead session ran.
             new_record = bind_recorder(
                 deps,
-                prepared.admission,
                 tenant_id=tenant_id,
                 external_user_id=external_user_id,
                 ma_session_id=new_session_id,
+                model_id=fresh.snapshot.model_id,
             )
 
             log.info(

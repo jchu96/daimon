@@ -314,7 +314,45 @@ class ThreadSession(Base):
     ma_session_id: Mapped[str] = mapped_column(Text, nullable=False)
     ma_agent_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     watermark_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Untyped Text on purpose — no CHECK, so widening the vocabulary never needs
+    # a lock on a hot table. Values:
+    #   'live'       the caller's current session (the only status the
+    #                caller-scoped lookup ever returns)
+    #   'dead'       the MA session is gone (404 / archived); written only by
+    #                the dead-session recovery path
+    #   'superseded' replaced by a newer session carrying this one's work;
+    #                `replaced_by_id` names the successor
+    #   'retired'    deliberately abandoned on an explicit fresh start
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'live'"))
+    # The configuration this session is actually running: an MA session freezes
+    # its agent at create time, so the agent spec read at admission is not what
+    # executes. A `daimon.core.session_snapshot.SessionSnapshot` serialized to
+    # JSON. NULL on rows written before continuity existed.
+    effective_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    identity_fingerprint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mutable_fingerprint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Lineage of one continuing task across session replacements.
+    predecessor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("thread_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("thread_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # The workspace bundle mounted into this session, and how complete it was:
+    # 'full' (checkpointed workspace), 'transcript' (conversation only) or
+    # 'history' (platform reseed only). No CHECK; the vocabulary is pinned by
+    # `stores.domain.TransferKind` so adapters render honest copy from it.
+    transfer_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transfer_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set when the caller explicitly asked to start over; the next bind creates
+    # the replacement first and only then retires this row.
+    fresh_start_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Set while a turn is running, cleared when it reaches a terminal state.
     # Distinct from `status`, which is about the session mapping and stays
     # 'live' on every healthy thread forever. Slack needs the channel because a
@@ -1322,7 +1360,7 @@ class ThreadAgentBinding(Base):
             "thread_id",
             name="uq_thread_agent_bindings_location",
         ),
-        CheckConstraint("kind = 'setup'", name="ck_thread_agent_bindings_kind"),
+        CheckConstraint("kind IN ('setup', 'handoff')", name="ck_thread_agent_bindings_kind"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1381,3 +1419,109 @@ class TurnOrigin(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SessionPreparation(Base):
+    """One in-flight attempt to move a caller's task onto a new configuration.
+
+    The row is the resume point: a replacement spans a billed checkpoint turn,
+    a file upload and a session create, and a process that dies between them
+    must not repeat the billed part. `stage` says how far the last attempt got;
+    `UNIQUE(mapping_id, target_fingerprint)` means retrying the *same* target
+    finds the same row, while a target that changed under us starts a new one.
+    """
+
+    __tablename__ = "session_preparations"
+    __table_args__ = (
+        UniqueConstraint(
+            "mapping_id",
+            "target_fingerprint",
+            name="uq_session_preparations_mapping_fingerprint",
+        ),
+        CheckConstraint(
+            "stage IN ('decided', 'checkpointed', 'uploaded', 'created', 'completed', 'failed')",
+            name="ck_session_preparations_stage",
+        ),
+        Index("session_preparations_mapping_idx", "mapping_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    mapping_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("thread_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    stage: Mapped[str] = mapped_column(Text, nullable=False)
+    transfer_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transfer_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    new_mapping_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("thread_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class TaskContinuation(Base):
+    """A queued first turn for an agent a task was just handed to.
+
+    `idempotency_key` plus the `status` ladder is the at-most-once guarantee:
+    a dispatcher claims a row with a single conditional UPDATE, so a restart
+    mid-dispatch can never post the same continuation twice.
+    """
+
+    __tablename__ = "task_continuations"
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('task_handoff', 'private_input_applied')",
+            name="ck_task_continuations_reason",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'delivered', 'skipped')",
+            name="ck_task_continuations_status",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_task_continuations_idempotency_key"),
+        Index(
+            "task_continuations_thread_idx",
+            "tenant_id",
+            "platform",
+            "thread_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    parent_channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_id: Mapped[str] = mapped_column(Text, nullable=False)
+    requester_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    requester_external_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    target_ma_agent_id: Mapped[str] = mapped_column(Text, nullable=False)
+    target_name: Mapped[str] = mapped_column(Text, nullable=False)
+    # NULL means the handoff carried no work to continue: the switch is
+    # recorded, and nothing is ever dispatched (never a billed turn).
+    requested_work: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    skip_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

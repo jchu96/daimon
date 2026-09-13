@@ -140,10 +140,10 @@ def _prepared_turn(
     mapping_id=None negative case bind_session never actually produces."""
     record = bind_recorder(
         deps,
-        admission,
         tenant_id=tenant_id,
         external_user_id=external_user_id,
         ma_session_id=ma_session_id,
+        model_id=admission.agent.model.id,
     )
     return PreparedTurn(
         admission=admission,
@@ -609,6 +609,161 @@ async def test_dead_session_recorder_rebind_targets_new_session_id(
     )
     assert rows[0].managed_session_id != "sess_old", (
         "the recorded session id must not be the stale old session"
+    )
+
+
+async def test_recovery_rebinds_the_recorder_to_the_recreated_sessions_model(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The replacement session freezes its own agent snapshot, which need not
+    be the model the dead session ran — so the rebound recorder must bill what
+    `sessions.create` returned, not what the admission asked for."""
+    from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
+        BetaManagedAgentsSpanModelRequestEndEvent,
+    )
+    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
+        BetaManagedAgentsSpanModelUsage,
+    )
+    from daimon.core.stores import tenant_ledger
+
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-recovery-model",
+        ma_session_id="sess_old",
+    )
+    await db_session.commit()
+
+    session_bodies: list[dict[str, object]] = []
+    router = MARouter()
+    memory_handler = make_fake_memory_store_handler()
+
+    def _memory(request: httpx.Request, _match: object) -> httpx.Response:
+        return memory_handler(request)
+
+    router.add("POST", r"/v1/memory_stores", _memory)
+
+    def _session_create(request: httpx.Request, _match: object) -> httpx.Response:
+        body = json.loads(request.content)
+        session_bodies.append(body)
+        # MA reports the model the NEW session froze — opus, while the
+        # admission below is still carrying sonnet.
+        return httpx.Response(
+            200,
+            json={
+                "id": "sess_new",
+                "type": "session",
+                "agent": {
+                    "id": body["agent"],
+                    "mcp_servers": [],
+                    "model": {"id": "claude-opus-5"},
+                    "name": "daimon",
+                    "skills": [],
+                    "tools": [],
+                    "type": "agent",
+                    "version": 2,
+                },
+                "created_at": "2026-07-28T00:00:00Z",
+                "outcome_evaluations": [],
+                "environment_id": body["environment_id"],
+                "metadata": {},
+                "resources": [],
+                "stats": {},
+                "status": "idle",
+                "updated_at": "2026-07-28T00:00:00Z",
+                "usage": {},
+                "vault_ids": [],
+            },
+        )
+
+    router.add("POST", r"/v1/sessions", _session_create)
+
+    def _send(_request: httpx.Request, _match: object) -> httpx.Response:
+        return send_events_response()
+
+    router.add("POST", r"/v1/sessions/[^/]+/events", _send)
+
+    def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        if match.group("sid") == "sess_old":
+            return not_found_response("session gone")
+        usage_evt = BetaManagedAgentsSpanModelRequestEndEvent(
+            id="evt_span",
+            is_error=False,
+            model_request_start_id="start_1",
+            model_usage=BetaManagedAgentsSpanModelUsage(
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+            processed_at=datetime.now(UTC),
+            type="span.model_request_end",
+        )
+        idle = make_status_idle(event_id="evt_idle")
+        return sse_response([usage_evt.model_dump(mode="json"), idle.model_dump(mode="json")])
+
+    router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _stream)
+
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
+    env = _env(env_id="env_1", tenant_id=tenant.id)
+    admission = _admission(account_id=account.id, agent=agent, env=env)
+    assert admission.agent.model.id == "claude-sonnet-4-6", (
+        "the admission must differ from the recreated session's model for this test to bite"
+    )
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=admission,
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_old",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-recovery-model",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is True, "the dead session must be recovered exactly once"
+    async with db_session_factory() as s:
+        rows = await usage_events.list_for_tenant(s, tenant_id=tenant.id)
+        entries = await tenant_ledger.list_for_tenant(s, tenant_id=tenant.id)
+    assert [usage.model for usage in rows] == ["claude-opus-5"], (
+        "the rebound recorder must bill the recreated session's model, not the admission's"
+    )
+    assert [entry.delta_usd for entry in entries if entry.reason == "turn_debit"] == [
+        Decimal("-5.000000")
+    ], "1M input tokens must be debited at the recreated session's opus rate"
+
+    async with db_session_factory() as s:
+        live = await get_live_thread_session(
+            s,
+            tenant_id=tenant.id,
+            platform="discord",
+            thread_id="thread-recovery-model",
+            account_id=account.id,
+        )
+    assert live is not None, "recovery must leave a live mapping row"
+    assert live.effective_config is not None, "the replacement row must record its configuration"
+    assert live.effective_config.model_id == "claude-opus-5", (
+        "the replacement row's snapshot must be the model the new session froze"
     )
 
 
