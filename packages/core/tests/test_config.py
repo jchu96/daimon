@@ -669,6 +669,9 @@ def test_thread_naming_defaults_on_with_bounded_input(monkeypatch: pytest.Monkey
     assert settings.thread_naming.max_input_chars == 2000, (
         "the naming prompt is bounded to 2000 chars of the opening message by default"
     )
+    assert settings.thread_naming.timeout_seconds == 5.0, (
+        "a mention waits at most 5 s for a title before the thread opens by default"
+    )
 
 
 def test_thread_naming_parsed_from_top_level_nested_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -676,12 +679,16 @@ def test_thread_naming_parsed_from_top_level_nested_env(monkeypatch: pytest.Monk
     monkeypatch.setenv("DAIMON_ANTHROPIC__API_KEY", "sk-test")
     monkeypatch.setenv("DAIMON_THREAD_NAMING__ENABLED", "false")
     monkeypatch.setenv("DAIMON_THREAD_NAMING__MAX_INPUT_CHARS", "500")
+    monkeypatch.setenv("DAIMON_THREAD_NAMING__TIMEOUT_SECONDS", "2.5")
     settings = load_settings(_env_file=None)
     assert settings.thread_naming.enabled is False, (
         "DAIMON_THREAD_NAMING__ENABLED=false must turn the feature off"
     )
     assert settings.thread_naming.max_input_chars == 500, (
         "DAIMON_THREAD_NAMING__MAX_INPUT_CHARS must override the input bound"
+    )
+    assert settings.thread_naming.timeout_seconds == 2.5, (
+        "DAIMON_THREAD_NAMING__TIMEOUT_SECONDS must override the wait for a title"
     )
 
 

@@ -771,6 +771,16 @@ class ThreadNamingSettings(BaseModel):
             "messages are cut here. Bounds the per-thread naming cost."
         ),
     )
+    timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description=(
+            "Seconds to wait for the naming model before the thread opens under the "
+            "static title. The thread is created only after this call, so this is "
+            "the most a mention can wait before anything appears."
+        ),
+    )
 
 
 class ArtifactsSettings(BaseModel):
