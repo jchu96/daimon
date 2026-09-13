@@ -13,6 +13,7 @@ from daimon.core.scope import (
     ChannelConfigRow,
     DeploymentDefault,
     TenantConfigRow,
+    _pick_agent,  # pyright: ignore[reportPrivateUsage]  # same cascade winner as the routing panel
     is_agent_reachable,
 )
 from daimon.core.specs import AgentSpec
@@ -84,6 +85,7 @@ class PanelState:
     # ExpiringView.bind_render_interaction on every render; a view holding a
     # stale generation is off screen and must not rewrite the message.
     render_seq: int = 0
+    recent_setup_conversations: list[str] = dataclasses.field(default_factory=list[str])
 
     def add_skill_repo_pending(self, url: str) -> None:
         """Mark a skill repo as in-flight; idempotent."""
@@ -274,9 +276,14 @@ class PanelState:
         deployment_default: DeploymentDefault | None = None,
         secret_count: int = 0,
     ) -> PanelState:
+        tenant_row, channel_rows = cascade_view if cascade_view is not None else (None, [])
+        channel_row = next((row for row in channel_rows if row.channel_id == str(channel_id)), None)
+        responder_name, _ = _pick_agent(
+            channel_row, tenant_row, deployment_default or DeploymentDefault()
+        )
         state = cls(
             roster=roster,
-            selected=(roster[0] if roster else None),
+            selected=next((entry for entry in roster if entry.name == responder_name), None),
             account_id=account_id,
             platform_principal_id=platform_principal_id,
             default_mcp_url=default_mcp_url,

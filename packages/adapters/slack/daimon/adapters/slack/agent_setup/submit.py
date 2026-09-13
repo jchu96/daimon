@@ -59,6 +59,7 @@ from daimon.adapters.slack.agent_setup.write import (
     store_inline_pat,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.adapters.slack.setup_conversations import setup_button
 from daimon.core.constants import DEFAULT_AGENT_MODEL
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
@@ -598,7 +599,7 @@ async def run_new_agent_submission(
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
-        await create_blank_agent(
+        outcome = await create_blank_agent(
             runtime,
             tenant_id=tenant_id,
             name=str(extra.get("name") or ""),
@@ -607,6 +608,8 @@ async def run_new_agent_submission(
             account_id=account_id,
         )
 
+        if outcome.anthropic_id is None:
+            raise DaimonError("Agent creation did not return an identity. Reopen setup and retry.")
         log.info(
             "slack.agent_setup.new_agent.created",
             team_id=team_id,
@@ -616,6 +619,13 @@ async def run_new_agent_submission(
             channel=channel_id,
             user=user_id,
             text=f":white_check_mark: Created agent `{extra.get('name')}`.",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"Created agent `{extra.get('name')}`."},
+                },
+                setup_button(outcome.anthropic_id),
+            ],
         )
     except (DaimonError, anthropic.APIError, SlackApiError, SQLAlchemyError) as exc:
         log.error("slack.agent_setup.new_agent_failed", team_id=team_id, exc_info=exc)

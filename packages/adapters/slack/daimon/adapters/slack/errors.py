@@ -15,6 +15,7 @@ import anthropic
 from cryptography.fernet import InvalidToken
 from daimon.adapters.slack.mrkdwn import escape_mrkdwn
 from daimon.core.errors import DaimonError, SpecError, StoreError
+from daimon.core.turn.errors import SessionAgentMismatch
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.exc import SQLAlchemyError
@@ -33,6 +34,12 @@ def render_error(exc: Exception, *, request_id: str) -> str:
     never turn into a live mention or link.
     """
     rid = f"`rid: {request_id}`"
+    if isinstance(exc, SessionAgentMismatch):
+        return (
+            "This conversation's session belongs to another responder. "
+            "Your existing work is preserved. Continuing with this responder currently "
+            "requires a new conversation."
+        )
     if isinstance(exc, SpecError):
         return f"⚠️ *Spec validation failed*: {escape_mrkdwn(str(exc))}\n{rid}"
     if isinstance(exc, StoreError):

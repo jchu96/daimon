@@ -125,6 +125,23 @@ async def test_new_agent_calls_reconcile_with_blank_spec_and_account_id(
             return httpx.Response(200, json={"data": [], "next_page": None})
         if request.method == "GET" and request.url.path == "/v1/agents":
             return httpx.Response(200, json={"data": [], "next_page": None})
+        if request.method == "GET" and request.url.path == "/v1/agents/ag_new":
+            agent = BetaManagedAgentsAgent(
+                id="ag_new",
+                type="agent",
+                name="research-bot",
+                model={"id": "claude-sonnet-4-6"},
+                metadata={"daimon_tenant": str(tenant_id)},
+                description=None,
+                system="be helpful",
+                created_at="2026-04-21T00:00:00Z",
+                updated_at="2026-04-21T00:00:00Z",
+                version=1,
+                mcp_servers=[],
+                skills=[],
+                tools=[],
+            )
+            return httpx.Response(200, json=agent.model_dump(mode="json"))
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     runtime = _runtime(build_stub_anthropic(handler), tenant_id)
@@ -148,6 +165,9 @@ async def test_new_agent_calls_reconcile_with_blank_spec_and_account_id(
 
     await modal.on_submit(interaction)
 
+    assert state.selected is not None and state.selected.ma_agent_id == "ag_new", (
+        "new-agent success must retain the created identity even before the roster lists it"
+    )
     assert "spec" in captured, "new-agent submit must invoke reconcile_agent"
     assert captured["spec"].name == "research-bot", "spec name must come from modal input"
     assert captured["account_id"] == guild_account, (

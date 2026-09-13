@@ -47,6 +47,10 @@ principal UUID. The orchestrator dispatches manually rather than via a unified
 Protocol — see RESEARCH.md A2.
 
 Deliberate carve-outs:
+- Shared setup conversations retain their binding and other participants' work;
+  account deletion removes creator attribution through ON DELETE SET NULL.
+  Short-lived turn origins are removed through the account's ON DELETE CASCADE,
+  including any still-active authority; neither needs an explicit delete helper.
 - Hosted chart artifacts in operator-owned object storage are not deleted by
   account purge; operators must enforce retention with a bucket lifecycle rule.
 - `usage_events` and `tenant_user_caps` rows are retained for billing integrity.

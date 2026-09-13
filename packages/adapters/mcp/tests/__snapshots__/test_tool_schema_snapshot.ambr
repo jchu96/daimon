@@ -226,6 +226,17 @@
       'parameters': dict({
         'additionalProperties': False,
         'properties': dict({
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'name': dict({
             'type': 'string',
           }),
@@ -323,6 +334,17 @@
         'properties': dict({
           'agent_name': dict({
             'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
           }),
           'server_name': dict({
             'type': 'string',
@@ -1595,6 +1617,17 @@
           'agent_name': dict({
             'type': 'string',
           }),
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'server_name': dict({
             'description': 'Name of the attached MCP server to disconnect.',
             'type': 'string',
@@ -1612,8 +1645,9 @@
         Who answers in this channel, for example #growth? Report who answers and
         which routing tier decided it.
         
-        Resolution is a cascade: the channel's own default wins, else the
-        workspace default, else the deployment default. This reports the winner
+        Supply thread_id to include its setup binding. Thread responder wins, else
+        the channel's own default, else the workspace default, else the deployment
+        default. This reports the winner
         AND every tier's setting, so "why that agent" is answerable without
         starting a turn and reading its footer.
         
@@ -1638,6 +1672,17 @@
         'properties': dict({
           'channel_id': dict({
             'type': 'string',
+          }),
+          'thread_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
           }),
         }),
         'required': list([
@@ -1701,6 +1746,17 @@
       'parameters': dict({
         'additionalProperties': False,
         'properties': dict({
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'new_name': dict({
             'type': 'string',
           }),
@@ -1726,6 +1782,17 @@
       'parameters': dict({
         'additionalProperties': False,
         'properties': dict({
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'name': dict({
             'type': 'string',
           }),
@@ -1962,6 +2029,17 @@
         'properties': dict({
           'agent_name': dict({
             'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
           }),
         }),
         'required': list([
@@ -2714,6 +2792,17 @@
           'agent_name': dict({
             'type': 'string',
           }),
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
           'key': dict({
             'description': 'Stored environment variable name, UPPER_SNAKE, e.g. TOGGL_TOKEN or OPENAI_API_KEY; never the secret value.',
             'type': 'string',
@@ -2740,6 +2829,17 @@
         'properties': dict({
           'agent_name': dict({
             'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
           }),
           'skill_id': dict({
             'type': 'string',
@@ -2799,11 +2899,17 @@
             'type': 'string',
           }),
           'channel_id': dict({
-            'description': 'Channel where the requester-only private-input card will be posted.',
+            'description': 'Compatibility field; origin controls the posting destination.',
+            'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
             'type': 'string',
           }),
           'key': dict({
             'description': 'Stored environment variable name, UPPER_SNAKE, e.g. TOGGL_TOKEN or OPENAI_API_KEY; never the secret value.',
+            'type': 'string',
+          }),
+          'origin_context_id': dict({
             'type': 'string',
           }),
           'purpose': dict({
@@ -2815,6 +2921,8 @@
           'key',
           'purpose',
           'channel_id',
+          'origin_context_id',
+          'expected_ma_agent_id',
         ]),
         'type': 'object',
       }),
@@ -2841,7 +2949,13 @@
             'type': 'string',
           }),
           'channel_id': dict({
-            'description': 'Channel where the requester-only private-input card will be posted.',
+            'description': 'Compatibility field; origin controls the posting destination.',
+            'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'type': 'string',
+          }),
+          'origin_context_id': dict({
             'type': 'string',
           }),
           'server_name': dict({
@@ -2858,6 +2972,8 @@
           'server_name',
           'url',
           'channel_id',
+          'origin_context_id',
+          'expected_ma_agent_id',
         ]),
         'type': 'object',
       }),
@@ -2882,7 +2998,13 @@
             'type': 'string',
           }),
           'channel_id': dict({
-            'description': 'Channel where the requester-only private-input card will be posted.',
+            'description': 'Compatibility field; origin controls the posting destination.',
+            'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'type': 'string',
+          }),
+          'origin_context_id': dict({
             'type': 'string',
           }),
           'purpose': dict({
@@ -2898,6 +3020,8 @@
           'repo_url',
           'purpose',
           'channel_id',
+          'origin_context_id',
+          'expected_ma_agent_id',
         ]),
         'type': 'object',
       }),
@@ -2925,7 +3049,13 @@
             'type': 'string',
           }),
           'channel_id': dict({
-            'description': 'Channel where the requester-only private-input card will be posted.',
+            'description': 'Compatibility field; origin controls the posting destination.',
+            'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'type': 'string',
+          }),
+          'origin_context_id': dict({
             'type': 'string',
           }),
           'path': dict({
@@ -2945,6 +3075,8 @@
           'repo_url',
           'purpose',
           'channel_id',
+          'origin_context_id',
+          'expected_ma_agent_id',
         ]),
         'type': 'object',
       }),
@@ -3219,8 +3351,8 @@
         ``<channel platform="discord" id="..." role="parent_channel">``.
         Never pass the current thread's id here. Slack: use the id from
         ``<channel platform="slack" id="...">`` — Slack's context always
-        names the current channel, with no thread-vs-parent split. A turn
-        always resolves its agent from the parent channel, so a default
+        names the parent channel. A channel default is resolved from the parent;
+        setup threads keep their bound responder. A default
         written against a thread id is a scope nothing ever reads: the write
         succeeds, this tool reports success, and the channel keeps answering
         with the old agent.
@@ -3232,6 +3364,17 @@
             'type': 'string',
           }),
           'channel_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'expected_ma_agent_id': dict({
             'anyOf': list([
               dict({
                 'type': 'string',
@@ -3274,6 +3417,31 @@
         'required': list([
           'repo_url',
           'default_branch',
+        ]),
+        'type': 'object',
+      }),
+    }),
+    'set_setup_target': dict({
+      'description': '''
+        Switch this setup conversation to an explicitly selected MA agent identity.
+        
+        Pass the current turn's origin_context_id and a current agent's MA id.
+        State the target switch briefly. Other running turns keep their own target.
+        This changes no routing or editing permissions.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_id': dict({
+            'type': 'string',
+          }),
+          'origin_context_id': dict({
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'origin_context_id',
+          'agent_id',
         ]),
         'type': 'object',
       }),
@@ -3413,6 +3581,17 @@
           'branch': dict({
             'default': 'main',
             'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
           }),
           'path': dict({
             'default': '',
@@ -3821,6 +4000,17 @@
         'additionalProperties': False,
         'properties': dict({
           'description': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'expected_ma_agent_id': dict({
             'anyOf': list([
               dict({
                 'type': 'string',

@@ -60,6 +60,7 @@ import json
 import uuid
 from typing import Any
 
+import aiohttp
 import anthropic
 import jwt as pyjwt
 import structlog
@@ -100,8 +101,11 @@ from daimon.adapters.slack.agent_setup.write import (
     do_unpropagate,
     replace_agent_resources_for_panel,
 )
+from daimon.adapters.slack.errors import render_error
 from daimon.adapters.slack.interactions import resolve_web_client
+from daimon.adapters.slack.mrkdwn import escape_mrkdwn
 from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.adapters.slack.setup_conversations import create_setup_conversation, setup_link
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     list_agents_by_tenant,
@@ -113,10 +117,12 @@ from daimon.core.mcp_auth import mint_agent_mcp_token
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.scope import (
     ChannelScopeRef,
+    ScopeContext,
     TenantScopeRef,
 )
 from daimon.core.specs import AgentSpec
-from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant, resolve
+from daimon.core.stores.thread_agent_bindings import list_active_bindings
 from slack_sdk.errors import SlackApiError
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -380,8 +386,35 @@ async def handle_agent_setup_command(runtime: SlackRuntime, payload: dict[str, A
                 session, runtime.anthropic, tenant_id=tenant_id
             )
 
+        async with runtime.sessionmaker() as session:
+            config = await resolve(
+                session,
+                context=ScopeContext(tenant_id=tenant_id, channel_id=channel_id),
+                default=runtime.deployment_default,
+            )
+            scope_hint = (
+                await load_scope_hint(
+                    session,
+                    tenant_id=tenant_id,
+                    agent_name=config.agent_name,
+                    channel_id=channel_id,
+                )
+                if config.agent_name
+                else "_(no default set for this channel)_"
+            )
+            setups = await list_active_bindings(
+                session,
+                tenant_id=tenant_id,
+                platform="slack",
+                parent_channel_id=channel_id,
+                limit=10,
+            )
+        recent_links = [
+            f"<{setup_link(team_id, channel_id, row.thread_id)}|Set up "
+            f"{escape_mrkdwn(row.configuration_target_name or 'an agent')}>"
+            for row in setups
+        ]
         state = AgentSetupState(rows=entries, over_cap_count=over_cap)
-        scope_hint = "_(no default set for this agent)_"
 
         await client.views_update(  # pyright: ignore[reportUnknownMemberType]
             view_id=view_id,  # pyright: ignore[reportUnknownArgumentType]
@@ -390,12 +423,21 @@ async def handle_agent_setup_command(runtime: SlackRuntime, payload: dict[str, A
                 is_admin=is_admin,
                 team_id=team_id,
                 channel_id=channel_id,
-                selected_agent_name=None,
+                selected_agent_name=config.agent_name,
                 scope_hint=scope_hint,
+                recent_setup_links=recent_links,
             ),
         )
 
-    except (DaimonError, anthropic.APIError, SlackApiError, InvalidToken, SQLAlchemyError) as exc:
+    except (
+        DaimonError,
+        anthropic.APIError,
+        SlackApiError,
+        InvalidToken,
+        SQLAlchemyError,
+        aiohttp.ClientError,
+        TimeoutError,
+    ) as exc:
         log.error("slack.agent_setup_command_failed", team_id=team_id, exc_info=exc)
         capture_exception_with_scope(exc)
         # No infinite spinner — update to error view on failure.
@@ -441,7 +483,8 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
     meta = decode_private_metadata(raw_meta)
 
     team_id = team_id or meta.get("team_id") or ""
-    channel_id: str = meta.get("channel_id") or ""
+    channel_info: dict[str, Any] = payload.get("channel") or {}
+    channel_id = str(meta.get("channel_id") or channel_info.get("id") or "")
     selected_agent_name: str | None = meta.get("selected_agent_name") or meta.get("agent_name")
     active_section: str = meta.get("active_section") or "agent"
 
@@ -458,6 +501,21 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
 
     try:
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+
+        if action_id == "agent_setup__conversation":
+            target_id = str(action.get("value") or "choose")
+            link = await create_setup_conversation(
+                runtime,
+                client,
+                team_id=team_id,
+                channel_id=channel_id,
+                user_id=user_id,
+                target_ma_agent_id=None if target_id == "choose" else target_id,
+            )
+            await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                channel=channel_id, user=user_id, text=f"<{link}|Open setup with Daimon>"
+            )
+            return
 
         # -----------------------------------------------------------------------
         # Roster select (read-only — no admin gate needed)
@@ -564,6 +622,11 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 view_id=view_id,
                 view=build_l2_view(
                     agent_name=agent_name_for_tab,
+                    target_ma_agent_id=next(
+                        str(a.id)
+                        for a in agents_check
+                        if a.metadata.get(MA_METADATA_KEY_NAME) == agent_name_for_tab
+                    ),
                     active_section=section,
                     team_id=team_id,
                     channel_id=channel_id,
@@ -630,6 +693,11 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 trigger_id=payload.get("trigger_id") or "",
                 view=build_l2_view(
                     agent_name=agent_name_for_edit,
+                    target_ma_agent_id=next(
+                        str(a.id)
+                        for a in agents_check
+                        if a.metadata.get(MA_METADATA_KEY_NAME) == agent_name_for_edit
+                    ),
                     active_section="agent",
                     team_id=team_id,
                     channel_id=channel_id,
@@ -1001,6 +1069,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 view_id=view_id,
                 view=build_l2_view(
                     agent_name=agent_name_for_remove,
+                    target_ma_agent_id=str(ma_agent.id),
                     active_section=active_section,
                     team_id=team_id,
                     channel_id=channel_id,
@@ -1086,6 +1155,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 view_id=view_id,
                 view=build_l2_view(
                     agent_name=agent_name_for_remove,
+                    target_ma_agent_id=str(ma_agent.id),
                     active_section=active_section,
                     team_id=team_id,
                     channel_id=channel_id,
@@ -1172,6 +1242,7 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 view_id=view_id,
                 view=build_l2_view(
                     agent_name=agent_name_for_remove,
+                    target_ma_agent_id=str(ma_agent.id),
                     active_section=active_section,
                     team_id=team_id,
                     channel_id=channel_id,
@@ -1585,7 +1656,15 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 team_id=team_id,
             )
 
-    except (DaimonError, anthropic.APIError, SlackApiError, InvalidToken, SQLAlchemyError) as exc:
+    except (
+        DaimonError,
+        anthropic.APIError,
+        SlackApiError,
+        InvalidToken,
+        SQLAlchemyError,
+        aiohttp.ClientError,
+        TimeoutError,
+    ) as exc:
         log.error(
             "slack.agent_setup_action_failed",
             team_id=team_id,
@@ -1593,3 +1672,9 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
             exc_info=exc,
         )
         capture_exception_with_scope(exc)
+        if action_id == "agent_setup__conversation":
+            await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                channel=channel_id,
+                user=user_id,
+                text=render_error(exc, request_id=_new_request_id()),
+            )

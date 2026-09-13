@@ -546,3 +546,121 @@ async def test_admit_clears_the_scope_row_that_named_an_archived_agent(
     assert chan3 is not None and chan3.agent_name == "other-agent", (
         "a channel naming a different agent must be untouched by the tenant-wide clear"
     )
+
+
+@pytest.mark.parametrize("role", ["admin", "user"])
+async def test_role_is_persisted_even_when_configuration_blocks_turn(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    role: str,
+) -> None:
+    from daimon.core.stores.accounts import get_account, set_role
+    from daimon.core.stores.domain import Role
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    tenant = await make_tenant(db_session, platform="slack")
+    principal = await get_or_create_platform_principal(
+        db_session, tenant_id=tenant.id, platform="slack", external_id="U_CURRENT"
+    )
+    await set_role(db_session, principal.account_id, Role.USER if role == "admin" else Role.ADMIN)
+    await db_session.commit()
+    with pytest.raises(MissingTurnConfigError):
+        await admit(
+            _deps(sessionmaker=db_session_factory, router=MARouter(), defaults_root=tmp_path),
+            tenant_id=tenant.id,
+            platform="slack",
+            external_user_id="U_CURRENT",
+            channel_id="C_CHANNEL",
+            thread_id="100.01",
+            role=Role(role),
+            now=_NOW,
+        )
+    db_session.expire_all()
+    account = await get_account(db_session, principal.account_id)
+    assert account is not None and account.role == Role(role), (
+        "successful role refresh precedes all turn gates"
+    )
+
+
+async def test_setup_admission_uses_bound_identity_and_leaves_missing_target_unchanged(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    await make_tenant_config(
+        db_session, tenant=tenant, agent_name="specialist", environment_name="default"
+    )
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="SETUP",
+        responder_ma_agent_id="ag_exact",
+        responder_name="daimon",
+        configuration_target_ma_agent_id="ag_deleted",
+        configuration_target_name="specialist",
+    )
+    await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
+    await db_session.commit()
+    responder = BetaManagedAgentsAgent(
+        id="ag_exact",
+        name="daimon",
+        type="agent",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
+        mcp_servers=[],
+        skills=[],
+        tools=[],
+        created_at=_NOW,
+        updated_at=_NOW,
+        metadata={
+            "daimon_tenant": str(tenant.id),
+            "daimon_name": "daimon",
+            "daimon_managed": "true",
+        },
+    )
+    environment = BetaEnvironment(
+        id="env_science",
+        type="environment",
+        name="default",
+        description="",
+        config=EMPTY_CLOUD_CONFIG,
+        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "default"},
+        created_at=_NOW.isoformat(),
+        updated_at=_NOW.isoformat(),
+    )
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents/ag_exact",
+        lambda req, match: httpx.Response(200, json=responder.model_dump(mode="json")),
+    )
+    router.add(
+        "GET",
+        r"/v1/environments",
+        lambda req, match: list_response([environment.model_dump(mode="json")]),
+    )
+    router.add(
+        "GET",
+        r"/v1/environments/env_science",
+        lambda req, match: httpx.Response(200, json=environment.model_dump(mode="json")),
+    )
+    admission = await admit(
+        _deps(sessionmaker=db_session_factory, router=router, defaults_root=tmp_path),
+        tenant_id=tenant.id,
+        platform="discord",
+        external_user_id="MEMBER",
+        channel_id="C_PARENT",
+        thread_id="SETUP",
+        now=_NOW,
+    )
+    assert admission.agent.id == "ag_exact", "setup never resolves the parent specialist"
+    assert admission.config.configuration_target_ma_agent_id == "ag_deleted", (
+        "missing target remains identifiable"
+    )
+    assert admission.environment.id == "env_science", "environment retains its existing resolution"

@@ -44,27 +44,30 @@ from daimon.core.defaults.report import compose_failure_reason
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
-from daimon.core.stores.accounts import set_role
 from daimon.core.stores.domain import Role, TenantRow
 from daimon.core.stores.tenants import (
     get_tenant_liveness,
     list_tenants_by_platform,
     set_provision_status,
 )
+from daimon.core.stores.thread_agent_bindings import update_lifecycle
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
     list_orphaned_turns,
     mark_turn_active,
     update_watermark,
 )
+from daimon.core.stores.turn_origins import get_active_origin
 from daimon.core.thread_naming import strip_mentions
 from daimon.core.thread_participation import ParticipationMode
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.ceiling import turn_deadline
+from daimon.core.turn.errors import SessionAgentMismatch
 from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import RunOutcome, run_prepared_turn
+from daimon.core.turn_origin import render_turn_origin, turn_origin
 from sqlalchemy.exc import SQLAlchemyError  # noqa: TCH002
 
 import discord
@@ -1226,6 +1229,34 @@ class DaimonBot(commands.Bot):
         else:
             await target.send(error_text)
 
+    async def on_raw_thread_update(self, payload: discord.RawThreadUpdateEvent) -> None:
+        metadata = payload.data["thread_metadata"]
+        tenant_id = derive_tenant_uuid(platform="discord", workspace_id=str(payload.guild_id))
+        async with self.runtime.sessionmaker() as session:
+            await update_lifecycle(
+                session,
+                tenant_id=tenant_id,
+                platform="discord",
+                parent_channel_id=str(payload.parent_id),
+                thread_id=str(payload.thread_id),
+                archived=metadata.get("archived"),
+                locked=metadata.get("locked"),
+            )
+            await session.commit()
+
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        tenant_id = derive_tenant_uuid(platform="discord", workspace_id=str(payload.guild_id))
+        async with self.runtime.sessionmaker() as session:
+            await update_lifecycle(
+                session,
+                tenant_id=tenant_id,
+                platform="discord",
+                parent_channel_id=str(payload.parent_id),
+                thread_id=str(payload.thread_id),
+                deleted=True,
+            )
+            await session.commit()
+
     async def _orchestrate(
         self,
         message: discord.Message,
@@ -1264,6 +1295,12 @@ class DaimonBot(commands.Bot):
             parent_channel_id = str(message.channel.id)
             thread = None
 
+        author = message.author
+        is_admin = isinstance(author, discord.Member) and is_member_guild_admin(
+            author, guild_owner_id=message.guild.owner_id if message.guild else None
+        )
+        role = Role.ADMIN if is_admin else Role.USER
+
         # --- Stage one: admission (identity, config cascade, missing-config
         # bail, MA resolve/retrieve, balance gate, cap gate) -- D-01 admit(). ---
         try:
@@ -1273,6 +1310,8 @@ class DaimonBot(commands.Bot):
                 platform="discord",
                 external_user_id=str(message.author.id),
                 channel_id=parent_channel_id,
+                thread_id=str(thread.id) if thread else None,
+                role=role,
                 now=datetime.now(UTC),
             )
         except MissingTurnConfigError as err:
@@ -1353,37 +1392,6 @@ class DaimonBot(commands.Bot):
         turn_deadline_at = turn_deadline(now=datetime.now(UTC))
 
         agent = admission.agent
-
-        # --- Derive is_admin from Discord-native permissions ---
-        # author is Union[User, Member]; guild_permissions is only on Member.
-        # Non-Member (DM edge case) defaults to False.
-        author = message.author
-        is_admin = isinstance(author, discord.Member) and is_member_guild_admin(
-            author, guild_owner_id=message.guild.owner_id if message.guild else None
-        )
-
-        # --- Per-turn role upsert: sync account.role from live Discord perms ---
-        # This write is UNCONDITIONAL — it is NOT gated by per_caller_thread_sessions.
-        # The admin-via-live-role mechanism (this write + the MCP gate) ships
-        # active on every deploy regardless of the session-keying flag (B4 disposition).
-        #
-        # (a) Runs BEFORE run_turn so the live-role gate reads the fresh DB role
-        #     when this turn's MCP calls arrive — ensuring the first post-deploy admin turn
-        #     already has role=ADMIN when the gate evaluates.
-        # (b) Idempotent per-(tenant, account_id) write: the value is derived solely from the
-        #     caller's current guild-admin status, so concurrent same-account turns write the
-        #     IDENTICAL value. No lock is needed — accounts are tenant-scoped so admin status
-        #     is singular within a tenant (B1).
-        # (c) Targets only admission.account_id — by construction a platform-principal account
-        #     created by admit()'s identity resolution. CLI/operator accounts are distinct
-        #     rows and are never touched by this write (T-88-04-03).
-        async with self.runtime.sessionmaker() as _role_session:
-            await set_role(
-                _role_session,
-                admission.account_id,
-                Role.ADMIN if is_admin else Role.USER,
-            )
-            await _role_session.commit()
 
         # --- Create thread + status embed BEFORE session create ---
         # MA sessions.create can hold its HTTP response for minutes while it
@@ -1471,7 +1479,10 @@ class DaimonBot(commands.Bot):
         assert discord_settings is not None, (
             "_orchestrate called without discord settings — entrypoint must validate at boot"
         )
-        if discord_settings.per_caller_thread_sessions:
+        if (
+            discord_settings.per_caller_thread_sessions
+            or admission.config.thread_binding_id is not None
+        ):
             session_account_id = admission.account_id
         else:
             session_account_id = uuid.uuid5(
@@ -1481,17 +1492,31 @@ class DaimonBot(commands.Bot):
 
         # --- Stage two: bind_session (find-or-create, mapping write,
         # recorder binding) -- D-01 bind_session(). ---
-        prepared = await bind_session(
-            self.runtime.turn_deps,
-            admission,
-            tenant_id=tenant_id,
-            platform="discord",
-            external_user_id=str(message.author.id),
-            thread_id=str(thread.id),
-            session_account_id=session_account_id,
-            reuse_existing=is_thread_mention,
-            deadline=turn_deadline_at,
-        )
+        try:
+            prepared = await bind_session(
+                self.runtime.turn_deps,
+                admission,
+                tenant_id=tenant_id,
+                platform="discord",
+                external_user_id=str(message.author.id),
+                thread_id=str(thread.id),
+                session_account_id=session_account_id,
+                reuse_existing=is_thread_mention,
+                deadline=turn_deadline_at,
+            )
+        except SessionAgentMismatch as error:
+            # Replace this attempt's status card; the mapped session and its
+            # workspace remain intact for the previous responder.
+            if lifecycle.message_ref is not None:
+                await _edit_message(
+                    lifecycle.message_ref,
+                    content=render_error(error, request_id=generate_request_id()),
+                    embed=None,
+                    view=None,
+                )
+            else:
+                await thread.send(render_error(error, request_id=generate_request_id()))
+            return
 
         log.info(
             "session.ready",
@@ -1649,7 +1674,20 @@ class DaimonBot(commands.Bot):
             )
             if synthetic_prefix:
                 full_message = synthetic_prefix + "\n" + full_message
-            return full_message
+            async with self.runtime.sessionmaker() as session:
+                recovery_origin = await get_active_origin(
+                    session,
+                    origin_id=origin.id,
+                    tenant_id=tenant_id,
+                    account_id=admission.account_id,
+                    platform="discord",
+                    now=datetime.now(UTC),
+                )
+            if recovery_origin is None:
+                raise DaimonError(
+                    "This turn's setup context expired. Mention me again to continue."
+                )
+            return render_turn_origin(recovery_origin) + "\n" + full_message
 
         def _recovery_lifecycle(cancel_event: asyncio.Event) -> TurnLifecycle:
             new_lifecycle = DiscordTurnLifecycle(
@@ -1677,22 +1715,36 @@ class DaimonBot(commands.Bot):
         )
         outcome: RunOutcome | None = None
         try:
-            outcome = await run_prepared_turn(
-                self.runtime.turn_deps,
-                prepared,
+            async with turn_origin(
+                self.runtime.sessionmaker,
                 tenant_id=tenant_id,
+                account_id=admission.account_id,
                 platform="discord",
+                parent_channel_id=parent_channel_id,
                 thread_id=str(thread.id),
-                external_user_id=str(message.author.id),
-                user_message=user_message,
-                lifecycle=lifecycle,
-                cancel=cancel,
-                reseed_user_message=_reseed_user_message,
-                recovery_lifecycle=_recovery_lifecycle,
-                image_blocks=image_blocks,
-                render_interval_s=2.0,
-                deadline=turn_deadline_at,
-            )
+                responder_ma_agent_id=str(agent.id),
+                responder_name=admission.config.agent_name or agent.name,
+                configuration_target_ma_agent_id=admission.config.configuration_target_ma_agent_id,
+                configuration_target_name=admission.config.configuration_target_name,
+                role=role,
+                is_setup=admission.config.thread_binding_id is not None,
+            ) as origin:
+                outcome = await run_prepared_turn(
+                    self.runtime.turn_deps,
+                    prepared,
+                    tenant_id=tenant_id,
+                    platform="discord",
+                    thread_id=str(thread.id),
+                    external_user_id=str(message.author.id),
+                    user_message=render_turn_origin(origin) + "\n" + user_message,
+                    lifecycle=lifecycle,
+                    cancel=cancel,
+                    reseed_user_message=_reseed_user_message,
+                    recovery_lifecycle=_recovery_lifecycle,
+                    image_blocks=image_blocks,
+                    render_interval_s=2.0,
+                    deadline=turn_deadline_at,
+                )
         finally:
             # Runs on any exception, not just the happy path: whatever else
             # went wrong, the thread must not be left holding its active_turn

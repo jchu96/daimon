@@ -91,7 +91,16 @@ def _runtime(
     settings.github.oauth_scopes = oauth_scopes
     return DiscordRuntime(
         settings=settings,
-        anthropic=anthropic if anthropic is not None else build_stub_anthropic(),
+        anthropic=anthropic
+        if anthropic is not None
+        else build_stub_anthropic(
+            _vault_handler(
+                "unused",
+                "unused",
+                [],
+                tenant_id=str(derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID))),
+            )
+        ),
         sessionmaker=sessionmaker,
         notebook_rate_limiter=RateLimiter(max_requests=999),
         billing_config=None,
@@ -108,7 +117,7 @@ def _admin_interaction(*, guild_id: int = _GUILD_ID) -> MagicMock:
     interaction = MagicMock()
     interaction.guild_id = guild_id
     interaction.user = MagicMock(spec=discord.Member)
-    interaction.user.id = 1
+    interaction.user.id = 100000000000000001
     interaction.user.guild_permissions.administrator = True
     interaction.user.guild_permissions.manage_guild = False
     interaction.guild.owner_id = 999
@@ -127,7 +136,7 @@ def _member_interaction(*, guild_id: int = _GUILD_ID) -> MagicMock:
     interaction = MagicMock()
     interaction.guild_id = guild_id
     interaction.user = MagicMock(spec=discord.Member)
-    interaction.user.id = 2
+    interaction.user.id = 100000000000000001
     interaction.user.guild_permissions.administrator = False
     interaction.user.guild_permissions.manage_guild = False
     interaction.guild.owner_id = 999
@@ -177,7 +186,7 @@ async def _seed_repo_request(
     guild_id: int = _GUILD_ID,
 ) -> CredentialRequestRow:
     """Seed a `kind="repo"` request row, deliberately NOT mirroring
-    `_seed_env_request`'s random `workspace_id=f"g-{token[:8]}"` -- a repo
+    `_seed_env_request`'s random `workspace_id=str(_GUILD_ID)` -- a repo
     bind's gate test must land on a tenant that matches the interaction
     builders' `guild_id`, or every gate-touching assertion below passes on
     the wrong-guild branch instead of the one it names.
@@ -271,21 +280,26 @@ async def _seed_env_request(
     *,
     target: str = "OPENAI_API_KEY",
     expires_at: datetime | None = None,
+    with_origin: bool = False,
 ) -> CredentialRequestRow:
     token = mint_request_token()
     async with db_session_factory() as session, session.begin():
-        tenant = await make_tenant(session, platform="discord", workspace_id=f"g-{token[:8]}")
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(_GUILD_ID))
         row = await create_credential_request(
             session,
             token=token,
             kind="env",
             tenant_id=tenant.id,
-            agent_id=uuid.uuid4(),
+            agent_id=derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=_MA_AGENT_ID),
             account_id=uuid.uuid4(),
             target=target,
             mcp_server_url=None,
             requester_platform_user_id="100000000000000001",
-            channel_id="chan-1",
+            channel_id="333" if with_origin else "chan-1",
+            platform="discord" if with_origin else None,
+            parent_channel_id="222" if with_origin else None,
+            origin_thread_id="333" if with_origin else None,
+            posted_message_id="444" if with_origin else None,
             expires_at=expires_at or (datetime.now(UTC) + timedelta(minutes=30)),
         )
     return row
@@ -298,7 +312,7 @@ async def _seed_mcp_request(
 ) -> CredentialRequestRow:
     token = mint_request_token()
     async with db_session_factory() as session, session.begin():
-        tenant = await make_tenant(session, platform="discord", workspace_id=f"g-{token[:8]}")
+        tenant = await make_tenant(session, platform="discord", workspace_id=str(_GUILD_ID))
         row = await create_credential_request(
             session,
             token=token,
@@ -320,6 +334,8 @@ async def _seed_mcp_request(
 
 def _interaction() -> MagicMock:
     interaction = MagicMock()
+    interaction.guild_id = _GUILD_ID
+    interaction.user.id = 100000000000000001
     interaction.response.defer = AsyncMock()
     interaction.followup.send = AsyncMock()
     interaction.edit_original_response = AsyncMock()
@@ -770,6 +786,27 @@ async def test_mcp_modal_vault_write_failure_keeps_exception_details_private(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     def _failing_vault(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/agents":
+            agent = BetaManagedAgentsAgent(
+                id=_MA_AGENT_ID,
+                type="agent",
+                name="test-agent",
+                model={"id": "claude-sonnet-4-6"},
+                description=None,
+                system=None,
+                metadata={
+                    "daimon_tenant": str(
+                        derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID))
+                    )
+                },
+                created_at="2026-04-21T00:00:00Z",
+                updated_at="2026-04-21T00:00:00Z",
+                version=1,
+                mcp_servers=[],
+                skills=[],
+                tools=[],
+            )
+            return list_response([agent.model_dump(mode="json")])
         raise httpx.ConnectError("upstream reset by peer -- request envelope: secret=abc123")
 
     row = await _seed_mcp_request(db_session_factory)
@@ -802,6 +839,27 @@ async def test_mcp_modal_disables_the_button_even_when_the_write_below_it_fails(
     """
 
     def _failing_vault(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/agents":
+            agent = BetaManagedAgentsAgent(
+                id=_MA_AGENT_ID,
+                type="agent",
+                name="test-agent",
+                model={"id": "claude-sonnet-4-6"},
+                description=None,
+                system=None,
+                metadata={
+                    "daimon_tenant": str(
+                        derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID))
+                    )
+                },
+                created_at="2026-04-21T00:00:00Z",
+                updated_at="2026-04-21T00:00:00Z",
+                version=1,
+                mcp_servers=[],
+                skills=[],
+                tools=[],
+            )
+            return list_response([agent.model_dump(mode="json")])
         raise httpx.ConnectError("upstream reset by peer")
 
     row = await _seed_mcp_request(db_session_factory)
@@ -833,7 +891,9 @@ async def test_mcp_modal_never_logs_the_raw_token(
     per_agent_display = f"daimon-mcp:{row.account_id}:{row.agent_id}"
     runtime = _runtime(
         sessionmaker=db_session_factory,
-        anthropic=build_stub_anthropic(_vault_handler(vault_id, per_agent_display, [])),
+        anthropic=build_stub_anthropic(
+            _vault_handler(vault_id, per_agent_display, [], tenant_id=str(row.tenant_id))
+        ),
         public_url=HttpUrl("https://mcp.example.com/mcp"),
         jwt_secret="x" * 32,
     )
@@ -1248,7 +1308,27 @@ async def test_skill_repo_failure_reports_only_confirmed_token_saves(
     )
     runtime = _runtime(
         sessionmaker=db_session_factory,
-        anthropic=build_stub_anthropic(),
+        anthropic=build_fake_anthropic(
+            lambda request: list_response(
+                [
+                    BetaManagedAgentsAgent(
+                        id="agent_skill_repo_failure",
+                        type="agent",
+                        name="test-agent",
+                        model={"id": "claude-sonnet-4-6"},
+                        description=None,
+                        system=None,
+                        metadata={"daimon_tenant": str(row.tenant_id)},
+                        created_at="2026-04-21T00:00:00Z",
+                        updated_at="2026-04-21T00:00:00Z",
+                        version=1,
+                        mcp_servers=[],
+                        skills=[],
+                        tools=[],
+                    ).model_dump(mode="json")
+                ]
+            )
+        ),
         crypto_keys=(Fernet.generate_key().decode(),),
     )
     probes = 0
@@ -1290,4 +1370,97 @@ async def test_skill_repo_failure_reports_only_confirmed_token_saves(
     assert "retry" in message, "a consumed request needs a concrete retry instruction"
     assert "private upstream detail" not in message and "ConnectError" not in message, (
         "unexpected exception details stay in operator logs"
+    )
+
+
+@pytest.mark.parametrize("wrong_install", [False, True])
+async def test_env_submit_rechecks_requester_and_install_before_consuming(
+    db_session_factory: async_sessionmaker[AsyncSession], wrong_install: bool
+) -> None:
+    row = await _seed_env_request(db_session_factory)
+    modal = EnvCredentialModal(runtime=_runtime(sessionmaker=db_session_factory), request_row=row)
+    modal.value_input._value = _SECRET_VALUE
+    interaction = _interaction()
+    if wrong_install:
+        interaction.guild_id = 222
+    else:
+        interaction.user.id = 999
+    await modal.on_submit(interaction)
+    async with db_session_factory() as session:
+        persisted = await peek_credential_request(session, token=row.token)
+        files = await list_agent_files(session, tenant_id=row.tenant_id, agent_id=row.agent_id)
+    assert persisted is not None and persisted.used_at is None, (
+        "an invalid caller must not consume the request"
+    )
+    assert files == [], "an invalid caller must not write a credential"
+    assert "no longer valid" in interaction.followup.send.call_args.args[0], (
+        "submission must honestly refuse changed authority"
+    )
+
+
+@pytest.mark.parametrize("recreated", [False, True])
+async def test_env_submit_never_saves_to_a_deleted_target_or_recreated_namesake(
+    db_session_factory: async_sessionmaker[AsyncSession], recreated: bool
+) -> None:
+    row = await _seed_env_request(db_session_factory)
+    namesake = BetaManagedAgentsAgent(
+        id="agent_recreated",
+        type="agent",
+        name="test-agent",
+        model={"id": "claude-sonnet-4-6"},
+        description=None,
+        system=None,
+        metadata={"daimon_tenant": str(row.tenant_id)},
+        created_at="2026-04-21T00:00:00Z",
+        updated_at="2026-04-21T00:00:00Z",
+        version=1,
+        mcp_servers=[],
+        skills=[],
+        tools=[],
+    )
+    anthropic = build_fake_anthropic(
+        lambda request: list_response([namesake.model_dump(mode="json")] if recreated else [])
+    )
+    modal = EnvCredentialModal(
+        runtime=_runtime(sessionmaker=db_session_factory, anthropic=anthropic), request_row=row
+    )
+    modal.value_input._value = _SECRET_VALUE
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+    async with db_session_factory() as session:
+        persisted = await peek_credential_request(session, token=row.token)
+        files = await list_agent_files(session, tenant_id=row.tenant_id, agent_id=row.agent_id)
+    assert persisted is not None and persisted.used_at is None, (
+        "missing identity must not consume the request"
+    )
+    assert files == [], "a namesake must not receive the old target's credential"
+    assert "no longer exists" in interaction.followup.send.call_args.args[0], (
+        "missing target needs a specific explanation"
+    )
+
+
+async def test_env_submit_updates_stored_card_when_modal_payload_omits_message(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    row = await _seed_env_request(db_session_factory, with_origin=True)
+    modal = EnvCredentialModal(runtime=_runtime(sessionmaker=db_session_factory), request_row=row)
+    modal.value_input._value = _SECRET_VALUE
+    interaction = _interaction()
+    interaction.type = discord.InteractionType.modal_submit
+    interaction.message = None
+    interaction.channel_id = 333
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.parent_id = 222
+    partial_channel = interaction.client.get_partial_messageable.return_value
+    card = partial_channel.get_partial_message.return_value
+    card.edit = AsyncMock()
+    await modal.on_submit(interaction)
+    interaction.client.get_partial_messageable.assert_called_once_with(333)
+    partial_channel.get_partial_message.assert_called_once_with(444)
+    card.edit.assert_awaited_once()
+    interaction.edit_original_response.assert_not_awaited()
+    async with db_session_factory() as session:
+        files = await list_agent_files(session, tenant_id=row.tenant_id, agent_id=row.agent_id)
+    assert len(files) == 1, (
+        "an authenticated modal remains valid without an optional message payload"
     )

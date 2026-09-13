@@ -12,6 +12,7 @@ from daimon.core.errors import (
     SpecError,
     StoreError,
 )
+from daimon.core.turn.errors import SessionAgentMismatch
 from sqlalchemy.exc import SQLAlchemyError
 from ulid import ULID
 
@@ -25,6 +26,13 @@ def generate_request_id() -> str:
 
 def render_error(exc: Exception, *, request_id: str) -> str:
     """Map known exceptions to structured markdown with emoji, label, and rid."""
+    if isinstance(exc, SessionAgentMismatch):
+        return (
+            "This conversation already has a session with another responder. "
+            "Your existing work is preserved. To continue with the current responder, "
+            "start a new conversation.\n"
+            f"`rid: {request_id}`"
+        )
     if isinstance(exc, SpecError):
         return f"⚠️ **Spec validation failed**: {exc}\n`rid: {request_id}`"
     if isinstance(exc, StoreError):

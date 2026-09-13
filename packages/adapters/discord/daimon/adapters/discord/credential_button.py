@@ -76,6 +76,7 @@ from daimon.adapters.discord.credential_modals import (
     RepoBindModal,
     SkillRepoModal,
 )
+from daimon.adapters.discord.credential_origin import is_credential_interaction_valid
 from daimon.adapters.discord.credential_repo_bind import (
     refuse_if_shared_and_not_admin_for_request,
 )
@@ -197,6 +198,9 @@ class CredentialRequestButton(
                 return False
             if str(interaction.user.id) != request_row.requester_platform_user_id:
                 await interaction.response.send_message(_WRONG_REQUESTER, ephemeral=True)
+                return False
+            if not is_credential_interaction_valid(interaction, request_row):
+                await interaction.response.send_message(_NO_LONGER_VALID, ephemeral=True)
                 return False
             if request_row.expires_at < datetime.now(UTC):
                 await interaction.response.send_message(_EXPIRED, ephemeral=True)

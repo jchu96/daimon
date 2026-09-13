@@ -429,6 +429,7 @@ async def make_thread_session(
     platform: str = "discord",
     thread_id: str | None = None,
     ma_session_id: str | None = None,
+    ma_agent_id: str | None = None,
     watermark_message_id: str | None = None,
     created_at: datetime | None = None,
 ) -> ThreadSessionRow:
@@ -444,6 +445,7 @@ async def make_thread_session(
         thread_id=thread_id,
         account_id=account.id,
         ma_session_id=ma_session_id,
+        ma_agent_id=ma_agent_id,
         watermark_message_id=watermark_message_id,
         created_at=created_at,
     )

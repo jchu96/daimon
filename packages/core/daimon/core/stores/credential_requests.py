@@ -34,6 +34,10 @@ async def create_credential_request(
     requester_platform_user_id: str,
     channel_id: str,
     expires_at: datetime,
+    platform: str | None = None,
+    parent_channel_id: str | None = None,
+    origin_thread_id: str | None = None,
+    posted_message_id: str | None = None,
 ) -> CredentialRequestRow:
     """Insert a fresh, unused credential-request row and return it."""
     orm = CredentialRequest(
@@ -47,6 +51,10 @@ async def create_credential_request(
         requester_platform_user_id=requester_platform_user_id,
         channel_id=channel_id,
         expires_at=expires_at,
+        platform=platform,
+        parent_channel_id=parent_channel_id,
+        origin_thread_id=origin_thread_id,
+        posted_message_id=posted_message_id,
     )
     session.add(orm)
     await session.flush()
@@ -145,3 +153,14 @@ async def count_credential_requests_for_platform_user(
         predicates.append(CredentialRequest.tenant_id == tenant_id)
     stmt = select(func.count()).select_from(CredentialRequest).where(*predicates)
     return int((await session.execute(stmt)).scalar_one())
+
+
+async def update_credential_request_message(
+    session: AsyncSession, *, token: str, posted_message_id: str
+) -> None:
+    """Save the posted card identity for outcomes after the origin has expired."""
+    await session.execute(
+        update(CredentialRequest)
+        .where(CredentialRequest.token == token)
+        .values(posted_message_id=posted_message_id)
+    )

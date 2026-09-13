@@ -29,6 +29,7 @@ class RosterEntry:
 
     agent_name: str
     model_id: str
+    ma_agent_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -71,3 +71,49 @@ def test_remove_mcp_at_removes_matching_toolset_entry() -> None:
     assert not any(
         t.get("type") == "mcp_toolset" and t.get("mcp_server_name") == "to-remove" for t in tools
     ), "removing an MCP must also remove its toolset reference (no orphan tools)"
+
+
+def test_initial_selection_uses_parent_responder_and_preserves_explicit_selection() -> None:
+    from daimon.core.scope import ChannelConfigRow, DeploymentDefault, TenantConfigRow
+
+    tenant_id = uuid.uuid4()
+    roster = [
+        RosterEntry(
+            name=name,
+            model="claude-sonnet-4-6",
+            spec=AgentSpec(name=name, model="claude-sonnet-4-6"),
+        )
+        for name in ("first", "specialist", "daimon")
+    ]
+    state = PanelState.initial(
+        roster=roster,
+        account_id=uuid.uuid4(),
+        platform_principal_id=uuid.uuid4(),
+        channel_id=222,
+        cascade_view=(
+            TenantConfigRow(tenant_id=tenant_id, agent_name="daimon"),
+            [ChannelConfigRow(tenant_id=tenant_id, channel_id="222", agent_name="specialist")],
+        ),
+        deployment_default=DeploymentDefault(agent_name="first"),
+    )
+    assert state.selected is roster[1], (
+        "Details initially targets the actual parent-channel responder"
+    )
+    state.select("first")
+    assert state.selected is roster[0], "explicit selection must win after initialization"
+
+
+def test_initial_selection_without_a_responder_keeps_setup_target_unset() -> None:
+    roster = [
+        RosterEntry(
+            name="specialist",
+            model="claude-sonnet-4-6",
+            spec=AgentSpec(name="specialist", model="claude-sonnet-4-6"),
+        )
+    ]
+    state = PanelState.initial(
+        roster=roster, account_id=uuid.uuid4(), platform_principal_id=uuid.uuid4()
+    )
+    assert state.selected is None, (
+        "setup must ask which agent instead of silently picking the first roster entry"
+    )

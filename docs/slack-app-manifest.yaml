@@ -78,6 +78,14 @@ settings:
   event_subscriptions:
     bot_events:
       - app_mention
+      - message.channels
+      - message.groups
+      - channel_archive
+      - channel_unarchive
+      - channel_deleted
+      - group_archive
+      - group_unarchive
+      - group_deleted
       - app_uninstalled
       - tokens_revoked
   interactivity:

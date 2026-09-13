@@ -30,11 +30,11 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core import agent_lifecycle
 from daimon.core.agent_guidance import apply_credential_guidance
 from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP, ALLOWED_MODEL_IDS
 from daimon.core.defaults.ma_index import (
-    find_agent_by_daimon_tag,
     find_agents_by_daimon_tag,
     list_agents_by_tenant,
     list_skills_lenient,
@@ -312,10 +312,11 @@ async def _get_agent_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
     name: str,
+    expected_ma_agent_id: str | None = None,
 ) -> AgentInfo:
-    agent = await find_agent_by_daimon_tag(runtime.client, tenant_id=auth.tenant_id, name=name)
-    if agent is None:
-        raise ToolError(f"agent '{name}' not found")
+    agent = await resolve_setup_agent(
+        runtime, auth, name=name, expected_ma_agent_id=expected_ma_agent_id, require_identity=False
+    )
     return await _build_agent_info(runtime.client, agent, tenant_id=auth.tenant_id)
 
 
@@ -482,6 +483,7 @@ async def _update_agent_impl(
     tools: list[Tool] | None,
     mcp_servers: list[BetaManagedAgentsURLMCPServerParams] | None,
     skills: list[str | BetaManagedAgentsSkillParams] | None,
+    expected_ma_agent_id: str | None = None,
 ) -> AgentInfo:
     if model is not None:
         _reject_unknown_model(model)
@@ -489,9 +491,9 @@ async def _update_agent_impl(
     list_fields = (tools, mcp_servers, skills)
     if all(v is None for v in scalars.values()) and all(v is None for v in list_fields):
         raise ToolError("update_agent: at least one field is required")
-    agent = await find_agent_by_daimon_tag(runtime.client, tenant_id=auth.tenant_id, name=name)
-    if agent is None:
-        raise ToolError(f"agent '{name}' not found")
+    agent = await resolve_setup_agent(
+        runtime, auth, name=name, expected_ma_agent_id=expected_ma_agent_id
+    )
     _reject_system_agent(agent)
 
     touched_fields = {field_name for field_name, value in scalars.items() if value is not None}
@@ -596,6 +598,7 @@ async def _attach_mcp_server_impl(
     agent_name: str,
     server_name: str,
     url: str,
+    expected_ma_agent_id: str | None = None,
 ) -> AgentInfo:
     # #142: guard the reserved daimon-mcp entry before even looking at the agent.
     # Also reject any URL that points at the deployment's own public_url under a
@@ -608,11 +611,9 @@ async def _attach_mcp_server_impl(
     rejection = get_reserved_mcp_rejection(server_name=server_name, url=url, public_url=public_url)
     if rejection is not None:
         raise ToolError(rejection)
-    agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    agent = await resolve_setup_agent(
+        runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    if agent is None:
-        raise ToolError(f"agent '{agent_name}' not found")
     _reject_system_agent(agent)
     await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=agent_name)
 
@@ -643,13 +644,12 @@ async def _fork_agent_impl(
     auth: AuthIdentity,
     source_name: str,
     new_name: str,
+    expected_ma_agent_id: str | None = None,
 ) -> AgentInfo:
     await _reject_guild_name_collision(runtime, auth, new_name)
-    source = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=source_name
+    source = await resolve_setup_agent(
+        runtime, auth, name=source_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    if source is None:
-        raise ToolError(f"agent '{source_name}' not found")
     source_ma = await runtime.client.beta.agents.retrieve(source.id)
     params = source_ma.model_dump(mode="json")
     fork_params = {k: params[k] for k in _FORK_COPY_FIELDS if k in params}
@@ -723,11 +723,12 @@ async def _archive_agent_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
     name: str,
+    expected_ma_agent_id: str | None = None,
 ) -> None:
     _require_admin(auth)
-    agent = await find_agent_by_daimon_tag(runtime.client, tenant_id=auth.tenant_id, name=name)
-    if agent is None:
-        raise ToolError(f"agent '{name}' not found")
+    agent = await resolve_setup_agent(
+        runtime, auth, name=name, expected_ma_agent_id=expected_ma_agent_id
+    )
     _reject_system_agent(agent)
     await runtime.client.beta.agents.archive(agent.id)
     try:
@@ -764,13 +765,20 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         return await _list_agents_impl(runtime, await _auth(ctx), page)
 
     @mcp.tool
-    async def get_agent(ctx: Context, name: str) -> AgentInfo:  # pyright: ignore[reportUnusedFunction]
+    async def get_agent(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context, name: str, expected_ma_agent_id: str | None = None
+    ) -> AgentInfo:
         """Show what an agent can access: attached MCP servers and skills.
 
         Use ``list_agent_keys`` for stored key names. Configuration does not prove
         the answering session's access. Returns server names/URLs and skills; custom
         skills have a display name (null if deleted), Anthropic skills have a readable id."""
-        return await _get_agent_impl(runtime, await _auth(ctx), name)
+        return await _get_agent_impl(
+            runtime,
+            await _auth(ctx),
+            name,
+            expected_ma_agent_id=expected_ma_agent_id,
+        )
 
     @mcp.tool
     async def create_agent(  # pyright: ignore[reportUnusedFunction]
@@ -820,6 +828,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         tools: list[Tool] | None = None,
         mcp_servers: list[BetaManagedAgentsURLMCPServerParams] | None = None,
         skills: list[str | BetaManagedAgentsSkillParams] | None = None,
+        expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
         """Change an agent's system prompt or switch its model; add existing skills such as
         build-models. Scalar ``model``, ``description`` and ``system`` fields replace.
@@ -843,6 +852,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             tools=tools,
             mcp_servers=mcp_servers,
             skills=skills,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool
@@ -851,6 +861,7 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         agent_name: str,
         server_name: str,
         url: str,
+        expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
         """Add an MCP server that needs no token, such as Context7, to an agent.
 
@@ -867,10 +878,13 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             agent_name=agent_name,
             server_name=server_name,
             url=url,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool
-    async def fork_agent(ctx: Context, source_name: str, new_name: str) -> AgentInfo:  # pyright: ignore[reportUnusedFunction]
+    async def fork_agent(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context, source_name: str, new_name: str, expected_ma_agent_id: str | None = None
+    ) -> AgentInfo:
         """Make a copy of Daimon or another agent that you can edit under a new name.
         Copies its prompt, model, skills, MCP definitions, working-repo binding and
         recorded GitHub access. Copying access does not freshly verify it.
@@ -881,12 +895,25 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         The copy answers in no channel until an admin routes it with
         ``set_agent_default``. Continue configuring it through Daimon with the copy
         named as the setup target; it cannot already answer mentions by name."""
-        return await _fork_agent_impl(runtime, await _auth(ctx), source_name, new_name)
+        return await _fork_agent_impl(
+            runtime,
+            await _auth(ctx),
+            source_name,
+            new_name,
+            expected_ma_agent_id=expected_ma_agent_id,
+        )
 
     @mcp.tool(tags={"admin"})
-    async def archive_agent(ctx: Context, name: str) -> None:  # pyright: ignore[reportUnusedFunction]
+    async def archive_agent(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context, name: str, expected_ma_agent_id: str | None = None
+    ) -> None:
         """Delete an agent, for example churn-explorer, by archiving it. Admin-only.
 
         This removes the agent from the tenant pool and clears its channel/workspace
         defaults so those channels fall back to the next routing tier."""
-        await _archive_agent_impl(runtime, await _auth(ctx), name)
+        await _archive_agent_impl(
+            runtime,
+            await _auth(ctx),
+            name,
+            expected_ma_agent_id=expected_ma_agent_id,
+        )

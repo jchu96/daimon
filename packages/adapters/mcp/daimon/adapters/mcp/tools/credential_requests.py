@@ -20,6 +20,7 @@ from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivat
 from daimon.adapters.mcp.tools.discord import (
     _post_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.setup_target import require_turn_origin, resolve_setup_agent
 from daimon.adapters.mcp.tools.slack._credential_button import (
     _post_slack_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
 )
@@ -29,10 +30,14 @@ from daimon.core.credential_requests import (
     build_skill_repo_target,
     mint_request_token,
 )
-from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.stores.credential_requests import create_credential_request
+from daimon.core.stores.credential_requests import (
+    create_credential_request,
+    update_credential_request_message,
+)
+from daimon.core.stores.domain import TurnOriginRow
+from daimon.core.stores.turn_origins import get_active_origin
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
@@ -82,12 +87,17 @@ async def _resolve_agent_uuid(
     runtime: McpRuntime,
     auth: AuthIdentity,
     agent_name: str,
+    expected_ma_agent_id: str | None,
+    origin: TurnOriginRow,
 ) -> uuid.UUID:
-    ma_agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    if expected_ma_agent_id is None:
+        if agent_name == origin.configuration_target_name:
+            expected_ma_agent_id = origin.configuration_target_ma_agent_id
+        elif agent_name == origin.responder_name:
+            expected_ma_agent_id = origin.responder_ma_agent_id
+    ma_agent = await resolve_setup_agent(
+        runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    if ma_agent is None:
-        raise ToolError(f"agent '{agent_name}' not found in this tenant")
     return derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(ma_agent.id))
 
 
@@ -103,10 +113,26 @@ async def _mint_and_post(
     agent_name: str,
     purpose: str,
     channel_id: str,
+    origin: TurnOriginRow,
 ) -> RequestCredentialResult:
+    # A tool-supplied channel cannot redirect a private-input request.
+    channel_id = origin.parent_channel_id if auth.platform == "slack" else origin.thread_id
     token = mint_request_token()
     expires_at = datetime.now(UTC) + DEFAULT_TTL
     async with runtime.session_factory.begin() as session:
+        active_origin = await get_active_origin(
+            session,
+            origin_id=origin.id,
+            tenant_id=auth.tenant_id,
+            account_id=auth.account_id,
+            platform=origin.platform,
+            now=datetime.now(UTC),
+            for_update=True,
+        )
+        if active_origin is None:
+            raise ToolError(
+                "This turn origin expired before the request; retry in that conversation."
+            )
         row = await create_credential_request(
             session,
             token=token,
@@ -119,23 +145,34 @@ async def _mint_and_post(
             requester_platform_user_id=requester_platform_user_id,
             channel_id=channel_id,
             expires_at=expires_at,
+            platform=origin.platform,
+            parent_channel_id=origin.parent_channel_id,
+            origin_thread_id=origin.thread_id,
         )
-    post = (
-        _post_slack_credential_button_impl
-        if auth.platform == "slack"
-        else _post_credential_button_impl
-    )
     try:
-        message_id = await post(
-            runtime,
-            auth,
-            channel_id=channel_id,
-            kind=kind,
-            target=target,
-            token=token,
-            agent_name=agent_name,
-            purpose=purpose,
-        )
+        if auth.platform == "slack":
+            message_id = await _post_slack_credential_button_impl(
+                runtime,
+                auth,
+                channel_id=channel_id,
+                thread_ts=origin.thread_id,
+                kind=kind,
+                target=target,
+                token=token,
+                agent_name=agent_name,
+                purpose=purpose,
+            )
+        else:
+            message_id = await _post_credential_button_impl(
+                runtime,
+                auth,
+                channel_id=channel_id,
+                kind=kind,
+                target=target,
+                token=token,
+                agent_name=agent_name,
+                purpose=purpose,
+            )
     except ToolError as exc:
         # The row already exists (single-use + TTL bound it regardless), but
         # with no live button it is silently unusable — say so rather than
@@ -143,6 +180,8 @@ async def _mint_and_post(
         raise ToolError(
             f"credential request was created but posting the button failed: {exc}"
         ) from exc
+    async with runtime.session_factory.begin() as session:
+        await update_credential_request_message(session, token=token, posted_message_id=message_id)
     return RequestCredentialResult(
         kind=kind, target=target, expires_at=row.expires_at, message_id=message_id
     )
@@ -156,6 +195,8 @@ async def _request_agent_key_impl(
     key: str,
     purpose: str,
     channel_id: str,
+    origin_context_id: str | None = None,
+    expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
     requester = _require_requestable_platform(auth)
     if not _POSIX_KEY_RE.match(key):
@@ -163,7 +204,8 @@ async def _request_agent_key_impl(
             "key must match [A-Za-z_][A-Za-z0-9_]* "
             "(letters, digits, underscores; must not start with a digit)"
         )
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name)
+    origin = await require_turn_origin(runtime, auth, origin_context_id)
+    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
     return await _mint_and_post(
         runtime,
         auth,
@@ -175,6 +217,7 @@ async def _request_agent_key_impl(
         agent_name=agent_name,
         purpose=purpose,
         channel_id=channel_id,
+        origin=origin,
     )
 
 
@@ -186,6 +229,8 @@ async def _request_mcp_token_impl(
     server_name: str,
     url: str,
     channel_id: str,
+    origin_context_id: str | None = None,
+    expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
     requester = _require_requestable_platform(auth)
     if urlparse(url).scheme not in ("http", "https"):
@@ -197,7 +242,8 @@ async def _request_mcp_token_impl(
     # would stack rather than replace. Observed live: request row held the
     # slashed form while the vault held the bare one.
     url = url.rstrip("/")
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name)
+    origin = await require_turn_origin(runtime, auth, origin_context_id)
+    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
     return await _mint_and_post(
         runtime,
         auth,
@@ -209,6 +255,7 @@ async def _request_mcp_token_impl(
         agent_name=agent_name,
         purpose=f"connecting the MCP server '{server_name}'",
         channel_id=channel_id,
+        origin=origin,
     )
 
 
@@ -227,6 +274,8 @@ async def _request_skill_repo_token_impl(
     path: str,
     purpose: str,
     channel_id: str,
+    origin_context_id: str | None = None,
+    expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
     requester = _require_requestable_platform(auth)
     if urlparse(repo_url).scheme not in ("http", "https"):
@@ -241,7 +290,8 @@ async def _request_skill_repo_token_impl(
         raise ToolError("branch must not contain '@' or '#'")
     if "#" in path:
         raise ToolError("path must not contain '#'")
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name)
+    origin = await require_turn_origin(runtime, auth, origin_context_id)
+    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
     return await _mint_and_post(
         runtime,
         auth,
@@ -253,6 +303,7 @@ async def _request_skill_repo_token_impl(
         agent_name=agent_name,
         purpose=purpose,
         channel_id=channel_id,
+        origin=origin,
     )
 
 
@@ -264,6 +315,8 @@ async def _request_repo_binding_impl(
     repo_url: str,
     purpose: str,
     channel_id: str,
+    origin_context_id: str | None = None,
+    expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
     requester = _require_requestable_platform(auth)
     if urlparse(repo_url).scheme not in ("http", "https"):
@@ -272,7 +325,8 @@ async def _request_repo_binding_impl(
         raise ToolError(
             "repo url must name exactly one owner/repo, e.g. https://github.com/owner/repo"
         )
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name)
+    origin = await require_turn_origin(runtime, auth, origin_context_id)
+    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
     return await _mint_and_post(
         runtime,
         auth,
@@ -284,6 +338,7 @@ async def _request_repo_binding_impl(
         agent_name=agent_name,
         purpose=purpose,
         channel_id=channel_id,
+        origin=origin,
     )
 
 
@@ -304,10 +359,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         purpose: str,
         channel_id: Annotated[
             str,
-            Field(
-                description="Channel where the requester-only private-input card will be posted."
-            ),
+            Field(description="Compatibility field; origin controls the posting destination."),
         ],
+        origin_context_id: str,
+        expected_ma_agent_id: str,
     ) -> RequestCredentialResult:
         """Give an agent an API key or token for any service: Toggl, OpenAI,
         Higgsfield, or a platform that just launched. Unknown services work too.
@@ -327,6 +382,8 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             key=key,
             purpose=purpose,
             channel_id=channel_id,
+            origin_context_id=origin_context_id,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
@@ -344,10 +401,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         ],
         channel_id: Annotated[
             str,
-            Field(
-                description="Channel where the requester-only private-input card will be posted."
-            ),
+            Field(description="Compatibility field; origin controls the posting destination."),
         ],
+        origin_context_id: str,
+        expected_ma_agent_id: str,
     ) -> RequestCredentialResult:
         """Connect an agent such as research-bot to Linear, Notion or GitHub through
         an MCP endpoint with a bearer token, not browser OAuth.
@@ -368,6 +425,8 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             server_name=server_name,
             url=url,
             channel_id=channel_id,
+            origin_context_id=origin_context_id,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
@@ -381,10 +440,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         purpose: str,
         channel_id: Annotated[
             str,
-            Field(
-                description="Channel where the requester-only private-input card will be posted."
-            ),
+            Field(description="Compatibility field; origin controls the posting destination."),
         ],
+        origin_context_id: str,
+        expected_ma_agent_id: str,
         branch: str = "main",
         path: str = "",
     ) -> RequestCredentialResult:
@@ -406,6 +465,8 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             path=path,
             purpose=purpose,
             channel_id=channel_id,
+            origin_context_id=origin_context_id,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
@@ -419,10 +480,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         purpose: str,
         channel_id: Annotated[
             str,
-            Field(
-                description="Channel where the requester-only private-input card will be posted."
-            ),
+            Field(description="Compatibility field; origin controls the posting destination."),
         ],
+        origin_context_id: str,
+        expected_ma_agent_id: str,
     ) -> RequestCredentialResult:
         """Let an agent read a GitHub working repo or repository, public or private.
 
@@ -441,4 +502,6 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             repo_url=repo_url,
             purpose=purpose,
             channel_id=channel_id,
+            origin_context_id=origin_context_id,
+            expected_ma_agent_id=expected_ma_agent_id,
         )

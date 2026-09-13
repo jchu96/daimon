@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 ConfigField = Literal["agent_name", "environment_name"]
 
-ConfigTier = Literal["channel", "tenant", "deployment"]
+ConfigTier = Literal["thread", "channel", "tenant", "deployment"]
 
 
 class DeploymentDefault(BaseModel):
@@ -63,6 +63,8 @@ class ScopeContext(BaseModel):
     tenant_id: uuid.UUID
     channel_id: str | None = None
     account_id: uuid.UUID | None = None
+    platform: str | None = None
+    thread_id: str | None = None
 
 
 class UserConfigRow(BaseModel):
@@ -102,6 +104,10 @@ class ResolvedConfig(BaseModel):
     agent_name_tier: ConfigTier | None = None
     environment_name: str | None = None
     environment_name_tier: ConfigTier | None = None
+    responder_ma_agent_id: str | None = None
+    configuration_target_ma_agent_id: str | None = None
+    configuration_target_name: str | None = None
+    thread_binding_id: uuid.UUID | None = None
 
 
 class PropagateOutcome(BaseModel):

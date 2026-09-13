@@ -94,6 +94,7 @@ from daimon.adapters.slack.routines_panel.submit import (
     run_routines_delete_submission,
 )
 from daimon.adapters.slack.runtime import SlackRuntime, resolve_bot_display_name
+from daimon.adapters.slack.setup_conversations import handle_setup_lifecycle
 from daimon.adapters.slack.vision import (
     SlackFile,
     download_as_image_blocks,
@@ -107,7 +108,6 @@ from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.slack_oauth import build_slack_connect_url
-from daimon.core.stores.accounts import set_role
 from daimon.core.stores.domain import Role
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token
 from daimon.core.stores.slack_connect_prompts import mark_connect_prompted, was_connect_prompted
@@ -117,18 +117,22 @@ from daimon.core.stores.slack_turn_contexts import (
     delete_slack_turn_context,
 )
 from daimon.core.stores.slack_user_tokens import get_slack_user_token
+from daimon.core.stores.thread_agent_bindings import get_binding as get_setup_binding
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
     mark_turn_active,
     update_watermark,
 )
+from daimon.core.stores.turn_origins import get_active_origin
 from daimon.core.turn import turn_deadline
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
+from daimon.core.turn.errors import SessionAgentMismatch
 from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import run_prepared_turn
 from daimon.core.turn.state import ToolUseBlock
+from daimon.core.turn_origin import render_turn_origin, turn_origin
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.async_client import AsyncBaseSocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -676,6 +680,15 @@ class SlackApp:
             etype: str | None = event.get("type")
             if etype == "app_mention":
                 self._spawn(self._handle_app_mention(event, team_id=team_id))
+            elif etype in {
+                "channel_archive",
+                "channel_unarchive",
+                "channel_deleted",
+                "group_archive",
+                "group_unarchive",
+                "group_deleted",
+            } or (etype == "message" and event.get("subtype") == "message_deleted"):
+                self._spawn(handle_setup_lifecycle(self.runtime, event, team_id=team_id))
             elif etype == "app_uninstalled" or (
                 etype == "tokens_revoked" and _revokes_bot_token(event)
             ):
@@ -1024,6 +1037,20 @@ class SlackApp:
             log.warning("slack.event_dropped.no_ts", team_id=team_id, channel=channel)
             return
 
+        # The deterministic setup root mentions this bot as reply instructions.
+        # An echoed app_mention for that bot-authored root must not run a turn.
+        if event.get("bot_id") and str(event.get("ts") or "") == thread_id:
+            async with self.runtime.sessionmaker() as session:
+                setup_root = await get_setup_binding(
+                    session,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    parent_channel_id=channel,
+                    thread_id=thread_id,
+                )
+            if setup_root is not None:
+                return
+
         # (1) Per-thread queue check — before cap so queued mentions don't consume a slot.
         if thread_id in self._processing:
             # Append before awaiting reactions_add so a Slack API error on the
@@ -1231,7 +1258,14 @@ class SlackApp:
         # would violate the one-call-per-turn constraint.
         author_id = str(event.get("user") or "")
         admin_status = await resolve_admin_status(web_client, user_id=author_id)
-        is_admin = bool(admin_status)
+        if admin_status is None:
+            await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                channel=channel,
+                thread_ts=thread_id,
+                text="I couldn't verify your workspace role. Please retry; no turn was started.",
+            )
+            return
+        is_admin = admin_status
 
         # --- Stage one: admission (identity, config cascade, missing-config
         # bail, MA resolve/retrieve, balance gate, cap gate) -- D-01 admit(). ---
@@ -1242,6 +1276,8 @@ class SlackApp:
                 platform="slack",
                 external_user_id=author_id,
                 channel_id=channel,
+                thread_id=thread_id,
+                role=Role.ADMIN if is_admin else Role.USER,
                 now=datetime.now(UTC),
             )
         except MissingTurnConfigError as err:
@@ -1324,19 +1360,6 @@ class SlackApp:
         agent = admission.agent
         _lc_agent_name: str = agent.name
         _lc_model_id: str = agent.model.id
-
-        # --- Per-turn role upsert: sync account.role from live Slack admin status
-        # Gated on the users.info lookup having succeeded above --
-        # on lookup failure admin_status is None and the stored role is left
-        # alone, never granted and never revoked on a transient Slack error.
-        if admin_status is not None:
-            async with self.runtime.sessionmaker() as _role_session:
-                await set_role(
-                    _role_session,
-                    admission.account_id,
-                    Role.ADMIN if is_admin else Role.USER,
-                )
-                await _role_session.commit()
 
         # lifecycle_holder tracks whichever SlackTurnLifecycle actually
         # completed the turn -- recovery_lifecycle rebuilds a fresh one against
@@ -1426,17 +1449,34 @@ class SlackApp:
             # recorder binding) -- D-01 bind_session(). Slack has no
             # per_caller_thread_sessions equivalent: session_account_id is always
             # the admitted caller's account, and threads always pre-exist. ---
-            prepared = await bind_session(
-                self.runtime.turn_deps,
-                admission,
-                tenant_id=tenant_id,
-                platform="slack",
-                external_user_id=str(event.get("user") or ""),
-                thread_id=thread_id,
-                session_account_id=admission.account_id,
-                reuse_existing=True,
-                deadline=turn_deadline_at,
-            )
+            try:
+                prepared = await bind_session(
+                    self.runtime.turn_deps,
+                    admission,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    external_user_id=str(event.get("user") or ""),
+                    thread_id=thread_id,
+                    session_account_id=admission.account_id,
+                    reuse_existing=True,
+                    deadline=turn_deadline_at,
+                )
+            except SessionAgentMismatch as error:
+                explanation = render_error(error, request_id=generate_request_id())
+                if lifecycle.status_ts is not None:
+                    await web_client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                        channel=channel,
+                        ts=lifecycle.status_ts,
+                        text=explanation,
+                        blocks=[],
+                    )
+                else:
+                    await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                        channel=channel,
+                        thread_ts=thread_id,
+                        text=explanation,
+                    )
+                return
             ma_session_id = prepared.ma_session_id
             watermark = prepared.watermark
             reused = prepared.reused
@@ -1575,7 +1615,20 @@ class SlackApp:
                 )
                 if synthetic_prefix:
                     full_message = synthetic_prefix + "\n" + full_message
-                return full_message
+                async with self.runtime.sessionmaker() as session:
+                    recovery_origin = await get_active_origin(
+                        session,
+                        origin_id=origin.id,
+                        tenant_id=tenant_id,
+                        account_id=admission.account_id,
+                        platform="slack",
+                        now=datetime.now(UTC),
+                    )
+                if recovery_origin is None:
+                    raise DaimonError(
+                        "This turn's setup context expired. Please retry your message."
+                    )
+                return render_turn_origin(recovery_origin) + "\n" + full_message
 
             def _recovery_lifecycle(cancel: asyncio.Event) -> TurnLifecycle:
                 new_lifecycle = SlackTurnLifecycle(
@@ -1616,22 +1669,36 @@ class SlackApp:
                 )
                 await s.commit()
             try:
-                outcome = await run_prepared_turn(
-                    self.runtime.turn_deps,
-                    prepared,
+                async with turn_origin(
+                    self.runtime.sessionmaker,
                     tenant_id=tenant_id,
+                    account_id=admission.account_id,
                     platform="slack",
+                    parent_channel_id=channel,
                     thread_id=thread_id,
-                    external_user_id=str(event.get("user") or ""),
-                    user_message=user_message,
-                    lifecycle=lifecycle,
-                    cancel=cancel_event,
-                    reseed_user_message=_reseed_user_message,
-                    recovery_lifecycle=_recovery_lifecycle,
-                    image_blocks=image_blocks or None,
-                    render_interval_s=2.0,
-                    deadline=turn_deadline_at,
-                )
+                    responder_ma_agent_id=str(agent.id),
+                    is_setup=admission.config.thread_binding_id is not None,
+                    responder_name=admission.config.agent_name or agent.name,
+                    configuration_target_ma_agent_id=admission.config.configuration_target_ma_agent_id,
+                    configuration_target_name=admission.config.configuration_target_name,
+                    role=Role.ADMIN if is_admin else Role.USER,
+                ) as origin:
+                    outcome = await run_prepared_turn(
+                        self.runtime.turn_deps,
+                        prepared,
+                        tenant_id=tenant_id,
+                        platform="slack",
+                        thread_id=thread_id,
+                        external_user_id=str(event.get("user") or ""),
+                        user_message=render_turn_origin(origin) + "\n" + user_message,
+                        lifecycle=lifecycle,
+                        cancel=cancel_event,
+                        reseed_user_message=_reseed_user_message,
+                        recovery_lifecycle=_recovery_lifecycle,
+                        image_blocks=image_blocks or None,
+                        render_interval_s=2.0,
+                        deadline=turn_deadline_at,
+                    )
             finally:
                 # Leak-policy bookkeeping only — a delete failure must not mask the
                 # turn's own outcome; stale rows age out via the reader-side TTL.

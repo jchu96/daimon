@@ -793,6 +793,13 @@ async def test_purge_covers_every_account_or_principal_scoped_table() -> None:
             # Not an erasure gap.
             "channel_config",
             "tenant_config",
+            # Shared setup binding attribution uses SET NULL on creator erasure;
+            # deleting the conversation would destroy other participants' work.
+            "thread_agent_bindings",
+            # Active-turn authority is ephemeral, carries no conversation content,
+            # and is automatically erased by accounts.id ON DELETE CASCADE.
+            # The store tests verify this; it needs no separately reported category.
+            "turn_origins",
             # Same shape: PK is (tenant_id, agent_id) and the only accounts.id FK is
             # the nullable provenance column proof_account_id with ON DELETE SET NULL.
             # An account purge severs who-proved-it while leaving the binding and its

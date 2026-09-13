@@ -66,6 +66,7 @@ def _fake_bot(
 def _interaction(*, user_id: str, client: Any) -> MagicMock:
     interaction = MagicMock()
     interaction.user.id = int(user_id)
+    interaction.guild_id = _GUILD_ID
     interaction.client = client
     interaction.response.send_message = AsyncMock()
     interaction.response.send_modal = AsyncMock()
@@ -77,7 +78,7 @@ def _repo_admin_interaction(*, client: Any, guild_id: int = _GUILD_ID) -> MagicM
     interaction.client = client
     interaction.guild_id = guild_id
     interaction.user = MagicMock(spec=discord.Member)
-    interaction.user.id = 1
+    interaction.user.id = int(_REQUESTER_ID)
     interaction.user.guild_permissions.administrator = True
     interaction.user.guild_permissions.manage_guild = False
     interaction.guild.owner_id = 999
@@ -93,7 +94,7 @@ def _repo_member_interaction(*, client: Any, guild_id: int = _GUILD_ID) -> Magic
     interaction.client = client
     interaction.guild_id = guild_id
     interaction.user = MagicMock(spec=discord.Member)
-    interaction.user.id = 2
+    interaction.user.id = int(_REQUESTER_ID)
     interaction.user.guild_permissions.administrator = False
     interaction.user.guild_permissions.manage_guild = False
     interaction.guild.owner_id = 999
@@ -129,7 +130,7 @@ def _row(
     return CredentialRequestRow(
         token=token,
         kind=kind,
-        tenant_id=tenant_id or uuid.uuid4(),
+        tenant_id=tenant_id or derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID)),
         agent_id=agent_id or uuid.uuid4(),
         account_id=account_id or uuid.uuid4(),
         target=target,
@@ -521,7 +522,7 @@ async def test_callback_repo_kind_pre_filter_timeout_opens_modal_and_submit_time
     submit_interaction.followup.send = AsyncMock()
     submit_interaction.guild_id = _GUILD_ID
     submit_interaction.user = MagicMock(spec=discord.Member)
-    submit_interaction.user.id = 2
+    submit_interaction.user.id = int(_REQUESTER_ID)
     submit_interaction.user.guild_permissions.administrator = False
     submit_interaction.user.guild_permissions.manage_guild = False
     submit_interaction.guild.owner_id = 999

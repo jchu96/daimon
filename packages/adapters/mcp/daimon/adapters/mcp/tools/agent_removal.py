@@ -34,7 +34,7 @@ from daimon.adapters.mcp.tools.agents import (
     _reject_system_agent,  # pyright: ignore[reportPrivateUsage]
     _resolve_custom_skill_titles,  # pyright: ignore[reportPrivateUsage]
 )
-from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
+from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
@@ -62,6 +62,7 @@ async def _detach_mcp_server_impl(
     *,
     agent_name: str,
     server_name: str,
+    expected_ma_agent_id: str | None = None,
 ) -> AgentInfo:
     # Reserved-name check first and unconditionally — before any agent lookup
     # or I/O, mirroring _attach_mcp_server_impl's #142 guard.
@@ -69,11 +70,9 @@ async def _detach_mcp_server_impl(
     if rejection is not None:
         raise ToolError(rejection)
 
-    agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    agent = await resolve_setup_agent(
+        runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    if agent is None:
-        raise ToolError(f"agent '{agent_name}' not found")
     _reject_system_agent(agent)
     await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=agent_name)
 
@@ -120,12 +119,11 @@ async def _remove_skill_impl(
     *,
     agent_name: str,
     skill_id: str,
+    expected_ma_agent_id: str | None = None,
 ) -> AgentInfo:
-    agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    agent = await resolve_setup_agent(
+        runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    if agent is None:
-        raise ToolError(f"agent '{agent_name}' not found")
     _reject_system_agent(agent)
     await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=agent_name)
 
@@ -172,17 +170,20 @@ async def _list_agent_keys_impl(
     auth: AuthIdentity,
     *,
     agent_name: str,
+    expected_ma_agent_id: str | None = None,
 ) -> list[str]:
     # Deliberately NOT reachability-gated and NOT _reject_system_agent-guarded:
     # env variables are per-agent daimon rows keyed (tenant_id, agent_id, key)
     # that never enter the MA agent spec, so neither the spec-drift guard nor
     # the approved-configuration gate applies. This is a read; the ungated-
     # reads convention (_ctx.py's _require_admin docstring) covers it too.
-    agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    agent = await resolve_setup_agent(
+        runtime,
+        auth,
+        name=agent_name,
+        expected_ma_agent_id=expected_ma_agent_id,
+        require_identity=False,
     )
-    if agent is None:
-        raise ToolError(f"agent '{agent_name}' not found")
     agent_id: uuid.UUID = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
     async with runtime.session_factory() as session:
         rows = await list_agent_files(session, tenant_id=auth.tenant_id, agent_id=agent_id)
@@ -195,6 +196,7 @@ async def _remove_agent_key_impl(
     *,
     agent_name: str,
     key: str,
+    expected_ma_agent_id: str | None = None,
 ) -> RemoveEnvCredentialResult:
     # Same rationale as _list_agent_keys_impl above: env variables
     # are per-agent daimon rows outside the MA spec, so neither
@@ -202,11 +204,9 @@ async def _remove_agent_key_impl(
     # — and the existing chat credential button already writes these rows for
     # the seeded agent, so gating removal would leave a write with no
     # matching delete.
-    agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
+    agent = await resolve_setup_agent(
+        runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    if agent is None:
-        raise ToolError(f"agent '{agent_name}' not found")
     agent_id: uuid.UUID = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
     async with runtime.session_factory.begin() as session:
         # The store delete is idempotent (no raise when absent) — read first
@@ -226,6 +226,7 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         server_name: Annotated[
             str, Field(description="Name of the attached MCP server to disconnect.")
         ],
+        expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
         """Disconnect an MCP server such as Linear from an agent. Detach the named
         connection and its tools while preserving other servers and skills.
@@ -234,7 +235,11 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         authenticated connections. The built-in daimon server cannot be removed.
         Changing a channel or workspace default needs admin."""
         return await _detach_mcp_server_impl(
-            runtime, await _auth(ctx), agent_name=agent_name, server_name=server_name
+            runtime,
+            await _auth(ctx),
+            agent_name=agent_name,
+            server_name=server_name,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool
@@ -242,6 +247,7 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ctx: Context,
         agent_name: str,
         skill_id: str,
+        expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
         """Stop an agent using an attached skill, such as eda. Remove that one
         attachment while preserving other skills.
@@ -250,7 +256,11 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ``update_agent`` adds existing skills. Accept a skill name or raw ``skill_id``.
         The resource and other agents stay intact. Changing a default agent needs admin."""
         return await _remove_skill_impl(
-            runtime, await _auth(ctx), agent_name=agent_name, skill_id=skill_id
+            runtime,
+            await _auth(ctx),
+            agent_name=agent_name,
+            skill_id=skill_id,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool
@@ -266,6 +276,7 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
                 )
             ),
         ],
+        expected_ma_agent_id: str | None = None,
     ) -> RemoveEnvCredentialResult:
         """Remove an old API key or token, such as a Toggl key, from an agent's stored keys.
 
@@ -274,17 +285,27 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         whether it was present. This deletes the stored environment variable, never
         returns its secret value, and does not prove an existing session refreshed."""
         return await _remove_agent_key_impl(
-            runtime, await _auth(ctx), agent_name=agent_name, key=key
+            runtime,
+            await _auth(ctx),
+            agent_name=agent_name,
+            key=key,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     @mcp.tool
     async def list_agent_keys(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         agent_name: str,
+        expected_ma_agent_id: str | None = None,
     ) -> list[str]:
         """What keys does an agent have? List its stored API key names, never values.
 
         Use ``get_agent`` for skills and MCP access, ``request_agent_key`` to add
         keys or ``remove_agent_key`` to remove them. Stored names on this target
         are not proof that the answering agent can use those keys."""
-        return await _list_agent_keys_impl(runtime, await _auth(ctx), agent_name=agent_name)
+        return await _list_agent_keys_impl(
+            runtime,
+            await _auth(ctx),
+            agent_name=agent_name,
+            expected_ma_agent_id=expected_ma_agent_id,
+        )

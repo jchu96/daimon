@@ -1,15 +1,8 @@
-"""Executable record that organic thread participation is Discord-only for now.
+"""Organic participation stays Discord-only while Slack observes setup lifecycle.
 
-The store and the tool are keyed by platform, but the Slack app subscribes to
-``app_mention`` alone: seeing unmentioned thread messages needs the
-``message.channels`` and ``message.groups`` events, and adding either forces
-every installed workspace through re-authorization. Asserting both halves
-here, rather than merely documenting them in the PR, makes drift fail loudly:
-an event quietly growing without the Slack responder behind it, or the tool
-starting to accept Slack callers before the adapter reads the rows.
-
-No platform parametrization, no database -- the platform refusal happens
-before any read, so the tool can be called with a session factory it never uses.
+Slack message subscriptions track deletion of setup roots. They do not grant
+permission to respond to unmentioned messages; the participation tool keeps
+refusing Slack callers before any database operation.
 """
 
 from __future__ import annotations
@@ -47,13 +40,15 @@ def _slack_bot_events() -> list[str]:
     return cast(list[str], manifest["settings"]["event_subscriptions"]["bot_events"])
 
 
-def test_slack_manifest_still_lacks_the_message_events() -> None:
+def test_slack_manifest_receives_setup_lifecycle_events() -> None:
     events = _slack_bot_events()
-    assert "message.channels" not in events and "message.groups" not in events, (
-        "the Slack app deliberately sees mentions only; message.channels / message.groups "
-        "force every installed workspace to re-authorize, so they land together with a Slack "
-        "auto-responder -- if that is what this change is, update this record"
-    )
+    assert {
+        "message.channels",
+        "message.groups",
+        "channel_archive",
+        "channel_unarchive",
+        "channel_deleted",
+    }.issubset(events), "setup lifecycle requires root deletion and channel events"
 
 
 async def test_the_tool_refuses_every_platform_but_discord() -> None:

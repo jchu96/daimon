@@ -100,6 +100,8 @@ source_modules = [
     "daimon.core.specs",
     "daimon.core.thread_naming",
     "daimon.core.turn",
+    "daimon.core.setup_conversations",
+    "daimon.core.turn_origin",
     "daimon.core.wizard",
     "daimon.core.wizard_sweep",
 ]

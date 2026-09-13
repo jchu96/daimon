@@ -69,7 +69,7 @@ def _make_state(
     is_admin: bool = True,
 ) -> PanelState:
     entry = _entry(selected_name)
-    return PanelState.initial(
+    state = PanelState.initial(
         roster=[entry],
         account_id=uuid.UUID(int=0xAA),
         platform_principal_id=uuid.uuid4(),
@@ -82,6 +82,9 @@ def _make_state(
         if deployment_default is not None
         else DeploymentDefault(),
     )
+
+    state.select(selected_name)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +697,7 @@ async def test_do_set_confirmation_carries_the_routing_note(
         guild_id=guild_id,
         channel_id=1001,
     )
+    state.select("writer")
     view = SetDefaultView(state, runtime=runtime, allowed_user_id=42)
 
     interaction = MagicMock()

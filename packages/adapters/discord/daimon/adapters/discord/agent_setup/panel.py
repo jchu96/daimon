@@ -18,10 +18,12 @@ import structlog
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.adapters.discord.agent_setup.conversations import open_setup_conversation
 from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel as _resolve_tenant
 from daimon.adapters.discord.agent_setup.write import (
+    _build_roster_entry,  # pyright: ignore[reportPrivateUsage]  # hydrate an exact newly created identity
     create_blank_agent,
     delete_agent,
     fork_agent,
@@ -43,6 +45,7 @@ from daimon.core.scope import (
     TenantConfigRow,
     _pick_agent,  # pyright: ignore[reportPrivateUsage]  # canonical cascade winner; adapter renders the result, never re-derives precedence.
 )
+from daimon.core.setup_conversations import get_setup_agent
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.agent_repo_binding import get_binding
 from daimon.core.stores.domain import AgentRepoBindingRow
@@ -314,7 +317,11 @@ def build_panel_container(
     if state.selected is None:
         # Every member can create an agent — the copy is identical for admins
         # and members alike (no "View only" variant on an empty roster).
-        copy = "_This server has no agents yet._ Use **New** to create the first one."
+        copy = (
+            "_Choose an agent, or ask Daimon which agent to set up._"
+            if state.roster
+            else "_This server has no agents yet._ Use **New** to create the first one."
+        )
         return discord.ui.Container(discord.ui.TextDisplay(copy))
 
     selected = state.selected
@@ -540,6 +547,20 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
         picker: _AgentPicker = _AgentPicker(state)
         picker_row.add_item(picker)
         container.add_item(picker_row)
+        setup_row: discord.ui.ActionRow[AgentSetupView] = discord.ui.ActionRow()
+        setup_button: discord.ui.Button[AgentSetupView] = discord.ui.Button(
+            label="💬 Set up with Daimon", style=discord.ButtonStyle.primary
+        )
+        setup_button.callback = self._on_setup_conversation  # type: ignore[method-assign]
+        setup_row.add_item(setup_button)
+        container.add_item(setup_row)
+        if state.recent_setup_conversations:
+            container.add_item(
+                discord.ui.TextDisplay(
+                    "**Recent setup conversations in this channel**\n"
+                    + "\n".join(state.recent_setup_conversations)
+                )
+            )
 
         # Member row: New / Fork / Edit — unconditional. Building and
         # configuring an unreachable agent is open to every member; only
@@ -616,6 +637,10 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
             )
             return False
         return True
+
+    async def _on_setup_conversation(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await open_setup_conversation(interaction, runtime=self.runtime, state=self.state)
 
     async def _rerender(self, interaction: discord.Interaction) -> None:
         """Re-send the panel after a state mutation."""
@@ -795,7 +820,7 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
         tenant_id: uuid.UUID | None = None
         try:
             tenant_id = await _resolve_tenant(self.runtime, interaction)
-            await create_blank_agent(
+            created = await create_blank_agent(
                 self.runtime,
                 tenant_id=tenant_id,
                 name=new_name,
@@ -803,12 +828,27 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
                 model=model_value,
                 account_id=self.state.guild_account_id,  # SC-2: stamp guild account
             )
+            if created.anthropic_id is None:
+                raise DaimonError(
+                    "Could not confirm the new agent. "
+                    "Reopen `/agent-setup` to check before retrying."
+                )
             roster = await load_tenant_roster(
                 self.runtime.anthropic,
                 tenant_id=tenant_id,
             )
+            selected = next(
+                (entry for entry in roster if entry.ma_agent_id == created.anthropic_id), None
+            )
+            if selected is None:
+                created_agent = await get_setup_agent(
+                    self.runtime.anthropic, tenant_id=tenant_id, ma_agent_id=created.anthropic_id
+                )
+                selected = _build_roster_entry(created_agent, custom_skill_titles={})
+                roster.append(selected)
             self.state.roster = roster
-            self.state.select(new_name)
+            self.state.selected = selected
+            self.state.hydrate_repo_binding(None)
             self.state.secret_count = 0
             self.state.github_login = None
             thumbnail_url = _get_thumbnail_url(interaction)

@@ -66,6 +66,10 @@ from daimon.adapters.discord.agent_setup.credentials import (
     _MAX_SECRET_VALUE_BYTES,  # pyright: ignore[reportPrivateUsage]  # reusing PasteSecretModal's byte cap rather than inventing a second number
 )
 from daimon.adapters.discord.agent_setup.write import mask_tail
+from daimon.adapters.discord.credential_origin import (
+    is_credential_interaction_valid,
+    refuse_if_credential_target_unavailable,
+)
 from daimon.adapters.discord.credential_repo_bind import (
     refuse_if_shared_and_not_admin_for_request,
     resolve_repo_binding_credential,
@@ -101,7 +105,9 @@ moment the consume commits, before the vault/binding/import below it is known
 to have worked, and one of those failing still leaves the button dead."""
 
 
-async def _mark_button_consumed(interaction: discord.Interaction, *, kind: str) -> None:
+async def _mark_button_consumed(
+    interaction: discord.Interaction, *, kind: str, row: CredentialRequestRow
+) -> None:
     """Swap the request's button for a disabled confirmation, in place.
 
     The bare `defer()` every `on_submit` opens with makes this interaction's
@@ -119,7 +125,11 @@ async def _mark_button_consumed(interaction: discord.Interaction, *, kind: str) 
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button[discord.ui.View](label=_CONSUMED_BUTTON_LABEL, disabled=True))
     try:
-        await interaction.edit_original_response(view=view)
+        if row.origin_thread_id is not None and row.posted_message_id is not None:
+            channel = interaction.client.get_partial_messageable(int(row.origin_thread_id))
+            await channel.get_partial_message(int(row.posted_message_id)).edit(view=view)
+        else:
+            await interaction.edit_original_response(view=view)
     except discord.HTTPException as err:
         # The consume already committed. A confirmation edit that fails
         # (message deleted, thread archived, permissions lost) must not read
@@ -148,6 +158,9 @@ class EnvCredentialModal(discord.ui.Modal, title="Add key"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
+        if not is_credential_interaction_valid(interaction, self._row):
+            await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
+            return
         raw_value = str(self.value_input.value or "")
 
         if not raw_value.strip():
@@ -162,6 +175,10 @@ class EnvCredentialModal(discord.ui.Modal, title="Add key"):
             )
             return
 
+        if await refuse_if_credential_target_unavailable(
+            interaction, runtime=self._runtime, row=self._row
+        ):
+            return
         now = datetime.now(UTC)
         try:
             async with self._runtime.sessionmaker() as session, session.begin():
@@ -190,7 +207,7 @@ class EnvCredentialModal(discord.ui.Modal, title="Add key"):
         # After the transaction, not inside it: the consume and the file write
         # commit together here, so this is the first point the row is durably
         # spent, and it keeps a Discord round trip out of an open transaction.
-        await _mark_button_consumed(interaction, kind="env")
+        await _mark_button_consumed(interaction, kind="env", row=consumed_row)
         await interaction.followup.send(
             f"Added `{consumed_row.target}`. Takes effect on the next session — "
             "anyone who talks to this agent can use it.",
@@ -215,6 +232,9 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP token"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
+        if not is_credential_interaction_valid(interaction, self._row):
+            await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
+            return
         token_value = str(self.token_input.value or "")
 
         if not token_value.strip():
@@ -233,6 +253,10 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP token"):
             )
             return
 
+        if await refuse_if_credential_target_unavailable(
+            interaction, runtime=self._runtime, row=self._row
+        ):
+            return
         now = datetime.now(UTC)
         async with self._runtime.sessionmaker() as session, session.begin():
             consumed_row = await credential_requests.consume_credential_request(
@@ -242,7 +266,7 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP token"):
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
 
-        await _mark_button_consumed(interaction, kind="mcp")
+        await _mark_button_consumed(interaction, kind="mcp", row=consumed_row)
 
         mcp_server_url = consumed_row.mcp_server_url
         if mcp_server_url is None:
@@ -385,12 +409,19 @@ class SkillRepoModal(discord.ui.Modal, title="Import skills"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
+        if not is_credential_interaction_valid(interaction, self._row):
+            await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
+            return
 
         pat = str(self.pat_in.value or "").strip()
         if not pat:
             await interaction.followup.send("Enter a GitHub token.", ephemeral=True)
             return
 
+        if await refuse_if_credential_target_unavailable(
+            interaction, runtime=self._runtime, row=self._row
+        ):
+            return
         now = datetime.now(UTC)
         async with self._runtime.sessionmaker() as session, session.begin():
             consumed_row = await credential_requests.consume_credential_request(
@@ -400,7 +431,7 @@ class SkillRepoModal(discord.ui.Modal, title="Import skills"):
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
 
-        await _mark_button_consumed(interaction, kind="skill_repo")
+        await _mark_button_consumed(interaction, kind="skill_repo", row=consumed_row)
 
         url, branch, path = split_skill_repo_target(consumed_row.target)
         # The token appears only as a masked tail, never in full, and never
@@ -608,6 +639,9 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
+        if not is_credential_interaction_valid(interaction, self._row):
+            await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
+            return
 
         if await refuse_if_shared_and_not_admin_for_request(
             interaction,
@@ -620,6 +654,10 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
         branch = str(self.branch_in.value or "").strip() or "main"
         pat = str(self.pat_in.value or "").strip()
 
+        if await refuse_if_credential_target_unavailable(
+            interaction, runtime=self._runtime, row=self._row
+        ):
+            return
         now = datetime.now(UTC)
         async with self._runtime.sessionmaker() as session, session.begin():
             consumed_row = await credential_requests.consume_credential_request(
@@ -629,7 +667,7 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
 
-        await _mark_button_consumed(interaction, kind="repo")
+        await _mark_button_consumed(interaction, kind="repo", row=consumed_row)
 
         # Log the repo and branch, and the token ONLY as a masked tail when
         # present — never the plain value, never the (now-consumed) request
