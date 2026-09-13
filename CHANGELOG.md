@@ -32,14 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0014_thread_participation` adds two empty tables.
 - **Discord threads get a real title.** A thread daimon opens for a mention is
   titled from the opening message by a short Haiku call before it is created,
-  so it never opens with a "renamed the thread" notice; the static
-  "Chat with <agent>" title remains only when naming is off, the message has
-  no text, or the call fails or exceeds eight seconds. The call is metered to
-  the tenant like any other model call and can be turned off with
-  `DAIMON_THREAD_NAMING__ENABLED=false`. A new `rename_thread` MCP tool lets
-  the agent retitle a thread on request: anyone who can post in a thread
-  daimon opened may rename it, other threads need Manage Threads. Slack threads
-  have no title, so both are Discord-only.
+  so it never opens with a "renamed the thread" notice; the channel shows
+  typing meanwhile. The static "Chat with <agent>" title remains only when
+  naming is off, the message has no text, the model answers blank, or the
+  call fails or outlasts `DAIMON_THREAD_NAMING__TIMEOUT_SECONDS` (default 5).
+  The call is metered to the tenant like any other model call and can be
+  turned off with `DAIMON_THREAD_NAMING__ENABLED=false`. A new `rename_thread`
+  MCP tool lets the agent retitle a thread on request: anyone who can post in
+  a thread daimon opened may rename it, other threads need Manage Threads.
+  Slack threads have no title, so both are Discord-only.
 
 ### Removed
 
