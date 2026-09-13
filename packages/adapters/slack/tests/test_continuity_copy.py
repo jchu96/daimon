@@ -506,6 +506,82 @@ async def test_replaced_makes_the_replacement_summary_the_answers_first_paragrap
     )
 
 
+async def test_replaced_with_no_transfer_kind_renders_no_summary_prefix(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A fresh start (`transfer_kind=None`) is a `replaced` bind with nothing
+    carried across -- not a transfer whose contents need summarizing. The old
+    `transfer_kind or "full"` fallback rendered the FULL-transfer summary
+    ("Your conversation, decisions and working files came across.") on a
+    fresh start, contradicting the fresh-start confirmation already posted.
+    No prefix should be rendered at all."""
+    team_id = "T_REPLACED_FRESH_START"
+    channel = "C_TEST"
+    thread_ts = "9100000006.000001"
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    fernet_key = Fernet.generate_key().decode()
+
+    await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
+    await upsert_slack_bot_token(
+        db_session,
+        team_id=team_id,
+        encrypted_token=encrypt_token(build_multifernet((fernet_key,)), "xoxb-fresh-start"),
+    )
+    await db_session.commit()
+
+    app = _make_app(db_session_factory, tenant_id_str=str(tenant_id))
+    app.runtime.settings.crypto.keys = (SecretStr(fernet_key),)
+
+    event = _event(channel=channel, thread_ts=thread_ts, user="U_REPLACED_FRESH_START")
+
+    prepared = _prepared_turn(continuity=ContinuityOutcome(state="replaced", transfer_kind=None))
+
+    with (
+        patch(
+            "daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock
+        ) as mock_resolve_agent,
+        patch(
+            "daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock
+        ) as mock_resolve_env,
+        patch(
+            "daimon.core.turn.admission.is_over_balance", new_callable=AsyncMock
+        ) as mock_over_balance,
+        patch("daimon.core.turn.admission.is_over_cap", new_callable=AsyncMock) as mock_over_cap,
+        patch(
+            "daimon.adapters.slack.app.bind_session", new_callable=AsyncMock
+        ) as mock_bind_session,
+        patch(
+            "daimon.adapters.slack.app.run_prepared_turn", new_callable=AsyncMock
+        ) as mock_run_prepared_turn,
+    ):
+        mock_resolve_agent.return_value = _AGENT_ID
+        mock_resolve_env.return_value = _ENV_ID
+        mock_over_balance.return_value = False
+        mock_over_cap.return_value = False
+        mock_bind_session.return_value = prepared
+        mock_run_prepared_turn.side_effect = _run_turn_revealing_answer(
+            RunOutcome(
+                state=TurnState(),
+                ma_session_id=prepared.ma_session_id,
+                mapping_id=prepared.mapping_id,
+                recovered=False,
+                continuity=prepared.continuity,
+            )
+        )
+
+        await app._handle_app_mention(event, team_id=team_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert _final_answer_text(fake_slack_web_client) == _ANSWER, (
+        "a fresh start must not prefix the answer with a replacement summary"
+    )
+    posted = _posted_texts(fake_slack_web_client)
+    assert render_replacement_summary("full", lost=[]) not in posted
+    assert render_replacement_summary("transcript", lost=[]) not in posted
+    assert render_replacement_summary("history", lost=[]) not in posted
+
+
 async def test_replaced_falls_back_to_its_own_message_when_no_answer_is_revealed(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],

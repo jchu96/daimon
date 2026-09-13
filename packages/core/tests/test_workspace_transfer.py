@@ -12,6 +12,7 @@ take the real-Postgres session factory.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -42,18 +43,22 @@ from anthropic.types.beta.sessions.beta_managed_agents_user_message_event import
     BetaManagedAgentsUserMessageEvent,
 )
 from daimon.core.checkpoint_prompt import (
+    CHECKPOINT_BUNDLE_MOUNT_PATH,
     CHECKPOINT_EXCLUDED_PATHS,
-    CHECKPOINT_SYSTEM_TRIGGER,
     HANDOFF_TOO_LARGE_MARKER,
     handoff_filename,
 )
 from daimon.core.session_snapshot import SessionSnapshot
 from daimon.core.stores.pending_file_deletes import list_due_pending_file_deletes
 from daimon.core.workspace_transfer import (
+    CHECKPOINT_REASON_CONFIGURATION_CHANGE,
+    CHECKPOINT_REASON_HANDOFF,
+    CHECKPOINT_REASON_MODEL_CHANGE,
     HANDOFF_MOUNT_PATH,
     FullHandoff,
     HistoryOnly,
     TranscriptOnly,
+    _checkpoint_reason,
     as_prepared_replacement,
     transfer_workspace,
 )
@@ -326,7 +331,7 @@ async def test_checkpoint_prompt_names_every_excluded_path(
     sent_session, batch = state.sent_batches[0]
     assert sent_session == old_session
     assert [event["type"] for event in batch] == ["user.message", "system.message"], (
-        "sonnet-5 takes a system.message, so the instruction travels there"
+        "sonnet-5 takes a system.message, so the instruction travels there too"
     )
     prompt = "".join(block["text"] for block in batch[1]["content"] if block["type"] == "text")
     for excluded in CHECKPOINT_EXCLUDED_PATHS:
@@ -908,15 +913,30 @@ async def test_checkpoint_rides_the_system_channel_on_a_model_that_takes_one(
     assert [event["type"] for event in batch] == ["user.message", "system.message"], (
         "the API takes at most one system.message and it must come last"
     )
-    trigger = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
-    assert trigger == CHECKPOINT_SYSTEM_TRIGGER, (
-        "the user message is only the trigger; it carries no instruction of its own"
+    user_message = "".join(
+        block["text"] for block in batch[0]["content"] if block["type"] == "text"
     )
+    assert user_message.startswith("<turn_controls>\n"), (
+        "the element the refusals named as missing is the first thing in the user message"
+    )
+    controls = json.loads(user_message.split("\n")[1])
+    assert controls == {
+        "checkpoint": {
+            "transfer_id": str(TRANSFER_ID),
+            "reason": "configuration change",
+            "archive": f"/mnt/session/outputs/{handoff_filename(TRANSFER_ID)}",
+            "carried_to": CHECKPOINT_BUNDLE_MOUNT_PATH,
+        }
+    }, "the controls carry the whole checkpoint, as host-supplied JSON"
+    assert "This instruction comes from the daimon host" in user_message, (
+        "and the prompt itself follows them in the same message"
+    )
+    assert "tar czf" in user_message, "in full, because the system block may not be read"
     instruction = "".join(block["text"] for block in batch[1]["content"] if block["type"] == "text")
     assert instruction.startswith("This instruction comes from the daimon host"), (
-        "the host-originated prompt is what rides the privileged channel"
+        "the same prompt also rides the privileged channel where the model takes one"
     )
-    assert "tar czf" in instruction, "in full — the trigger does not repeat any of it"
+    assert "tar czf" in instruction
 
 
 async def test_checkpoint_stays_a_user_message_on_a_model_without_system_support(
@@ -953,8 +973,11 @@ async def test_checkpoint_stays_a_user_message_on_a_model_without_system_support
         "a system.message would 400 the whole request on this model"
     )
     prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
-    assert prompt.startswith("This instruction comes from the daimon host"), (
-        "so the instruction itself is the user message, unchanged"
+    assert prompt.startswith("<turn_controls>"), (
+        "the controls lead the user message on either model"
+    )
+    assert "This instruction comes from the daimon host" in prompt, (
+        "and the instruction itself follows them, unchanged"
     )
 
 
@@ -990,3 +1013,85 @@ async def test_transfer_degrades_to_transcript_when_the_checkpoint_rejects_its_o
         "the size is why the files did not cross, and the copy has to say so"
     )
     assert "fit the hierarchical model" in outcome.transcript, "the conversation still crosses"
+
+
+def test_the_mount_path_the_prompt_promises_is_the_one_the_successor_gets() -> None:
+    """The prompt tells the old session where its archive reappears, and
+    `handoff_context` tells the successor where to unpack it. Two modules name
+    the same path and neither imports the other, so the agreement is asserted
+    rather than assumed."""
+    assert f"/mnt/session/uploads{HANDOFF_MOUNT_PATH}" == CHECKPOINT_BUNDLE_MOUNT_PATH, (
+        "MA joins the mount path under /mnt/session/uploads/, and the prompt says so"
+    )
+
+
+def test_the_reason_the_controls_carry_is_derived_from_the_destination() -> None:
+    """`WorkspaceTransfer` carries no reason, and the protocol lives in a
+    module the runner cannot change, so the reason is derived from the
+    destination it was handed. A different responder is a handoff whatever else
+    moved with it; a different model under the same responder is a model
+    change; everything else reduces to one honest phrase rather than a guess at
+    which of instructions, skills, repo or environment moved.
+
+    A pure decision, tested where it lives: the runner around it is the I/O
+    this module's other tests already drive end to end.
+    """
+    cases = [
+        ("claude-sonnet-5", "analysis-bot", CHECKPOINT_REASON_CONFIGURATION_CHANGE),
+        ("claude-sonnet-4-6", "analysis-bot", CHECKPOINT_REASON_MODEL_CHANGE),
+        ("claude-sonnet-5", "qa-relay", CHECKPOINT_REASON_HANDOFF),
+        ("claude-sonnet-4-6", "qa-relay", CHECKPOINT_REASON_HANDOFF),
+    ]
+    for destination_model_id, destination_agent_name, expected in cases:
+        assert (
+            _checkpoint_reason(
+                old_snapshot=_snapshot(model_id="claude-sonnet-5"),
+                from_agent_name="analysis-bot",
+                destination_model_id=destination_model_id,
+                destination_agent_name=destination_agent_name,
+            )
+            == expected
+        ), (
+            f"destination {destination_agent_name} on {destination_model_id} reads as "
+            f"{expected!r} to the session being asked"
+        )
+
+
+async def test_the_checkpoint_controls_carry_the_reason_they_were_given(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reason is not a code: it is the one word the old session gets for
+    why its workspace is going away, and it rides the controls the refusals
+    said they would have trusted."""
+    state = FakeSessionsState(ma=FakeMAState())
+    client = _client(state)
+    old_session = await _make_session(client, model="claude-sonnet-5")
+    _seed_conversation(state, old_session, with_reply=True)
+    _script_checkpoint_reply(state, old_session, "-rw-r--r-- 1 root root 42 handoff.tar.gz")
+    state.write_output(old_session, handoff_filename(TRANSFER_ID), TARBALL)
+
+    outcome = await transfer_workspace(
+        client,
+        db_session_factory,
+        old_session_id=old_session,
+        old_snapshot=_snapshot(),
+        tenant_id=TENANT_ID,
+        external_user_id="U123",
+        transfer_id=TRANSFER_ID,
+        markup=Decimal("1.0"),
+        checkpoint_deadline=DEADLINE,
+        from_agent_name="analysis-bot",
+        reason=CHECKPOINT_REASON_HANDOFF,
+        sleep=_no_sleep,
+        now=_now,
+    )
+
+    assert isinstance(outcome, FullHandoff), f"expected a full handoff, got {outcome!r}"
+    _, batch = state.sent_batches[0]
+    user_message = "".join(
+        block["text"] for block in batch[0]["content"] if block["type"] == "text"
+    )
+    controls = json.loads(user_message.split("\n")[1])
+    assert controls["checkpoint"]["reason"] == CHECKPOINT_REASON_HANDOFF, (
+        "the caller's reason is what the session is told, unmodified"
+    )

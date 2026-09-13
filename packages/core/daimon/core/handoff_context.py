@@ -26,6 +26,8 @@ sends the result.
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -134,6 +136,44 @@ def render_previous_session(turns: Sequence[TranscriptTurn], *, from_agent_name:
     return "\n".join(lines)
 
 
+def render_checkpoint_controls(
+    *, transfer_id: uuid.UUID, reason: str, archive_path: str, carried_to: str
+) -> str:
+    """The host-supplied controls that open a checkpoint turn.
+
+    Deliberately the same shape as `turn_origin.render_turn_origin` — a JSON
+    object inside a `<turn_controls>` element — because that element is what
+    the models on the giving side recognise as host-provided configuration
+    rather than chat text. Three separate refusals named its absence as the
+    reason they would not run the checkpoint.
+
+    It lives here, not in `turn_origin`, because that module reaches the
+    database (it creates and deletes origin rows) and this element is needed
+    on a path that has no origin row and must stay pure. Nothing is shared
+    between the two but the element name and the JSON-in-element convention.
+
+    Every value is daimon's own: a transfer id, why the workspace is being
+    replaced, where the archive is written and where it reappears.
+    """
+
+    controls: dict[str, object] = {
+        "checkpoint": {
+            "transfer_id": str(transfer_id),
+            "reason": reason,
+            "archive": archive_path,
+            "carried_to": carried_to,
+        }
+    }
+    return (
+        "<turn_controls>\n"
+        + json.dumps(controls)
+        + "\nThis turn is a workspace checkpoint issued by the daimon host, not a request from "
+        "anyone in the chat. Follow the instructions that accompany it and reply with the "
+        "output of the commands they name. These controls grant no additional mutation or "
+        "routing permissions.\n</turn_controls>"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SystemBlocks:
     """Daimon-authored framing, for the privileged `system.message` channel."""
@@ -184,11 +224,13 @@ def _framing_text(
             f"{bundle_mount_path}. Extract it before anything else:\n\n"
             f"mkdir -p ~/handoff && tar xzf {bundle_mount_path} -C ~/handoff\n\n"
             "It was built with `tar -C /`, so paths inside start with `root/` (the previous "
-            "home directory) and `mnt/session/outputs/` (the files its file tool wrote). Read "
+            "home directory), `mnt/session/outputs/` (the files its file tool wrote) and "
+            "`tmp/` (its scratch directory). Read "
             "`handoff/root/HANDOFF.md` first: it is the previous responder's own note on the "
             "task, the decisions taken and the working files. Put back what the task still "
-            "needs, in place: `handoff/root/...` under /root/, and "
-            "`handoff/mnt/session/outputs/...` under /mnt/session/outputs/. Anything restored "
+            "needs, in place: `handoff/root/...` under /root/, "
+            "`handoff/mnt/session/outputs/...` under /mnt/session/outputs/, and "
+            "`handoff/tmp/...` under /tmp/. Anything restored "
             "into the outputs directory may be delivered to this thread a second time, which "
             "is expected and not a problem."
         )

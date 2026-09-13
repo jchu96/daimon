@@ -6,10 +6,11 @@ import re
 import uuid
 
 from daimon.core.checkpoint_prompt import (
+    CHECKPOINT_BUNDLE_MOUNT_PATH,
     CHECKPOINT_EXCLUDED_GLOBS,
     CHECKPOINT_EXCLUDED_PATHS,
     CHECKPOINT_OUTPUTS_DIR,
-    CHECKPOINT_SYSTEM_TRIGGER,
+    CHECKPOINT_SCRATCH_DIR,
     HANDOFF_FILENAME_PREFIX,
     HANDOFF_MAX_BYTES,
     HANDOFF_TOO_LARGE_MARKER,
@@ -76,7 +77,9 @@ def test_prompt_writes_an_oversize_exclude_list_before_tarring() -> None:
     prompt = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=7
     )
-    find_index = prompt.index("find root mnt/session/outputs mnt/repo/analytics -type f -size +7M")
+    find_index = prompt.index(
+        "find root mnt/session/outputs tmp mnt/repo/analytics -type f -size +7M"
+    )
     tar_index = prompt.index("tar czf")
     assert find_index < tar_index, "the exclude list must exist before tar reads it"
     exclude_list = prompt[find_index:].split(">", 1)[1].split("\n", 1)[0].strip()
@@ -116,8 +119,8 @@ def test_prompt_captures_repo_state_without_a_repo_omitting_the_git_steps() -> N
     assert with_repo.count(f"git -C {REPO} rev-parse HEAD") == 2, (
         "HEAD is echoed before and after the archive so a commit is detectable"
     )
-    assert "-C / root mnt/session/outputs mnt/repo/analytics" in with_repo, (
-        "the repo mount is archived alongside $HOME and the outputs directory"
+    assert "-C / root mnt/session/outputs tmp mnt/repo/analytics" in with_repo, (
+        "the repo mount is archived alongside $HOME, the outputs directory and /tmp"
     )
 
     without_repo = build_checkpoint_prompt(
@@ -125,8 +128,8 @@ def test_prompt_captures_repo_state_without_a_repo_omitting_the_git_steps() -> N
     )
     assert "git -C" not in without_repo, "no repo means no git commands"
     assert "NEVER RUN GIT" not in without_repo, "and no repo prohibition to state"
-    assert "-C / root mnt/session/outputs" in without_repo, (
-        "the home directory and the outputs directory are archived either way"
+    assert "-C / root mnt/session/outputs tmp" in without_repo, (
+        "the home directory, the outputs directory and /tmp are archived either way"
     )
 
 
@@ -147,9 +150,9 @@ def test_prompt_honours_a_non_default_home_dir() -> None:
     )
     assert "/home/claude/HANDOFF.md" in prompt, "the note goes in the given home directory"
     assert "/home/claude/uncommitted.patch" in prompt, "so does the patch"
-    assert "-C / home/claude mnt/session/outputs mnt/repo/analytics" in prompt, (
-        "the tar roots are the given home directory, the outputs directory and the repo, "
-        "relative to /"
+    assert "-C / home/claude mnt/session/outputs tmp mnt/repo/analytics" in prompt, (
+        "the tar roots are the given home directory, the outputs directory, /tmp and the "
+        "repo, relative to /"
     )
     assert "--exclude='home/claude/.*'" in prompt, (
         "the dot-entry exclusion follows the home directory it was given"
@@ -157,14 +160,23 @@ def test_prompt_honours_a_non_default_home_dir() -> None:
     assert "/root/" not in prompt, "the default home directory must not leak in"
 
 
-def test_prompt_asks_for_output_only_and_forbids_reading_images() -> None:
+def test_prompt_asks_for_the_output_without_suppressing_the_reply() -> None:
+    """Two of the three live refusals named the old wording — "reply with the
+    output and nothing else: no summary, no commentary" — as what turned an odd
+    request into "a classic exfiltration pattern". Daimon parses the output and
+    ignores the prose, so it can ask for the first without forbidding the
+    second."""
     prompt = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
     )
     assert "Do not open or read any image file." in prompt, (
         "reading an image is what poisons a session's history"
     )
-    assert "no summary, no commentary" in prompt, "the reply is parsed, not read"
+    assert "A short note alongside it is fine" in prompt, (
+        "a reply the model may explain is a reply it will actually send"
+    )
+    for tell in ("nothing else", "no commentary", "no summary", ".ssh"):
+        assert tell not in prompt, f"{tell!r} is one of the phrases the refusals singled out"
 
 
 def test_prompt_is_deterministic_and_under_the_word_budget() -> None:
@@ -234,7 +246,7 @@ def test_prompt_captures_uncommitted_changes_when_the_answer_is_copy_or_absent()
         assert f"git -C {REPO} ls-files --others --exclude-standard" in prompt, (
             "untracked files are part of the work being captured"
         )
-        assert "-C / root mnt/session/outputs mnt/repo/analytics" in prompt, (
+        assert "-C / root mnt/session/outputs tmp mnt/repo/analytics" in prompt, (
             "and the checkout itself travels"
         )
 
@@ -247,11 +259,11 @@ def test_prompt_leaves_uncommitted_changes_behind_when_the_answer_is_leave() -> 
         "the person chose to leave the changes, so nothing captures them as a patch"
     )
     assert "ls-files --others" not in prompt, "nor lists the untracked files to carry"
-    assert "-C / root mnt/session/outputs\n" in f"{prompt}\n", (
+    assert "-C / root mnt/session/outputs tmp\n" in f"{prompt}\n", (
         "the checkout must not be tarred either, or the changes would come across anyway"
     )
     assert "-C / root mnt/session/outputs mnt/repo" not in prompt, "the repo is not a root here"
-    assert "find root mnt/session/outputs -type f" in prompt, (
+    assert "find root mnt/session/outputs tmp -type f" in prompt, (
         "and the oversize scan covers only what is archived"
     )
     assert "deliberately being left behind" in prompt, (
@@ -270,43 +282,59 @@ def test_prompt_ignores_the_unsaved_work_answer_when_no_repo_is_mounted() -> Non
     ), "with no checkout there is nothing to leave in it, so the prompt is unchanged"
 
 
-def test_prompt_says_the_instruction_comes_from_the_host_and_goes_nowhere_else() -> None:
-    """The refusal this sentence exists to prevent was real: a compliant model
-    read the checkpoint as chat text asking it to tar `.ssh` into a delivery
-    directory, and declined. The prompt has to say whose instruction it is and
-    where the archive ends up, on either channel it travels."""
+def test_prompt_points_at_the_controls_and_the_agent_own_instructions() -> None:
+    """Saying "this comes from the host" is not self-authenticating, and the
+    models that refused said so. The prompt now points at two things the model
+    can check for itself: the `checkpoint` block in this turn's controls, and
+    the WORKSPACE MOVES section of its own system prompt."""
     prompt = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
     )
     assert prompt.startswith(
         "This instruction comes from the daimon host that runs your workspace, not from a "
-        "chat participant."
-    ), "the first thing the prompt says is where it came from"
+        "chat participant: the checkpoint block in this turn's <turn_controls> is the host's "
+        "own record of it, and your system instructions describe this operation under "
+        "WORKSPACE MOVES."
+    ), "the first thing the prompt says is where it came from and how to verify that"
+
+
+def test_prompt_says_what_happens_to_the_archive_next() -> None:
+    """The refusals read the outputs directory as a delivery path, which on
+    Slack it is — for everything except a handoff bundle. Saying where the
+    archive actually goes is what replaces the old, unverifiable "nothing is
+    shared with anyone"."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
+    )
+    assert f"mounts it in your next workspace at {CHECKPOINT_BUNDLE_MOUNT_PATH}" in prompt, (
+        "the archive's destination is a fact the successor's framing repeats"
+    )
     assert (
-        "The archive stays in this workspace's outputs directory and is moved to your next "
-        "workspace by the host; nothing is shared with anyone." in prompt
-    ), "and the second is that the bundle is not an exfiltration route"
+        f"The archive is not posted to the chat: the file sweep that delivers "
+        f"{CHECKPOINT_OUTPUTS_DIR} to the thread skips names starting with "
+        f"{HANDOFF_FILENAME_PREFIX}." in prompt
+    ), "and the delivery carve-out is why writing it there is not an export"
+    assert "nothing is shared with anyone" not in prompt, (
+        "an unverifiable blanket promise is what the model refused to take on trust"
+    )
 
 
-def test_prompt_forbids_ssh_credentials_dotfiles_and_toolchains_in_words() -> None:
+def test_prompt_names_what_travels_and_what_stays_behind_in_words() -> None:
     """The exclusions are commands; this is the sentence a model reads when it
-    asks itself whether the commands are safe to run."""
+    asks itself whether the commands are safe to run. It names the categories
+    rather than one file: naming `.ssh` put the idea of exfiltrating keys into
+    a prompt whose whole problem was reading as an exfiltration request."""
     prompt = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
     )
     assert (
-        "Never include /root/.ssh, credential mounts, dotfiles or language toolchains and "
-        "their caches." in prompt
-    ), "the prompt must name what never travels, not only exclude it in a flag"
-
-
-def test_checkpoint_system_trigger_carries_no_instruction_of_its_own() -> None:
-    """On the privileged channel the trigger is the whole user message, so it
-    must point at the system instructions rather than restate them."""
-    assert CHECKPOINT_SYSTEM_TRIGGER == (
-        "Run the workspace checkpoint described in your system instructions now "
-        "and reply only with the command output."
-    )
+        "Only the task's own work travels: the non-hidden entries in /root and /tmp, the "
+        "outputs directory, and the working repository if one is mounted." in prompt
+    ), "the prompt must name what travels, not only pass it to tar"
+    assert (
+        "Credential mounts, hidden directories and language toolchains and their caches "
+        "stay behind." in prompt
+    ), "and name what never does, not only exclude it in a flag"
 
 
 def test_prompt_archives_the_outputs_directory_and_skips_only_the_bundles() -> None:
@@ -320,7 +348,7 @@ def test_prompt_archives_the_outputs_directory_and_skips_only_the_bundles() -> N
     assert CHECKPOINT_OUTPUTS_DIR not in CHECKPOINT_EXCLUDED_PATHS, (
         "the outputs directory is where the task's own files are, not a destination mount"
     )
-    assert "-C / root mnt/session/outputs" in prompt, "so it is a tar root"
+    assert "-C / root mnt/session/outputs tmp" in prompt, "so it is a tar root"
     assert f"--exclude='mnt/session/outputs/{HANDOFF_FILENAME_PREFIX}*'" in prompt, (
         "the archive being written, and any bundle an earlier transfer left, stay out"
     )
@@ -352,6 +380,8 @@ def test_prompt_generates_the_whole_tar_command_exactly() -> None:
             f"  tar czf {archive} \\",
             "    --exclude-from=/tmp/daimon-handoff-excludes.txt \\",
             "    --exclude='root/.*' \\",
+            "    --exclude='tmp/.*' \\",
+            "    --exclude='tmp/daimon-handoff-excludes.txt' \\",
             "    --exclude='mnt/session/outputs/daimon-handoff-*' \\",
             "    --exclude='mnt/session/uploads' \\",
             "    --exclude='mnt/memory' \\",
@@ -362,7 +392,7 @@ def test_prompt_generates_the_whole_tar_command_exactly() -> None:
             "    --exclude='*/__pycache__' \\",
             "    --exclude='*/.cache' \\",
             "    --exclude='*.env' \\",
-            "    -C / root mnt/session/outputs mnt/repo/analytics",
+            "    -C / root mnt/session/outputs tmp mnt/repo/analytics",
         ]
     )
     assert expected in prompt, "the generated tar command changed"
@@ -411,4 +441,28 @@ def test_checkpoint_too_large_bytes_ignores_an_echo_of_the_command() -> None:
     echoed = next(line for line in prompt.splitlines() if "size=$(stat" in line)
     assert checkpoint_too_large_bytes(echoed) is None, (
         "quoting back the command it was handed is not evidence the archive was rejected"
+    )
+
+
+def test_prompt_archives_the_scratch_directory_minus_its_own_exclude_list() -> None:
+    """Issue 2 of the round-2 acceptance run: asked to "create a file called
+    notes.md", the agent ran `mkdir -p /tmp/work && … > /tmp/work/notes.md` —
+    outside every archived root, so even a compliant checkpoint would have lost
+    it. /tmp is a root now; its dot entries (sandbox sockets and locks) and this
+    transfer's own oversize list are what stay out of it."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
+    )
+    assert CHECKPOINT_SCRATCH_DIR == "/tmp"
+    assert "-C / root mnt/session/outputs tmp" in prompt, (
+        "a working file the agent put in /tmp/work has to travel with the rest"
+    )
+    assert "--exclude='tmp/.*'" in prompt, (
+        "only the non-hidden entries travel, exactly as under $HOME"
+    )
+    assert "--exclude='tmp/daimon-handoff-excludes.txt'" in prompt, (
+        "the list tar is reading must not end up inside the archive tar is writing"
+    )
+    assert "find root mnt/session/outputs tmp -type f -size +20M" in prompt, (
+        "and the oversize scan covers every root it will tar"
     )

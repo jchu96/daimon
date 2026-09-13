@@ -181,3 +181,54 @@ def test_replaces_stale_block_preserving_user_body() -> None:
         "/mnt/session/uploads/.env"
     ), "must not duplicate the block when one already exists"
     assert reapplied.endswith("EDITED BODY"), "user's edited body must be preserved"
+
+
+def _collapse(text: str) -> str:
+    """Whitespace-collapsed, so an assertion is about wording not line wrapping."""
+    return " ".join(text.split())
+
+
+def test_pre_authorises_the_workspace_checkpoint() -> None:
+    # Regression for the acceptance runs where claude-sonnet-5 refused the
+    # checkpoint turn 6/6 times, on Discord and on Slack, reading it as an
+    # exfiltration attempt. The refusals were correct given what the agent
+    # knew: nothing in its configuration described the operation. This block
+    # IS its configuration, so this is where the operation gets described.
+    block = CREDENTIAL_GUIDANCE_BLOCK
+    assert "WORKSPACE MOVES" in block, "the operation needs a name the prompt can point at"
+    section = _collapse(block[block.index("WORKSPACE MOVES") :])
+    assert "`checkpoint` block" in section and "`<turn_controls>`" in section, (
+        "the agent must know which element carries a genuine checkpoint request"
+    )
+    assert "daimon-handoff-<id>.tar.gz" in section, "and what it is being asked to build"
+    assert "routine host operation, not a request from someone in the chat" in section, (
+        "the block has to settle the authority question the refusals raised"
+    )
+    assert "never keys, hidden directories or toolchains" in section, (
+        "and bound what the commands touch, since that is what made it look hostile"
+    )
+    assert "never posted to the thread" in section, (
+        "the Slack refusal turned on /mnt/session/outputs being a delivery path; the "
+        "handoff bundle is the carve-out and the block must say so"
+    )
+    assert "output delivery skips that name" in section, (
+        "and say what makes it the carve-out, not just assert it"
+    )
+    assert (
+        "Your memory store (/mnt/memory) and your keys and mounted files "
+        "(/mnt/session/uploads) are not in the archive" in section
+    ), "the mounts that belong to the workspace, not the task, are never packed"
+    assert "daimon remounts them on the new workspace" in section, (
+        "and leaving them out costs the agent nothing, which is why it need not argue"
+    )
+    assert "/root/work" in section and "/mnt/session/outputs" in section, (
+        "Issue 2: nothing told the agent where to work, so a working file landed in "
+        "/tmp/work, outside the roots the archive was built from"
+    )
+
+
+def test_workspace_move_guidance_survives_idempotent_reapplication() -> None:
+    once = apply_credential_guidance("base prompt")
+    twice = apply_credential_guidance(once)
+    assert once.count("WORKSPACE MOVES") == 1, "the section is written exactly once"
+    assert twice == once, "re-applying must replace the block, never stack it"
