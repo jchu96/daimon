@@ -1095,3 +1095,34 @@ async def test_the_checkpoint_controls_carry_the_reason_they_were_given(
     assert controls["checkpoint"]["reason"] == CHECKPOINT_REASON_HANDOFF, (
         "the caller's reason is what the session is told, unmodified"
     )
+
+
+def test_full_handoff_framing_names_the_normalised_mount_path() -> None:
+    """The receiving side is told the path MA actually mounts, not the requested one.
+
+    Live staging showed a successor searching for `/daimon-handoff.tar.gz` while
+    the bundle sat at `/mnt/session/uploads/daimon-handoff.tar.gz`.
+    """
+    outcome = FullHandoff(
+        transfer_file_id="file_new",
+        mount_path=HANDOFF_MOUNT_PATH,
+        bytes_transferred=2569,
+        transcript=None,
+        unpreserved=(),
+    )
+    prepared = as_prepared_replacement(
+        outcome,
+        destination_model_id="claude-sonnet-5",
+        from_agent_name="daimon",
+        to_agent_name="daimon",
+        requested_work=None,
+    )
+    framing_text = prepared.user_prefix + "".join(
+        str(block.get("text", "")) for block in prepared.system_blocks
+    )
+    assert "/mnt/session/uploads/daimon-handoff.tar.gz" in framing_text, (
+        "the successor must be pointed at the normalised mount path"
+    )
+    assert "tar xzf /daimon-handoff.tar.gz" not in framing_text, (
+        "the requested (un-normalised) path must never be the extraction command"
+    )

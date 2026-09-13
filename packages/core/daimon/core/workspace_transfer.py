@@ -563,7 +563,11 @@ def as_prepared_replacement(
     if isinstance(outcome, FullHandoff):
         transfer_kind = "full"
         transfer_file_id = outcome.transfer_file_id
-        bundle_mount_path = outcome.mount_path
+        # The successor must be told where MA actually mounts the bundle. The
+        # resource is requested at `HANDOFF_MOUNT_PATH`, but every mount path is
+        # normalised under /mnt/session/uploads/ (live-verified), which is the
+        # path the checkpoint prompt already names to the giving side.
+        bundle_mount_path = CHECKPOINT_BUNDLE_MOUNT_PATH
         extra_resources = (
             {
                 "type": "file",
