@@ -1397,29 +1397,34 @@ class DaimonBot(commands.Bot):
         # MA sessions.create can hold its HTTP response for minutes while it
         # provisions the session (the record exists server-side in ~1s; the
         # response is what stalls). The thread and a thinking embed go up
-        # first so the user gets instant feedback; the lifecycle adopts the
-        # embed and edits it in place once SSE events flow.
+        # first, behind only the short naming call, so the user gets early
+        # feedback; the lifecycle adopts the embed and edits it in place once
+        # SSE events flow.
         is_thread_mention = thread is not None
         if thread is None:
             # Titled BEFORE creation: renaming afterwards posted a "renamed the
-            # thread" system message into every new thread. Once the mention
-            # tokens are gone an attachment-only message has nothing to title,
-            # so it keeps the static name and skips the (metered) call.
+            # thread" system message into every new thread. The channel shows
+            # typing meanwhile, the only signal possible before the thread
+            # exists. Once the mention tokens are gone an attachment-only
+            # message has nothing to title, so it keeps the static name and
+            # skips the (metered) call.
             thread_name = f"Chat with {agent.name}"
             naming = self.runtime.settings.thread_naming
             opening_text = strip_mentions(message.content)
             if naming.enabled and opening_text:
-                thread_name = await generate_thread_name(
-                    fallback=thread_name,
-                    message_text=opening_text,
-                    message_id=message.id,
-                    anthropic=self.runtime.anthropic,
-                    sessionmaker=self.runtime.sessionmaker,
-                    tenant_id=tenant_id,
-                    platform_user_id=str(message.author.id),
-                    markup=self.runtime.settings.billing.markup,
-                    max_input_chars=naming.max_input_chars,
-                )
+                async with message.channel.typing():
+                    thread_name = await generate_thread_name(
+                        fallback=thread_name,
+                        message_text=opening_text,
+                        message_id=message.id,
+                        anthropic=self.runtime.anthropic,
+                        sessionmaker=self.runtime.sessionmaker,
+                        tenant_id=tenant_id,
+                        platform_user_id=str(message.author.id),
+                        markup=self.runtime.settings.billing.markup,
+                        max_input_chars=naming.max_input_chars,
+                        timeout_seconds=naming.timeout_seconds,
+                    )
             thread = await message.create_thread(
                 name=thread_name,
                 auto_archive_duration=10080,

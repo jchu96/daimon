@@ -71,7 +71,6 @@ _FALLBACK = "Chat with test-agent"
 def _thread(thread_id: int = 4242) -> Any:
     thread = MagicMock(spec=discord.Thread)
     thread.id = thread_id
-    thread.name = _FALLBACK
     thread.send = AsyncMock()
     return thread
 
@@ -105,6 +104,7 @@ async def test_generate_thread_name_returns_title_and_meters_haiku_call_to_autho
         platform_user_id="555",
         markup=Decimal("1.0"),
         max_input_chars=2000,
+        timeout_seconds=5.0,
     )
 
     assert name == "PyMC Divergences on M2 Mac", "the model's title is what the thread opens under"
@@ -133,6 +133,7 @@ async def test_generate_thread_name_falls_back_but_still_meters_when_model_answe
         platform_user_id="555",
         markup=Decimal("1.0"),
         max_input_chars=2000,
+        timeout_seconds=5.0,
     )
 
     assert name == _FALLBACK, "a blank answer leaves the static title"
@@ -163,6 +164,7 @@ async def test_generate_thread_name_falls_back_without_metering_on_api_error(
         platform_user_id="555",
         markup=Decimal("1.0"),
         max_input_chars=2000,
+        timeout_seconds=5.0,
     )
 
     assert name == _FALLBACK, "a failed call leaves the static title"
@@ -175,7 +177,8 @@ async def test_generate_thread_name_falls_back_without_metering_when_model_is_to
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """The thread waits on this call, so a stalled API yields the static title
-    instead of a thread that appears minutes late."""
+    instead of a thread that appears minutes late. The cancelled call cannot
+    be metered; that is the accepted, bounded cost of the cap."""
     tenant = await make_tenant(db_session)
     await db_session.commit()
 
@@ -339,14 +342,22 @@ def _channel_message(*, guild_id: int, content: str) -> Any:
     return message
 
 
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize(
+    ("enabled", "content", "expects_naming"),
+    [
+        (True, "<@999> my PyMC model diverges", True),
+        (False, "<@999> my PyMC model diverges", False),
+        (True, "<@999>", False),
+    ],
+    ids=["enabled", "disabled", "attachment_only"],
+)
 @patch("daimon.adapters.discord.bot.generate_thread_name", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
 @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
 @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
-async def test_on_message_creates_thread_under_generated_title_only_when_naming_enabled(
+async def test_on_message_creates_thread_under_generated_title_only_when_there_is_text_to_name(
     mock_resolve_config: AsyncMock,
     mock_create_session: AsyncMock,
     mock_run_turn: AsyncMock,
@@ -356,16 +367,24 @@ async def test_on_message_creates_thread_under_generated_title_only_when_naming_
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     enabled: bool,
+    content: str,
+    expects_naming: bool,
 ) -> None:
     """The title is generated with the turn's tenant, author and settings and
     the thread is created under it — no rename, so no "renamed the thread"
-    notice — and only when ``DAIMON_THREAD_NAMING__ENABLED`` is on.
+    notice. With ``DAIMON_THREAD_NAMING__ENABLED`` off, or a mention that
+    carries no text (attachment-only), the metered call is skipped and the
+    static title is used.
 
     ``generate_thread_name`` itself is covered above against a real DB; here
-    it is patched so the wiring test asserts only what ``on_message`` hands it
-    and does with the answer.
+    it is patched so this test asserts only what ``on_message`` hands it and
+    does with the answer.
     """
-    guild_id = "801000777" if enabled else "801000778"
+    guild_id = {
+        (True, True): "801000777",
+        (False, False): "801000778",
+        (True, False): "801000779",
+    }[(enabled, expects_naming)]
     await provision_tenant(
         db_session_factory,
         platform="discord",
@@ -387,10 +406,12 @@ async def test_on_message_creates_thread_under_generated_title_only_when_naming_
     runtime = _runtime(
         db_session_factory,
         router=_ma_router(),
-        thread_naming=ThreadNamingSettings(enabled=enabled, max_input_chars=321),
+        thread_naming=ThreadNamingSettings(
+            enabled=enabled, max_input_chars=321, timeout_seconds=2.5
+        ),
     )
     bot = _bot(runtime)
-    message = _channel_message(guild_id=int(guild_id), content="<@999> my PyMC model diverges")
+    message = _channel_message(guild_id=int(guild_id), content=content)
     message.id = 8001
     message.create_thread.return_value = _thread(thread_id=8001)
 
@@ -399,9 +420,11 @@ async def test_on_message_creates_thread_under_generated_title_only_when_naming_
 
     message.create_thread.assert_awaited_once()
     created_name = message.create_thread.await_args.kwargs["name"]
-    if not enabled:
+    if not expects_naming:
         mock_generate_name.assert_not_awaited()
-        assert created_name == "Chat with test-agent", "naming off keeps the static title"
+        assert created_name == "Chat with test-agent", (
+            "naming off or nothing to title keeps the static title without a model call"
+        )
         return
     assert created_name == "PyMC Divergences", (
         "the thread must be created under the generated title, not renamed into it"
@@ -417,5 +440,7 @@ async def test_on_message_creates_thread_under_generated_title_only_when_naming_
     assert (handed["tenant_id"], handed["platform_user_id"]) == (tenant_id, "555"), (
         "the naming call must be billed to the turn's tenant under the message author"
     )
-    assert handed["max_input_chars"] == 321, "settings must reach the call unchanged"
+    assert (handed["max_input_chars"], handed["timeout_seconds"]) == (321, 2.5), (
+        "settings must reach the call unchanged"
+    )
     assert handed["anthropic"] is runtime.anthropic, "the runtime client is reused"
