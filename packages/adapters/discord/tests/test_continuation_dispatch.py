@@ -1,0 +1,206 @@
+"""Tests for `continuation_dispatch.dispatch_pending_continuations`.
+
+Real Postgres for the `task_continuations` rows (the claim-once guarantee is
+a real conditional UPDATE); `run_follow_up` is a plain injected async
+callable, per the module's own DI-friendly design, so these tests assert
+dispatch happened without paying for a second real turn.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import httpx
+from anthropic.types.beta import BetaManagedAgentsAgent
+from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
+from daimon.adapters.discord.continuation_dispatch import dispatch_pending_continuations
+from daimon.core.continuity.continuation import ContinuationDecision
+from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
+from daimon.core.stores.domain import TaskContinuationRow
+from daimon.core.stores.task_continuations import get_continuation, record_continuation
+from daimon.testing.factories import make_account, make_tenant
+from daimon.testing.ma import build_stub_anthropic
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+_TENANT_UUID = uuid.uuid4()
+
+
+class _AsyncIter:
+    def __init__(self, items: list[object]) -> None:
+        self._items = iter(items)
+
+    def __aiter__(self) -> _AsyncIter:
+        return self
+
+    async def __anext__(self) -> object:
+        try:
+            return next(self._items)
+        except StopIteration as err:
+            raise StopAsyncIteration from err
+
+
+def _make_thread(*, thread_id: int = 42) -> MagicMock:
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
+    thread.history = MagicMock(return_value=_AsyncIter([]))
+    thread.send = AsyncMock()
+    return thread
+
+
+async def _seed_pending_row(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    requested_work: str | None,
+) -> tuple[uuid.UUID, uuid.UUID, str, uuid.UUID]:
+    """Seed one pending continuation row; return (tenant_id, account_id, thread_id, key)."""
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(
+            session, platform="discord", workspace_id=str(uuid.uuid4().int)[:9]
+        )
+        account = await make_account(session, tenant=tenant)
+        idempotency_key = uuid.uuid4()
+        await record_continuation(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="parent-1",
+            thread_id="42",
+            requester_account_id=account.id,
+            requester_external_user_id="555",
+            target_ma_agent_id="ag_target",
+            target_name="target-agent",
+            reason="task_handoff",
+            idempotency_key=idempotency_key,
+            requested_work=requested_work,
+        )
+    return tenant.id, account.id, "42", idempotency_key
+
+
+async def test_dispatches_exactly_once_and_settles_delivered(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id, _account_id, _thread_id, key = await _seed_pending_row(
+        db_session_factory, requested_work="pick up the report"
+    )
+    thread = _make_thread()
+    anthropic = build_stub_anthropic(_reachable_agent_handler(tenant_id, ma_agent_id="ag_target"))
+    run_follow_up = AsyncMock()
+
+    await dispatch_pending_continuations(
+        db_session_factory,
+        anthropic,
+        tenant_id=tenant_id,
+        thread=thread,
+        run_follow_up=run_follow_up,
+    )
+
+    run_follow_up.assert_awaited_once()
+    assert run_follow_up.await_args is not None
+    row_arg, decision_arg = run_follow_up.await_args.args
+    assert isinstance(row_arg, TaskContinuationRow)
+    assert isinstance(decision_arg, ContinuationDecision)
+    assert decision_arg.seed_user_message == "pick up the report"
+
+    async with db_session_factory() as session:
+        settled = await get_continuation(session, idempotency_key=key)
+    assert settled is not None
+    assert settled.status == "delivered"
+
+    # A second call against the same thread must not re-dispatch: the row
+    # is no longer pending.
+    run_follow_up.reset_mock()
+    await dispatch_pending_continuations(
+        db_session_factory,
+        anthropic,
+        tenant_id=tenant_id,
+        thread=thread,
+        run_follow_up=run_follow_up,
+    )
+    run_follow_up.assert_not_awaited()
+
+
+async def test_skips_save_only_continuation_without_dispatch(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id, _account_id, _thread_id, key = await _seed_pending_row(
+        db_session_factory, requested_work=None
+    )
+    thread = _make_thread()
+    run_follow_up = AsyncMock()
+
+    await dispatch_pending_continuations(
+        db_session_factory,
+        MagicMock(),
+        tenant_id=tenant_id,
+        thread=thread,
+        run_follow_up=run_follow_up,
+    )
+
+    run_follow_up.assert_not_awaited()
+    thread.send.assert_not_called()  # skip_save_only is a silent skip -- nothing was promised
+    async with db_session_factory() as session:
+        settled = await get_continuation(session, idempotency_key=key)
+    assert settled is not None
+    assert settled.status == "skipped"
+    assert settled.skip_reason == "skip_save_only"
+
+
+async def test_preparation_failure_settles_skipped_not_delivered(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from daimon.core.turn.errors import SessionPreparationFailed
+
+    tenant_id, _account_id, _thread_id, key = await _seed_pending_row(
+        db_session_factory, requested_work="continue"
+    )
+    thread = _make_thread()
+    anthropic = build_stub_anthropic(_reachable_agent_handler(tenant_id, ma_agent_id="ag_target"))
+
+    async def _failing_follow_up(row: object, decision: object) -> None:
+        raise SessionPreparationFailed(
+            reasons=("agent_identity",), stage="checkpointed", retry_after=datetime.now(UTC)
+        )
+
+    await dispatch_pending_continuations(
+        db_session_factory,
+        anthropic,
+        tenant_id=tenant_id,
+        thread=thread,
+        run_follow_up=_failing_follow_up,
+    )
+
+    async with db_session_factory() as session:
+        settled = await get_continuation(session, idempotency_key=key)
+    assert settled is not None
+    assert settled.status == "skipped"
+    assert settled.skip_reason == "blocked_preparation_failed"
+
+
+def _reachable_agent_handler(
+    tenant_id: uuid.UUID, *, ma_agent_id: str
+) -> Callable[[httpx.Request], httpx.Response]:
+    """`GET /v1/agents/{id}` handler for a real, tenant-owned, non-archived agent."""
+    agent = BetaManagedAgentsAgent(
+        id=ma_agent_id,
+        type="agent",
+        name="target-agent",
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
+        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: "target-agent"},
+        description=None,
+        created_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
+        updated_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
+        version=1,
+        mcp_servers=[],
+        skills=[],
+        tools=[],
+        system=None,
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=agent.model_dump(mode="json"))
+
+    return _handler

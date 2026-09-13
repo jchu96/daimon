@@ -229,7 +229,8 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
         """Disconnect an MCP server such as Linear from an agent. Detach the named
-        connection and its tools while preserving other servers and skills.
+        connection and its tools while preserving other servers and skills; the
+        change reaches the agent on its next message, not the one running now.
 
         ``attach_mcp_server`` adds public endpoints; ``request_mcp_token`` enrolls
         authenticated connections. The built-in daimon server cannot be removed.
@@ -250,7 +251,8 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
         """Stop an agent using an attached skill, such as eda. Remove that one
-        attachment while preserving other skills.
+        attachment while preserving other skills; it applies from the agent's next
+        message, not the one running now.
 
         ``delete_skill`` destroys the shared workspace skill instead;
         ``update_agent`` adds existing skills. Accept a skill name or raw ``skill_id``.
@@ -282,8 +284,9 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
 
         Use ``request_agent_key`` to add a key privately and ``list_agent_keys`` to
         inspect stored names. Removing a missing key also succeeds; ``removed`` says
-        whether it was present. This deletes the stored environment variable, never
-        returns its secret value, and does not prove an existing session refreshed."""
+        whether it was present. This deletes the stored environment variable and never
+        returns its secret value. Removing it stops it being supplied from the next
+        message; it does not cancel it at the service or stop work already using it."""
         return await _remove_agent_key_impl(
             runtime,
             await _auth(ctx),

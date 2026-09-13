@@ -27,6 +27,9 @@ Platform = Literal["discord", "cli", "slack"]
 # a preparation's `stage` is its resume point.
 TransferKind = Literal["full", "transcript", "history"]
 PreparationStage = Literal["decided", "checkpointed", "uploaded", "created", "completed", "failed"]
+# What the caller answered about uncommitted repository changes: carry them
+# into the successor's working files, or leave them in the old checkout.
+UnsavedWorkChoice = Literal["copy", "leave"]
 ContinuationReason = Literal["task_handoff", "private_input_applied"]
 ContinuationStatus = Literal["pending", "claimed", "delivered", "skipped"]
 
@@ -200,6 +203,10 @@ class ThreadSessionRow(BaseModel):
     transfer_file_id: str | None = None
     transfer_kind: TransferKind | None = None
     fresh_start_requested_at: datetime | None = None
+    # The caller's answer to the uncommitted-work question, waiting for the
+    # replacement it governs. None means unanswered, which reads as the
+    # default: capture the changes.
+    pending_unsaved_work: UnsavedWorkChoice | None = None
 
 
 class SessionPreparationRow(BaseModel):

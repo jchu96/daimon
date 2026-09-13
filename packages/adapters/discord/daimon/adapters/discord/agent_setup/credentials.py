@@ -30,6 +30,7 @@ from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.stores.agent_files import (
     delete_agent_file,
     list_agent_files,
@@ -215,12 +216,20 @@ class PasteSecretModal(discord.ui.Modal, title="Add keys"):
             )
             return
 
+        target_name = self._entry.name if self._entry is not None else "this agent"
         n = len(pairs)
         if n == 1:
-            toast = f"Added `{pairs[0][0]}`. Takes effect on the next session."
+            change = ConfigurationChange(
+                target_name=target_name,
+                kind="key",
+                availability="next_message",
+                detail=pairs[0][0],
+            )
         else:
-            toast = f"Added {n} keys. Takes effect on the next session."
-        await interaction.followup.send(toast, ephemeral=True)
+            change = ConfigurationChange(
+                target_name=target_name, kind="keys_bulk", availability="next_message", count=n
+            )
+        await interaction.followup.send(render_change_confirmation(change), ephemeral=True)
         # Carries the count of keys actually WRITTEN — never a key name, never
         # a value. It is all the collapsed render needs.
         await self._on_added(interaction, key_count=len(pairs))
@@ -355,7 +364,13 @@ class CredentialsSubView(ExpiringView, discord.ui.LayoutView):
             await interaction.followup.send(render_error(err, request_id=rid), ephemeral=True)
             return
         await self._reload_and_rerender(interaction)
-        await interaction.followup.send(f"Removed `{key_name}`.", ephemeral=True)
+        change = ConfigurationChange(
+            target_name=self._agent_name(),
+            kind="key_removed",
+            availability="saved",
+            detail=key_name,
+        )
+        await interaction.followup.send(render_change_confirmation(change), ephemeral=True)
 
     async def _on_add(self, interaction: discord.Interaction) -> None:
         _log.info("credentials.add.click")

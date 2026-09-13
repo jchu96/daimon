@@ -54,6 +54,7 @@ from daimon.core.stores.thread_sessions import (
     get_live_thread_session,
     get_thread_session_by_id,
     mark_turn_active,
+    set_pending_unsaved_work,
 )
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
@@ -936,3 +937,89 @@ async def test_a_responder_change_authorized_by_a_handoff_binding_replaces_the_s
     superseded = await get_thread_session_by_id(db_session, id=old_row.id)
     assert superseded is not None and superseded.status == "superseded"
     assert await _count_live_rows(db_session_factory, tenant=tenant, account=account) == 1
+
+
+async def test_the_callers_unsaved_work_answer_reaches_the_transfer_hook_once(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The question is answered in one turn and used in the next, so the answer
+    rides the caller's row into the replacement it was given for — and is gone
+    from the row afterwards, so it cannot govern a second one."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    transport = _Transport()
+    deps = _deps(db_session_factory, transport)
+
+    first = await _prepare(deps, _admission(account=account), tenant=tenant, account=account)
+    assert isinstance(first, PreparedTurn)
+    old_row = await _live_row(db_session_factory, tenant=tenant, account=account)
+    assert old_row is not None
+    async with db_session_factory() as session, session.begin():
+        await set_pending_unsaved_work(session, id=old_row.id, choice="leave")
+
+    seen: list[Any] = []
+
+    async def _transfer(**kwargs: Any) -> PreparedReplacement:
+        seen.append(kwargs["unsaved_work"])
+        return PreparedReplacement(
+            extra_resources=(),
+            transfer_file_id=None,
+            transfer_kind="transcript",
+            user_prefix="",
+        )
+
+    moved = _agent(model_id="claude-opus-5")
+    _register(transport.state, moved)
+    second = await _prepare(
+        deps,
+        _admission(account=account, agent=moved),
+        tenant=tenant,
+        account=account,
+        transfer=_transfer,
+    )
+
+    assert isinstance(second, PreparedTurn)
+    assert seen == ["leave"], "the transfer decides what to capture from the caller's answer"
+    closed = await get_thread_session_by_id(db_session, id=old_row.id)
+    assert closed is not None and closed.pending_unsaved_work is None, (
+        "one answer governs one replacement"
+    )
+
+
+async def test_a_caller_who_was_never_asked_carries_no_unsaved_work_answer(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    transport = _Transport()
+    deps = _deps(db_session_factory, transport)
+
+    first = await _prepare(deps, _admission(account=account), tenant=tenant, account=account)
+    assert isinstance(first, PreparedTurn)
+
+    seen: list[Any] = []
+
+    async def _transfer(**kwargs: Any) -> PreparedReplacement:
+        seen.append(kwargs["unsaved_work"])
+        return PreparedReplacement(
+            extra_resources=(),
+            transfer_file_id=None,
+            transfer_kind="transcript",
+            user_prefix="",
+        )
+
+    moved = _agent(model_id="claude-opus-5")
+    _register(transport.state, moved)
+    await _prepare(
+        deps,
+        _admission(account=account, agent=moved),
+        tenant=tenant,
+        account=account,
+        transfer=_transfer,
+    )
+
+    assert seen == [None], "an unanswered question is None, which the transfer reads as 'capture'"

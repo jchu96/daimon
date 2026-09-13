@@ -34,6 +34,7 @@ from daimon.core.stores.thread_sessions import (
     mark_dead,
     mark_turn_active,
     record_snapshot,
+    set_pending_unsaved_work,
     update_mutable_fingerprint,
     update_watermark,
 )
@@ -1064,3 +1065,84 @@ async def test_mark_dead_still_only_changes_status(
         )
         is None
     ), "a dead row stays invisible to the caller-scoped lookup"
+
+
+async def test_pending_unsaved_work_round_trips_and_the_last_answer_wins(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="unsaved-work",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_unsaved",
+    )
+    assert row.pending_unsaved_work is None, "a new row carries no answer"
+
+    await set_pending_unsaved_work(db_session, id=row.id, choice="leave")
+    answered = await get_thread_session_by_id(db_session, id=row.id)
+    assert answered is not None and answered.pending_unsaved_work == "leave", (
+        "the answer has to survive the turn it was given in"
+    )
+
+    await set_pending_unsaved_work(db_session, id=row.id, choice="copy")
+    changed = await get_thread_session_by_id(db_session, id=row.id)
+    assert changed is not None and changed.pending_unsaved_work == "copy", (
+        "a caller who answers again means the newer answer"
+    )
+
+
+async def test_superseding_a_row_clears_the_answer_it_was_given_for(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    account_id = uuid.uuid4()
+    old = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="unsaved-work-supersede",
+        account_id=account_id,
+        ma_session_id="sess_unsaved_old",
+    )
+    await set_pending_unsaved_work(db_session, id=old.id, choice="leave")
+    new = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="unsaved-work-supersede",
+        account_id=account_id,
+        ma_session_id="sess_unsaved_new",
+        predecessor_id=old.id,
+    )
+
+    await mark_superseded(db_session, id=old.id, replaced_by_id=new.id)
+
+    closed = await get_thread_session_by_id(db_session, id=old.id)
+    assert closed is not None and closed.pending_unsaved_work is None, (
+        "the answer governed the replacement that just happened; it must not govern another"
+    )
+
+
+async def test_retiring_a_row_clears_the_answer_it_was_given_for(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="unsaved-work-retire",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_unsaved_retire",
+    )
+    await set_pending_unsaved_work(db_session, id=row.id, choice="copy")
+
+    await mark_retired(db_session, id=row.id)
+
+    retired = await get_thread_session_by_id(db_session, id=row.id)
+    assert retired is not None and retired.pending_unsaved_work is None, (
+        "a retired row is not live, so it holds no standing answer"
+    )

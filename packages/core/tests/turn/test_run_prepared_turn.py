@@ -31,7 +31,7 @@ from daimon.core.stores.thread_sessions import get_live_thread_session
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.lifecycle import InterruptSource, ReconnectReason, TurnLifecycle
-from daimon.core.turn.prepare import PreparedTurn, bind_recorder
+from daimon.core.turn.prepare import ContinuityOutcome, PreparedTurn, bind_recorder
 from daimon.core.turn.run import _is_dead_session, run_prepared_turn
 from daimon.core.turn.state import TurnState
 from daimon.testing.ma import (
@@ -160,6 +160,7 @@ def _router(
     *,
     session_bodies: list[dict[str, object]],
     dead_session_ids: set[str],
+    sent_batches: list[tuple[str, list[dict[str, object]]]] | None = None,
 ) -> MARouter:
     """A router serving memory-store cold-provision, session-create (each
     call assigns the next `sess_N` id), events.send, and events.stream --
@@ -207,10 +208,12 @@ def _router(
 
     router.add("POST", r"/v1/sessions", _session_create)
 
-    def _send(_request: httpx.Request, _match: object) -> httpx.Response:
+    def _send(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        if sent_batches is not None:
+            sent_batches.append((match.group("sid"), json.loads(request.content)["events"]))
         return send_events_response()
 
-    router.add("POST", r"/v1/sessions/[^/]+/events", _send)
+    router.add("POST", r"/v1/sessions/(?P<sid>[^/]+)/events", _send)
 
     def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
         sid = match.group("sid")
@@ -1506,6 +1509,7 @@ async def test_cancel_set_before_recovery_starts_aborts_recovery_and_flushes_hel
         render_interval_s: object,
         billing: object,
         image_blocks: object,
+        system_blocks: object = (),
     ) -> TurnState:
         nonlocal call_count
         call_count += 1
@@ -1602,6 +1606,7 @@ async def test_cancel_during_recovery_mirrors_into_the_recovery_turn_and_interru
         render_interval_s: object,
         billing: object,
         image_blocks: object,
+        system_blocks: object = (),
     ) -> TurnState:
         nonlocal call_count
         call_count += 1
@@ -1708,4 +1713,242 @@ async def test_recovery_happy_path_unaffected_by_the_cancel_mirror_and_leaks_no_
     assert len(session_bodies) == 1
     assert _leaked_turn_task_names() == [], (
         "no turn.cancel_mirror task may linger after a clean recovery"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A replacement session's first turn: the framing it cannot answer without
+# ---------------------------------------------------------------------------
+
+
+def _replacement_continuity() -> ContinuityOutcome:
+    """What the bind hands over after it replaced this caller's session."""
+    return ContinuityOutcome(
+        state="replaced",
+        transfer_kind="full",
+        user_prefix='<previous_session from="analysis-bot" trust="untrusted">\n'
+        '<turn role="user">fit the hierarchical model</turn>\n</previous_session>',
+        system_blocks=(
+            {"type": "text", "text": "This conversation continues work started elsewhere."},
+        ),
+    )
+
+
+async def test_a_replacement_sends_its_framing_with_the_first_user_message(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The successor has no conversation and no files of its own, so the first
+    send carries both channels: the quoted prior conversation in front of the
+    user message, and daimon's own words as a trailing system.message."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-framing",
+        ma_session_id="sess_1",
+    )
+    await db_session.commit()
+
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    router = _router(session_bodies=[], dead_session_ids=set(), sent_batches=sent)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    admission = _admission(
+        account_id=account.id,
+        agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
+        env=_env(env_id="env_1", tenant_id=tenant.id),
+    )
+    continuity = _replacement_continuity()
+    prepared = dataclasses.replace(
+        _prepared_turn(
+            deps=deps,
+            admission=admission,
+            tenant_id=tenant.id,
+            external_user_id="user-1",
+            ma_session_id="sess_1",
+            mapping_id=row.id,
+            session_account_id=account.id,
+        ),
+        continuity=continuity,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-framing",
+        external_user_id="user-1",
+        user_message="carry on please",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.state.error is None
+    assert len(sent) == 1, "one turn, one send"
+    session_id, batch = sent[0]
+    assert session_id == "sess_1"
+    assert [event["type"] for event in batch] == ["user.message", "system.message"], (
+        "the API takes at most one system.message and it must come last"
+    )
+    text = "".join(
+        block["text"]
+        for block in batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert text == f"{continuity.user_prefix}\ncarry on please", (
+        "the prior conversation goes in front of the message the person actually sent"
+    )
+    assert batch[1]["content"] == list(continuity.system_blocks), (
+        "daimon's own framing rides the privileged channel verbatim"
+    )
+    assert outcome.continuity == continuity, "the adapter is told what the bind decided"
+
+
+async def test_an_ordinary_turn_sends_exactly_the_user_message(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The default continuity is every turn that changed nothing. Those must
+    send byte-identical bytes to before continuity existed."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-plain",
+        ma_session_id="sess_1",
+    )
+    await db_session.commit()
+
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    router = _router(session_bodies=[], dead_session_ids=set(), sent_batches=sent)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=_admission(
+            account_id=account.id,
+            agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
+            env=_env(env_id="env_1", tenant_id=tenant.id),
+        ),
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_1",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-plain",
+        external_user_id="user-1",
+        user_message="hello",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    _, batch = sent[0]
+    assert [event["type"] for event in batch] == ["user.message"], (
+        "no framing means no system.message"
+    )
+    text = "".join(
+        block["text"]
+        for block in batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert text == "hello", "an ordinary turn sends the message and nothing else"
+    assert outcome.continuity.state == "continued"
+
+
+async def test_recovery_reports_a_replacement_after_loss_and_keeps_the_framing_prefix(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """When the bound session is gone, the successor the recovery cycle builds
+    mounts nothing: the workspace was lost, not handed over. The state says so
+    (so the copy stays honest), while the quoted conversation -- the one thing
+    that still crosses -- stays in front of the reseeded message."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id="thread-loss",
+        ma_session_id="sess_old",
+    )
+    await db_session.commit()
+
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    router = _router(session_bodies=[], dead_session_ids={"sess_old"}, sent_batches=sent)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    continuity = _replacement_continuity()
+    prepared = dataclasses.replace(
+        _prepared_turn(
+            deps=deps,
+            admission=_admission(
+                account_id=account.id,
+                agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
+                env=_env(env_id="env_1", tenant_id=tenant.id),
+            ),
+            tenant_id=tenant.id,
+            external_user_id="user-1",
+            ma_session_id="sess_old",
+            mapping_id=row.id,
+            session_account_id=account.id,
+        ),
+        continuity=continuity,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id="thread-loss",
+        external_user_id="user-1",
+        user_message="carry on please",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+
+    assert outcome.recovered is True
+    assert outcome.continuity.state == "replaced_after_loss", (
+        "the session was lost, so the copy must not claim a planned replacement"
+    )
+    assert outcome.continuity.user_prefix == continuity.user_prefix, (
+        "what the bind decided is restated, not discarded"
+    )
+
+    recovery_session, recovery_batch = sent[-1]
+    assert recovery_session == outcome.ma_session_id
+    assert [event["type"] for event in recovery_batch] == ["user.message"], (
+        "the recreated session has no bundle mounted, so the framing that describes one "
+        "must not be sent to it"
+    )
+    text = "".join(
+        block["text"]
+        for block in recovery_batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert text == f"{continuity.user_prefix}\nfull history reseed", (
+        "the quoted conversation still leads the reseeded message"
     )

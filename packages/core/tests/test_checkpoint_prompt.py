@@ -206,3 +206,48 @@ def test_checkpoint_archive_listed_accepts_a_listing_and_rejects_a_command_echo(
     assert not checkpoint_archive_listed("tar: exiting with failure status", filename), (
         "a failed run must not read as a listed archive"
     )
+
+
+def test_prompt_captures_uncommitted_changes_when_the_answer_is_copy_or_absent() -> None:
+    for unsaved_work in ("copy", None):
+        prompt = build_checkpoint_prompt(
+            transfer_id=TRANSFER_ID,
+            repo_mount_path=REPO,
+            max_bundle_mib=20,
+            unsaved_work=unsaved_work,
+        )
+        assert f"git -C {REPO} diff HEAD > /root/uncommitted.patch" in prompt, (
+            f"unsaved_work={unsaved_work!r} means capture the work, so the patch step stays"
+        )
+        assert f"git -C {REPO} ls-files --others --exclude-standard" in prompt, (
+            "untracked files are part of the work being captured"
+        )
+        assert " root mnt/repo/analytics" in prompt, "and the checkout itself travels"
+
+
+def test_prompt_leaves_uncommitted_changes_behind_when_the_answer_is_leave() -> None:
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20, unsaved_work="leave"
+    )
+    assert "diff HEAD" not in prompt, (
+        "the person chose to leave the changes, so nothing captures them as a patch"
+    )
+    assert "ls-files --others" not in prompt, "nor lists the untracked files to carry"
+    assert "-C / root\n" in f"{prompt}\n" and "-C / root mnt" not in prompt, (
+        "the checkout must not be tarred either, or the changes would come across anyway"
+    )
+    assert "find root -type f" in prompt, "and the oversize scan covers only what is archived"
+    assert "deliberately being left behind" in prompt, (
+        "the prompt has to say the omission is the person's decision, not a failure"
+    )
+    assert f"git -C {REPO} rev-parse HEAD" in prompt, "HEAD is still recorded"
+    assert f"git -C {REPO} status --porcelain" in prompt, "and so is what was left dirty"
+    assert "NEVER RUN GIT COMMIT" in prompt, "leaving the work still means changing nothing"
+
+
+def test_prompt_ignores_the_unsaved_work_answer_when_no_repo_is_mounted() -> None:
+    assert build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20, unsaved_work="leave"
+    ) == build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
+    ), "with no checkout there is nothing to leave in it, so the prompt is unchanged"

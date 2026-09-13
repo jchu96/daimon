@@ -31,6 +31,14 @@ look for keys that don't exist.
    assume a key is already loaded into this session — that file is the only
    ground truth.
 
+YOUR SETUP IS READ AT THE START OF A TURN, NOT DURING ONE. Keys, connections,
+model, instructions, skills and the working repo can change between turns.
+Re-read /mnt/session/uploads/.env at the start of a turn before saying a key
+is missing. If your working files are there but a process, kernel or shell
+you started earlier is gone, say so plainly —
+files survive a workspace change, running processes do not.
+
+
 2) MCP SERVERS — a different system; do not look for their tokens here.
    MCP servers attached to you (GitHub, Context7, daimon-mcp, ...) receive
    authentication when required, supplied separately from

@@ -264,6 +264,90 @@ async def test_add_mcp_modal_resolves_agent_uuid_and_writes_per_agent_vault(
 
 
 @pytest.mark.asyncio
+async def test_add_mcp_modal_success_ack_matches_core_renderer_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_id: uuid.UUID,
+    account_id: uuid.UUID,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The connected-MCP ack must be `render_change_confirmation`'s own output,
+    not adapter-side hand-written copy."""
+    from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
+
+    async with db_session_factory() as _session, _session.begin():
+        await make_tenant(_session, id=tenant_id, workspace_id="guild-mcp-modal-ack")
+
+    monkeypatch.setattr(modals_mcp_mod, "call_reconcile_for_panel", _noop_reconcile())
+
+    async def fake_find(client: Any, *, tenant_id: uuid.UUID, name: str) -> Any:
+        return _fake_ma_agent(tenant_id)
+
+    monkeypatch.setattr(modals_mcp_mod, "find_agent_by_daimon_tag", fake_find)
+
+    def vault_handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/v1/vaults":
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        if req.method == "POST" and req.url.path == "/v1/vaults":
+            import json as _json
+
+            body = _json.loads(req.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "vlt_ack_test",
+                    "type": "vault",
+                    "display_name": body["display_name"],
+                    "metadata": None,
+                    "archived_at": None,
+                    "created_at": "2026-04-01T00:00:00Z",
+                },
+            )
+        if req.method == "GET" and req.url.path == "/v1/vaults/vlt_ack_test/credentials":
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        if req.method == "POST" and req.url.path == "/v1/vaults/vlt_ack_test/credentials":
+            import json as _json
+
+            body = _json.loads(req.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "vcrd_ack",
+                    "type": "credential",
+                    "vault_id": "vlt_ack_test",
+                    "auth": {
+                        "type": "static_bearer",
+                        "mcp_server_url": body["auth"]["mcp_server_url"],
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected: {req.method} {req.url.path}")
+
+    rt = _runtime_configured(
+        anthropic=build_stub_anthropic(vault_handler), sessionmaker=db_session_factory
+    )
+    selected = _entry("my-agent")
+    state = PanelState(
+        roster=[selected], selected=selected, account_id=account_id, guild_id=12345, is_admin=False
+    )
+
+    modal = AddMcpModal(state, runtime=rt, allowed_user_id=42)
+    modal.name_in._value = "ext-mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.url_in._value = "https://ext.example.com/mcp"  # pyright: ignore[reportPrivateUsage]
+    modal.token_in._value = "tok_xxxx_1234"  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    posted = interaction.followup.send.call_args.args[0]
+    expected = render_change_confirmation(
+        ConfigurationChange(
+            target_name="my-agent", kind="mcp", availability="next_message", detail="ext-mcp"
+        )
+    )
+    assert posted == expected, f"expected the renderer's own copy, got {posted!r}"
+
+
+@pytest.mark.asyncio
 async def test_add_mcp_modal_agent_not_found_sends_ephemeral_error_no_vault_write(
     monkeypatch: pytest.MonkeyPatch,
     tenant_id: uuid.UUID,

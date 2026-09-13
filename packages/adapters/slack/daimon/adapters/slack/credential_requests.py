@@ -50,6 +50,7 @@ from daimon.adapters.slack.agent_setup.write import (
 from daimon.adapters.slack.interactions import resolve_web_client
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.credential_requests import (
     MAX_SLACK_BUTTON_LABEL_CHARS,
     CredentialRequestKind,
@@ -660,14 +661,21 @@ async def run_env_credential_submission(
     await _mark_button_consumed(
         client, channel_id=channel_id, message_ts=message_ts, kind="env", target=consumed.target
     )
+    agent = await find_agent_by_derived_uuid(
+        runtime.anthropic, tenant_id=consumed.tenant_id, agent_id=consumed.agent_id
+    )
     await _post_ephemeral(
         client,
         thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
-        text=(
-            f"Saved `{consumed.target}` for shared use by this agent. "
-            "Existing sessions may still use the previous setup."
+        text=render_change_confirmation(
+            ConfigurationChange(
+                target_name=agent.name if agent is not None else "this agent",
+                kind="key",
+                detail=consumed.target,
+                availability="next_message",
+            )
         ),
     )
 
@@ -855,9 +863,13 @@ async def run_mcp_credential_submission(
         thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
-        text=(
-            f"MCP token added for `{mcp_server_url}` and attached as "
-            f"`{consumed.target}`. Anyone who talks to this agent can use it."
+        text=render_change_confirmation(
+            ConfigurationChange(
+                target_name=agent.name,
+                kind="mcp",
+                detail=consumed.target,
+                availability="next_message",
+            )
         ),
     )
 
@@ -921,13 +933,29 @@ async def _resolve_repo_binding_credential(
     return "anon:", RepoAccessProof(kind="public", at=now, account_id=account_id)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class SkillAttachOutcome:
+    """Result of attaching the just-imported skills to the requested agent.
+
+    `attached` is the one bit `run_skill_repo_credential_submission` needs to
+    pick the confirmation copy's availability: `next_message` when the attach
+    actually landed, `preparation_failed` when the import succeeded but the
+    attach did not (or found nothing new to attach).
+    """
+
+    note: str
+    attached: bool
+    agent_name: str | None
+    skill_count: int
+
+
 async def _attach_skills_to_requested_agent(
     runtime: SlackRuntime,
     *,
     tenant_id: uuid.UUID,
     agent_id: uuid.UUID,
     outcomes: list[ResourceOutcome],
-) -> str:
+) -> SkillAttachOutcome:
     """Attach the just-imported skills to the agent this request named.
 
     Importing puts skills in the tenant's shared library; it does not put
@@ -935,7 +963,7 @@ async def _attach_skills_to_requested_agent(
     only the import leaves the user staring at an agent with no skills and
     no way to tell that anything worked.
 
-    Returns prose rather than raising: the import has already succeeded by
+    Returns a result rather than raising: the import has already succeeded by
     the time this runs, so a failure here is partial and both halves must
     be reported truthfully.
     """
@@ -945,12 +973,19 @@ async def _attach_skills_to_requested_agent(
         if outcome.anthropic_id is not None and outcome.action in (Action.CREATED, Action.UPDATED)
     )
     if not skill_ids:
-        return "Nothing new to attach."
+        return SkillAttachOutcome(
+            note="Nothing new to attach.", attached=False, agent_name=None, skill_count=0
+        )
     agent = await find_agent_by_derived_uuid(
         runtime.anthropic, tenant_id=tenant_id, agent_id=agent_id
     )
     if agent is None:
-        return "Could not attach: that agent no longer exists. The skills are in the library."
+        return SkillAttachOutcome(
+            note="Could not attach: that agent no longer exists. The skills are in the library.",
+            attached=False,
+            agent_name=None,
+            skill_count=len(skill_ids),
+        )
     new_skills: list[BetaManagedAgentsSkillParams] = [
         {"type": "custom", "skill_id": skill_id} for skill_id in skill_ids
     ]
@@ -974,8 +1009,21 @@ async def _attach_skills_to_requested_agent(
             agent_id=str(agent_id),
             err_type=type(err).__name__,
         )
-        return f"Imported, but attaching to `{agent.name}` failed. Ask again to retry attaching it."
-    return f"Attached {len(skill_ids)} to `{agent.name}`."
+        return SkillAttachOutcome(
+            note=(
+                f"Imported, but attaching to `{agent.name}` failed. "
+                "Ask again to retry attaching it."
+            ),
+            attached=False,
+            agent_name=agent.name,
+            skill_count=len(skill_ids),
+        )
+    return SkillAttachOutcome(
+        note=f"Attached {len(skill_ids)} to `{agent.name}`.",
+        attached=True,
+        agent_name=agent.name,
+        skill_count=len(skill_ids),
+    )
 
 
 async def run_skill_repo_credential_submission(
@@ -1129,9 +1177,20 @@ async def run_skill_repo_credential_submission(
         )
         return
 
-    attach_note = await _attach_skills_to_requested_agent(
+    attach = await _attach_skills_to_requested_agent(
         runtime, tenant_id=consumed.tenant_id, agent_id=consumed.agent_id, outcomes=outcomes
     )
+    if attach.skill_count > 0 and attach.agent_name is not None:
+        change_text = render_change_confirmation(
+            ConfigurationChange(
+                target_name=attach.agent_name,
+                kind="skill",
+                detail=f"{attach.skill_count} skill(s) from {normalize_owner_repo(url)}",
+                availability="next_message" if attach.attached else "preparation_failed",
+            )
+        )
+    else:
+        change_text = attach.note
     await _post_ephemeral(
         client,
         thread_ts=thread_ts,
@@ -1139,7 +1198,7 @@ async def run_skill_repo_credential_submission(
         user_id=user_id,
         text=(
             f"Imported {len(outcomes)} skill(s) from `{normalize_owner_repo(url)}`. "
-            f"{attach_note} The token is stored and the repo is bound, so future "
+            f"{change_text} The token is stored and the repo is bound, so future "
             "imports from it will not ask again."
         ),
     )
@@ -1269,13 +1328,21 @@ async def run_repo_bind_credential_submission(
         )
         return
 
+    agent = await find_agent_by_derived_uuid(
+        runtime.anthropic, tenant_id=consumed.tenant_id, agent_id=consumed.agent_id
+    )
     await _post_ephemeral(
         client,
         thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
-        text=(
-            f"Bound `{consumed.target}` on `{branch}`. "
-            "Existing sessions may still use the previous setup."
+        text=render_change_confirmation(
+            ConfigurationChange(
+                target_name=agent.name if agent is not None else "this agent",
+                kind="repo",
+                repo=consumed.target,
+                branch=branch,
+                availability="next_message",
+            )
         ),
     )

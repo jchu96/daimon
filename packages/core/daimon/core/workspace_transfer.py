@@ -69,6 +69,7 @@ from daimon.core.ma import replay_events
 from daimon.core.pricing import MODEL_PRICING
 from daimon.core.session_preparation_stages import PreparedReplacement
 from daimon.core.session_snapshot import SessionSnapshot
+from daimon.core.stores.domain import UnsavedWorkChoice
 from daimon.core.stores.pending_file_deletes import enqueue_pending_file_delete
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
@@ -165,6 +166,11 @@ _GAP_PHRASING: dict[GapReason | Literal["events_unavailable"], str] = {
 }
 
 _COMMITTED_DURING_CHECKPOINT = "the agent committed to the repository during checkpoint"
+
+# What `leave` costs, in the same noun-phrase shape as `_GAP_PHRASING`: the
+# person was asked and chose this, so the successor is told plainly rather
+# than left to discover the changes missing.
+_UNSAVED_WORK_LEFT_BEHIND = "uncommitted repository changes were left in the old checkout"
 
 
 class _NoOpLifecycle(TurnLifecycle):
@@ -344,6 +350,7 @@ async def transfer_workspace(
     markup: Decimal,
     checkpoint_deadline: datetime,
     from_agent_name: str,
+    unsaved_work: UnsavedWorkChoice | None = None,
     max_bundle_bytes: int = HANDOFF_MAX_BYTES,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now: Callable[[], datetime] = _utc_now,
@@ -354,6 +361,12 @@ async def transfer_workspace(
     session actually produced work (`is_worth_checkpointing`). Never
     archives or deletes the old session: retiring the mapping row is the
     caller's job, and the old session stays readable.
+
+    `unsaved_work` is the person's answer about uncommitted changes in the
+    mounted repository: `"leave"` keeps them in the old checkout and out of the
+    bundle, anything else (including an unanswered None) captures them. The
+    choice reaches the checkpoint prompt and, when it was `"leave"`, is also
+    reported as something the successor did not get.
 
     Never raises for an expected degradation — every rung below the top is a
     returned value. It does raise for an unexpected upstream failure (a 500
@@ -382,6 +395,7 @@ async def transfer_workspace(
             transfer_id=transfer_id,
             repo_mount_path=old_snapshot.repo_mount_path,
             max_bundle_mib=max_bundle_bytes // _MIB,
+            unsaved_work=unsaved_work,
         ),
         lifecycle=_NoOpLifecycle(),
         cancel=asyncio.Event(),
@@ -427,7 +441,13 @@ async def transfer_workspace(
     # Two different hashes mean the session committed despite being told not
     # to; that is recorded and told to the successor, not prevented.
     first_head, last_head = checkpoint_head_lines(extract_final_response(state.content))
-    unpreserved: tuple[str, ...] = ()
+    # Only meaningful with a repository mounted: without one there is no
+    # checkout for anything to be left in, and the question is never asked.
+    unpreserved: tuple[str, ...] = (
+        (_UNSAVED_WORK_LEFT_BEHIND,)
+        if unsaved_work == "leave" and old_snapshot.repo_mount_path is not None
+        else ()
+    )
     if first_head is not None and last_head is not None and first_head != last_head:
         log.warning(
             "workspace_transfer.repository_changed",
@@ -435,7 +455,7 @@ async def transfer_workspace(
             head_before=first_head,
             head_after=last_head,
         )
-        unpreserved = (_COMMITTED_DURING_CHECKPOINT,)
+        unpreserved = (*unpreserved, _COMMITTED_DURING_CHECKPOINT)
 
     rehosted = await _rehost_bundle(client, sessionmaker, bundle=bundle, now=now)
     if isinstance(rehosted, str):
@@ -546,6 +566,7 @@ class WorkspaceTransferRunner:
         destination_model_id: str,
         destination_agent_name: str,
         requested_work: str | None,
+        unsaved_work: UnsavedWorkChoice | None = None,
     ) -> PreparedReplacement:
         from_agent_name = self.from_agent_name or old_snapshot.agent_name
         outcome = await transfer_workspace(
@@ -559,6 +580,7 @@ class WorkspaceTransferRunner:
             markup=self.markup,
             checkpoint_deadline=deadline,
             from_agent_name=from_agent_name,
+            unsaved_work=unsaved_work,
         )
         return as_prepared_replacement(
             outcome,

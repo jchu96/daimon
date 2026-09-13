@@ -7,6 +7,7 @@ bold labels, and ULID request ID suffix for cross-referencing with logs.
 from __future__ import annotations
 
 import anthropic
+from daimon.core.continuity.messages import render_responder_changed_without_handoff
 from daimon.core.errors import (
     DaimonError,
     SpecError,
@@ -24,14 +25,30 @@ def generate_request_id() -> str:
     return str(ULID())
 
 
-def render_error(exc: Exception, *, request_id: str) -> str:
-    """Map known exceptions to structured markdown with emoji, label, and rid."""
+def render_error(
+    exc: Exception,
+    *,
+    request_id: str,
+    new_responder: str | None = None,
+    owner: str | None = None,
+    channel: str | None = None,
+) -> str:
+    """Map known exceptions to structured markdown with emoji, label, and rid.
+
+    `new_responder`/`owner`/`channel` are the contextual facts a
+    `SessionAgentMismatch` render needs (who answers now, whose work this
+    conversation belongs to, where). Resolving them (an async agent-name
+    lookup) is the caller's job -- this function stays synchronous -- so
+    every other caller omits them and gets a generic fallback phrasing.
+    """
     if isinstance(exc, SessionAgentMismatch):
         return (
-            "This conversation already has a session with another responder. "
-            "Your existing work is preserved. To continue with the current responder, "
-            "start a new conversation.\n"
-            f"`rid: {request_id}`"
+            render_responder_changed_without_handoff(
+                new_responder=new_responder or "the current responder",
+                owner=owner or "the previous agent",
+                channel=channel or "this channel",
+            )
+            + f"\n`rid: {request_id}`"
         )
     if isinstance(exc, SpecError):
         return f"⚠️ **Spec validation failed**: {exc}\n`rid: {request_id}`"

@@ -76,6 +76,7 @@ from daimon.adapters.discord.credential_repo_bind import (
 )
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.credential_requests import split_skill_repo_target
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid, find_attach_mount_collision
 from daimon.core.defaults.report import Action, ResourceOutcome
@@ -208,11 +209,18 @@ class EnvCredentialModal(discord.ui.Modal, title="Add key"):
         # commit together here, so this is the first point the row is durably
         # spent, and it keeps a Discord round trip out of an open transaction.
         await _mark_button_consumed(interaction, kind="env", row=consumed_row)
-        await interaction.followup.send(
-            f"Added `{consumed_row.target}`. Takes effect on the next session — "
-            "anyone who talks to this agent can use it.",
-            ephemeral=True,
+        agent = await find_agent_by_derived_uuid(
+            self._runtime.anthropic,
+            tenant_id=consumed_row.tenant_id,
+            agent_id=consumed_row.agent_id,
         )
+        change = ConfigurationChange(
+            target_name=agent.name if agent is not None else "this agent",
+            kind="key",
+            availability="next_message",
+            detail=consumed_row.target,
+        )
+        await interaction.followup.send(render_change_confirmation(change), ephemeral=True)
 
 
 class McpCredentialModal(discord.ui.Modal, title="Add MCP token"):
@@ -366,16 +374,27 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP token"):
                 err_type=type(err).__name__,
             )
             await interaction.followup.send(
-                f"MCP token saved, but connecting `{mcp_server_url}` to the agent "
-                "did not finish — "
-                "ask the agent to connect the MCP server again using a private token form.",
+                render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=agent.name,
+                        kind="mcp",
+                        availability="preparation_failed",
+                        detail=consumed_row.target,
+                    )
+                ),
                 ephemeral=True,
             )
             return
 
         await interaction.followup.send(
-            f"MCP token saved for `{mcp_server_url}` and connected as "
-            f"`{consumed_row.target}`. Anyone who talks to this agent can use it.",
+            render_change_confirmation(
+                ConfigurationChange(
+                    target_name=agent.name,
+                    kind="mcp",
+                    availability="next_message",
+                    detail=consumed_row.target,
+                )
+            ),
             ephemeral=True,
         )
 
@@ -723,7 +742,16 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
             )
             return
 
-        await interaction.followup.send(
-            f"Bound `{consumed_row.target}` on `{branch}`. Takes effect on the next session.",
-            ephemeral=True,
+        agent = await find_agent_by_derived_uuid(
+            self._runtime.anthropic,
+            tenant_id=consumed_row.tenant_id,
+            agent_id=consumed_row.agent_id,
         )
+        change = ConfigurationChange(
+            target_name=agent.name if agent is not None else "this agent",
+            kind="repo",
+            availability="next_message",
+            repo=consumed_row.target,
+            branch=branch,
+        )
+        await interaction.followup.send(render_change_confirmation(change), ephemeral=True)

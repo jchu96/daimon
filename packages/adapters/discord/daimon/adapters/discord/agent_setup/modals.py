@@ -34,6 +34,7 @@ from daimon.adapters.discord.agent_setup.write import (
 )
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.constants import DEFAULT_AGENT_MODEL
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
 from daimon.core.github_visibility import (
@@ -128,12 +129,15 @@ class AgentSectionModal(discord.ui.Modal, title="Prompt & model"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         # name_in is intentionally ignored — rename forbidden (Pitfall 4).
+        # Snapshot before `apply_agent_modal` mutates `state.selected`, so the
+        # post-submit acks below can tell whether the model/prompt actually
+        # changed rather than just re-reading the new value against itself.
+        previous = self.state.selected
         model_value = str(self.model_in).strip() or DEFAULT_AGENT_MODEL
         submitted_system = str(self.prompt_in).strip()
         if self._system_omitted and not submitted_system:
             # Prompt was too long to show; a blank submit must KEEP it, not wipe it.
-            current = self.state.selected
-            system_value = current.spec.system if current is not None else None
+            system_value = previous.spec.system if previous is not None else None
         else:
             system_value = submitted_system or None
         agent_name = self.state.selected.name if self.state.selected else None
@@ -166,6 +170,27 @@ class AgentSectionModal(discord.ui.Modal, title="Prompt & model"):
                 ).bind_render_interaction(interaction, panel=self.state),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            if previous is not None and agent_name is not None:
+                if model_value != previous.model:
+                    await interaction.followup.send(
+                        render_change_confirmation(
+                            ConfigurationChange(
+                                target_name=agent_name, kind="model", availability="next_message"
+                            )
+                        ),
+                        ephemeral=True,
+                    )
+                if system_value != (previous.spec.system or None):
+                    await interaction.followup.send(
+                        render_change_confirmation(
+                            ConfigurationChange(
+                                target_name=agent_name,
+                                kind="instructions",
+                                availability="next_message",
+                            )
+                        ),
+                        ephemeral=True,
+                    )
         except Exception as err:
             _log.exception(
                 "agent_setup.agent_section.failed",
@@ -194,7 +219,7 @@ class RepoAuthModal(discord.ui.Modal, title="Working repo"):
     Repo URL is optional: a token submitted with no repo is verified against
     its own GitHub identity (`is_valid_pat`, no repo-scoped permission
     needed), stored, and writes NO `agent_repo_binding` row — the GitHub
-    Copilot MCP mirror in `core/sessions.py` picks it up on the next session
+    Copilot MCP mirror in `core/sessions.py` picks it up on the next message
     with zero core changes. A repo submitted with no token still runs the
     existing App-coverage / public-visibility probes; it ALSO re-verifies
     any already-stored inline PAT against the newly-typed repo before
@@ -316,9 +341,10 @@ class RepoAuthModal(discord.ui.Modal, title="Working repo"):
                     plaintext_pat=pat,
                 )
                 self.state.pat_last4 = pat[-4:]
-                coverage_note = (
-                    "Token stored — no repo pinned. The GitHub MCP server "
-                    "picks it up on the next session."
+                coverage_note = render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=selected.name, kind="repo", availability="next_message"
+                    )
                 )
             else:
                 pat_last4: str | None = None

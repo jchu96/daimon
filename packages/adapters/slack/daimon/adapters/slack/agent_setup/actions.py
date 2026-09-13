@@ -110,6 +110,7 @@ from daimon.adapters.slack.setup_conversations import (
     setup_link,
     setup_reply_button,
 )
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     list_agents_by_tenant,
@@ -1106,6 +1107,18 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     section_blocks=section_blocks,
                 ),
             )
+            await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel_id or user_id,
+                user=user_id,
+                text=render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=agent_name_for_remove,
+                        kind="skill_removed",
+                        detail=skill_to_remove,
+                        availability="next_message",
+                    )
+                ),
+            )
 
         # -----------------------------------------------------------------------
         # Remove MCP — field-conditional: MCP servers are part of the
@@ -1190,6 +1203,18 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     is_admin=is_admin,
                     can_edit_spec=True,
                     section_blocks=section_blocks,
+                ),
+            )
+            await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel_id or user_id,
+                user=user_id,
+                text=render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=agent_name_for_remove,
+                        kind="mcp_removed",
+                        detail=mcp_to_remove,
+                        availability="next_message",
+                    )
                 ),
             )
 
@@ -1277,6 +1302,18 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                     is_admin=is_admin,
                     can_edit_spec=can_edit_spec,
                     section_blocks=section_blocks,
+                ),
+            )
+            await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+                channel=channel_id or user_id,
+                user=user_id,
+                text=render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=agent_name_for_remove,
+                        kind="key_removed",
+                        detail=secret_key_to_remove,
+                        availability="next_message",
+                    )
                 ),
             )
 

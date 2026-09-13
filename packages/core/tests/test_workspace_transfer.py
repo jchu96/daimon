@@ -753,3 +753,100 @@ def test_as_prepared_replacement_says_only_the_thread_survived_for_history_only(
     assert prepared.user_prefix == ""
     system_text = prepared.system_blocks[0]["text"]
     assert "only what was posted in this thread came across" in system_text
+
+
+async def test_transfer_leaves_uncommitted_work_behind_and_names_it_when_asked_to(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`leave` is a person's answer, not a failure: the prompt stops capturing
+    the changes, the checkout stays out of the archive, and the successor is
+    told plainly that they did not come across."""
+    state = FakeSessionsState(ma=FakeMAState())
+    client = _client(state)
+    old_session = await _make_session(client)
+    _seed_conversation(state, old_session, with_reply=True)
+    _script_checkpoint_reply(state, old_session, "-rw-r--r-- 1 root root 42 handoff.tar.gz")
+    state.write_output(old_session, handoff_filename(TRANSFER_ID), TARBALL)
+
+    outcome = await transfer_workspace(
+        client,
+        db_session_factory,
+        old_session_id=old_session,
+        old_snapshot=_snapshot(repo_mount_path="/root/repo"),
+        tenant_id=TENANT_ID,
+        external_user_id="U123",
+        transfer_id=TRANSFER_ID,
+        markup=Decimal("1.0"),
+        checkpoint_deadline=DEADLINE,
+        from_agent_name="analysis-bot",
+        unsaved_work="leave",
+        sleep=_no_sleep,
+        now=_now,
+    )
+
+    _, batch = state.sent_batches[0]
+    prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    assert "diff HEAD" not in prompt, "the changes the person left are never captured as a patch"
+    assert "deliberately being left behind" in prompt
+
+    assert isinstance(outcome, FullHandoff), f"the rest of the workspace still crosses: {outcome!r}"
+    assert outcome.unpreserved == (
+        "uncommitted repository changes were left in the old checkout",
+    ), "what did not cross has to be sayable, or the copy would overstate the handoff"
+
+
+async def test_transfer_captures_uncommitted_work_when_the_answer_is_copy(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    state = FakeSessionsState(ma=FakeMAState())
+    client = _client(state)
+    old_session = await _make_session(client)
+    _seed_conversation(state, old_session, with_reply=True)
+    _script_checkpoint_reply(state, old_session, "-rw-r--r-- 1 root root 42 handoff.tar.gz")
+    state.write_output(old_session, handoff_filename(TRANSFER_ID), TARBALL)
+
+    outcome = await transfer_workspace(
+        client,
+        db_session_factory,
+        old_session_id=old_session,
+        old_snapshot=_snapshot(repo_mount_path="/root/repo"),
+        tenant_id=TENANT_ID,
+        external_user_id="U123",
+        transfer_id=TRANSFER_ID,
+        markup=Decimal("1.0"),
+        checkpoint_deadline=DEADLINE,
+        from_agent_name="analysis-bot",
+        unsaved_work="copy",
+        sleep=_no_sleep,
+        now=_now,
+    )
+
+    _, batch = state.sent_batches[0]
+    prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    assert "diff HEAD > /root/uncommitted.patch" in prompt, "copy means capture the patch"
+
+    assert isinstance(outcome, FullHandoff)
+    assert outcome.unpreserved == (), "nothing was left behind, so nothing is claimed to be"
+
+
+def test_as_prepared_replacement_tells_the_successor_the_changes_were_left_behind() -> None:
+    """The phrase travels all the way into the framing the successor reads, so
+    it cannot quietly work around files that were never going to be there."""
+    prepared = as_prepared_replacement(
+        FullHandoff(
+            transfer_file_id="file_bundle",
+            mount_path=HANDOFF_MOUNT_PATH,
+            bytes_transferred=4096,
+            transcript=None,
+            unpreserved=("uncommitted repository changes were left in the old checkout",),
+        ),
+        destination_model_id="claude-sonnet-5",
+        from_agent_name="analysis-bot",
+        to_agent_name="analysis-bot",
+        requested_work=None,
+    )
+
+    system_text = prepared.system_blocks[0]["text"]
+    assert "Not carried over: uncommitted repository changes were left in the old checkout" in (
+        system_text
+    ), "the not-carried line is where an honest handoff names what is missing"

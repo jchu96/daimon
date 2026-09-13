@@ -31,6 +31,7 @@ from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.github_app_auth import build_app_install_url
 from daimon.core.ma_identity import derive_agent_uuid
@@ -175,6 +176,23 @@ class _SkillRemoveSelect(discord.ui.Select["EditView"]):
             )
             return
         log.info("agent_setup.edit.skill.removed", index=index, agent_name=agent_name)
+        removed_skill_id = (
+            old_selected.spec.skills[index].skill_id
+            if old_selected is not None and 0 <= index < len(old_selected.spec.skills)
+            else None
+        )
+        if removed_skill_id is not None:
+            await interaction.followup.send(
+                render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=agent_name or "this agent",
+                        kind="skill_removed",
+                        availability="saved",
+                        detail=removed_skill_id,
+                    )
+                ),
+                ephemeral=True,
+            )
 
 
 class _McpRemoveSelect(discord.ui.Select["EditView"]):
@@ -269,6 +287,18 @@ class _McpRemoveSelect(discord.ui.Select["EditView"]):
                 allowed_user_id=self.view.allowed_user_id,
             ).bind_render_interaction(interaction, panel=self.view.state)
         )
+        if removed_name:
+            await interaction.followup.send(
+                render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=agent_name or "this agent",
+                        kind="mcp_removed",
+                        availability="saved",
+                        detail=removed_name,
+                    )
+                ),
+                ephemeral=True,
+            )
 
 
 class EditView(ExpiringView, discord.ui.LayoutView):

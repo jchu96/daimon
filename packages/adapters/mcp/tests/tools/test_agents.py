@@ -39,6 +39,7 @@ from daimon.adapters.mcp.tools.agents import (
 )
 from daimon.core.agent_guidance import CREDENTIAL_GUIDANCE_BLOCK
 from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.metadata import MA_METADATA_KEY_ISOLATED
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
@@ -619,6 +620,182 @@ async def test_update_agent_impl_forwards_only_non_none_fields() -> None:
     assert "model" not in captured, "should omit None model field"
     assert "system" not in captured, "should omit None system field"
     # version is sent by the SDK automatically (callers don't provide it)
+    assert row.applies is None, "a description-only update touches neither model nor system"
+
+
+async def test_update_agent_impl_returns_applies_for_model_change() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    metadata = {
+        "daimon_tenant": str(tenant_id),
+        "daimon_name": "a",
+        "daimon_account": str(account_id),
+    }
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [make_ma_agent(id="ag_a", name="a", metadata=metadata).model_dump(mode="json")]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200, json=make_ma_agent(id="ag_a", name="a", metadata=metadata).model_dump(mode="json")
+        ),
+    )
+    router.add(
+        "POST",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200,
+            json=make_ma_agent(
+                id="ag_a", name="a", model={"id": "claude-opus-5"}, metadata=metadata
+            ).model_dump(mode="json"),
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    row = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="a",
+        model="claude-opus-5",
+        description=None,
+        system=None,
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    expected = render_change_confirmation(
+        ConfigurationChange(target_name="a", kind="model", availability="next_message")
+    )
+    assert row.applies == expected, (
+        "a model change must return the next-message confirmation text, not an 'immediately' claim"
+    )
+
+
+async def test_update_agent_impl_returns_applies_for_system_change() -> None:
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    metadata = {
+        "daimon_tenant": str(tenant_id),
+        "daimon_name": "a",
+        "daimon_account": str(account_id),
+    }
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [make_ma_agent(id="ag_a", name="a", metadata=metadata).model_dump(mode="json")]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200, json=make_ma_agent(id="ag_a", name="a", metadata=metadata).model_dump(mode="json")
+        ),
+    )
+    router.add(
+        "POST",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200,
+            json=make_ma_agent(
+                id="ag_a", name="a", system="new prompt", metadata=metadata
+            ).model_dump(mode="json"),
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    row = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="a",
+        model=None,
+        description=None,
+        system="new prompt",
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    expected = render_change_confirmation(
+        ConfigurationChange(target_name="a", kind="instructions", availability="next_message")
+    )
+    assert row.applies == expected, (
+        "a system-prompt change must return the instructions confirmation"
+    )
+
+
+async def test_update_agent_impl_returns_applies_for_model_then_instructions_when_both_change() -> (
+    None
+):
+    tenant_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    metadata = {
+        "daimon_tenant": str(tenant_id),
+        "daimon_name": "a",
+        "daimon_account": str(account_id),
+    }
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents",
+        lambda _req, _m: list_response(
+            [make_ma_agent(id="ag_a", name="a", metadata=metadata).model_dump(mode="json")]
+        ),
+    )
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200, json=make_ma_agent(id="ag_a", name="a", metadata=metadata).model_dump(mode="json")
+        ),
+    )
+    router.add(
+        "POST",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(
+            200,
+            json=make_ma_agent(
+                id="ag_a",
+                name="a",
+                model={"id": "claude-opus-5"},
+                system="new prompt",
+                metadata=metadata,
+            ).model_dump(mode="json"),
+        ),
+    )
+    client = build_fake_anthropic(router.dispatch)
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+
+    row = await _update_agent_impl(
+        _runtime(client),
+        auth,
+        name="a",
+        model="claude-opus-5",
+        description=None,
+        system="new prompt",
+        tools=None,
+        mcp_servers=None,
+        skills=None,
+    )
+    model_line = render_change_confirmation(
+        ConfigurationChange(target_name="a", kind="model", availability="next_message")
+    )
+    instructions_line = render_change_confirmation(
+        ConfigurationChange(target_name="a", kind="instructions", availability="next_message")
+    )
+    assert row.applies == f"{model_line}\n{instructions_line}", (
+        "when both model and system change, applies must render model then instructions, "
+        "joined by a newline"
+    )
 
 
 async def test_update_agent_impl_rejects_empty_patch() -> None:

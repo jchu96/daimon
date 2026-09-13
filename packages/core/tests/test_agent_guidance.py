@@ -109,6 +109,38 @@ def test_states_the_interactive_delivery_contract_not_only_the_headless_one() ->
     assert "There is no way to attach a file to your reply" not in block
 
 
+def test_states_setup_reads_at_turn_start_not_mid_turn() -> None:
+    # Regression for task-continuity: an agent must not claim a key is
+    # missing, or that a workspace change did nothing, using knowledge that
+    # was only true earlier in a long-running turn. Setup (keys, MCP,
+    # model, instructions, skills, working repo) is fixed at turn start and
+    # can differ on the next one.
+    block = CREDENTIAL_GUIDANCE_BLOCK
+    assert "YOUR SETUP IS READ AT THE START OF A TURN, NOT DURING ONE" in block, (
+        "block must state setup is turn-start-fixed, not live during the turn"
+    )
+    assert "Re-read /mnt/session/uploads/.env at the start of a turn" in block, (
+        "block must tell the agent to re-read the mounted env file at turn start"
+    )
+    assert "files survive a workspace change, running processes do not" in block, (
+        "block must distinguish surviving files from a process/kernel/shell that does not"
+    )
+    keys_index = block.index("1) KEYS")
+    setup_index = block.index("YOUR SETUP IS READ AT THE START OF A TURN")
+    mcp_index = block.index("2) MCP SERVERS")
+    assert keys_index < setup_index < mcp_index, (
+        "the turn-start note must sit right after the keys section and before MCP servers"
+    )
+
+
+def test_setup_read_note_survives_idempotent_reapplication() -> None:
+    out = apply_credential_guidance("base prompt")
+    twice = apply_credential_guidance(out)
+    assert out.count("YOUR SETUP IS READ AT THE START OF A TURN, NOT DURING ONE") == 1
+    assert twice.count("YOUR SETUP IS READ AT THE START OF A TURN, NOT DURING ONE") == 1
+    assert twice == out, "re-applying must not duplicate the turn-start note"
+
+
 def test_slack_guidance_states_output_write_discipline() -> None:
     # The Slack outputs directory is snapshot-indexed by Managed Agents: the
     # content is captured at first write, subdirectory paths flatten, and an

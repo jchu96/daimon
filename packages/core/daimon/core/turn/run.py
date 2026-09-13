@@ -14,7 +14,7 @@ import asyncio
 import contextlib
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import anthropic as _anthropic
@@ -27,7 +27,12 @@ from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.driver import run_turn
 from daimon.core.turn.lifecycle import InterruptSource, ReconnectReason, TurnLifecycle
 from daimon.core.turn.posture import Billed
-from daimon.core.turn.prepare import PreparedTurn, bind_recorder, create_fresh_session
+from daimon.core.turn.prepare import (
+    ContinuityOutcome,
+    PreparedTurn,
+    bind_recorder,
+    create_fresh_session,
+)
 from daimon.core.turn.state import TurnState
 
 log = structlog.get_logger(__name__)
@@ -40,12 +45,19 @@ class RunOutcome:
     """The final `TurnState` plus the session/mapping ids the FINAL attempt
     ran against -- needed because the adapter still owns the watermark
     write, which must target the post-recovery mapping_id.
+
+    `continuity` is what the adapter should say happened to the session. It is
+    the bound `PreparedTurn`'s outcome unless recovery recreated the session
+    mid-call, in which case it is that outcome restated as
+    `replaced_after_loss`: the workspace was lost rather than deliberately
+    replaced, and the copy must not claim the work came across.
     """
 
     state: TurnState
     ma_session_id: str
     mapping_id: uuid.UUID | None
     recovered: bool
+    continuity: ContinuityOutcome = ContinuityOutcome()
 
 
 # MA's rejection when events.send targets a session it has terminated. The id
@@ -166,6 +178,15 @@ def _is_dead_session(state: TurnState) -> bool:
     return cause.status_code == 400 and _ARCHIVED_SESSION_MARKER in str(cause).lower()
 
 
+def _with_prefix(prefix: str, message: str) -> str:
+    """The user message actually sent, with the successor's framing in front.
+
+    One newline, and only when there is a prefix: an ordinary turn must send
+    exactly the bytes it always did.
+    """
+    return f"{prefix}\n{message}" if prefix else message
+
+
 async def run_prepared_turn(
     deps: TurnDeps,
     prepared: PreparedTurn,
@@ -189,6 +210,12 @@ async def run_prepared_turn(
     fresh session + mapping row, rebind the recorder to the NEW session id,
     reseed the user message, and re-run once. A second consecutive dead
     signature is returned as-is -- no further retry.
+
+    When the bind produced a replacement session, `prepared.continuity`
+    carries what that session has to be told before it can answer: the framing
+    prefix goes in front of the user message, and the daimon-authored system
+    blocks ride the same first send. Adapters pass nothing for this -- they
+    already hand over the `PreparedTurn` that carries it.
 
     `external_user_id` is required here (not carried on `PreparedTurn`)
     because recovery must rebuild the usage recorder from scratch against
@@ -221,6 +248,12 @@ async def run_prepared_turn(
     active_session_id_cell: list[str] = [prepared.ma_session_id]
     active_mapping_id_cell: list[uuid.UUID | None] = [prepared.mapping_id]
     recovered_cell: list[bool] = [False]
+    continuity_cell: list[ContinuityOutcome] = [prepared.continuity]
+
+    # A replacement session's first user message opens with daimon's framing
+    # for the work it inherited (`daimon.core.handoff_context`). Empty for
+    # every ordinary turn, which then sends byte-identical bytes to before.
+    prefix = prepared.continuity.user_prefix
 
     async def _run() -> RunOutcome:
         ma_session_id = prepared.ma_session_id
@@ -230,12 +263,13 @@ async def run_prepared_turn(
         state = await run_turn(
             anthropic=deps.anthropic,
             session_id=ma_session_id,
-            user_message=user_message,
+            user_message=_with_prefix(prefix, user_message),
             lifecycle=first_attempt,
             cancel=cancel,
             render_interval_s=render_interval_s,
             billing=Billed(record=prepared._record),  # pyright: ignore[reportPrivateUsage]
             image_blocks=image_blocks,
+            system_blocks=prepared.continuity.system_blocks,
         )
 
         if not (_is_dead_session(state) and mapping_id is not None):
@@ -245,6 +279,7 @@ async def run_prepared_turn(
                 ma_session_id=ma_session_id,
                 mapping_id=mapping_id,
                 recovered=False,
+                continuity=prepared.continuity,
             )
 
         # D-07(a): a cancel already signalled by the time we'd start recovery
@@ -259,6 +294,7 @@ async def run_prepared_turn(
                 ma_session_id=ma_session_id,
                 mapping_id=mapping_id,
                 recovered=False,
+                continuity=prepared.continuity,
             )
 
         # If recovery itself blows up, the withheld failure is the only thing
@@ -283,6 +319,10 @@ async def run_prepared_turn(
             active_session_id_cell[0] = new_session_id
             active_mapping_id_cell[0] = new_mapping_id
             recovered_cell[0] = True
+            # The session this turn was bound to is gone, so whatever the bind
+            # decided has been overtaken: this is a replacement after a loss,
+            # with nothing carried into it.
+            continuity_cell[0] = replace(prepared.continuity, state="replaced_after_loss")
 
             # Bill the REPLACEMENT's own model: it froze the responder agent as
             # it stands now, which need not be what the dead session ran.
@@ -303,7 +343,12 @@ async def run_prepared_turn(
                 thread_id=thread_id,
             )
 
-            reseeded_message = await reseed_user_message()
+            # The framing prefix follows the message into the recovery
+            # session: the quoted previous conversation is the one thing that
+            # still crosses when the workspace is gone. The system blocks do
+            # NOT -- they describe a bundle mounted on the session that just
+            # died, and this one has none.
+            reseeded_message = _with_prefix(prefix, await reseed_user_message())
             fresh_cancel = asyncio.Event()
             new_lifecycle = recovery_lifecycle(fresh_cancel)
 
@@ -338,6 +383,7 @@ async def run_prepared_turn(
             ma_session_id=new_session_id,
             mapping_id=new_mapping_id,
             recovered=True,
+            continuity=continuity_cell[0],
         )
 
     try:
@@ -375,4 +421,5 @@ async def run_prepared_turn(
             ma_session_id=active_session_id,
             mapping_id=active_mapping_id,
             recovered=recovered,
+            continuity=continuity_cell[0],
         )

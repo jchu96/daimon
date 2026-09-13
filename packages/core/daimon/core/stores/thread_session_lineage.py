@@ -39,11 +39,15 @@ async def mark_superseded(
     row is still the caller's live session and still holds the only copy of the
     work. The order matters — replacement first, supersede second — so a crash
     between them leaves a working session rather than none.
+
+    Any pending uncommitted-work answer is cleared here: it was given for the
+    replacement that has now happened, and an answer left behind would govern
+    an unrelated replacement later.
     """
     await session.execute(
         update(ThreadSession)
         .where(ThreadSession.id == id)
-        .values(status="superseded", replaced_by_id=replaced_by_id)
+        .values(status="superseded", replaced_by_id=replaced_by_id, pending_unsaved_work=None)
     )
     await session.flush()
 
@@ -54,9 +58,14 @@ async def mark_retired(session: AsyncSession, *, id: _uuid.UUID) -> None:
     Distinct from `mark_dead` (the MA session is gone) and from
     `mark_superseded` (the work moved on): the session may be perfectly
     healthy, the caller just asked for a clean one.
+
+    Clears any pending uncommitted-work answer for the same reason
+    `mark_superseded` does: the row it was given for is no longer live.
     """
     await session.execute(
-        update(ThreadSession).where(ThreadSession.id == id).values(status="retired")
+        update(ThreadSession)
+        .where(ThreadSession.id == id)
+        .values(status="retired", pending_unsaved_work=None)
     )
     await session.flush()
 

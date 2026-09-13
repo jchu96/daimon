@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import anthropic as _anthropic
 import sentry_sdk
@@ -21,6 +21,7 @@ from daimon.adapters.discord.context import (
     build_context_xml,
     build_delta_xml,
 )
+from daimon.adapters.discord.continuation_dispatch import dispatch_pending_continuations
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.feedback_seed import seed_feedback_reactions
 from daimon.adapters.discord.gating import is_participation_candidate, should_process_message
@@ -37,14 +38,22 @@ from daimon.adapters.discord.vision import (
     download_as_image_blocks,
     is_vision_image_attachment,
 )
-from daimon.core.config import Settings
-from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
+from daimon.core.config import DiscordSettings, Settings
+from daimon.core.continuity.continuation import ContinuationDecision
+from daimon.core.continuity.messages import (
+    render_current_work_must_finish,
+    render_preparation_failed,
+    render_replacement_summary,
+    render_unexpected_loss,
+)
+from daimon.core.defaults.ma_index import find_agent_by_daimon_tag, list_agents_by_tenant
+from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME
 from daimon.core.defaults.provisioning import provision_tenant, reconcile_tenant_defaults
 from daimon.core.defaults.report import compose_failure_reason
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
-from daimon.core.stores.domain import Role, TenantRow
+from daimon.core.stores.domain import Role, TaskContinuationRow, TenantRow
 from daimon.core.stores.tenants import (
     get_tenant_liveness,
     list_tenants_by_platform,
@@ -53,6 +62,7 @@ from daimon.core.stores.tenants import (
 from daimon.core.stores.thread_agent_bindings import update_lifecycle
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
+    get_live_thread_session,
     list_orphaned_turns,
     mark_turn_active,
     update_watermark,
@@ -60,14 +70,14 @@ from daimon.core.stores.thread_sessions import (
 from daimon.core.stores.turn_origins import get_active_origin
 from daimon.core.thread_naming import strip_mentions
 from daimon.core.thread_participation import ParticipationMode
-from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
+from daimon.core.turn.admission import Admission, AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.ceiling import turn_deadline
-from daimon.core.turn.errors import SessionAgentMismatch
+from daimon.core.turn.errors import SessionAgentMismatch, SessionPreparationFailed
 from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import RunOutcome, run_prepared_turn
-from daimon.core.turn_origin import render_turn_origin, turn_origin
+from daimon.core.turn_origin import HandoffNotice, SessionState, render_turn_origin, turn_origin
 from sqlalchemy.exc import SQLAlchemyError  # noqa: TCH002
 
 import discord
@@ -113,6 +123,49 @@ def _credit_depleted_message(bot_display_name: str) -> str:
     return (
         f"This server's {bot_display_name} credit is depleted. An admin can top up with `/billing`."
     )
+
+
+async def _resolve_agent_display_name(
+    anthropic: _anthropic.AsyncAnthropic, *, tenant_id: uuid.UUID, ma_agent_id: str
+) -> str:
+    """Best-effort display name for a concrete MA agent id, tenant-scoped.
+
+    Used only for copy -- a lookup miss (agent gone since, API hiccup) falls
+    back to a generic phrase rather than failing the render.
+    """
+    try:
+        agents = await list_agents_by_tenant(anthropic, tenant_id=tenant_id)
+    except _anthropic.APIError:
+        return "the previous agent"
+    for candidate in agents:
+        if candidate.id == ma_agent_id:
+            name = candidate.metadata.get(MA_METADATA_KEY_NAME)
+            if name:
+                return str(name)
+    return "the previous agent"
+
+
+def _resolve_session_account_id(
+    discord_settings: DiscordSettings,
+    admission: Admission,
+    *,
+    tenant_id: uuid.UUID,
+    thread_id: str,
+) -> uuid.UUID:
+    """Per-caller vs legacy single-session-per-thread account key.
+
+    Shared by the main mention path and continuation dispatch's follow-up
+    turn -- both must derive the SAME key for the same (tenant, thread,
+    caller) so a follow-up turn binds the session the mention path would
+    have bound. See `_orchestrate`'s original inline comment (#162) for the
+    confused-deputy history this closes.
+    """
+    if (
+        discord_settings.per_caller_thread_sessions
+        or admission.config.thread_binding_id is not None
+    ):
+        return admission.account_id
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"legacy-thread-sentinel:{tenant_id}:{thread_id}")
 
 
 def _compose_queued_content(messages: list[discord.Message]) -> str:
@@ -1229,6 +1282,237 @@ class DaimonBot(commands.Bot):
         else:
             await target.send(error_text)
 
+    async def _run_continuation_turn(
+        self,
+        row: TaskContinuationRow,
+        decision: ContinuationDecision,
+        *,
+        thread: discord.Thread,
+        tenant_id: uuid.UUID,
+        guild_id: str,
+    ) -> None:
+        """Run the destination agent's first turn for one dispatched continuation.
+
+        Same admit -> bind_session -> run_prepared_turn path an ordinary
+        mention takes, seeded with the requester's own words
+        (`decision.seed_user_message`) instead of a Discord message, and
+        framed with a one-time `HandoffNotice` since this is the receiving
+        agent's first turn in the thread. Raises on failure (propagates to
+        `continuation_dispatch`'s caller, which settles the row) rather than
+        rendering its own error -- there is no lifecycle message to attach
+        one to before `bind_session` has even run.
+        """
+        _ = guild_id  # kept for parity with _handle_mention's error-context signature
+        discord_settings = self.runtime.settings.discord
+        assert discord_settings is not None, (
+            "_run_continuation_turn called without discord settings"
+        )
+
+        # Read the predecessor BEFORE bind_session decides the replacement --
+        # once it runs, the old row is superseded and this is the only chance
+        # to read what it was running.
+        async with self.runtime.sessionmaker() as session:
+            predecessor = await get_live_thread_session(
+                session,
+                tenant_id=tenant_id,
+                platform="discord",
+                thread_id=row.thread_id,
+                account_id=row.requester_account_id,
+            )
+        from_ma_agent_id = predecessor.ma_agent_id if predecessor is not None else None
+        from_name = (
+            predecessor.effective_config.agent_name
+            if predecessor is not None and predecessor.effective_config is not None
+            else None
+        )
+
+        admission = await admit(
+            self.runtime.turn_deps,
+            tenant_id=tenant_id,
+            platform="discord",
+            external_user_id=row.requester_external_user_id,
+            channel_id=row.parent_channel_id,
+            thread_id=row.thread_id,
+            role=Role.USER,
+            now=datetime.now(UTC),
+        )
+        turn_deadline_at = turn_deadline(now=datetime.now(UTC))
+        agent = admission.agent
+
+        async def _send_embed(**kwargs: Any) -> discord.Message:
+            return await thread.send(**kwargs)
+
+        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:
+            await msg.edit(**kwargs)
+
+        async def _delete_message(msg: discord.Message) -> None:
+            await msg.delete()
+
+        cancel = asyncio.Event()
+        lifecycle = DiscordTurnLifecycle(
+            send=_send_embed,
+            edit=_edit_message,
+            delete=_delete_message,
+            agent_name=agent.name,
+            model_id=agent.model.id,
+            cancel_view=CancelView(
+                allowed_user_id=int(row.requester_external_user_id), cancel=cancel
+            ),
+            unprompted=False,
+        )
+        await lifecycle.post_initial()
+
+        session_account_id = _resolve_session_account_id(
+            discord_settings, admission, tenant_id=tenant_id, thread_id=row.thread_id
+        )
+        prepared = await bind_session(
+            self.runtime.turn_deps,
+            admission,
+            tenant_id=tenant_id,
+            platform="discord",
+            external_user_id=row.requester_external_user_id,
+            thread_id=row.thread_id,
+            session_account_id=session_account_id,
+            reuse_existing=True,
+            deadline=turn_deadline_at,
+        )
+
+        if prepared.mapping_id is not None and lifecycle.final_message_id is not None:
+            async with self.runtime.sessionmaker() as session:
+                await mark_turn_active(
+                    session,
+                    id=prepared.mapping_id,
+                    active_turn_message_id=lifecycle.final_message_id,
+                    now=datetime.now(UTC),
+                )
+                await session.commit()
+
+        transfer_kind = prepared.continuity.transfer_kind
+        workspace: Literal["transferred", "transcript_only", "history_only"] = (
+            "transferred"
+            if transfer_kind == "full"
+            else "transcript_only"
+            if transfer_kind == "transcript"
+            else "history_only"
+        )
+        handoff_notice = HandoffNotice(
+            from_name=from_name or "the previous agent",
+            from_ma_agent_id=from_ma_agent_id or "",
+            requested_by=f"<@{row.requester_external_user_id}>",
+            requested_work=decision.seed_user_message,
+            workspace=workspace,
+        )
+        session_state = (
+            None
+            if prepared.continuity.state == "continued"
+            else SessionState(
+                state=prepared.continuity.state, applied=prepared.continuity.applied, lost=()
+            )
+        )
+        seed_message = decision.seed_user_message or ""
+
+        lifecycle_holder: list[DiscordTurnLifecycle] = [lifecycle]
+
+        async def _reseed_continuation_message() -> str:
+            async with self.runtime.sessionmaker() as session:
+                recovery_origin = await get_active_origin(
+                    session,
+                    origin_id=origin.id,
+                    tenant_id=tenant_id,
+                    account_id=admission.account_id,
+                    platform="discord",
+                    now=datetime.now(UTC),
+                )
+            if recovery_origin is None:
+                raise DaimonError(
+                    "This turn's setup context expired. Mention me again to continue."
+                )
+            return (
+                render_turn_origin(
+                    recovery_origin, session_state=session_state, handoff=handoff_notice
+                )
+                + "\n"
+                + seed_message
+            )
+
+        def _recovery_lifecycle(cancel_event: asyncio.Event) -> TurnLifecycle:
+            new_lifecycle = DiscordTurnLifecycle(
+                send=_send_embed,
+                edit=_edit_message,
+                delete=_delete_message,
+                agent_name=agent.name,
+                model_id=agent.model.id,
+                cancel_view=CancelView(
+                    allowed_user_id=int(row.requester_external_user_id), cancel=cancel_event
+                ),
+                adopt_message_ref=lifecycle.message_ref,
+                unprompted=False,
+            )
+            lifecycle_holder[0] = new_lifecycle
+            return new_lifecycle
+
+        outcome: RunOutcome | None = None
+        try:
+            async with turn_origin(
+                self.runtime.sessionmaker,
+                tenant_id=tenant_id,
+                account_id=admission.account_id,
+                platform="discord",
+                parent_channel_id=row.parent_channel_id,
+                thread_id=row.thread_id,
+                responder_ma_agent_id=str(agent.id),
+                responder_name=admission.config.agent_name or agent.name,
+                configuration_target_ma_agent_id=admission.config.configuration_target_ma_agent_id,
+                configuration_target_name=admission.config.configuration_target_name,
+                role=Role.USER,
+                is_setup=admission.config.thread_binding_kind == "setup",
+            ) as origin:
+                outcome = await run_prepared_turn(
+                    self.runtime.turn_deps,
+                    prepared,
+                    tenant_id=tenant_id,
+                    platform="discord",
+                    thread_id=row.thread_id,
+                    external_user_id=row.requester_external_user_id,
+                    user_message=(
+                        render_turn_origin(
+                            origin, session_state=session_state, handoff=handoff_notice
+                        )
+                        + "\n"
+                        + seed_message
+                    ),
+                    lifecycle=lifecycle,
+                    cancel=cancel,
+                    reseed_user_message=_reseed_continuation_message,
+                    recovery_lifecycle=_recovery_lifecycle,
+                    render_interval_s=2.0,
+                    deadline=turn_deadline_at,
+                )
+        finally:
+            done_ids = {prepared.mapping_id}
+            if outcome is not None:
+                done_ids.add(outcome.mapping_id)
+            for done_id in done_ids - {None}:
+                if done_id is None:  # pragma: no cover - set difference guarantees this
+                    continue
+                async with self.runtime.sessionmaker() as session:
+                    await clear_active_turn(session, id=done_id)
+                    await session.commit()
+
+        assert outcome is not None
+        final_lifecycle = lifecycle_holder[0]
+        if outcome.state.error is None and prepared.mapping_id is not None:
+            if final_lifecycle.final_message_id is not None:
+                async with self.runtime.sessionmaker() as session:
+                    await update_watermark(
+                        session,
+                        id=prepared.mapping_id,
+                        watermark_message_id=final_lifecycle.final_message_id,
+                    )
+                    await session.commit()
+            if final_lifecycle.was_answered and final_lifecycle.final_message_id is not None:
+                await seed_feedback_reactions(thread, message_id=final_lifecycle.final_message_id)
+
     async def on_raw_thread_update(self, payload: discord.RawThreadUpdateEvent) -> None:
         metadata = payload.data["thread_metadata"]
         tenant_id = derive_tenant_uuid(platform="discord", workspace_id=str(payload.guild_id))
@@ -1482,16 +1766,9 @@ class DaimonBot(commands.Bot):
         assert discord_settings is not None, (
             "_orchestrate called without discord settings — entrypoint must validate at boot"
         )
-        if (
-            discord_settings.per_caller_thread_sessions
-            or admission.config.thread_binding_id is not None
-        ):
-            session_account_id = admission.account_id
-        else:
-            session_account_id = uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"legacy-thread-sentinel:{tenant_id}:{thread.id}",
-            )
+        session_account_id = _resolve_session_account_id(
+            discord_settings, admission, tenant_id=tenant_id, thread_id=str(thread.id)
+        )
 
         # --- Stage two: bind_session (find-or-create, mapping write,
         # recorder binding) -- D-01 bind_session(). ---
@@ -1509,16 +1786,38 @@ class DaimonBot(commands.Bot):
             )
         except SessionAgentMismatch as error:
             # Replace this attempt's status card; the mapped session and its
-            # workspace remain intact for the previous responder.
+            # workspace remain intact for the previous responder. No handoff
+            # binding authorized this responder change (a handoff would have
+            # resolved via config.thread_binding_kind == "handoff" instead),
+            # so the copy offers the handoff rather than describing an error.
+            owner_name = await _resolve_agent_display_name(
+                self.runtime.anthropic, tenant_id=tenant_id, ma_agent_id=error.source_agent_id
+            )
+            error_text = render_error(
+                error,
+                request_id=generate_request_id(),
+                new_responder=agent.name,
+                owner=owner_name,
+                channel=f"<#{parent_channel_id}>",
+            )
             if lifecycle.message_ref is not None:
                 await _edit_message(
-                    lifecycle.message_ref,
-                    content=render_error(error, request_id=generate_request_id()),
-                    embed=None,
-                    view=None,
+                    lifecycle.message_ref, content=error_text, embed=None, view=None
                 )
             else:
-                await thread.send(render_error(error, request_id=generate_request_id()))
+                await thread.send(error_text)
+            return
+        except SessionPreparationFailed:
+            # Nothing was attempted -- bind_session did not run the turn
+            # against a configuration nobody asked for, so no turn to render
+            # here either; the copy says what was preserved and asks for a retry.
+            failure_text = render_preparation_failed(agent.name)
+            if lifecycle.message_ref is not None:
+                await _edit_message(
+                    lifecycle.message_ref, content=failure_text, embed=None, view=None
+                )
+            else:
+                await thread.send(failure_text)
             return
 
         log.info(
@@ -1526,6 +1825,26 @@ class DaimonBot(commands.Bot):
             session_id=prepared.ma_session_id,
             thread_id=thread.id,
             reused=prepared.reused,
+        )
+        # A planned transition the caller didn't necessarily ask to see this
+        # turn: say what happened to the workspace BEFORE the answer, so a
+        # loss or a replacement is never discovered only by its side effects.
+        if prepared.continuity.state == "replaced_after_loss":
+            transfer_kind = prepared.continuity.transfer_kind
+            loss_kind: Literal["transcript", "history"] = (
+                "transcript" if transfer_kind == "transcript" else "history"
+            )
+            await thread.send(render_unexpected_loss(loss_kind))
+        elif prepared.continuity.state == "replaced":
+            await thread.send(
+                render_replacement_summary(prepared.continuity.transfer_kind or "history", [])
+            )
+        session_state = (
+            None
+            if prepared.continuity.state == "continued"
+            else SessionState(
+                state=prepared.continuity.state, applied=prepared.continuity.applied, lost=()
+            )
         )
 
         # Flag the turn as in flight. The render loop lives in THIS process, so
@@ -1690,7 +2009,11 @@ class DaimonBot(commands.Bot):
                 raise DaimonError(
                     "This turn's setup context expired. Mention me again to continue."
                 )
-            return render_turn_origin(recovery_origin) + "\n" + full_message
+            return (
+                render_turn_origin(recovery_origin, session_state=session_state)
+                + "\n"
+                + full_message
+            )
 
         def _recovery_lifecycle(cancel_event: asyncio.Event) -> TurnLifecycle:
             new_lifecycle = DiscordTurnLifecycle(
@@ -1730,7 +2053,7 @@ class DaimonBot(commands.Bot):
                 configuration_target_ma_agent_id=admission.config.configuration_target_ma_agent_id,
                 configuration_target_name=admission.config.configuration_target_name,
                 role=role,
-                is_setup=admission.config.thread_binding_id is not None,
+                is_setup=admission.config.thread_binding_kind == "setup",
             ) as origin:
                 outcome = await run_prepared_turn(
                     self.runtime.turn_deps,
@@ -1739,7 +2062,11 @@ class DaimonBot(commands.Bot):
                     platform="discord",
                     thread_id=str(thread.id),
                     external_user_id=str(message.author.id),
-                    user_message=render_turn_origin(origin) + "\n" + user_message,
+                    user_message=(
+                        render_turn_origin(origin, session_state=session_state)
+                        + "\n"
+                        + user_message
+                    ),
                     lifecycle=lifecycle,
                     cancel=cancel,
                     reseed_user_message=_reseed_user_message,
@@ -1799,3 +2126,22 @@ class DaimonBot(commands.Bot):
             # session mapping, not whether the turn actually answered.
             if final_lifecycle.was_answered and final_lifecycle.final_message_id is not None:
                 await seed_feedback_reactions(thread, message_id=final_lifecycle.final_message_id)
+            # A change queued behind this turn (it was already running when the
+            # change landed) applies at the caller's NEXT message, not this one
+            # -- said only after the answer, so it never reads as a caveat on
+            # work that already finished.
+            if prepared.continuity.pending:
+                await target.send(render_current_work_must_finish(agent.name, handoff=False))
+            # Any task handed to another agent in THIS thread, with work to
+            # continue, gets its first turn dispatched now -- still inside this
+            # turn's concurrency guard, so nothing else can land in the thread
+            # first.
+            await dispatch_pending_continuations(
+                self.runtime.sessionmaker,
+                self.runtime.anthropic,
+                tenant_id=tenant_id,
+                thread=thread,
+                run_follow_up=lambda row, decision: self._run_continuation_turn(
+                    row, decision, thread=thread, tenant_id=tenant_id, guild_id=guild_id
+                ),
+            )

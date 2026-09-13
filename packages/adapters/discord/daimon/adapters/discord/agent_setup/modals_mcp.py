@@ -14,6 +14,7 @@ from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel
 from daimon.adapters.discord.agent_setup.write import call_reconcile_for_panel, mask_tail
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.ma_identity import derive_agent_uuid
@@ -168,6 +169,7 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
         #    can authenticate against the user's MCP server. Bootstraps the
         #    per-agent vault when it does not yet exist. Failures here are
         #    surfaced to the user but do not unwind reconcile.
+        vault_write_ok = True
         try:
             # Agent-scoped copy first: the server is attached to the AGENT, so
             # every caller's session needs this credential mirrored in at
@@ -207,6 +209,7 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
                 agent_name=selected_name,
             )
         except Exception as err:
+            vault_write_ok = False
             _log.exception(
                 "mcp_add.vault_write_failed",
                 mcp_name=name,
@@ -218,8 +221,14 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
             # The server definition was saved; token storage spans multiple writes.
             # Keep unexpected exception details in the operator log.
             await interaction.followup.send(
-                f"MCP server **{name}** was added, but saving its token did not finish. "
-                "Open `/agent-setup` and add the server again to retry its connection.",
+                render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=selected.name,
+                        kind="mcp",
+                        availability="preparation_failed",
+                        detail=name,
+                    )
+                ),
                 ephemeral=True,
             )
         from daimon.adapters.discord.agent_setup.edit_view import EditView
@@ -232,3 +241,15 @@ class AddMcpModal(discord.ui.Modal, title="Add MCP server"):
             ).bind_render_interaction(interaction, panel=self.state),
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        if vault_write_ok:
+            await interaction.followup.send(
+                render_change_confirmation(
+                    ConfigurationChange(
+                        target_name=selected.name,
+                        kind="mcp",
+                        availability="next_message",
+                        detail=name,
+                    )
+                ),
+                ephemeral=True,
+            )
