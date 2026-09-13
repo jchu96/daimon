@@ -109,6 +109,13 @@ def _make_runtime(
     anthropic = AsyncMock()
     anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())
     anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
+    # Dead-session recovery's transcript rescue (`_replay_previous_session`)
+    # walks this as an async iterator, not an awaitable -- an unconfigured
+    # AsyncMock attribute returns a coroutine instead and blows up with
+    # "'async for' requires an object with __aiter__ method". Empty history
+    # degrades it to the history-only rung, same as before that rescue path
+    # existed.
+    anthropic.beta.sessions.events.list = MagicMock(return_value=_AsyncIter([]))
     from daimon.core.ma_resolver import new_resolver_cache  # noqa: PLC0415
 
     resolver_cache = new_resolver_cache()

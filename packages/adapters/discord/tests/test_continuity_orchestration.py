@@ -18,11 +18,13 @@ import types
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anthropic as _anthropic
 import discord
 import httpx
+import pytest
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from anthropic.types.beta.beta_cloud_config import BetaCloudConfig
 from anthropic.types.beta.beta_managed_agents_model_config import (
@@ -33,16 +35,25 @@ from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwo
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings, ThreadNamingSettings
+from daimon.core.continuity.messages import (
+    render_current_work_must_finish,
+    render_replacement_summary,
+    render_unexpected_loss,
+)
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_resolver import ResolverCache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.core.stores import tenant_ledger
 from daimon.core.turn.deps import TurnDeps
-from daimon.core.turn.errors import SessionAgentMismatch, SessionPreparationFailed
+from daimon.core.turn.errors import (
+    SessionAgentMismatch,
+    SessionBusyError,
+    SessionPreparationFailed,
+)
 from daimon.core.turn.prepare import ContinuityOutcome, PreparedTurn
 from daimon.core.turn.run import RunOutcome
-from daimon.core.turn.state import TurnState
+from daimon.core.turn.state import TextBlock, TurnState
 from daimon.core.turn_origin import turn_origin as real_turn_origin
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
@@ -53,6 +64,41 @@ _TENANT_UUID_NS = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 
 async def _noop_recorder(*, event: object) -> None:
     return None
+
+
+#: The text a driven turn "answers" with. Short enough that a prepended
+#: notice never pushes the first chunk past Discord's message limit.
+_ANSWER = "Here is the answer you asked for."
+
+
+def _run_turn_revealing_answer(outcome: RunOutcome, *, answer: str = _ANSWER) -> object:
+    """A `run_prepared_turn` stand-in that actually reveals an answer.
+
+    The real driver ends a turn by calling `on_terminal_success`, which is
+    where the adapter's continuity notices are folded into the answer text. A
+    mock that only returns a `RunOutcome` never reaches that code, so these
+    tests drive the lifecycle exactly as the driver would before returning.
+    """
+
+    async def _run(*_args: object, **kwargs: object) -> RunOutcome:
+        lifecycle = kwargs["lifecycle"]
+        await lifecycle.on_terminal_success(  # pyright: ignore[reportAttributeAccessIssue]
+            TurnState(content=[TextBlock(kind="text", text=answer)])
+        )
+        return outcome
+
+    return _run
+
+
+def _final_answer_text(message: MagicMock) -> str:
+    """The content of the last edit that carried answer text."""
+    contents = [
+        c.kwargs["content"]
+        for c in message.channel.send.return_value.edit.call_args_list
+        if c.kwargs.get("content")
+    ]
+    assert contents, "the answer must have replaced the embed"
+    return str(contents[-1])
 
 
 class _AsyncIter:
@@ -426,7 +472,7 @@ async def test_is_setup_false_for_a_handoff_binding(
 @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
 @patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
-async def test_replaced_after_loss_posts_the_unexpected_loss_copy_before_the_answer(
+async def test_bind_replaced_after_loss_never_fires_before_the_turn(
     mock_build_context_xml: AsyncMock,
     mock_resolve_config: AsyncMock,
     mock_resolve_env: AsyncMock,
@@ -434,6 +480,14 @@ async def test_replaced_after_loss_posts_the_unexpected_loss_copy_before_the_ans
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """`bind_session`'s own `PreparedTurn.continuity` can never be
+    "replaced_after_loss" -- that state only exists on the post-turn
+    `RunOutcome`, set when `run_prepared_turn`'s recovery cycle recreates the
+    session mid-call. This is a regression guard for the dead pre-turn branch
+    removed from `_orchestrate`: even if `prepared.continuity` somehow carried
+    that state, no loss notice is posted from it -- only `outcome.continuity`
+    (covered by the tests below) can trigger one.
+    """
     mock_build_context_xml.return_value = ("<user_query>hello</user_query>", [])
     guild_id = "700000004"
     await _seed_tenant(db_session, guild_id=guild_id)
@@ -451,8 +505,17 @@ async def test_replaced_after_loss_posts_the_unexpected_loss_copy_before_the_ans
         account_id=account_id,
         mapping_id=mapping_id,
     )
+    # The real run_prepared_turn always restates a mid-call recovery through
+    # `outcome.continuity`, never leaves `prepared.continuity` as the final
+    # word -- so the fake outcome here reports an ordinary completed turn,
+    # exactly what would happen if bind_session's decision were (wrongly)
+    # trusted post-turn.
     run_outcome = RunOutcome(
-        state=TurnState(), ma_session_id="sess_test", mapping_id=mapping_id, recovered=False
+        state=TurnState(),
+        ma_session_id="sess_test",
+        mapping_id=mapping_id,
+        recovered=False,
+        continuity=ContinuityOutcome(),
     )
 
     with (
@@ -470,8 +533,139 @@ async def test_replaced_after_loss_posts_the_unexpected_loss_copy_before_the_ans
         await bot.on_message(message)
 
     sent_texts = [c.args[0] for c in message.channel.send.call_args_list if c.args]
-    assert any("lost the workspace this task was running in" in t for t in sent_texts), (
-        f"expected the unexpected-loss copy posted directly to the thread, got {sent_texts}"
+    assert not any("lost the workspace this task was running in" in t for t in sent_texts), (
+        f"prepared.continuity alone must never trigger the loss notice, got {sent_texts}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("transfer_kind", "expected_phrase"),
+    [
+        ("transcript", "the files that were saved to your task"),
+        (None, "not the earlier conversation"),
+    ],
+    ids=["transcript_variant", "history_variant_default"],
+)
+@patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
+@patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
+async def test_outcome_replaced_after_loss_prepends_exactly_one_loss_notice_to_the_answer(
+    mock_build_context_xml: AsyncMock,
+    mock_resolve_config: AsyncMock,
+    mock_resolve_env: AsyncMock,
+    mock_resolve_agent: AsyncMock,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    transfer_kind: Literal["transcript"] | None,
+    expected_phrase: str,
+) -> None:
+    """A dead-session recovery must tell the person their workspace was lost.
+    `run_prepared_turn` only learns this mid-call, so the fact is keyed off
+    `outcome.continuity` -- never `prepared.continuity`. By then the answer has
+    already replaced the embed posted at mention time, so the message is edited
+    once more to put the notice above the answer rather than sending it
+    underneath, where it would read as a footnote to the thing it explains."""
+    mock_build_context_xml.return_value = ("<user_query>hello</user_query>", [])
+    guild_id = "700000006"
+    await _seed_tenant(db_session, guild_id=guild_id)
+    mock_resolve_config.return_value = _stub_resolved_config()
+    mock_resolve_agent.return_value = "ag_test"
+    mock_resolve_env.return_value = "env_test"
+
+    runtime = _make_runtime(db_session_factory)
+    bot = _make_bot(runtime)
+    message = _make_thread_message(guild_id=int(guild_id))
+    account_id = uuid.uuid4()
+    mapping_id = uuid.uuid4()
+    prepared = _make_prepared_turn(
+        continuity=ContinuityOutcome(), account_id=account_id, mapping_id=mapping_id
+    )
+    run_outcome = RunOutcome(
+        state=TurnState(),
+        ma_session_id="sess_recovered",
+        mapping_id=mapping_id,
+        recovered=True,
+        continuity=ContinuityOutcome(state="replaced_after_loss", transfer_kind=transfer_kind),
+    )
+
+    with (
+        patch(
+            "daimon.adapters.discord.bot.bind_session",
+            new_callable=AsyncMock,
+            return_value=prepared,
+        ),
+        patch(
+            "daimon.adapters.discord.bot.run_prepared_turn",
+            new_callable=AsyncMock,
+            side_effect=_run_turn_revealing_answer(run_outcome),
+        ),
+    ):
+        await bot.on_message(message)
+
+    notice = render_unexpected_loss("transcript" if transfer_kind == "transcript" else "history")
+    assert expected_phrase in notice, "the parametrized phrase must pin the right variant"
+    assert _final_answer_text(message) == f"{notice}\n\n{_ANSWER}", (
+        "the loss notice must be the answer's first paragraph, exactly once"
+    )
+    sent_texts = [c.args[0] for c in message.channel.send.call_args_list if c.args]
+    assert not any("lost the workspace this task was running in" in t for t in sent_texts), (
+        f"the loss notice must not also be sent as its own message, got {sent_texts}"
+    )
+
+
+@patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
+@patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
+async def test_ordinary_turn_posts_no_loss_notice(
+    mock_build_context_xml: AsyncMock,
+    mock_resolve_config: AsyncMock,
+    mock_resolve_env: AsyncMock,
+    mock_resolve_agent: AsyncMock,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    mock_build_context_xml.return_value = ("<user_query>hello</user_query>", [])
+    guild_id = "700000007"
+    await _seed_tenant(db_session, guild_id=guild_id)
+    mock_resolve_config.return_value = _stub_resolved_config()
+    mock_resolve_agent.return_value = "ag_test"
+    mock_resolve_env.return_value = "env_test"
+
+    runtime = _make_runtime(db_session_factory)
+    bot = _make_bot(runtime)
+    message = _make_thread_message(guild_id=int(guild_id))
+    account_id = uuid.uuid4()
+    mapping_id = uuid.uuid4()
+    prepared = _make_prepared_turn(
+        continuity=ContinuityOutcome(), account_id=account_id, mapping_id=mapping_id
+    )
+    run_outcome = RunOutcome(
+        state=TurnState(),
+        ma_session_id="sess_test",
+        mapping_id=mapping_id,
+        recovered=False,
+        continuity=ContinuityOutcome(),
+    )
+
+    with (
+        patch(
+            "daimon.adapters.discord.bot.bind_session",
+            new_callable=AsyncMock,
+            return_value=prepared,
+        ),
+        patch(
+            "daimon.adapters.discord.bot.run_prepared_turn",
+            new_callable=AsyncMock,
+            return_value=run_outcome,
+        ),
+    ):
+        await bot.on_message(message)
+
+    sent_texts = [c.args[0] for c in message.channel.send.call_args_list if c.args]
+    assert not any("lost the workspace this task was running in" in t for t in sent_texts), (
+        f"an ordinary turn must post no loss notice, got {sent_texts}"
     )
 
 
@@ -527,3 +721,176 @@ async def test_pending_change_posts_must_finish_copy_after_the_answer(
         "still working on the previous message here" in t and "picks it up on the next message" in t
         for t in sent_texts
     ), f"expected the must-finish copy posted after the answer, got {sent_texts}"
+
+
+@patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
+@patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
+async def test_replaced_makes_the_replacement_summary_the_answers_first_paragraph(
+    mock_build_context_xml: AsyncMock,
+    mock_resolve_config: AsyncMock,
+    mock_resolve_env: AsyncMock,
+    mock_resolve_agent: AsyncMock,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The summary explains the answer, so it has to be readable above it.
+
+    The answer is an in-place edit of the embed posted at mention time, so a
+    summary sent as its own message always lands below it -- the reader saw
+    "the file vanished" before the explanation of why. It rides the answer
+    text instead."""
+    mock_build_context_xml.return_value = ("<user_query>hello</user_query>", [])
+    guild_id = "700000008"
+    await _seed_tenant(db_session, guild_id=guild_id)
+    mock_resolve_config.return_value = _stub_resolved_config()
+    mock_resolve_agent.return_value = "ag_test"
+    mock_resolve_env.return_value = "env_test"
+
+    runtime = _make_runtime(db_session_factory)
+    bot = _make_bot(runtime)
+    message = _make_thread_message(guild_id=int(guild_id))
+    mapping_id = uuid.uuid4()
+    prepared = _make_prepared_turn(
+        continuity=ContinuityOutcome(state="replaced", transfer_kind="transcript"),
+        account_id=uuid.uuid4(),
+        mapping_id=mapping_id,
+    )
+    run_outcome = RunOutcome(
+        state=TurnState(),
+        ma_session_id="sess_test",
+        mapping_id=mapping_id,
+        recovered=False,
+        continuity=prepared.continuity,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.discord.bot.bind_session",
+            new_callable=AsyncMock,
+            return_value=prepared,
+        ),
+        patch(
+            "daimon.adapters.discord.bot.run_prepared_turn",
+            new_callable=AsyncMock,
+            side_effect=_run_turn_revealing_answer(run_outcome),
+        ),
+    ):
+        await bot.on_message(message)
+
+    summary = render_replacement_summary("transcript", [])
+    assert _final_answer_text(message) == f"{summary}\n\n{_ANSWER}", (
+        "the replacement summary must be the answer's first paragraph"
+    )
+    sent_texts = [c.args[0] for c in message.channel.send.call_args_list if c.args]
+    assert summary not in sent_texts, (
+        f"the summary must not also be sent as its own message, got {sent_texts}"
+    )
+
+
+@patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
+@patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
+async def test_replaced_falls_back_to_its_own_message_when_no_answer_is_revealed(
+    mock_build_context_xml: AsyncMock,
+    mock_resolve_config: AsyncMock,
+    mock_resolve_env: AsyncMock,
+    mock_resolve_agent: AsyncMock,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A tool-only, cancelled or failed turn reveals no answer to carry the
+    summary. The person still has to be told what the replacement carried
+    across, so it goes out on its own rather than being dropped."""
+    mock_build_context_xml.return_value = ("<user_query>hello</user_query>", [])
+    guild_id = "700000009"
+    await _seed_tenant(db_session, guild_id=guild_id)
+    mock_resolve_config.return_value = _stub_resolved_config()
+    mock_resolve_agent.return_value = "ag_test"
+    mock_resolve_env.return_value = "env_test"
+
+    runtime = _make_runtime(db_session_factory)
+    bot = _make_bot(runtime)
+    message = _make_thread_message(guild_id=int(guild_id))
+    mapping_id = uuid.uuid4()
+    prepared = _make_prepared_turn(
+        continuity=ContinuityOutcome(state="replaced", transfer_kind="full"),
+        account_id=uuid.uuid4(),
+        mapping_id=mapping_id,
+    )
+    run_outcome = RunOutcome(
+        state=TurnState(),
+        ma_session_id="sess_test",
+        mapping_id=mapping_id,
+        recovered=False,
+        continuity=prepared.continuity,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.discord.bot.bind_session",
+            new_callable=AsyncMock,
+            return_value=prepared,
+        ),
+        patch(
+            "daimon.adapters.discord.bot.run_prepared_turn",
+            new_callable=AsyncMock,
+            return_value=run_outcome,
+        ),
+    ):
+        await bot.on_message(message)
+
+    sent_texts = [c.args[0] for c in message.channel.send.call_args_list if c.args]
+    assert render_replacement_summary("full", []) in sent_texts, (
+        f"with no answer to carry it, the summary must still reach the person, got {sent_texts}"
+    )
+
+
+@patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
+async def test_session_busy_posts_must_finish_copy_and_runs_no_turn(
+    mock_resolve_config: AsyncMock,
+    mock_resolve_env: AsyncMock,
+    mock_resolve_agent: AsyncMock,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A responder change that arrives while the previous turn is still running
+    must not be made *around* that turn: the session still in flight belongs to
+    the outgoing responder, so running this turn on it would answer as one agent
+    inside another agent's workspace. No turn runs; the person is told the
+    in-flight message finishes first."""
+    guild_id = "700000010"
+    await _seed_tenant(db_session, guild_id=guild_id)
+    mock_resolve_config.return_value = _stub_resolved_config()
+    mock_resolve_agent.return_value = "ag_test"
+    mock_resolve_env.return_value = "env_test"
+
+    runtime = _make_runtime(db_session_factory)
+    bot = _make_bot(runtime)
+    message = _make_thread_message(guild_id=int(guild_id))
+
+    with (
+        patch(
+            "daimon.adapters.discord.bot.bind_session",
+            new_callable=AsyncMock,
+            side_effect=SessionBusyError(
+                pending_reasons=("agent_identity",), retry_after=datetime.now(UTC)
+            ),
+        ),
+        patch(
+            "daimon.adapters.discord.bot.run_prepared_turn", new_callable=AsyncMock
+        ) as mock_run_prepared_turn,
+    ):
+        await bot.on_message(message)
+
+    mock_run_prepared_turn.assert_not_called()
+    edited = [
+        c.kwargs.get("content") for c in message.channel.send.return_value.edit.call_args_list
+    ]
+    assert render_current_work_must_finish("test-agent", handoff=True) in edited, (
+        f"expected the busy copy edited into the status embed, got {edited}"
+    )

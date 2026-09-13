@@ -29,13 +29,14 @@ from daimon.core.continuity.continuation import (
     ContinuationRequest,
     claim_continuation,
     decide_continuation,
+    record_continuation,
     settle_continuation,
 )
 from daimon.core.errors import DaimonError
 from daimon.core.stores.domain import TaskContinuationRow
 from daimon.core.stores.task_continuations import list_pending_continuations
 from daimon.core.stores.thread_sessions import get_live_thread_session
-from daimon.core.turn.errors import SessionPreparationFailed
+from daimon.core.turn.errors import SessionBusyError, SessionPreparationFailed
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import discord
@@ -128,6 +129,27 @@ async def _dispatch_one(
             status="skipped",
             now=now,
             skip_reason="blocked_preparation_failed",
+        )
+        return
+    except SessionBusyError:
+        # Same outcome as `skip_turn_running`, reached one step later: a turn
+        # was still running in this thread when the follow-up tried to bind, so
+        # the destination could not take the session over. The store has no
+        # "unclaim", so the claimed row is settled `skipped` and the SAME
+        # request is queued again under a NEW idempotency key. At-most-once
+        # still holds per key (the settled row can never dispatch again) while
+        # the work the person asked for is not dropped -- the next turn to
+        # finish in this thread picks the new row up.
+        log.warning("continuation.dispatch_turn_running", thread_id=row.thread_id)
+        await settle_continuation(
+            sessionmaker,
+            idempotency_key=row.idempotency_key,
+            status="skipped",
+            now=now,
+            skip_reason="turn_running",
+        )
+        await record_continuation(
+            sessionmaker, request.model_copy(update={"idempotency_key": uuid.uuid4()})
         )
         return
     except (DaimonError, _anthropic.APIError, discord.HTTPException) as exc:

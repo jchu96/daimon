@@ -21,7 +21,16 @@ import anthropic as _anthropic
 import structlog
 from anthropic.types import RawMessageStreamEvent
 from anthropic.types.beta.sessions import BetaManagedAgentsImageBlockParam
-from daimon.core.stores.thread_sessions import mark_dead
+from daimon.core.errors import TurnError
+from daimon.core.handoff_context import (
+    render_lost_workspace_framing,
+    render_previous_session,
+    select_recent_turns,
+)
+from daimon.core.ma import replay_events
+from daimon.core.stores.domain import TransferKind
+from daimon.core.stores.thread_session_lineage import link_replacement
+from daimon.core.stores.thread_sessions import get_thread_session_by_id, mark_dead
 from daimon.core.turn.ceiling import ceiling_error, remaining_s, turn_deadline
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.driver import run_turn
@@ -50,7 +59,11 @@ class RunOutcome:
     the bound `PreparedTurn`'s outcome unless recovery recreated the session
     mid-call, in which case it is that outcome restated as
     `replaced_after_loss`: the workspace was lost rather than deliberately
-    replaced, and the copy must not claim the work came across.
+    replaced, and the copy must not claim the work came across. Its
+    `transfer_kind` then says how much of the old session could be rescued --
+    `transcript` when its event log was still readable, `history` when it was
+    not -- and `user_prefix` / `system_blocks` are what the replacement was
+    actually told, not what the overtaken bind had decided.
     """
 
     state: TurnState
@@ -178,6 +191,40 @@ def _is_dead_session(state: TurnState) -> bool:
     return cause.status_code == 400 and _ARCHIVED_SESSION_MARKER in str(cause).lower()
 
 
+async def _replay_previous_session(
+    anthropic: _anthropic.AsyncAnthropic,
+    *,
+    session_id: str,
+    from_agent_name: str,
+) -> str | None:
+    """The lost session's conversation as a quoted block, or None.
+
+    Reading it is the difference between a successor that knows what the task
+    was and one that only sees whatever the platform thread happens to show.
+    Which of the two a given loss gets is decided by MA: an ARCHIVED session's
+    event log stays fully listable (capability matrix P9.d), a DELETED one's
+    is gone with it (P9.e), and both reach this function as the same dead
+    signature.
+
+    A failure here is not a failed turn: this whole path exists to heal a
+    thread that is already broken, so an unreadable log degrades to the
+    history rung rather than surfacing.
+    """
+    try:
+        events = await replay_events(anthropic, session_id=session_id)
+    except (_anthropic.APIError, TurnError) as err:
+        log.info(
+            "turn.recovery_transcript_unavailable",
+            session_id=session_id,
+            error=str(err)[:200],
+        )
+        return None
+    turns = select_recent_turns(events)
+    if not turns:
+        return None
+    return render_previous_session(turns, from_agent_name=from_agent_name)
+
+
 def _with_prefix(prefix: str, message: str) -> str:
     """The user message actually sent, with the successor's framing in front.
 
@@ -216,6 +263,13 @@ async def run_prepared_turn(
     prefix goes in front of the user message, and the daimon-authored system
     blocks ride the same first send. Adapters pass nothing for this -- they
     already hand over the `PreparedTurn` that carries it.
+
+    The recovery cycle does the same job for the session it creates after a
+    loss, from scratch: the dead session's event log is read back first (still
+    listable while MA has only archived it), quoted into the reseeded user
+    message, and described by daimon's own framing on the `system.message`
+    channel where the replacement's model takes one. The bind's framing is
+    dropped rather than forwarded -- it describes the workspace that just died.
 
     `external_user_id` is required here (not carried on `PreparedTurn`)
     because recovery must rebuild the usage recorder from scratch against
@@ -303,9 +357,32 @@ async def run_prepared_turn(
         # prevent. Re-raise: the caller still needs to know recovery broke.
         try:
             async with deps.sessionmaker() as session:
+                dead_row = await get_thread_session_by_id(session, id=mapping_id)
                 await mark_dead(session, id=mapping_id)
                 await session.commit()
 
+            # Whose conversation it was, for the quoted block's `from`
+            # attribute: the snapshot the dead session actually froze, or the
+            # responder resolved for this turn on a row written before
+            # snapshots existed.
+            dead_snapshot = dead_row.effective_config if dead_row is not None else None
+            from_agent_name = (
+                dead_snapshot.agent_name
+                if dead_snapshot is not None
+                else prepared.admission.agent.name
+            )
+            previous_session = await _replay_previous_session(
+                deps.anthropic,
+                session_id=ma_session_id,
+                from_agent_name=from_agent_name,
+            )
+
+            # What the successor actually inherited, recorded on its row as
+            # the rung it came in on: `transcript` when the archived log read,
+            # `history` when nothing of the old session was left to read.
+            loss_transfer_kind: TransferKind = (
+                "transcript" if previous_session is not None else "history"
+            )
             fresh = await create_fresh_session(
                 deps,
                 prepared.admission,
@@ -313,16 +390,45 @@ async def run_prepared_turn(
                 platform=platform,
                 thread_id=thread_id,
                 session_account_id=prepared.session_account_id,
+                predecessor_id=mapping_id,
+                transfer_kind=loss_transfer_kind,
             )
             new_session_id = fresh.ma_session_id
             new_mapping_id = fresh.mapping_id
+
+            # Close the chain from the other end. The dead row keeps
+            # `status="dead"` -- it says how this session ended, which a
+            # supersede would overwrite -- and gains only the pointer forward.
+            async with deps.sessionmaker() as session:
+                await link_replacement(session, id=mapping_id, replaced_by_id=new_mapping_id)
+                await session.commit()
+
             active_session_id_cell[0] = new_session_id
             active_mapping_id_cell[0] = new_mapping_id
             recovered_cell[0] = True
+
             # The session this turn was bound to is gone, so whatever the bind
-            # decided has been overtaken: this is a replacement after a loss,
-            # with nothing carried into it.
-            continuity_cell[0] = replace(prepared.continuity, state="replaced_after_loss")
+            # decided has been overtaken: this is a replacement after a loss.
+            # No files cross -- a bundle the bind mounted was mounted on the
+            # session that just died -- but the conversation still can, quoted,
+            # when MA only archived the old session rather than deleting it.
+            # `transcript` when that read worked, `history` when it did not --
+            # the same two rungs `workspace_transfer` walks, so the copy means
+            # the same thing on both paths.
+            loss_framing = render_lost_workspace_framing(
+                model_id=fresh.snapshot.model_id,
+                previous_session=previous_session,
+            )
+            loss_system_blocks = (
+                loss_framing.system.blocks if loss_framing.system is not None else ()
+            )
+            continuity_cell[0] = replace(
+                prepared.continuity,
+                state="replaced_after_loss",
+                transfer_kind=loss_transfer_kind,
+                user_prefix=loss_framing.user_prefix,
+                system_blocks=loss_system_blocks,
+            )
 
             # Bill the REPLACEMENT's own model: it froze the responder agent as
             # it stands now, which need not be what the dead session ran.
@@ -343,12 +449,13 @@ async def run_prepared_turn(
                 thread_id=thread_id,
             )
 
-            # The framing prefix follows the message into the recovery
-            # session: the quoted previous conversation is the one thing that
-            # still crosses when the workspace is gone. The system blocks do
-            # NOT -- they describe a bundle mounted on the session that just
-            # died, and this one has none.
-            reseeded_message = _with_prefix(prefix, await reseed_user_message())
+            # The bind's own framing is deliberately dropped here: it
+            # describes a workspace that no longer exists, and on the full
+            # rung it points at a bundle mounted on the session that just
+            # died. What goes instead is this loss's own framing -- daimon's
+            # words on the privileged channel where the replacement's model
+            # takes one, the quoted conversation always in the user message.
+            reseeded_message = _with_prefix(loss_framing.user_prefix, await reseed_user_message())
             fresh_cancel = asyncio.Event()
             new_lifecycle = recovery_lifecycle(fresh_cancel)
 
@@ -368,6 +475,7 @@ async def run_prepared_turn(
                     render_interval_s=render_interval_s,
                     billing=Billed(record=new_record),
                     image_blocks=image_blocks,
+                    system_blocks=loss_system_blocks,
                 )
             finally:
                 if not mirror_task.done():

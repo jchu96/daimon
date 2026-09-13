@@ -108,6 +108,13 @@ def _make_runtime(
     settings.discord = discord_settings
     settings.thread_naming = ThreadNamingSettings(enabled=False)
     anthropic = AsyncMock()
+    # Dead-session recovery's transcript rescue (`_replay_previous_session`)
+    # walks this as an async iterator, not an awaitable -- an unconfigured
+    # AsyncMock attribute returns a coroutine instead and blows up with
+    # "'async for' requires an object with __aiter__ method". Empty history
+    # degrades it to the history-only rung, same as before that rescue path
+    # existed.
+    anthropic.beta.sessions.events.list = MagicMock(return_value=_AsyncIter([]))
     # A live agent/environment by default -- admit() now reads archived_at off
     # the retrieved agent, so an unconfigured AsyncMock (whose attributes are
     # themselves truthy mocks) would wrongly look archived on every turn.

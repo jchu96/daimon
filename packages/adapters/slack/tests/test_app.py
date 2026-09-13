@@ -40,6 +40,7 @@ from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAg
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.app import SlackApp
 from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
+from daimon.core.continuity.messages import render_unexpected_loss
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, encrypt_token
@@ -4162,10 +4163,14 @@ async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
 
     Drives one dead-session-recovery scenario through the real adapter
     boundary and pins four properties from a single set of observations taken
-    mid-recovery (inside the second run_turn call):
+    mid-recovery (inside the second run_turn call), plus the post-turn loss
+    notice (Issue 4, staging QA 2026-09-13):
 
-    1. One card. Exactly one chat.postMessage happens across the whole turn --
-       the count observed mid-recovery is already 1, and it never grows.
+    1. One card. Exactly one chat.postMessage happens DURING the turn -- the
+       count observed mid-recovery is already 1, and it never grows before the
+       terminal render. The unexpected-loss notice is a second, separate
+       chat.postMessage sent only AFTER the turn settles (assertion 5), never
+       a second status card.
     2. The marker addresses the live card. The one row list_orphaned_turns
        would return mid-recovery has active_turn_message_id/channel equal to
        the card the recovered turn is rendering into, not the abandoned first
@@ -4177,11 +4182,15 @@ async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
        the author id is unchanged, so a Cancel click during recovery stops
        the turn that is actually running and is still refused for anyone but
        the author.
+    5. The loss notice posts exactly once, after the turn. The transcript
+       rescue in this scenario fails closed (a real `APIError` from the fake
+       transport), so it is the history variant.
 
     The Slack API fake returns a constant ts for every chat.postMessage, so a
     second card would be indistinguishable from the first by ts alone -- the
-    postMessage COUNT is what proves adoption. Weakening assertion 1 to a ts
-    comparison would make this test pass against the pre-adoption code.
+    postMessage COUNT observed mid-recovery is what proves adoption. Weakening
+    assertion 1 to a ts comparison would make this test pass against the
+    pre-adoption code.
     """
     import anthropic as _anthropic
     from daimon.core.errors import TurnError
@@ -4339,9 +4348,9 @@ async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
         "recovered turn must not post a second card before anything else runs"
     )
     assert _post_count() == 1, (
-        "a recovered turn must not post a second status card, because nothing "
-        "would ever finalise the first one and the database marker would "
-        "address a card nobody is rendering into"
+        "a recovered turn must not post a second status card, and the "
+        "unexpected-loss notice is edited in above the answer rather than "
+        "posted as its own message -- so the card is the only post"
     )
 
     # 2. The marker addresses the live card.
@@ -4386,6 +4395,32 @@ async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
     )
     assert rebound_event is not observed["first_cancel"], (
         "the registry entry must no longer be bound to the first attempt's Event"
+    )
+
+    # 5. The loss notice reaches the reader exactly once, history variant (the
+    # fake transport gives the transcript rescue a real APIError, which
+    # `_replay_previous_session` degrades to None -- logged above as
+    # "turn.recovery_transcript_unavailable"), and it sits ABOVE the answer it
+    # explains rather than under it: the answer replaced the status card, and
+    # Slack orders by the original ts, so a later message always reads below.
+    notice = render_unexpected_loss("history")
+    post_calls = [
+        req
+        for (_, url), reqs in fake_slack_web_client.mock.requests.items()
+        if url == post_url
+        for req in reqs
+    ]
+    posted_texts = [req.kwargs["json"].get("text") for req in post_calls]
+    assert notice not in posted_texts, (
+        f"the loss notice must not arrive as its own message, got {posted_texts}"
+    )
+    final_blocks = json.dumps(last_update_body.get("blocks", []))
+    assert json.dumps(notice)[1:-1] in final_blocks, (
+        f"the loss notice must be rendered into the answer card, got {final_blocks}"
+    )
+    answer_body = last_update_body["blocks"][0]["text"]
+    assert answer_body.startswith(notice + "\n\n"), (
+        f"the loss notice must be the answer's first paragraph, got {answer_body!r}"
     )
     assert rebound_author == "U_TEST_RECOVER", "the rebind must not change who is allowed to cancel"
 

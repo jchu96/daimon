@@ -52,6 +52,45 @@ from pydantic import Field
 #: person-facing text, so the model's job is to relay it, not to rewrite it.
 _REPLY_VERBATIM = "Reply with `confirmation` verbatim and nothing else."
 
+#: Below this length a `continuation` is too short to be a real work
+#: description -- almost always the model echoing the destination's name or
+#: a one-word restatement of the switch itself.
+_MIN_CONTINUATION_LENGTH = 8
+
+
+def _sanitize_continuation(continuation: str | None, *, destination_name: str) -> str | None:
+    """Null out a `continuation` that cannot be a real request to carry on work.
+
+    Deterministic backstop for Issue 2 (staging QA, 2026-09-13): the model
+    invented a continuation restating already-finished work for a bare
+    "take over this task", billing an unrequested second turn. This cannot
+    read the turn's own triggering message -- `TurnOriginRow` carries no such
+    text -- so it only catches the shapes that are never a legitimate
+    continuation regardless of what was said: empty, too short to describe
+    work, or just the destination's own name.
+    """
+    if continuation is None:
+        return None
+    normalized = continuation.strip().lower()
+    if not normalized or len(normalized) < _MIN_CONTINUATION_LENGTH:
+        return None
+    if normalized == destination_name.strip().lower():
+        return None
+    return continuation
+
+
+def _channel_mention(platform: Literal["discord", "slack"], channel_id: str) -> str:
+    """Render a parent channel id as this platform's channel-link mention.
+
+    Discord and Slack both render `<#id>` as a clickable channel link, kept
+    as an explicit per-platform switch rather than a bare f-string so a
+    future platform with different mention syntax is not silently handed
+    the wrong one.
+    """
+    if platform in ("discord", "slack"):
+        return f"<#{channel_id}>"
+    raise ValueError(f"unsupported platform for channel mention: {platform!r}")
+
 
 @dataclass(frozen=True)
 class TaskHandoffResult:
@@ -119,6 +158,7 @@ async def _hand_off_task_impl(
             "That agent has no configuration name, so nobody can reach it by name. "
             "Choose a named agent in this workspace. Nothing was changed."
         )
+    continuation = _sanitize_continuation(continuation, destination_name=destination_name)
     if continuation is not None and auth.platform_user_id is None:
         raise ToolError(
             "Continuing work needs the requester's platform identity, which this "
@@ -155,7 +195,9 @@ async def _hand_off_task_impl(
         origin_responder_ma_agent_id=origin.responder_ma_agent_id,
     )
     if isinstance(decision, HandoffRefused):
-        raise ToolError(_refusal_text(decision, channel=origin.parent_channel_id))
+        raise ToolError(
+            _refusal_text(decision, channel=_channel_mention(platform, origin.parent_channel_id))
+        )
 
     # We cannot know whether the checkout is dirty without spending a turn in
     # the session, so the rule is: ask only for a meaningful choice involving loss — when a
@@ -240,7 +282,7 @@ async def _hand_off_task_impl(
         confirmation=render_handoff_acknowledged(
             target_name=destination_name,
             from_name=origin.responder_name,
-            channel=origin.parent_channel_id,
+            channel=_channel_mention(platform, origin.parent_channel_id),
             requested_work=queued_work,
         ),
         instruction=_REPLY_VERBATIM,
@@ -306,8 +348,9 @@ def register_task_continuity_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
             str | None,
             Field(
                 description=(
-                    "The work to carry on with, in the person's own words; "
-                    "null to change the responder only."
+                    "Null unless the person explicitly asked the destination to continue "
+                    "or finish NAMED work, in their own words. 'Take over' alone, with no "
+                    "named work, is null. Never restate work that already finished."
                 )
             ),
         ] = None,
@@ -318,19 +361,21 @@ def register_task_continuity_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     ) -> TaskHandoffResult:
         """Hand this task over to another agent in the same conversation: "have that one take over", "let churn-explorer finish this".
 
-        To change which agent you are configuring while Daimon keeps answering, use
-        `set_setup_target`; to change who answers a whole channel, use
-        `set_agent_default`. This changes neither. The destination must already answer
-        somewhere in this workspace.
+        `set_setup_target` changes your configuration target; `set_agent_default`
+        changes who answers a channel; neither does this. The destination must
+        already answer in this workspace.
 
-        From the next message here, that agent answers. The conversation, decisions and
-        working files move with the person who asked. It uses its own keys, connections
-        and memory; nothing private is copied between people. Posted files stay posted.
-        No extra billed turn.
+        From the next message here, that agent answers, with its own keys,
+        connections and memory; conversation, decisions and files move with the
+        requester. Posted files stay posted. No extra billed turn unless
+        `continuation` is set.
 
         `agent_id`: the destination's current id from `list_agents`; a recreated
-        namesake is refused. `continuation`: the work to carry on with, or null to
-        switch only.
+        namesake is refused. `continuation` is null unless the person asked the
+        destination to continue or finish NAMED work ("let it finish the chart").
+        "Take over" alone is switch-only — null. Never restate finished work. A
+        too-short, empty, or name-only value is auto-nulled — get the wording
+        right regardless.
         """  # noqa: E501
         return await _hand_off_task_impl(
             runtime,

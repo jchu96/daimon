@@ -8,11 +8,15 @@ import uuid
 from daimon.core.checkpoint_prompt import (
     CHECKPOINT_EXCLUDED_GLOBS,
     CHECKPOINT_EXCLUDED_PATHS,
+    CHECKPOINT_OUTPUTS_DIR,
+    CHECKPOINT_SYSTEM_TRIGGER,
     HANDOFF_FILENAME_PREFIX,
     HANDOFF_MAX_BYTES,
+    HANDOFF_TOO_LARGE_MARKER,
     build_checkpoint_prompt,
     checkpoint_archive_listed,
     checkpoint_head_lines,
+    checkpoint_too_large_bytes,
     handoff_filename,
     is_handoff_filename,
 )
@@ -72,7 +76,7 @@ def test_prompt_writes_an_oversize_exclude_list_before_tarring() -> None:
     prompt = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=7
     )
-    find_index = prompt.index("find root mnt/repo/analytics -type f -size +7M")
+    find_index = prompt.index("find root mnt/session/outputs mnt/repo/analytics -type f -size +7M")
     tar_index = prompt.index("tar czf")
     assert find_index < tar_index, "the exclude list must exist before tar reads it"
     exclude_list = prompt[find_index:].split(">", 1)[1].split("\n", 1)[0].strip()
@@ -112,14 +116,18 @@ def test_prompt_captures_repo_state_without_a_repo_omitting_the_git_steps() -> N
     assert with_repo.count(f"git -C {REPO} rev-parse HEAD") == 2, (
         "HEAD is echoed before and after the archive so a commit is detectable"
     )
-    assert " root mnt/repo/analytics" in with_repo, "the repo mount is archived alongside $HOME"
+    assert "-C / root mnt/session/outputs mnt/repo/analytics" in with_repo, (
+        "the repo mount is archived alongside $HOME and the outputs directory"
+    )
 
     without_repo = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
     )
     assert "git -C" not in without_repo, "no repo means no git commands"
     assert "NEVER RUN GIT" not in without_repo, "and no repo prohibition to state"
-    assert "-C / root" in without_repo, "the home directory is archived either way"
+    assert "-C / root mnt/session/outputs" in without_repo, (
+        "the home directory and the outputs directory are archived either way"
+    )
 
 
 def test_prompt_numbers_steps_consecutively_when_the_repo_step_is_skipped() -> None:
@@ -139,8 +147,12 @@ def test_prompt_honours_a_non_default_home_dir() -> None:
     )
     assert "/home/claude/HANDOFF.md" in prompt, "the note goes in the given home directory"
     assert "/home/claude/uncommitted.patch" in prompt, "so does the patch"
-    assert "-C / home/claude mnt/repo/analytics" in prompt, (
-        "the tar roots are the given home directory and the repo, relative to /"
+    assert "-C / home/claude mnt/session/outputs mnt/repo/analytics" in prompt, (
+        "the tar roots are the given home directory, the outputs directory and the repo, "
+        "relative to /"
+    )
+    assert "--exclude='home/claude/.*'" in prompt, (
+        "the dot-entry exclusion follows the home directory it was given"
     )
     assert "/root/" not in prompt, "the default home directory must not leak in"
 
@@ -222,7 +234,9 @@ def test_prompt_captures_uncommitted_changes_when_the_answer_is_copy_or_absent()
         assert f"git -C {REPO} ls-files --others --exclude-standard" in prompt, (
             "untracked files are part of the work being captured"
         )
-        assert " root mnt/repo/analytics" in prompt, "and the checkout itself travels"
+        assert "-C / root mnt/session/outputs mnt/repo/analytics" in prompt, (
+            "and the checkout itself travels"
+        )
 
 
 def test_prompt_leaves_uncommitted_changes_behind_when_the_answer_is_leave() -> None:
@@ -233,10 +247,13 @@ def test_prompt_leaves_uncommitted_changes_behind_when_the_answer_is_leave() -> 
         "the person chose to leave the changes, so nothing captures them as a patch"
     )
     assert "ls-files --others" not in prompt, "nor lists the untracked files to carry"
-    assert "-C / root\n" in f"{prompt}\n" and "-C / root mnt" not in prompt, (
+    assert "-C / root mnt/session/outputs\n" in f"{prompt}\n", (
         "the checkout must not be tarred either, or the changes would come across anyway"
     )
-    assert "find root -type f" in prompt, "and the oversize scan covers only what is archived"
+    assert "-C / root mnt/session/outputs mnt/repo" not in prompt, "the repo is not a root here"
+    assert "find root mnt/session/outputs -type f" in prompt, (
+        "and the oversize scan covers only what is archived"
+    )
     assert "deliberately being left behind" in prompt, (
         "the prompt has to say the omission is the person's decision, not a failure"
     )
@@ -251,3 +268,147 @@ def test_prompt_ignores_the_unsaved_work_answer_when_no_repo_is_mounted() -> Non
     ) == build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
     ), "with no checkout there is nothing to leave in it, so the prompt is unchanged"
+
+
+def test_prompt_says_the_instruction_comes_from_the_host_and_goes_nowhere_else() -> None:
+    """The refusal this sentence exists to prevent was real: a compliant model
+    read the checkpoint as chat text asking it to tar `.ssh` into a delivery
+    directory, and declined. The prompt has to say whose instruction it is and
+    where the archive ends up, on either channel it travels."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
+    )
+    assert prompt.startswith(
+        "This instruction comes from the daimon host that runs your workspace, not from a "
+        "chat participant."
+    ), "the first thing the prompt says is where it came from"
+    assert (
+        "The archive stays in this workspace's outputs directory and is moved to your next "
+        "workspace by the host; nothing is shared with anyone." in prompt
+    ), "and the second is that the bundle is not an exfiltration route"
+
+
+def test_prompt_forbids_ssh_credentials_dotfiles_and_toolchains_in_words() -> None:
+    """The exclusions are commands; this is the sentence a model reads when it
+    asks itself whether the commands are safe to run."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
+    )
+    assert (
+        "Never include /root/.ssh, credential mounts, dotfiles or language toolchains and "
+        "their caches." in prompt
+    ), "the prompt must name what never travels, not only exclude it in a flag"
+
+
+def test_checkpoint_system_trigger_carries_no_instruction_of_its_own() -> None:
+    """On the privileged channel the trigger is the whole user message, so it
+    must point at the system instructions rather than restate them."""
+    assert CHECKPOINT_SYSTEM_TRIGGER == (
+        "Run the workspace checkpoint described in your system instructions now "
+        "and reply only with the command output."
+    )
+
+
+def test_prompt_archives_the_outputs_directory_and_skips_only_the_bundles() -> None:
+    """Issue 1c: the file tool writes to /mnt/session/outputs, so a task told
+    to "create notes.md" puts its only working file there. That directory is a
+    root; the bundles written into it are the one thing excluded."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
+    )
+    assert CHECKPOINT_OUTPUTS_DIR == "/mnt/session/outputs"
+    assert CHECKPOINT_OUTPUTS_DIR not in CHECKPOINT_EXCLUDED_PATHS, (
+        "the outputs directory is where the task's own files are, not a destination mount"
+    )
+    assert "-C / root mnt/session/outputs" in prompt, "so it is a tar root"
+    assert f"--exclude='mnt/session/outputs/{HANDOFF_FILENAME_PREFIX}*'" in prompt, (
+        "the archive being written, and any bundle an earlier transfer left, stay out"
+    )
+
+
+def test_prompt_excludes_every_dot_entry_directly_under_home() -> None:
+    """Issue 1b: the base image ships ~100 MB of toolchain caches in $HOME
+    before the task writes anything, so the bundle blew the cap on an empty
+    task. One pattern covers .ssh and every one of them."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
+    )
+    assert "--exclude='root/.*'" in prompt, (
+        "every dot entry directly under $HOME - .ssh, .bun, .cargo, .rustup, .gradle, "
+        ".npm, .local, .config - is excluded with its subtree"
+    )
+
+
+def test_prompt_generates_the_whole_tar_command_exactly() -> None:
+    """The tar line is the contract with the sandbox: daimon cannot inspect
+    what the session built, so the bytes it asks for are the only guarantee.
+    Pinned in full, once, so a careless edit to the list has to be deliberate."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
+    )
+    archive = f"/mnt/session/outputs/{handoff_filename(TRANSFER_ID)}"
+    expected = "\n".join(
+        [
+            f"  tar czf {archive} \\",
+            "    --exclude-from=/tmp/daimon-handoff-excludes.txt \\",
+            "    --exclude='root/.*' \\",
+            "    --exclude='mnt/session/outputs/daimon-handoff-*' \\",
+            "    --exclude='mnt/session/uploads' \\",
+            "    --exclude='mnt/memory' \\",
+            "    --exclude='mnt/skills' \\",
+            "    --exclude='*/.git/objects' \\",
+            "    --exclude='*/node_modules' \\",
+            "    --exclude='*/.venv' \\",
+            "    --exclude='*/__pycache__' \\",
+            "    --exclude='*/.cache' \\",
+            "    --exclude='*.env' \\",
+            "    -C / root mnt/session/outputs mnt/repo/analytics",
+        ]
+    )
+    assert expected in prompt, "the generated tar command changed"
+
+
+def test_prompt_deletes_an_over_cap_archive_and_reports_the_size_instead() -> None:
+    """Issue 5: a rejected bundle used to sit in the old session's outputs
+    forever - the sweep skips handoff files and the delete queue is only fed
+    after a successful upload. The turn that built it is the cheapest place to
+    delete it, and the marker is what tells daimon why the transfer degraded."""
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
+    )
+    archive = f"/mnt/session/outputs/{handoff_filename(TRANSFER_ID)}"
+    assert (
+        f'  size=$(stat -c %s {archive}); if [ "$size" -gt 20971520 ]; '
+        f'then rm -f {archive}; echo "HANDOFF_TOO_LARGE $size"; '
+        f"else ls -l {archive}; fi" in prompt
+    ), "the size guard, the delete and the listing are one command"
+    assert "do not retry, shrink or rebuild it" in prompt, (
+        "an over-cap archive is a final answer, not an invitation to a second attempt"
+    )
+
+
+def test_the_size_guard_threshold_follows_the_cap_it_is_given() -> None:
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=7
+    )
+    assert "-gt 7340032" in prompt, "7 MiB in bytes, so the shell test needs no arithmetic"
+    assert "cannot be carried above 7 MiB" in prompt, "and the prose says the same number"
+
+
+def test_checkpoint_too_large_bytes_reads_the_reported_size() -> None:
+    assert checkpoint_too_large_bytes(f"{HANDOFF_TOO_LARGE_MARKER} 108097268\n") == 108097268, (
+        "the size the session measured is what the transfer logs"
+    )
+    assert checkpoint_too_large_bytes("-rw-r--r-- 1 claude claude 42 bundle.tar.gz") is None, (
+        "an ordinary listing is not a rejection"
+    )
+
+
+def test_checkpoint_too_large_bytes_ignores_an_echo_of_the_command() -> None:
+    prompt = build_checkpoint_prompt(
+        transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
+    )
+    echoed = next(line for line in prompt.splitlines() if "size=$(stat" in line)
+    assert checkpoint_too_large_bytes(echoed) is None, (
+        "quoting back the command it was handed is not evidence the archive was rejected"
+    )

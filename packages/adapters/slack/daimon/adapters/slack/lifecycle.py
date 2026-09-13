@@ -160,6 +160,18 @@ class SlackTurnLifecycle:
         self._last_flush: float = 0.0
         self._terminal: bool = False
         self.final_ts: str | None = None
+        # A continuity notice that belongs ABOVE the answer it explains. The
+        # answer replaces the status card in place, so a notice posted as its
+        # own message always sorts below it no matter when it was sent --
+        # Slack orders by the original ts. Set before the answer is revealed
+        # (a planned replacement, known at bind time); `prepend_revealed_answer`
+        # covers the fact learned only after the turn ran.
+        self.answer_prefix: str | None = None
+        self.answer_prefix_applied: bool = False
+        # The first chunk and blocks actually rendered into the status card,
+        # kept so a late notice can be edited in above them exactly once.
+        self._revealed_first_chunk: str | None = None
+        self._revealed_first_blocks: list[dict[str, Any]] | None = None
 
     @property
     def status_ts(self) -> str | None:
@@ -362,6 +374,9 @@ class SlackTurnLifecycle:
                 return
 
             repair_notice = "⚠️ Something went wrong posting the answer."
+            if self.answer_prefix is not None:
+                final_text = f"{self.answer_prefix}\n\n{final_text}"
+                self.answer_prefix_applied = True
             chunks = split_for_slack_safe(escape_mrkdwn_preserving_mentions(final_text))
             first_chunk = chunks[0]
             # First chunk + the cost/usage footer replace the status message
@@ -377,6 +392,8 @@ class SlackTurnLifecycle:
             if len(chunks) == 1:
                 first_blocks.append(build_feedback_actions_block())
             await self._post_or_update(first_blocks, _notification_text(first_chunk))
+            self._revealed_first_chunk = first_chunk
+            self._revealed_first_blocks = first_blocks
             surface_replaced = True
             assert self._status_ts is not None  # narrowing — _post_or_update always sets it
             current_ts = self._status_ts
@@ -406,6 +423,37 @@ class SlackTurnLifecycle:
         finally:
             if self._status_ts is not None:
                 self._deregister(self._status_ts)
+
+    async def prepend_revealed_answer(self, notice: str) -> bool:
+        """Edit `notice` in above an answer already on screen; False if it cannot go there.
+
+        For a fact the turn only produces on its way out (an unexpected
+        workspace loss, discovered by the driver's mid-call recovery): by the
+        time the caller knows it, the answer has replaced the status card.
+        Sending the notice afterwards puts it below the answer it explains, so
+        instead the card is updated once with the notice on top.
+
+        Returns False -- caller posts it as an ordinary message instead --
+        when there is no revealed answer to sit above, when the notice would
+        push the first chunk past Slack's per-block ceiling (re-splitting would
+        strand the overflow messages already posted), or when the edit fails.
+        """
+        if self._revealed_first_chunk is None or self._revealed_first_blocks is None:
+            return False
+        updated = f"{escape_mrkdwn_preserving_mentions(notice)}\n\n{self._revealed_first_chunk}"
+        if len(split_for_slack_safe(updated)) > 1:
+            return False
+        blocks = list(self._revealed_first_blocks)
+        blocks[0] = {"type": "markdown", "text": updated}
+        try:
+            await self._post_or_update(blocks, _notification_text(updated))
+        except _SLACK_SEND_ERRORS:
+            log.warning("turn.answer_prefix.edit_failed", exc_info=True)
+            return False
+        self._revealed_first_chunk = updated
+        self._revealed_first_blocks = blocks
+        self.answer_prefix_applied = True
+        return True
 
     async def on_terminal_failure(self, state: TurnState, err: Exception) -> None:
         """Log failure, attempt to flush error state, then deregister.

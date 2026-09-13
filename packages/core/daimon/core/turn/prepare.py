@@ -54,7 +54,7 @@ from daimon.core.stores.thread_sessions import create_thread_session, get_live_t
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.ceiling import ceiling_error, remaining_s, turn_deadline
 from daimon.core.turn.deps import TurnDeps
-from daimon.core.turn.errors import SessionPreparationFailed
+from daimon.core.turn.errors import SessionBusyError, SessionPreparationFailed
 from daimon.core.turn.posture import UsageRecorder
 from daimon.core.usage_recording import record_turn_usage
 
@@ -296,7 +296,10 @@ async def bind_session(
     prepared against the current session — the change lands at the caller's
     next message, and `prepared.continuity.pending` says which — while a failed
     one raises `SessionPreparationFailed`, because the turn must not run
-    against a configuration nobody asked for.
+    against a configuration nobody asked for. A busy one raises
+    `SessionBusyError` for the same reason with a different cause: the session
+    still in flight belongs to the responder being replaced, so there is no
+    session this turn could honestly run on yet.
 
     When `reuse_existing` is True, a live `thread_sessions` row for
     (tenant_id, platform, thread_id, session_account_id) is reused, refreshed
@@ -340,6 +343,7 @@ async def bind_session(
         # scope would make either module unimportable first. The import is
         # cached after the first bind.
         from daimon.core.session_preparation import (
+            PreparationBusy,
             PreparationDeferred,
             PreparationFailure,
             SessionOps,
@@ -381,6 +385,10 @@ async def bind_session(
         )
         if isinstance(outcome, PreparationDeferred):
             return outcome.prepared
+        if isinstance(outcome, PreparationBusy):
+            raise SessionBusyError(
+                pending_reasons=outcome.pending_reasons, retry_after=outcome.retry_after
+            )
         if isinstance(outcome, PreparationFailure):
             raise SessionPreparationFailed(
                 reasons=outcome.reasons,

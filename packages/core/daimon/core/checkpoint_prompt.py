@@ -23,6 +23,17 @@ matrix §A/§D):
 - ``/mnt/session/uploads`` (credential and bundle mounts), ``/mnt/memory``
   (agent memory) and ``/mnt/skills`` are mounts belonging to the destination,
   never to the task; they must not travel in the bundle.
+- The agent's file tool writes the task's own files to
+  ``/mnt/session/outputs``, so that directory is an archived ROOT (minus the
+  bundle itself), not an exclusion. ``$HOME`` ships a populated toolchain
+  (``.bun``, ``.cargo``, ``.rustup``, ``.gradle``, ``.npm``, ``.local``,
+  ``.config``, plus ``.ssh``) that is ~100 MB before the task writes
+  anything, so every dot entry directly under ``$HOME`` is excluded and only
+  the non-hidden ones are carried.
+- The prompt is written to be legible as HOST instruction rather than chat
+  text: delivered on the ``system.message`` channel where the old session's
+  model supports one, it is the same bytes either way, and it says whose
+  instruction it is and where the archive goes.
 """
 
 from __future__ import annotations
@@ -41,13 +52,30 @@ HANDOFF_FILENAME_PREFIX = "daimon-handoff-"
 HANDOFF_MAX_BYTES = 20 * 1024 * 1024
 
 # Absolute mount points that must never enter a bundle: they hold the
-# destination's own credentials, the agent's memory store, the platform's
-# skills, and the outputs directory the archive itself is written into.
+# destination's own credentials, the agent's memory store and the platform's
+# skills. The outputs directory is deliberately NOT here — it is where the
+# file tool writes the task's own work, so it is an archived root.
 CHECKPOINT_EXCLUDED_PATHS: tuple[str, ...] = (
     "/mnt/session/uploads",
     "/mnt/memory",
     "/mnt/skills",
-    "/mnt/session/outputs",
+)
+
+#: Where the file tool writes, where the archive is written, and the second
+#: archived root.
+CHECKPOINT_OUTPUTS_DIR = "/mnt/session/outputs"
+
+#: Printed by the checkpoint turn instead of a listing when the finished
+#: archive is over the cap. The archive is deleted first, so a rejected
+#: transfer leaves nothing behind in the old session's outputs.
+HANDOFF_TOO_LARGE_MARKER = "HANDOFF_TOO_LARGE"
+
+#: The whole user message when the prompt itself travels on the privileged
+#: `system.message` channel. The instruction is in the system block; this is
+#: only what makes the turn start.
+CHECKPOINT_SYSTEM_TRIGGER = (
+    "Run the workspace checkpoint described in your system instructions now "
+    "and reply only with the command output."
 )
 
 # Directory names that are large, reproducible, or both. Matched at any depth.
@@ -64,6 +92,8 @@ CHECKPOINT_EXCLUDED_GLOBS: tuple[str, ...] = (
 _EXCLUDE_LIST_PATH = "/tmp/daimon-handoff-excludes.txt"
 
 _SHA1_LINE = re.compile(r"^\s*([0-9a-f]{40})\s*$", re.MULTILINE)
+
+_TOO_LARGE_LINE = re.compile(rf"^\s*{HANDOFF_TOO_LARGE_MARKER}\s+(\d+)\s*$", re.MULTILINE)
 
 # Lines that merely echo a command from the prompt, rather than being its
 # output, when :func:`checkpoint_archive_listed` looks for the listing.
@@ -117,14 +147,24 @@ def build_checkpoint_prompt(
     checkout" stays true.
     """
 
-    archive_path = f"/mnt/session/outputs/{handoff_filename(transfer_id)}"
+    archive_path = f"{CHECKPOINT_OUTPUTS_DIR}/{handoff_filename(transfer_id)}"
+    max_bundle_bytes = max_bundle_mib * 1024 * 1024
     leave_unsaved = repo_mount_path is not None and unsaved_work == "leave"
-    roots = [_relative_to_root(home_dir)]
+    home_root = _relative_to_root(home_dir)
+    outputs_root = _relative_to_root(CHECKPOINT_OUTPUTS_DIR)
+    roots = [home_root, outputs_root]
     if repo_mount_path is not None and not leave_unsaved:
         roots.append(_relative_to_root(repo_mount_path))
     roots_argument = " ".join(roots)
 
     excludes = [f"--exclude-from={_EXCLUDE_LIST_PATH}"]
+    # Every dot entry directly under $HOME: .ssh, and the ~100 MB of toolchain
+    # caches the base image ships (.bun/.cargo/.rustup/.gradle/.npm/.local/
+    # .config). `*` matches `/` in a tar exclude pattern, so the subtree goes
+    # with it, while a dotfile deeper inside the task's own work is untouched.
+    excludes.append(f"--exclude='{home_root}/.*'")
+    # The bundle being written, and any bundle a previous transfer left.
+    excludes.append(f"--exclude='{outputs_root}/{HANDOFF_FILENAME_PREFIX}*'")
     excludes += [f"--exclude='{_relative_to_root(path)}'" for path in CHECKPOINT_EXCLUDED_PATHS]
     excludes += [f"--exclude='*/{glob}'" for glob in CHECKPOINT_EXCLUDED_GLOBS]
     excludes.append("--exclude='*.env'")
@@ -142,9 +182,16 @@ def build_checkpoint_prompt(
         return f"Step {len(steps) + 1} - {header}"
 
     sections: list[str] = [
+        "This instruction comes from the daimon host that runs your workspace, not from a chat "
+        "participant. The archive stays in this workspace's outputs directory and is moved to "
+        "your next workspace by the host; nothing is shared with anyone.",
         "This is a checkpoint turn. The workspace you are working in is being retired and "
         "your work is moving to a new one. Do exactly the steps below, in order, and nothing "
-        "else. Do not open or read any image file."
+        "else. Do not open or read any image file.",
+        "Only the task's own work travels: the outputs directory and the non-hidden entries in "
+        f"{home_dir}. Never include {home_dir}/.ssh, credential mounts, dotfiles or language "
+        "toolchains and their caches. The commands below already exclude every one of them; run "
+        "them as written and add nothing.",
     ]
     steps.append(
         "\n".join(
@@ -207,9 +254,19 @@ def build_checkpoint_prompt(
         )
     )
 
-    show: list[str] = [f"{step('show the result.')} Run:", f"  ls -l {archive_path}"]
+    show: list[str] = [
+        f"{step('check the size, then show the result.')} Run:",
+        f'  size=$(stat -c %s {archive_path}); if [ "$size" -gt {max_bundle_bytes} ]; '
+        f'then rm -f {archive_path}; echo "{HANDOFF_TOO_LARGE_MARKER} $size"; '
+        f"else ls -l {archive_path}; fi",
+    ]
     if repo_mount_path is not None:
         show.append(f"  git -C {repo_mount_path} rev-parse HEAD")
+    show.append(
+        f"The archive cannot be carried above {max_bundle_mib} MiB, so that command deletes it "
+        f"and prints {HANDOFF_TOO_LARGE_MARKER} instead. That is a complete answer: do not "
+        "retry, shrink or rebuild it."
+    )
     steps.append("\n".join(show))
 
     steps.append(
@@ -235,6 +292,19 @@ def checkpoint_head_lines(reply: str) -> tuple[str | None, str | None]:
     if len(hashes) == 1:
         return (hashes[0], None)
     return (hashes[0], hashes[-1])
+
+
+def checkpoint_too_large_bytes(reply: str) -> int | None:
+    """The size the checkpoint turn reported when it rejected its own archive.
+
+    The prompt's last step deletes an over-cap archive and prints
+    ``HANDOFF_TOO_LARGE <bytes>``; matching a whole line means a reply that
+    merely echoes the command it was given cannot be read as the outcome.
+    Returns None when no such line was printed.
+    """
+
+    match = _TOO_LARGE_LINE.search(reply)
+    return None if match is None else int(match.group(1))
 
 
 def checkpoint_archive_listed(reply: str, filename: str) -> bool:

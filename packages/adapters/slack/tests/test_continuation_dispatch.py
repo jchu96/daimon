@@ -20,7 +20,8 @@ from daimon.core.continuity.continuation import ContinuationRequest, record_cont
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores.domain import TaskContinuationRow
 from daimon.core.stores.identity import get_or_create_platform_principal
-from daimon.core.stores.task_continuations import get_continuation
+from daimon.core.stores.task_continuations import get_continuation, list_pending_continuations
+from daimon.core.turn.errors import SessionBusyError
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]
@@ -188,3 +189,76 @@ async def test_dispatch_skips_silently_when_no_work_was_requested(
         for req in reqs
     ]
     assert posts == [], "a silent skip must not post anything into the thread"
+
+
+async def test_a_busy_session_settles_skipped_and_requeues_under_a_new_key(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """A follow-up that cannot bind because a turn is still running is not lost.
+
+    `claim_continuation` has no inverse, so the claimed row is settled
+    `skipped`/`turn_running` and the same request is queued again under a NEW
+    idempotency key. At-most-once still holds per key -- the settled row can
+    never dispatch again -- while the work the person asked for survives to be
+    picked up by the next turn that finishes in this thread.
+    """
+    tenant = await make_tenant(db_session, platform="slack", workspace_id="T_CONT_DISPATCH_BUSY")
+    requester = await get_or_create_platform_principal(
+        db_session, tenant_id=tenant.id, platform="slack", external_id="U_REQUESTER"
+    )
+    await db_session.commit()
+
+    thread_id = "9200000003.000001"
+    request = ContinuationRequest(
+        tenant_id=tenant.id,
+        platform="slack",
+        parent_channel_id="C_CONT_DISPATCH",
+        thread_id=thread_id,
+        requester_account_id=requester.account_id,
+        requester_external_user_id="U_REQUESTER",
+        target_ma_agent_id=_TARGET_AGENT_ID,
+        target_name="receiving-agent",
+        requested_work="please pick up the migration",
+        reason="task_handoff",
+        idempotency_key=uuid.uuid4(),
+    )
+    await record_continuation(db_session_factory, request)
+
+    anthropic = build_fake_anthropic(_fake_target_agent_handler(str(tenant.id)))
+
+    async def _busy_follow_up(row: TaskContinuationRow, seed: str) -> None:
+        raise SessionBusyError(pending_reasons=("agent_identity",), retry_after=datetime.now(UTC))
+
+    await dispatch_pending_continuations(
+        db_session_factory,
+        anthropic,
+        fake_slack_web_client.client,
+        tenant_id=tenant.id,
+        channel="C_CONT_DISPATCH",
+        thread_id=thread_id,
+        active_turn=False,
+        run_follow_up=_busy_follow_up,
+        now=lambda: datetime.now(UTC),
+    )
+
+    settled = await get_continuation(db_session, idempotency_key=request.idempotency_key)
+    assert settled is not None
+    assert settled.status == "skipped", "the claimed row must not be left claimed"
+    assert settled.skip_reason == "turn_running"
+
+    pending = await list_pending_continuations(
+        db_session, tenant_id=tenant.id, platform="slack", thread_id=thread_id
+    )
+    assert len(pending) == 1, f"the request must be re-queued exactly once, got {pending}"
+    requeued = pending[0]
+    assert requeued.idempotency_key != request.idempotency_key, (
+        "the re-queued row must carry a NEW key, so the settled row's at-most-once still holds"
+    )
+    assert requeued.requested_work == "please pick up the migration", (
+        "the person's own words must survive the requeue"
+    )
+    assert requeued.target_ma_agent_id == _TARGET_AGENT_ID
+    assert requeued.requester_account_id == requester.account_id
+    assert requeued.reason == "task_handoff"

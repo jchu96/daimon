@@ -8,11 +8,14 @@ module closes that: at every bind it compares what the session runs against
 what the caller's configuration now wants, applies what can be applied in
 place, and replaces the session when it cannot.
 
-Three results, never an exception for an expected outcome:
+Four results, never an exception for an expected outcome:
 
 - `PreparedTurn` — run the turn. `continuity` says what happened to the session.
 - `PreparationDeferred` — a turn is already running, or MA refused a mid-turn
   update. The turn runs on the current session and the change lands next time.
+- `PreparationBusy` — same timing, but the change is a responder switch, and
+  the current session belongs to the responder being switched away from. No
+  turn runs; the switch is made at the caller's next message.
 - `PreparationFailure` — the change could not be made. The old session is
   untouched and still live, so nothing the caller saved is lost; the turn is
   simply not run.
@@ -91,6 +94,7 @@ log = structlog.get_logger(__name__)
 CONTINUED = ContinuityOutcome()
 
 __all__ = [
+    "PreparationBusy",
     "PreparationDeferred",
     "PreparationFailure",
     "PreparedReplacement",
@@ -99,6 +103,11 @@ __all__ = [
     "prepare_session_for_turn",
 ]
 
+# How long a caller is told to wait when a responder change lands on a thread
+# whose previous turn has not finished. Short on purpose: the wait is for the
+# in-flight turn to end, and the retry is the caller's next message either way.
+BUSY_RETRY_S = 5
+
 
 @dataclass(frozen=True, slots=True)
 class PreparationDeferred:
@@ -106,6 +115,23 @@ class PreparationDeferred:
 
     prepared: PreparedTurn
     pending_reasons: tuple[ChangeReason, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparationBusy:
+    """A responder change arrived while the outgoing responder's turn still runs.
+
+    Deliberately not a `PreparationDeferred`: deferring means "run this turn on
+    the CURRENT session", and the current session is the one being taken away —
+    it belongs to the agent handing the task over, with that agent's system
+    prompt, skills, memory store, vault and `.env`. Running the incoming
+    responder's turn there executes one agent's request inside another agent's
+    workspace while the footer credits the incoming one. No turn runs; the
+    change is made at the caller's next message, once the marker has cleared.
+    """
+
+    pending_reasons: tuple[ChangeReason, ...]
+    retry_after: dt.datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,7 +425,7 @@ async def prepare_session_for_turn(
     transfer: WorkspaceTransfer | None = None,
     deadline: dt.datetime | None = None,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
-) -> PreparedTurn | PreparationDeferred | PreparationFailure:
+) -> PreparedTurn | PreparationDeferred | PreparationBusy | PreparationFailure:
     """Find, refresh or replace this caller's session, then bind its recorder.
 
     Billing binds to the model the bound session actually runs — the fresh
@@ -541,6 +567,26 @@ async def prepare_session_for_turn(
             )
 
         current_model = admission.agent.model.id if recorded is None else recorded.model_id
+
+        if (
+            isinstance(decision, ReplaceSession)
+            and "agent_identity" in decision.reasons
+            and turn_is_active(row, now=moment)
+        ):
+            # The one change that cannot be deferred onto the current session:
+            # that session belongs to the responder being replaced, so running
+            # this turn there would run the incoming agent's work with the
+            # outgoing agent's credentials, memory and prompt.
+            log.info(
+                "session_preparation.busy",
+                mapping_id=str(row.id),
+                session_id=row.ma_session_id,
+                reasons=list(decision.reasons),
+            )
+            return PreparationBusy(
+                pending_reasons=decision.reasons,
+                retry_after=moment + dt.timedelta(seconds=BUSY_RETRY_S),
+            )
 
         if not isinstance(decision, ReuseAsIs) and turn_is_active(row, now=moment):
             # Uniformly deferred: MA itself refuses `sessions.update` mid-turn,

@@ -229,6 +229,142 @@ async def test_handoff_with_a_continuation_queues_the_work_bounded_to_its_limit(
     assert queued.requested_work == long_request[:500], "and otherwise preserved verbatim"
 
 
+@pytest.mark.parametrize(
+    "continuation",
+    ["", "   ", "ok", "short-1", _DESTINATION_NAME, f"  {_DESTINATION_NAME.upper()}  "],
+    ids=["empty", "blank", "too_short", "seven_chars", "destination_name", "destination_name_ci"],
+)
+async def test_handoff_nulls_a_fabricated_or_switch_only_continuation(
+    db_session: AsyncSession,
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    continuation: str,
+) -> None:
+    """Issue 2 (staging QA, 2026-09-13): a bare "take over" must never bill a
+    second turn. The deterministic guard catches the shapes that are never a
+    real work description regardless of wording -- empty, too short, or just
+    the destination's own name -- and nulls them before a continuation is
+    ever queued."""
+    tenant = await make_tenant(db_session)
+    caller = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    runtime = _runtime(committing_sessionmaker, _client([_destination(tenant.id)]))
+    auth = AuthIdentity(
+        account_id=caller.id,
+        tenant_id=tenant.id,
+        role=Role.USER,
+        platform="discord",
+        platform_user_id="42",
+    )
+
+    async with turn_origin(
+        committing_sessionmaker,
+        tenant_id=tenant.id,
+        account_id=caller.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="T_THREAD",
+        responder_ma_agent_id=_RESPONDER_ID,
+        responder_name="daimon",
+        role=Role.USER,
+    ) as origin:
+        result = await _hand_off_task_impl(
+            runtime,
+            auth,
+            origin_context_id=str(origin.id),
+            agent_id=_DESTINATION_ID,
+            continuation=continuation,
+        )
+
+    assert result.continuation_recorded is False, (
+        f"continuation={continuation!r} must be nulled, not queued as work"
+    )
+    assert "It will pick up with:" not in result.confirmation, (
+        "a nulled continuation must not surface in the person-facing confirmation"
+    )
+    async with committing_sessionmaker() as session:
+        pending = await list_pending_continuations(
+            session, tenant_id=tenant.id, platform="discord", thread_id="T_THREAD"
+        )
+    assert pending == [], "nothing is queued when the continuation was nulled"
+
+
+async def test_handoff_confirmation_renders_the_channel_as_a_mention(
+    db_session: AsyncSession,
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Issue 3 (staging QA, 2026-09-13): the confirmation must never print a
+    raw platform channel id."""
+    tenant = await make_tenant(db_session)
+    caller = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    runtime = _runtime(committing_sessionmaker, _client([_destination(tenant.id)]))
+    auth = AuthIdentity(
+        account_id=caller.id,
+        tenant_id=tenant.id,
+        role=Role.USER,
+        platform="discord",
+        platform_user_id="42",
+    )
+
+    async with turn_origin(
+        committing_sessionmaker,
+        tenant_id=tenant.id,
+        account_id=caller.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="T_THREAD",
+        responder_ma_agent_id=_RESPONDER_ID,
+        responder_name="daimon",
+        role=Role.USER,
+    ) as origin:
+        result = await _hand_off_task_impl(
+            runtime, auth, origin_context_id=str(origin.id), agent_id=_DESTINATION_ID
+        )
+
+    assert "<#C_PARENT>" in result.confirmation, (
+        f"expected a channel mention, got: {result.confirmation!r}"
+    )
+    assert "C_PARENT is unchanged" not in result.confirmation, (
+        "the raw channel id must never appear unwrapped in person-facing copy"
+    )
+
+
+async def test_handoff_unreachable_refusal_renders_the_channel_as_a_mention(
+    db_session: AsyncSession,
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant = await make_tenant(db_session)
+    caller = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    runtime = _runtime(
+        committing_sessionmaker, _client([_destination(tenant.id)]), default_agent_name="daimon"
+    )
+    auth = AuthIdentity(
+        account_id=caller.id,
+        tenant_id=tenant.id,
+        role=Role.USER,
+        platform="discord",
+        platform_user_id="42",
+    )
+
+    async with turn_origin(
+        committing_sessionmaker,
+        tenant_id=tenant.id,
+        account_id=caller.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="T_THREAD",
+        responder_ma_agent_id=_RESPONDER_ID,
+        responder_name="daimon",
+        role=Role.USER,
+    ) as origin:
+        with pytest.raises(ToolError, match=r"<#C_PARENT>") as excinfo:
+            await _hand_off_task_impl(
+                runtime, auth, origin_context_id=str(origin.id), agent_id=_DESTINATION_ID
+            )
+    assert "make research-bot answer in <#C_PARENT>" in str(excinfo.value)
+
+
 async def test_handoff_refuses_an_agent_nobody_can_reach_and_writes_nothing(
     db_session: AsyncSession,
     committing_sessionmaker: async_sessionmaker[AsyncSession],

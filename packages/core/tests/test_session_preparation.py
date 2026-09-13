@@ -37,6 +37,7 @@ from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.core.session_preparation import (
+    PreparationBusy,
     PreparationDeferred,
     PreparationFailure,
     PreparedReplacement,
@@ -57,6 +58,7 @@ from daimon.core.stores.thread_sessions import (
     set_pending_unsaved_work,
 )
 from daimon.core.turn.admission import Admission
+from daimon.core.turn.ceiling import TURN_CEILING_S
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.errors import SessionAgentMismatch
 from daimon.core.turn.prepare import (
@@ -236,7 +238,7 @@ async def _prepare(
     thread_id: str = "thread-1",
     transfer: Any = None,
     now: datetime = _NOW,
-) -> PreparedTurn | PreparationDeferred | PreparationFailure:
+) -> PreparedTurn | PreparationDeferred | PreparationBusy | PreparationFailure:
     return await prepare_session_for_turn(
         deps,
         admission,
@@ -462,6 +464,9 @@ async def test_a_replacement_is_deferred_while_a_turn_is_running(
         "a replacement must never interrupt work already in flight"
     )
     assert deferred.pending_reasons == ("model",)
+    assert deferred.prepared.ma_session_id == first.ma_session_id, (
+        "a change that keeps the same responder still runs on the caller's own session"
+    )
     assert transport.creates == 1, "no successor may be created while the old turn runs"
     still_live = await _live_row(db_session_factory, tenant=tenant, account=account)
     assert still_live is not None and still_live.id == row.id
@@ -937,6 +942,115 @@ async def test_a_responder_change_authorized_by_a_handoff_binding_replaces_the_s
     superseded = await get_thread_session_by_id(db_session, id=old_row.id)
     assert superseded is not None and superseded.status == "superseded"
     assert await _count_live_rows(db_session_factory, tenant=tenant, account=account) == 1
+
+
+async def test_a_responder_change_does_not_run_the_new_agent_on_the_old_agents_session(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Observed on staging: `hand_off_task` dispatched its follow-up turn while
+    the source agent's own turn marker was still fresh. The uniform deferral
+    ran that turn on the CURRENT session — the source agent's workspace,
+    credentials and memory — while the footer named the destination. A
+    responder change is the one change that has nowhere safe to defer to."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    transport = _Transport()
+    deps = _deps(db_session_factory, transport)
+
+    first = await _prepare(deps, _admission(account=account), tenant=tenant, account=account)
+    assert isinstance(first, PreparedTurn)
+    old_row = await _live_row(db_session_factory, tenant=tenant, account=account)
+    assert old_row is not None
+
+    successor_agent = _agent(agent_id="ag_successor")
+    _register(transport.state, successor_agent)
+    async with db_session_factory() as session, session.begin():
+        binding = await create_binding(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="channel-1",
+            thread_id="thread-1",
+            responder_ma_agent_id="ag_successor",
+            responder_name="research-bot",
+            kind="handoff",
+        )
+        await mark_turn_active(
+            session, id=old_row.id, active_turn_message_id="msg-in-flight", now=_NOW
+        )
+    before = len(transport.calls)
+
+    busy = await _prepare(
+        deps,
+        _admission(account=account, agent=successor_agent, thread_binding_id=binding.id),
+        tenant=tenant,
+        account=account,
+    )
+
+    assert isinstance(busy, PreparationBusy), (
+        "the incoming responder must not be handed the outgoing responder's session"
+    )
+    assert busy.pending_reasons == ("agent_identity",)
+    assert busy.retry_after > _NOW, "the caller is told when the switch can be made"
+    assert transport.calls[before:] == [], "no turn is prepared, so MA is not touched at all"
+    unchanged = await _live_row(db_session_factory, tenant=tenant, account=account)
+    assert unchanged is not None and unchanged.id == old_row.id, (
+        "the in-flight session is left exactly as it was"
+    )
+    assert transport.creates == 1, "and no successor is created behind the running turn"
+
+
+async def test_a_responder_change_proceeds_once_the_turn_marker_has_gone_stale(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A marker older than the per-turn ceiling belongs to a turn that died
+    with its process, so it must not block the switch forever."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    transport = _Transport()
+    deps = _deps(db_session_factory, transport)
+
+    first = await _prepare(deps, _admission(account=account), tenant=tenant, account=account)
+    assert isinstance(first, PreparedTurn)
+    old_row = await _live_row(db_session_factory, tenant=tenant, account=account)
+    assert old_row is not None
+
+    successor_agent = _agent(agent_id="ag_successor")
+    _register(transport.state, successor_agent)
+    async with db_session_factory() as session, session.begin():
+        binding = await create_binding(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="channel-1",
+            thread_id="thread-1",
+            responder_ma_agent_id="ag_successor",
+            responder_name="research-bot",
+            kind="handoff",
+        )
+        await mark_turn_active(
+            session,
+            id=old_row.id,
+            active_turn_message_id="msg-abandoned",
+            now=_NOW - timedelta(seconds=TURN_CEILING_S + 1),
+        )
+
+    handed = await _prepare(
+        deps,
+        _admission(account=account, agent=successor_agent, thread_binding_id=binding.id),
+        tenant=tenant,
+        account=account,
+    )
+
+    assert isinstance(handed, PreparedTurn), "an abandoned marker must not wedge the thread"
+    assert handed.ma_session_id != first.ma_session_id
+    assert handed.continuity.applied == ("agent_identity",)
+    superseded = await get_thread_session_by_id(db_session, id=old_row.id)
+    assert superseded is not None and superseded.status == "superseded"
 
 
 async def test_the_callers_unsaved_work_answer_reaches_the_transfer_hook_once(
