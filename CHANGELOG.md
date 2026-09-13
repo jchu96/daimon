@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **daimon can change its own name and picture on Discord.** Ask it to
+  rename itself or use an attached image as its profile picture and the new
+  `set_display_identity` MCP tool edits the bot's nickname and per-server
+  avatar. Both apply to the whole server, since Discord has no per-channel
+  identity, and the tool says so in its result. A server admin must ask;
+  the image must be a Discord attachment (png, jpeg, gif or webp). Slack
+  bots cannot rename themselves, so the tool is Discord-only.
 - Slack supports `post_github_app_install_link` and the configurable
   `DAIMON_SLACK__BOT_DISPLAY_NAME`. An unconfigured GitHub App link names the
   operator setting needed; posting a link does not prove installation or repo access.

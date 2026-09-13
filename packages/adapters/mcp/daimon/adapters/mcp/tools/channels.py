@@ -12,6 +12,7 @@ from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
 from daimon.adapters.mcp.tools.discord import (
     ChannelRow,
+    DisplayIdentityRow,
     MessageRow,
     ParsedLink,
     ReadChannelResult,
@@ -28,6 +29,7 @@ from daimon.adapters.mcp.tools.discord import (
     _rename_thread_impl,  # pyright: ignore[reportPrivateUsage]
     _search_messages_impl,  # pyright: ignore[reportPrivateUsage]
     _send_message_impl,  # pyright: ignore[reportPrivateUsage]
+    _set_display_identity_impl,  # pyright: ignore[reportPrivateUsage]
 )
 from daimon.adapters.mcp.tools.slack._models import (
     SlackChannelResult,
@@ -210,6 +212,33 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         if auth.platform == "slack":
             raise _slack_unsupported("rename_thread")
         return await _rename_thread_impl(runtime, auth, thread_id=thread_id, name=name)
+
+    @mcp.tool(tags={"discord"})  # pyright: ignore[reportArgumentType]
+    async def set_display_identity(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        display_name: str | None = None,
+        avatar_url: str | None = None,
+    ) -> DisplayIdentityRow:
+        """Change how daimon appears in this Discord server: its display name,
+        its avatar, or both.
+
+        Use when the user asks you to rename yourself or change your profile
+        picture. ``display_name`` is the new nickname (1-32 characters).
+        ``avatar_url`` is the URL of an image the user attached to a message
+        (a cdn.discordapp.com or media.discordapp.net link); png, jpeg, gif
+        and webp work. Both apply to the whole server: Discord has no
+        per-channel identity, so tell the user when they asked for one
+        channel. There is no reset yet: an empty ``display_name`` is treated
+        as omitted, so a name cannot be cleared back to the default. Needs a
+        server admin. Discord-only.
+        """
+        auth = await _auth(ctx)
+        if auth.platform == "slack":
+            raise _slack_unsupported("set_display_identity")
+        # MCP clients often send "" for an optional param they mean to omit.
+        return await _set_display_identity_impl(
+            runtime, auth, display_name=display_name or None, avatar_url=avatar_url or None
+        )
 
     @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
     async def parse_link(  # pyright: ignore[reportUnusedFunction]
