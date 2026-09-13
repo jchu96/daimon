@@ -57,7 +57,7 @@ from daimon.core.credential_requests import (
     split_skill_repo_target,
 )
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid, find_attach_mount_collision
-from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
+from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED, MA_METADATA_KEY_NAME
 from daimon.core.defaults.report import Action, ResourceOutcome
 from daimon.core.defaults.spec_merge import merge_skills_with_ma
 from daimon.core.errors import DaimonError
@@ -311,10 +311,15 @@ def evaluate_credential_submission(payload: dict[str, Any]) -> CredentialSubmiss
 
 
 async def _post_ephemeral(
-    client: AsyncWebClient, *, channel_id: str, user_id: str, text: str
+    client: AsyncWebClient,
+    *,
+    channel_id: str,
+    user_id: str,
+    text: str,
+    thread_ts: str | None = None,
 ) -> None:
     await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-        channel=channel_id, user=user_id, text=text
+        channel=channel_id, user=user_id, text=text, thread_ts=thread_ts
     )
 
 
@@ -326,6 +331,7 @@ async def _refuse_if_shared_and_not_admin_for_request(
     agent_id: uuid.UUID,
     channel_id: str,
     user_id: str,
+    thread_ts: str | None = None,
 ) -> bool:
     """Click/submit-time re-check for the chat-initiated repo-bind write.
 
@@ -356,24 +362,36 @@ async def _refuse_if_shared_and_not_admin_for_request(
             agent_id=str(agent_id),
         )
         await _post_ephemeral(
-            client, channel_id=channel_id, user_id=user_id, text=_AGENT_GONE_MESSAGE
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_AGENT_GONE_MESSAGE,
         )
         return True
     if agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true":
         await _post_ephemeral(
-            client, channel_id=channel_id, user_id=user_id, text=_SHARED_AGENT_MESSAGE
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_SHARED_AGENT_MESSAGE,
         )
         return True
     async with runtime.sessionmaker() as session:
         reachable = await is_agent_reachable_in_tenant(
             session,
             tenant_id=tenant_id,
-            agent_name=agent.name,
+            agent_name=str(agent.metadata.get(MA_METADATA_KEY_NAME) or agent.name),
             default=runtime.deployment_default,
         )
     if reachable:
         await _post_ephemeral(
-            client, channel_id=channel_id, user_id=user_id, text=_SHARED_AGENT_MESSAGE
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_SHARED_AGENT_MESSAGE,
         )
         return True
     return False
@@ -421,6 +439,15 @@ async def handle_credential_request_click(runtime: SlackRuntime, payload: dict[s
         # workspace the mint named, so a cross-workspace click stays
         # unreachable by construction rather than by luck.
         refusal = _WRONG_WORKSPACE
+    elif row.platform is not None and row.platform != "slack":
+        refusal = _WRONG_WORKSPACE
+    elif (
+        row.parent_channel_id is not None
+        and row.parent_channel_id != channel_id
+        or row.posted_message_id is not None
+        and row.posted_message_id != message_ts
+    ):
+        refusal = _NO_LONGER_VALID
     elif user_id != row.requester_platform_user_id:
         refusal = _WRONG_REQUESTER
     elif row.expires_at < datetime.now(UTC):
@@ -503,6 +530,65 @@ async def _consume(
         )
 
 
+async def _validate_submission(
+    runtime: SlackRuntime,
+    client: AsyncWebClient,
+    *,
+    token: str,
+    team_id: str,
+    user_id: str,
+    channel_id: str,
+    kind: CredentialRequestKind,
+) -> CredentialRequestRow | None:
+    async with runtime.sessionmaker() as session:
+        row = await credential_requests_store.peek_credential_request(session, token=token)
+    if (
+        row is None
+        or row.tenant_id != derive_tenant_uuid(platform="slack", workspace_id=team_id)
+        or row.platform not in (None, "slack")
+        or row.requester_platform_user_id != user_id
+        or row.kind != kind
+    ):
+        await _post_ephemeral(client, channel_id=channel_id, user_id=user_id, text=_NO_LONGER_VALID)
+        return None
+    if row.used_at is not None or row.expires_at <= datetime.now(UTC):
+        await _post_ephemeral(
+            client,
+            channel_id=row.parent_channel_id or channel_id,
+            thread_ts=row.origin_thread_id,
+            user_id=user_id,
+            text=_NO_LONGER_VALID,
+        )
+        return None
+    agent = await find_agent_by_derived_uuid(
+        runtime.anthropic,
+        tenant_id=row.tenant_id,
+        agent_id=row.agent_id,
+    )
+    if agent is None:
+        await _post_ephemeral(
+            client,
+            channel_id=row.parent_channel_id or channel_id,
+            thread_ts=row.origin_thread_id,
+            user_id=user_id,
+            text=_AGENT_GONE_MESSAGE,
+        )
+        return None
+    # Repo rebinding rechecks current permissions. Credential contributions keep
+    # their existing member access, including shared and built-in agents.
+    if kind == "repo" and await _refuse_if_shared_and_not_admin_for_request(
+        runtime,
+        client,
+        tenant_id=row.tenant_id,
+        agent_id=row.agent_id,
+        channel_id=row.parent_channel_id or channel_id,
+        thread_ts=row.origin_thread_id,
+        user_id=user_id,
+    ):
+        return None
+    return row
+
+
 async def run_env_credential_submission(
     runtime: SlackRuntime,
     *,
@@ -521,6 +607,20 @@ async def run_env_credential_submission(
     client = await resolve_web_client(runtime, team_id=team_id)
     if client is None:
         return
+    request = await _validate_submission(
+        runtime,
+        client,
+        token=token,
+        team_id=team_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        kind="env",
+    )
+    if request is None:
+        return
+    channel_id = request.parent_channel_id or channel_id
+    message_ts = request.posted_message_id or message_ts
+    thread_ts = request.origin_thread_id
 
     now = datetime.now(UTC)
     try:
@@ -530,7 +630,11 @@ async def run_env_credential_submission(
             )
             if consumed is None:
                 await _post_ephemeral(
-                    client, channel_id=channel_id, user_id=user_id, text=_NO_LONGER_VALID
+                    client,
+                    thread_ts=thread_ts,
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    text=_NO_LONGER_VALID,
                 )
                 return
             await put_agent_file(
@@ -544,6 +648,7 @@ async def run_env_credential_submission(
         log.exception("credential_request.env_write_failed", key_present=True)
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text="Something went wrong — please try again.",
@@ -557,6 +662,7 @@ async def run_env_credential_submission(
     )
     await _post_ephemeral(
         client,
+        thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
         text=(
@@ -585,11 +691,26 @@ async def run_mcp_credential_submission(
     client = await resolve_web_client(runtime, team_id=team_id)
     if client is None:
         return
+    request = await _validate_submission(
+        runtime,
+        client,
+        token=token,
+        team_id=team_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        kind="mcp",
+    )
+    if request is None:
+        return
+    channel_id = request.parent_channel_id or channel_id
+    message_ts = request.posted_message_id or message_ts
+    thread_ts = request.origin_thread_id
 
     mcp = runtime.settings.mcp
     if mcp.public_url is None or mcp.jwt_secret is None:
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -602,7 +723,13 @@ async def run_mcp_credential_submission(
     now = datetime.now(UTC)
     consumed = await _consume(runtime, token=token, now=now)
     if consumed is None:
-        await _post_ephemeral(client, channel_id=channel_id, user_id=user_id, text=_NO_LONGER_VALID)
+        await _post_ephemeral(
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_NO_LONGER_VALID,
+        )
         return
 
     await _mark_button_consumed(
@@ -614,6 +741,7 @@ async def run_mcp_credential_submission(
         log.error("credential_request.mcp_missing_server_url", token_tail=token[-4:])
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text="This request is missing its server URL — please ask again.",
@@ -665,6 +793,7 @@ async def run_mcp_credential_submission(
         # carry the request envelope, which is a token-leak surface.
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -686,6 +815,7 @@ async def run_mcp_credential_submission(
         log.error("credential_request.mcp_agent_not_found", agent_id=str(consumed.agent_id))
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -709,6 +839,7 @@ async def run_mcp_credential_submission(
         )
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -721,6 +852,7 @@ async def run_mcp_credential_submission(
 
     await _post_ephemeral(
         client,
+        thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
         text=(
@@ -869,11 +1001,31 @@ async def run_skill_repo_credential_submission(
     client = await resolve_web_client(runtime, team_id=team_id)
     if client is None:
         return
+    request = await _validate_submission(
+        runtime,
+        client,
+        token=token,
+        team_id=team_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        kind="skill_repo",
+    )
+    if request is None:
+        return
+    channel_id = request.parent_channel_id or channel_id
+    message_ts = request.posted_message_id or message_ts
+    thread_ts = request.origin_thread_id
 
     now = datetime.now(UTC)
     consumed = await _consume(runtime, token=token, now=now)
     if consumed is None:
-        await _post_ephemeral(client, channel_id=channel_id, user_id=user_id, text=_NO_LONGER_VALID)
+        await _post_ephemeral(
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_NO_LONGER_VALID,
+        )
         return
 
     await _mark_button_consumed(
@@ -903,6 +1055,7 @@ async def run_skill_repo_credential_submission(
         ):
             await _post_ephemeral(
                 client,
+                thread_ts=thread_ts,
                 channel_id=channel_id,
                 user_id=user_id,
                 text=(
@@ -945,6 +1098,7 @@ async def run_skill_repo_credential_submission(
         log.warning("credential_request.skill_repo_sync_failed", err_type=type(err).__name__)
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -963,6 +1117,7 @@ async def run_skill_repo_credential_submission(
         )
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -979,6 +1134,7 @@ async def run_skill_repo_credential_submission(
     )
     await _post_ephemeral(
         client,
+        thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
         text=(
@@ -1010,27 +1166,43 @@ async def run_repo_bind_credential_submission(
     client = await resolve_web_client(runtime, team_id=team_id)
     if client is None:
         return
+    request = await _validate_submission(
+        runtime,
+        client,
+        token=token,
+        team_id=team_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        kind="repo",
+    )
+    if request is None:
+        return
+    channel_id = request.parent_channel_id or channel_id
+    message_ts = request.posted_message_id or message_ts
+    thread_ts = request.origin_thread_id
 
     now = datetime.now(UTC)
     async with runtime.sessionmaker() as session:
         row = await credential_requests_store.peek_credential_request(session, token=token)
     if row is None:
-        await _post_ephemeral(client, channel_id=channel_id, user_id=user_id, text=_NO_LONGER_VALID)
-        return
-
-    if await _refuse_if_shared_and_not_admin_for_request(
-        runtime,
-        client,
-        tenant_id=row.tenant_id,
-        agent_id=row.agent_id,
-        channel_id=channel_id,
-        user_id=user_id,
-    ):
+        await _post_ephemeral(
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_NO_LONGER_VALID,
+        )
         return
 
     consumed = await _consume(runtime, token=token, now=now)
     if consumed is None:
-        await _post_ephemeral(client, channel_id=channel_id, user_id=user_id, text=_NO_LONGER_VALID)
+        await _post_ephemeral(
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_NO_LONGER_VALID,
+        )
         return
 
     await _mark_button_consumed(
@@ -1071,6 +1243,7 @@ async def run_repo_bind_credential_submission(
         log.warning("credential_request.repo_write_failed", err_type=type(err).__name__)
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -1086,6 +1259,7 @@ async def run_repo_bind_credential_submission(
         )
         await _post_ephemeral(
             client,
+            thread_ts=thread_ts,
             channel_id=channel_id,
             user_id=user_id,
             text=(
@@ -1097,6 +1271,7 @@ async def run_repo_bind_credential_submission(
 
     await _post_ephemeral(
         client,
+        thread_ts=thread_ts,
         channel_id=channel_id,
         user_id=user_id,
         text=(

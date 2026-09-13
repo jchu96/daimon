@@ -6,6 +6,7 @@ import uuid
 from typing import Literal, cast
 
 from daimon.core._models import ChannelConfig, TenantConfig, UserConfig
+from daimon.core.errors import DaimonError
 from daimon.core.scope import (
     ChannelConfigRow,
     ChannelScopeRef,
@@ -19,6 +20,7 @@ from daimon.core.scope import (
     is_agent_reachable,
     merge,
 )
+from daimon.core.stores.thread_agent_bindings import get_binding
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,7 +40,35 @@ async def resolve(
         )
 
     tenant_row = await _fetch_tenant(session, tenant_id=context.tenant_id)
-    return merge(channel=channel_row, tenant=tenant_row, default=default)
+    config = merge(channel=channel_row, tenant=tenant_row, default=default)
+    if (
+        context.platform is not None
+        and context.channel_id is not None
+        and context.thread_id is not None
+    ):
+        binding = await get_binding(
+            session,
+            tenant_id=context.tenant_id,
+            platform=context.platform,
+            parent_channel_id=context.channel_id,
+            thread_id=context.thread_id,
+        )
+        if binding is not None:
+            if binding.deleted:
+                raise DaimonError(
+                    "This setup conversation was deleted. Open a new setup conversation."
+                )
+            return config.model_copy(
+                update={
+                    "agent_name": binding.responder_name,
+                    "agent_name_tier": "thread",
+                    "responder_ma_agent_id": binding.responder_ma_agent_id,
+                    "configuration_target_ma_agent_id": binding.configuration_target_ma_agent_id,
+                    "configuration_target_name": binding.configuration_target_name,
+                    "thread_binding_id": binding.id,
+                }
+            )
+    return config
 
 
 async def get_scope(

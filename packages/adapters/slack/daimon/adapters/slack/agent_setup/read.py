@@ -61,6 +61,7 @@ async def load_tenant_roster(
             RosterEntry(
                 agent_name=name,
                 model_id=agent.model.id,
+                ma_agent_id=str(agent.id),
             )
         )
     entries.sort(key=lambda e: e.agent_name.lower())

@@ -25,6 +25,7 @@ from daimon.adapters.slack.agent_setup.state import (
     encode_private_metadata,
 )
 from daimon.adapters.slack.mrkdwn import escape_mrkdwn
+from daimon.adapters.slack.setup_conversations import setup_button
 
 __all__ = [
     "build_loading_view",
@@ -119,6 +120,7 @@ def build_l1_view(
     channel_id: str,
     selected_agent_name: str | None,
     scope_hint: str,
+    recent_setup_links: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the L1 entry modal: roster static_select + lifecycle + scope picker.
 
@@ -153,6 +155,22 @@ def build_l1_view(
             "text": {"type": "mrkdwn", "text": ":robot_face: *Agent Setup*"},
         }
     )
+
+    target_id = next(
+        (row.ma_agent_id for row in state.rows if row.agent_name == selected_agent_name), None
+    )
+    blocks.append(setup_button(target_id))
+    if recent_setup_links:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Recent setup conversations in this channel*\n"
+                    + "\n".join(recent_setup_links[:10]),
+                },
+            }
+        )
 
     # Block 2: divider
     blocks.append({"type": "divider"})
@@ -375,6 +393,7 @@ def build_l2_view(
     is_admin: bool,
     can_edit_spec: bool,
     section_blocks: list[dict[str, Any]],
+    target_ma_agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the L2 section editor: header + tabs + section content.
 
@@ -428,6 +447,7 @@ def build_l2_view(
             "elements": tab_elements,
         },
         {"type": "divider"},
+        setup_button(target_ma_agent_id),
         *section_blocks,
     ]
 

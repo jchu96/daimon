@@ -21,6 +21,7 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core.routing_facts import (
     build_clear_default_note,
     build_resolution_note,
@@ -33,8 +34,10 @@ from daimon.core.scope import (
     TenantScopeRef,
     merge,
 )
+from daimon.core.stores.domain import ThreadAgentBindingRow
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields, unset_fields
+from daimon.core.stores.thread_agent_bindings import get_binding, list_active_bindings
 from fastmcp import Context, FastMCP
 
 
@@ -73,8 +76,13 @@ async def _set_agent_default_impl(
     auth: AuthIdentity,
     agent_name: str,
     channel_id: str | None,
+    expected_ma_agent_id: str | None = None,
 ) -> SetDefaultResult:
     _require_admin(auth)
+    if expected_ma_agent_id is not None or auth.platform in ("discord", "slack"):
+        await resolve_setup_agent(
+            runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
+        )
 
     tenant_id: uuid.UUID = auth.tenant_id
     if channel_id is not None:
@@ -161,6 +169,10 @@ class AgentResolutionExplanation:
     """The environment that would be used, resolved over the same cascade."""
     environment_winning_tier: str | None
     """Which tier supplied the environment."""
+    responder_ma_agent_id: str | None
+    configuration_target_ma_agent_id: str | None
+    configuration_target_name: str | None
+    recent_setup_conversations: tuple[ThreadAgentBindingRow, ...]
     explanation: str
     """One sentence naming the winner and the tier it came from, so the caller
     can answer 'why that one' without re-deriving the cascade."""
@@ -170,6 +182,7 @@ async def _explain_agent_resolution_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
     channel_id: str,
+    thread_id: str | None = None,
 ) -> AgentResolutionExplanation:
     """Resolve the cascade for one channel and report every tier's contribution.
 
@@ -185,6 +198,26 @@ async def _explain_agent_resolution_impl(
             session, scope=ChannelScopeRef(tenant_id=tenant_id, channel_id=channel_id)
         )
         tenant_row = await get_scope(session, scope=TenantScopeRef(tenant_id=tenant_id))
+        binding = None
+        recent: list[ThreadAgentBindingRow] = []
+        if auth.platform in ("discord", "slack"):
+            if thread_id is not None:
+                binding = await get_binding(
+                    session,
+                    tenant_id=tenant_id,
+                    platform=auth.platform,
+                    parent_channel_id=channel_id,
+                    thread_id=thread_id,
+                )
+                if binding is not None and binding.deleted:
+                    binding = None
+            recent = await list_active_bindings(
+                session,
+                tenant_id=tenant_id,
+                platform=auth.platform,
+                parent_channel_id=channel_id,
+                limit=10,
+            )
 
     channel_cfg = channel_row if isinstance(channel_row, ChannelConfigRow) else None
     tenant_cfg = tenant_row if isinstance(tenant_row, TenantConfigRow) else None
@@ -192,14 +225,25 @@ async def _explain_agent_resolution_impl(
 
     return AgentResolutionExplanation(
         channel_id=channel_id,
-        effective_agent_name=resolved.agent_name,
-        winning_tier=resolved.agent_name_tier,
+        effective_agent_name=binding.responder_name if binding else resolved.agent_name,
+        winning_tier="thread" if binding else resolved.agent_name_tier,
         channel_default=channel_cfg.agent_name if channel_cfg is not None else None,
         tenant_default=tenant_cfg.agent_name if tenant_cfg is not None else None,
         deployment_default=runtime.deployment_default.agent_name,
         effective_environment_name=resolved.environment_name,
         environment_winning_tier=resolved.environment_name_tier,
-        explanation=build_resolution_note(
+        responder_ma_agent_id=binding.responder_ma_agent_id if binding else None,
+        configuration_target_ma_agent_id=binding.configuration_target_ma_agent_id
+        if binding
+        else None,
+        configuration_target_name=binding.configuration_target_name if binding else None,
+        recent_setup_conversations=tuple(recent),
+        explanation=(
+            f"{binding.responder_name} answers in this setup thread; configuring "
+            f"{binding.configuration_target_name or 'an agent not yet selected'}."
+        )
+        if binding
+        else build_resolution_note(
             agent_name=resolved.agent_name,
             tier=resolved.agent_name_tier,
             channel_id=channel_id,
@@ -213,6 +257,7 @@ def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ctx: Context,
         agent_name: str,
         channel_id: str | None = None,
+        expected_ma_agent_id: str | None = None,
     ) -> SetDefaultResult:
         """Make an agent answer in a channel or become the whole server/workspace default.
         For example, make churn-explorer answer in #growth. Changes the agent that answers;
@@ -228,13 +273,15 @@ def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ``<channel platform="discord" id="..." role="parent_channel">``.
         Never pass the current thread's id here. Slack: use the id from
         ``<channel platform="slack" id="...">`` — Slack's context always
-        names the current channel, with no thread-vs-parent split. A turn
-        always resolves its agent from the parent channel, so a default
+        names the parent channel. A channel default is resolved from the parent;
+        setup threads keep their bound responder. A default
         written against a thread id is a scope nothing ever reads: the write
         succeeds, this tool reports success, and the channel keeps answering
         with the old agent.
         """
-        return await _set_agent_default_impl(runtime, await _auth(ctx), agent_name, channel_id)
+        return await _set_agent_default_impl(
+            runtime, await _auth(ctx), agent_name, channel_id, expected_ma_agent_id
+        )
 
     @mcp.tool(tags={"admin"})
     async def clear_agent_default(  # pyright: ignore[reportUnusedFunction]
@@ -261,12 +308,14 @@ def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
     async def explain_agent_resolution(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         channel_id: str,
+        thread_id: str | None = None,
     ) -> AgentResolutionExplanation:
         """Who answers in this channel, for example #growth? Report who answers and
         which routing tier decided it.
 
-        Resolution is a cascade: the channel's own default wins, else the
-        workspace default, else the deployment default. This reports the winner
+        Supply thread_id to include its setup binding. Thread responder wins, else
+        the channel's own default, else the workspace default, else the deployment
+        default. This reports the winner
         AND every tier's setting, so "why that agent" is answerable without
         starting a turn and reading its footer.
 
@@ -286,4 +335,6 @@ def register_propagation_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         same wrong id was just passed to ``set_agent_default``, this tool
         will agree with it.
         """
-        return await _explain_agent_resolution_impl(runtime, await _auth(ctx), channel_id)
+        return await _explain_agent_resolution_impl(
+            runtime, await _auth(ctx), channel_id, thread_id
+        )

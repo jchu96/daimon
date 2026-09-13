@@ -576,8 +576,8 @@ class TestThreadMention:
         await bot.on_message(message)
 
         call_kwargs = mock_run_turn.call_args.kwargs
-        assert call_kwargs["user_message"] == fake_xml, (
-            "XML context should be passed as user_message"
+        assert call_kwargs["user_message"].endswith(fake_xml), (
+            "platform history should supplement the trusted per-turn control context"
         )
         assert call_kwargs["session_id"] == "sess-xml", "should use ma_session.id"
 
@@ -1438,7 +1438,7 @@ class TestAttachmentOrchestration:
 
         mock_run_turn.assert_called_once()
         user_msg: str = mock_run_turn.call_args.kwargs["user_message"]
-        assert user_msg.startswith("[attachment] `x.csv`"), (
+        assert "[attachment] `x.csv`" in user_msg, (
             "data attachment CDN-URL prefix must be prepended to the user message"
         )
         assert "https://cdn.discord/x.csv" in user_msg, "the signed CDN URL must be surfaced"
@@ -1506,7 +1506,7 @@ class TestAttachmentOrchestration:
 
         mock_run_turn.assert_called_once()
         user_msg: str = mock_run_turn.call_args.kwargs["user_message"]
-        assert user_msg.startswith("[attachment] image `chart.png`"), (
+        assert "[attachment] image `chart.png`" in user_msg, (
             "image URL prefix must be prepended to user message"
         )
         assert signed_url in user_msg, "full signed CDN URL must reach the agent"
@@ -1564,6 +1564,7 @@ class TestSessionReuse:
         async with db_session_factory() as seed_session:
             await create_thread_session(
                 seed_session,
+                ma_agent_id="ag_test",
                 tenant_id=tenant.id,
                 platform="discord",
                 thread_id="5555",  # matches _make_thread_message default thread_id
@@ -1721,6 +1722,7 @@ class TestSessionReuse:
         async with db_session_factory() as seed_session:
             await create_thread_session(
                 seed_session,
+                ma_agent_id="ag_test",
                 tenant_id=tenant.id,
                 platform="discord",
                 thread_id="5557",

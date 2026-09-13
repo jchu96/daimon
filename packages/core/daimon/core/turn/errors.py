@@ -8,6 +8,7 @@ unchanged; adapters add specific handlers on top in the cutover plans.
 
 from __future__ import annotations
 
+import uuid
 from typing import Literal
 
 from daimon.core.errors import DaimonError
@@ -49,3 +50,25 @@ class MissingTurnConfigError(DaimonError):
         self.missing: tuple[MissingConfigPart, ...] = missing
         self.agent_name_tier: ConfigTier | None = agent_name_tier
         self.environment_name_tier: ConfigTier | None = environment_name_tier
+
+
+class SessionAgentMismatch(DaimonError):
+    """An existing workspace belongs to a different responder; leave it intact."""
+
+    def __init__(
+        self,
+        *,
+        mapping_id: uuid.UUID,
+        session_id: str,
+        source_agent_id: str,
+        destination_agent_id: str,
+    ) -> None:
+        super().__init__(
+            "This conversation's existing session belongs to another agent. "
+            "Continuing with a different responder currently requires a new conversation. "
+            "Your existing session and workspace have been kept."
+        )
+        self.mapping_id = mapping_id
+        self.session_id = session_id
+        self.source_agent_id = source_agent_id
+        self.destination_agent_id = destination_agent_id

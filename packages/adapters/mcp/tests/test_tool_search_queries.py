@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -33,8 +33,10 @@ from daimon.core.config import (
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.scope import TenantScopeRef
 from daimon.core.stores.credential_requests import peek_credential_request
+from daimon.core.stores.domain import Role
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
+from daimon.core.stores.turn_origins import create_origin
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, build_stub_anthropic, list_response
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -314,7 +316,11 @@ async def test_member_default_agent_edit_refuses_with_admin_handoff(
             "name": "call_tool",
             "arguments": {
                 "name": "update_agent",
-                "arguments": {"name": "research-bot", "system": "a revised prompt"},
+                "arguments": {
+                    "name": "research-bot",
+                    "system": "a revised prompt",
+                    "expected_ma_agent_id": "ag_research",
+                },
             },
         },
     )
@@ -338,6 +344,22 @@ async def test_member_can_request_new_key_on_managed_agent(
         account = await make_account(session, tenant=tenant)
         await upsert_slack_bot_token(
             session, team_id="T_TEST", encrypted_token=encrypt_token(fernet, "xoxb-test")
+        )
+        now = datetime.now(UTC)
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=account.id,
+            platform="slack",
+            parent_channel_id="C_TEST",
+            thread_id="123.000",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=Role.USER,
+            now=now,
+            expires_at=now + timedelta(minutes=10),
         )
     agent = BetaManagedAgentsAgent(
         id="ag_daimon",
@@ -402,6 +424,8 @@ async def test_member_can_request_new_key_on_managed_agent(
                     "name": "request_agent_key",
                     "arguments": {
                         "agent_name": "daimon",
+                        "expected_ma_agent_id": "ag_daimon",
+                        "origin_context_id": str(origin.id),
                         "key": "NEW_SERVICE_API_KEY",
                         "purpose": "use the new service",
                         "channel_id": "C_TEST",
@@ -446,6 +470,22 @@ async def test_member_can_request_mcp_token_on_managed_default_agent(
         )
         await upsert_slack_bot_token(
             session, team_id="T_TEST", encrypted_token=encrypt_token(fernet, "xoxb-test")
+        )
+        now = datetime.now(UTC)
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=account.id,
+            platform="slack",
+            parent_channel_id="C_TEST",
+            thread_id="123.000",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=Role.USER,
+            now=now,
+            expires_at=now + timedelta(minutes=10),
         )
     agent = BetaManagedAgentsAgent(
         id="ag_daimon",
@@ -515,6 +555,8 @@ async def test_member_can_request_mcp_token_on_managed_default_agent(
                     "name": "request_mcp_token",
                     "arguments": {
                         "agent_name": "daimon",
+                        "expected_ma_agent_id": "ag_daimon",
+                        "origin_context_id": str(origin.id),
                         "server_name": "Example Research MCP",
                         "url": "https://mcp.example.com/research",
                         "channel_id": "C_TEST",

@@ -992,6 +992,7 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
             thread_id=thread_ts,
             account_id=cont_principal.account_id,
             ma_session_id="sess-cont-existing",
+            ma_agent_id="agent_test_id",
             watermark_message_id=prior_watermark,
         )
         await s.commit()
@@ -1130,8 +1131,12 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
     # Patch all store functions so concurrent tasks don't share the single test connection.
     # The coalesce test verifies queue/drain logic, not DB correctness (that is tested
     # in test_orchestrate_first_turn_*).
-    fake_principal = MagicMock()
-    fake_principal.account_id = uuid.uuid4()
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    async with db_session_factory.begin() as session:
+        fake_principal = await get_or_create_platform_principal(
+            session, tenant_id=tenant_id, platform="slack", external_id="U_TEST_A"
+        )
     # The patched store returns the same validated Pydantic type the real
     # store returns, so a field the production code reads is a real value
     # or a loud failure, never an auto-generated mock attribute.
@@ -1352,8 +1357,12 @@ async def test_drain_partitions_queued_mentions_by_author_when_two_users_queue_i
     # Patch all store functions so concurrent tasks don't share the single test connection.
     # The coalesce test verifies queue/drain logic, not DB correctness (that is tested
     # in test_orchestrate_first_turn_*).
-    fake_principal = MagicMock()
-    fake_principal.account_id = uuid.uuid4()
+    from daimon.core.stores.identity import get_or_create_platform_principal
+
+    async with db_session_factory.begin() as session:
+        fake_principal = await get_or_create_platform_principal(
+            session, tenant_id=tenant_id, platform="slack", external_id="U_TEST_A"
+        )
     resolved_authors: list[str] = []
     fake_row = MagicMock()
     fake_row.id = uuid.uuid4()
@@ -3202,6 +3211,7 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
             thread_id=thread_ts,
             account_id=principal.account_id,
             ma_session_id=seeded_session_id,
+            ma_agent_id="agent_test_id",
             watermark_message_id="9000000032.000000",
         )
         await s.commit()
@@ -5348,6 +5358,8 @@ class TestPerTurnRoleUpsert:
                 )
                 await asyncio.sleep(0)
 
+        assert mock_run_turn.call_count == 0, "unverified role must stop before a billed turn"
+        assert mock_create_session.call_count == 0, "unverified role must not create a session"
         assert _users_info_request_count(fake_slack_web_client) == 1, (
             "exactly one users.info request must be issued per turn, whatever the outcome"
         )
@@ -5360,14 +5372,13 @@ class TestPerTurnRoleUpsert:
             f"not demote it; got: {account.role!r}"
         )
 
-    async def test_admission_failure_performs_no_role_write(
+    async def test_admission_failure_persists_successfully_verified_role(
         self,
         db_session: AsyncSession,
         db_session_factory: async_sessionmaker[AsyncSession],
         fake_slack_web_client: Any,
     ) -> None:
-        """An admission-denied branch (over-balance) must not write account.role
-        even though the live admin lookup already ran before admit()."""
+        """Verified role changes persist even when the balance gate rejects a turn."""
         from daimon.core.stores.accounts import get_account, set_role
         from daimon.core.stores.domain import Role
         from daimon.core.stores.identity import get_or_create_platform_principal
@@ -5385,11 +5396,6 @@ class TestPerTurnRoleUpsert:
             await set_role(s, principal.account_id, Role.ADMIN)
             await s.commit()
 
-        # Admin users.info payload -- if the write were unconditional (bug), this
-        # would already be ADMIN and the test would pass for the wrong reason;
-        # combined with the pre-seeded ADMIN role above it is neutral either way,
-        # so what actually proves "no write" is mock_over_balance being the sole
-        # reason admit() denies, with create_session/run_turn never called.
         _override_users_info(
             fake_slack_web_client.mock,
             payload={
@@ -5446,12 +5452,7 @@ class TestPerTurnRoleUpsert:
             mock_create_session.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
             mock_run_turn.assert_not_called()  # pyright: ignore[reportUnknownMemberType]
 
-        # The account was pre-seeded ADMIN and the incoming users.info signal was
-        # a plain member (False). If the role write ran despite the admission
-        # denial, it would have flipped to USER. It must still be ADMIN.
         async with db_session_factory() as s:
             account = await get_account(s, principal.account_id)
         assert account is not None, "account must exist (identity resolution runs before the gate)"
-        assert account.role == Role.ADMIN, (
-            f"an admission-denied branch must perform no role write; got: {account.role!r}"
-        )
+        assert account.role == Role.USER, "verified role must persist before the balance gate"

@@ -172,6 +172,7 @@ class ThreadSessionRow(BaseModel):
     thread_id: str
     account_id: uuid.UUID | None
     ma_session_id: str
+    ma_agent_id: str | None = None
     watermark_message_id: str | None
     status: str
     created_at: datetime
@@ -458,6 +459,10 @@ class CredentialRequestRow(BaseModel):
     mcp_server_url: str | None
     requester_platform_user_id: str
     channel_id: str
+    platform: str | None = None
+    parent_channel_id: str | None = None
+    origin_thread_id: str | None = None
+    posted_message_id: str | None = None
     created_at: datetime
     expires_at: datetime
     used_at: datetime | None
@@ -587,3 +592,43 @@ class ThreadAutoResponseRow(BaseModel):
     thread_id: str
     message_id: str
     created_at: datetime
+
+
+class ThreadAgentBindingRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    platform: str
+    parent_channel_id: str
+    thread_id: str
+    kind: Literal["setup"] = "setup"
+    responder_ma_agent_id: str
+    responder_name: str
+    configuration_target_ma_agent_id: str | None
+    configuration_target_name: str | None
+    creator_account_id: uuid.UUID | None
+    archived: bool
+    locked: bool
+    deleted: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class TurnOriginRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    account_id: uuid.UUID
+    platform: str
+    parent_channel_id: str
+    thread_id: str
+    responder_ma_agent_id: str
+    responder_name: str
+    configuration_target_ma_agent_id: str | None
+    configuration_target_name: str | None
+    is_setup: bool = False
+    role: Role
+    created_at: datetime
+    expires_at: datetime

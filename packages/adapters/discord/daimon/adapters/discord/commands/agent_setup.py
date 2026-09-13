@@ -28,6 +28,7 @@ from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.errors import DaimonError
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.tenants import get_tenant
+from daimon.core.stores.thread_agent_bindings import list_active_bindings
 
 import discord
 from discord import Interaction, app_commands
@@ -72,6 +73,9 @@ class AgentSetupCog(commands.Cog):
             guild_id = interaction.guild_id
             channel_id = interaction.channel_id
             channel = interaction.channel
+            if isinstance(channel, discord.Thread):
+                channel_id = channel.parent_id
+                channel = channel.parent
             channel_name = (
                 channel.name
                 if isinstance(channel, discord.abc.GuildChannel | discord.Thread)
@@ -108,11 +112,6 @@ class AgentSetupCog(commands.Cog):
             )
             async with runtime.sessionmaker() as session:
                 cascade = await list_guild_propagations(session, tenant_id=tenant_id)
-            secret_count = (
-                await load_secret_count(runtime, tenant_id=tenant_id, agent_name=roster[0].name)
-                if roster
-                else 0
-            )
             state = PanelState.initial(
                 roster=roster,
                 # KEEP — personal principal for PAT/skill-sync/MCP/audit-actor
@@ -127,8 +126,26 @@ class AgentSetupCog(commands.Cog):
                 channel_name=channel_name,
                 cascade_view=cascade,
                 deployment_default=runtime.deployment_default,
-                secret_count=secret_count,
             )
+            state.secret_count = (
+                await load_secret_count(
+                    runtime, tenant_id=tenant_id, agent_name=state.selected.name
+                )
+                if state.selected
+                else 0
+            )
+            async with runtime.sessionmaker() as session:
+                bindings = await list_active_bindings(
+                    session,
+                    tenant_id=tenant_id,
+                    platform="discord",
+                    parent_channel_id=str(channel_id),
+                    limit=10,
+                )
+            state.recent_setup_conversations = [
+                f"[Set up {binding.configuration_target_name or 'an agent'}](https://discord.com/channels/{guild_id}/{binding.thread_id})"
+                for binding in bindings
+            ]
             state.github_login = await load_selected_github_login(
                 runtime, tenant_id=tenant_id, entry=state.selected
             )

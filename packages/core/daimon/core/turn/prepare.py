@@ -29,6 +29,7 @@ from daimon.core.turn.admission import Admission
 from daimon.core.turn.ceiling import ceiling_error, remaining_s, turn_deadline
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.posture import UsageRecorder
+from daimon.core.turn.session_identity import check_session_agent
 from daimon.core.usage_recording import record_turn_usage
 
 log = structlog.get_logger(__name__)
@@ -98,6 +99,7 @@ async def create_fresh_session(
             thread_id=thread_id,
             account_id=session_account_id,
             ma_session_id=ma_session_id,
+            ma_agent_id=admission.agent.id,
         )
         await session.commit()
 
@@ -191,6 +193,12 @@ async def bind_session(
                     account_id=session_account_id,
                 )
             if existing is not None:
+                session_exists = await check_session_agent(
+                    deps.anthropic,
+                    deps.sessionmaker,
+                    mapping=existing,
+                    responder_ma_agent_id=admission.agent.id,
+                )
                 ma_session_id = existing.ma_session_id
                 mapping_id = existing.id
                 watermark = existing.watermark_message_id
@@ -202,7 +210,8 @@ async def bind_session(
                 # session already mounts is read at each turn's MCP init, so
                 # writing into it here reaches this session on this turn.
                 if (
-                    deps.fernet is not None
+                    session_exists
+                    and deps.fernet is not None
                     and deps.mcp.public_url is not None
                     and deps.mcp.jwt_secret is not None
                 ):

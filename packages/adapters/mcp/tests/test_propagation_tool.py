@@ -339,3 +339,59 @@ async def test_explain_says_so_when_nothing_resolves(
     assert "nothing to answer it" in result.explanation, (
         "the sentence must say a mention there goes unanswered, not stay silent"
     )
+
+
+async def test_explanation_separates_setup_responder_target_and_parent_defaults(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    runtime = _runtime(committing_sessionmaker)
+    await _set_agent_default_impl(
+        runtime, _admin_auth(tenant_id=tenant.id, account_id=account.id), "specialist", "parent"
+    )
+    async with committing_sessionmaker.begin() as session:
+        for index in range(12):
+            await create_binding(
+                session,
+                tenant_id=tenant.id,
+                platform="discord",
+                parent_channel_id="parent",
+                thread_id=f"thread-{index}",
+                responder_ma_agent_id="agent_daimon",
+                responder_name="Daimon",
+                configuration_target_ma_agent_id="agent_specialist",
+                configuration_target_name="specialist",
+                creator_account_id=account.id,
+            )
+        await create_binding(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="another-parent",
+            thread_id="unrelated-thread",
+            responder_ma_agent_id="agent_daimon",
+            responder_name="Daimon",
+        )
+    auth = AuthIdentity(
+        account_id=account.id, tenant_id=tenant.id, role=Role.USER, platform="discord"
+    )
+    explained = await _explain_agent_resolution_impl(runtime, auth, "parent", "thread-0")
+    assert explained.effective_agent_name == "Daimon", "thread binding determines who answers"
+    assert explained.winning_tier == "thread", "the setup responder outranks parent routing"
+    assert explained.responder_ma_agent_id == "agent_daimon", "report concrete responder identity"
+    assert explained.configuration_target_ma_agent_id == "agent_specialist", (
+        "target remains distinct"
+    )
+    assert explained.configuration_target_name == "specialist", (
+        "target snapshot names configuration"
+    )
+    assert explained.channel_default == "specialist", "parent routing is preserved and explained"
+    assert len(explained.recent_setup_conversations) == 10, "show at most ten recent setup threads"
+    assert all(row.parent_channel_id == "parent" for row in explained.recent_setup_conversations), (
+        "recent setup conversations must be restricted to the requested parent"
+    )

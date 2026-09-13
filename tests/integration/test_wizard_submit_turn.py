@@ -350,6 +350,7 @@ async def test_submitting_a_form_resumes_the_threads_existing_session(
             platform="discord",
             thread_id=str(channel.id),
             ma_session_id=existing_session_id,
+            ma_agent_id=_AGENT_ID,
         )
 
     sent_events: list[dict[str, Any]] = []

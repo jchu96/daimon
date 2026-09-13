@@ -9,7 +9,9 @@ is gone afterward whether the turn succeeds or raises.
 
 from __future__ import annotations
 
+import json
 import re
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -30,6 +32,7 @@ from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.slack_turn_contexts import get_slack_turn_channels
+from daimon.core.stores.turn_origins import get_active_origin
 from daimon.core.turn.state import TextBlock, TurnState
 from daimon.testing.ma import (
     _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]  # test-only
@@ -159,9 +162,32 @@ async def test_turn_context_row_lives_exactly_during_run_turn(
     app = _make_orchestrate_app(db_session_factory)
 
     seen: list[frozenset[str]] = []
+    origin_ids: list[uuid.UUID] = []
 
     async def fake_run_turn(**kwargs: object) -> TurnState:
+        message = str(kwargs["user_message"])
+        assert message.startswith("<turn_controls>"), (
+            "trusted controls must supplement platform history"
+        )
+        controls = json.loads(message.splitlines()[1])
+        origin_id = uuid.UUID(controls["origin_context_id"])
+        origin_ids.append(origin_id)
+        assert controls["parent_channel_id"] == channel, "controls carry parent location"
+        assert controls["thread_id"] == thread_ts, "controls carry exact thread"
+        assert controls["current_role"] == "user", "controls carry verified current role"
+        assert controls["responder"]["ma_agent_id"] == "agent_turn_ctx_id", (
+            "controls carry concrete responder"
+        )
         async with db_session_factory() as s:
+            origin = await get_active_origin(
+                s,
+                origin_id=origin_id,
+                tenant_id=tenant_id,
+                account_id=principal.account_id,
+                platform="slack",
+                now=datetime.now(UTC),
+            )
+            assert origin is not None, "origin must be committed while the turn runs"
             seen.append(
                 await get_slack_turn_channels(
                     s, tenant_id=tenant_id, account_id=principal.account_id, cutoff=EPOCH
@@ -218,6 +244,18 @@ async def test_turn_context_row_lives_exactly_during_run_turn(
             s, tenant_id=tenant_id, account_id=principal.account_id, cutoff=EPOCH
         )
     assert after == frozenset(), "row must be deleted in finally"
+
+    async with db_session_factory() as session:
+        for origin_id in origin_ids:
+            origin = await get_active_origin(
+                session,
+                origin_id=origin_id,
+                tenant_id=tenant_id,
+                account_id=principal.account_id,
+                platform="slack",
+                now=datetime.now(UTC),
+            )
+            assert origin is None, "turn must delete its trusted origin after execution"
 
 
 async def test_turn_context_row_deleted_when_run_turn_raises(

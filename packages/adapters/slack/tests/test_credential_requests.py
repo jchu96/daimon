@@ -42,7 +42,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import yarl
-from anthropic.types.beta import BetaManagedAgentsAgent
+from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
 from cryptography.fernet import Fernet
 from daimon.adapters.slack import credential_requests as credential_requests_mod
 from daimon.adapters.slack.credential_requests import (
@@ -495,9 +495,35 @@ async def test_env_submission_consumes_row_and_writes_the_secret(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    token = await _seed_request(db_session, tenant_id=tenant_id, kind="env")
+    now = datetime.now(UTC)
+    live_agent = BetaManagedAgentsAgent(
+        id="agent_credentials",
+        type="agent",
+        name="specialist",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        tools=[],
+        skills=[],
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    def ma_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return list_response([live_agent.model_dump(mode="json")])
+        raise AssertionError(f"Unexpected MA request: {request.method} {request.url.path}")
+
+    token = await _seed_request(
+        db_session,
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id),
+        tenant_id=tenant_id,
+        kind="env",
+    )
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=ma_handler)
 
     await run_env_credential_submission(
         runtime,
@@ -528,9 +554,35 @@ async def test_env_submission_of_consumed_row_writes_nothing(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    token = await _seed_request(db_session, tenant_id=tenant_id, kind="env")
+    now = datetime.now(UTC)
+    live_agent = BetaManagedAgentsAgent(
+        id="agent_credentials",
+        type="agent",
+        name="specialist",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        tools=[],
+        skills=[],
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    def ma_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return list_response([live_agent.model_dump(mode="json")])
+        raise AssertionError(f"Unexpected MA request: {request.method} {request.url.path}")
+
+    token = await _seed_request(
+        db_session,
+        tenant_id=tenant_id,
+        kind="env",
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id),
+    )
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=ma_handler)
 
     common: dict[str, Any] = {
         "team_id": _TEAM_ID,
@@ -561,15 +613,39 @@ async def test_mcp_submission_with_unconfigured_mcp_refuses_before_the_consume(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
+    now = datetime.now(UTC)
+    live_agent = BetaManagedAgentsAgent(
+        id="agent_credentials",
+        type="agent",
+        name="specialist",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        tools=[],
+        skills=[],
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    def ma_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return list_response([live_agent.model_dump(mode="json")])
+        raise AssertionError(f"Unexpected MA request: {request.method} {request.url.path}")
+
     token = await _seed_request(
         db_session,
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id),
         tenant_id=tenant_id,
         kind="mcp",
         target="my-server",
         mcp_server_url="https://mcp.example.com",
     )
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)  # mcp settings are None
+    runtime = _build_runtime(
+        fernet_key, db_session_factory, anthropic_handler=ma_handler
+    )  # mcp settings are None
 
     await run_mcp_credential_submission(
         runtime,
@@ -645,11 +721,36 @@ async def test_repo_submission_by_admin_binds_a_public_repo(
     monkeypatch.setattr(credential_requests_mod, "is_public_repo", AsyncMock(return_value=True))
     _override_users_info_admin(fake_slack_web_client.mock)
     tenant_id, fernet_key = await _seed_team(db_session)
+    now = datetime.now(UTC)
+    live_agent = BetaManagedAgentsAgent(
+        id="agent_credentials",
+        type="agent",
+        name="specialist",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        tools=[],
+        skills=[],
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    def ma_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return list_response([live_agent.model_dump(mode="json")])
+        raise AssertionError(f"Unexpected MA request: {request.method} {request.url.path}")
+
     token = await _seed_request(
-        db_session, tenant_id=tenant_id, kind="repo", target="https://github.com/o/r"
+        db_session,
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id),
+        tenant_id=tenant_id,
+        kind="repo",
+        target="https://github.com/o/r",
     )
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = _build_runtime(fernet_key, db_session_factory, anthropic_handler=ma_handler)
 
     await run_repo_bind_credential_submission(
         runtime,
@@ -787,7 +888,28 @@ async def test_skill_repo_failure_receipt_reflects_confirmed_token_storage(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    live_agent = BetaManagedAgentsAgent(
+        id="agent_credentials",
+        type="agent",
+        name="specialist",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        tools=[],
+        skills=[],
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    def ma_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return list_response([live_agent.model_dump(mode="json")])
+        raise AssertionError(f"Unexpected MA request: {request.method} {request.url.path}")
+
+    agent_id = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id)
     token = await _seed_request(
         db_session,
         tenant_id=tenant_id,
@@ -806,7 +928,10 @@ async def test_skill_repo_failure_receipt_reflects_confirmed_token_storage(
         return httpx.Response(403, text="sensitive-upstream-detail")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(github_response)) as http_client:
-        runtime = replace(_build_runtime(fernet_key, db_session_factory), http_client=http_client)
+        runtime = replace(
+            _build_runtime(fernet_key, db_session_factory, anthropic_handler=ma_handler),
+            http_client=http_client,
+        )
         await run_skill_repo_credential_submission(
             runtime,
             team_id=_TEAM_ID,
@@ -834,3 +959,116 @@ async def test_skill_repo_failure_receipt_reflects_confirmed_token_storage(
         "upstream details must stay out of the receipt"
     )
     assert "ghp_test_private_value" not in receipt, "the private token must stay out of the receipt"
+
+
+@pytest.mark.parametrize("wrong_dimension", ["requester", "tenant", "platform", "deleted_target"])
+async def test_env_submission_rechecks_request_identity_before_consuming(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+    wrong_dimension: str,
+) -> None:
+    tenant_id, fernet_key = await _seed_team(db_session)
+    request_tenant_id = tenant_id
+    if wrong_dimension == "tenant":
+        other_tenant = await make_tenant(db_session, platform="slack", workspace_id="T_OTHER")
+        await make_account(
+            db_session, tenant=other_tenant, id=derive_guild_account_uuid(tenant_id=other_tenant.id)
+        )
+        request_tenant_id = other_tenant.id
+    token = mint_request_token()
+    await create_credential_request(
+        db_session,
+        token=token,
+        tenant_id=request_tenant_id,
+        account_id=derive_guild_account_uuid(tenant_id=request_tenant_id),
+        agent_id=uuid.uuid4(),
+        kind="env",
+        mcp_server_url=None,
+        target="TOKEN",
+        requester_platform_user_id="U_OTHER" if wrong_dimension == "requester" else _USER_ID,
+        channel_id=_CHANNEL_ID,
+        platform="discord" if wrong_dimension == "platform" else "slack",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    await db_session.commit()
+    await run_env_credential_submission(
+        _build_runtime(fernet_key, db_session_factory),
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        message_ts=_MESSAGE_TS,
+        token=token,
+        value="private-value",
+    )
+    async with db_session_factory() as session:
+        row = await peek_credential_request(session, token=token)
+        files = await _agent_file_rows(session)
+    assert row is not None and row.used_at is None, "wrong identity must not consume request"
+    assert not files, "wrong identity must not write private input"
+
+
+async def test_env_submission_uses_durable_destination_after_origin_turn_ends(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    tenant_id, fernet_key = await _seed_team(db_session)
+    now = datetime.now(UTC)
+    live_agent = BetaManagedAgentsAgent(
+        id="agent_credentials",
+        type="agent",
+        name="specialist",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        system=None,
+        tools=[],
+        skills=[],
+        mcp_servers=[],
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    def ma_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            return list_response([live_agent.model_dump(mode="json")])
+        raise AssertionError(f"Unexpected MA request: {request.method} {request.url.path}")
+
+    token = mint_request_token()
+    await create_credential_request(
+        db_session,
+        token=token,
+        tenant_id=tenant_id,
+        account_id=derive_guild_account_uuid(tenant_id=tenant_id),
+        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id),
+        kind="env",
+        mcp_server_url=None,
+        target="TOKEN",
+        requester_platform_user_id=_USER_ID,
+        channel_id="C_ORIGIN",
+        platform="slack",
+        parent_channel_id="C_ORIGIN",
+        origin_thread_id="123.456",
+        posted_message_id="123.789",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    await db_session.commit()
+    await run_env_credential_submission(
+        _build_runtime(fernet_key, db_session_factory, anthropic_handler=ma_handler),
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id="C_REDIRECT",
+        message_ts="999.999",
+        token=token,
+        value="private-value",
+    )
+    edit = fake_slack_web_client.mock.requests[("POST", _CHAT_UPDATE_URL)][0].kwargs["json"]
+    notice = fake_slack_web_client.mock.requests[("POST", _EPHEMERAL_URL)][0].kwargs["json"]
+    assert (edit["channel"], edit["ts"]) == ("C_ORIGIN", "123.789"), (
+        "card identity must come from durable request"
+    )
+    assert (notice["channel"], notice["thread_ts"]) == ("C_ORIGIN", "123.456"), (
+        "confirmation must stay in originating thread"
+    )
+    assert "private-value" not in json.dumps(notice), "confirmation must not disclose private input"

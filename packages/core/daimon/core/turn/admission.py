@@ -27,6 +27,9 @@ from daimon.core.billing import is_over_cap
 from daimon.core.defaults.provisioning import reconcile_tenant_defaults
 from daimon.core.ma_resolver import MAResolverMissError, resolve_agent, resolve_environment
 from daimon.core.scope import ResolvedConfig, ScopeContext
+from daimon.core.setup_conversations import get_setup_responder
+from daimon.core.stores.accounts import set_role
+from daimon.core.stores.domain import Role
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.scoped_config_read import resolve as resolve_config
 from daimon.core.stores.scoped_config_write import clear_agent_references
@@ -55,6 +58,8 @@ async def admit(
     external_user_id: str,
     channel_id: str,
     now: datetime,
+    thread_id: str | None = None,
+    role: Role | None = None,
 ) -> Admission:
     """Run the full pre-turn gate sequence; raise instead of returning bool."""
     # --- Identity resolution ---
@@ -65,6 +70,8 @@ async def admit(
             platform=platform,
             external_id=external_user_id,
         )
+        if role is not None:
+            await set_role(session, principal.account_id, role)
         await session.commit()
 
     # --- Config resolution (per turn) ---
@@ -72,6 +79,8 @@ async def admit(
         account_id=principal.account_id,
         tenant_id=tenant_id,
         channel_id=channel_id,
+        platform=platform,
+        thread_id=thread_id,
     )
     async with deps.sessionmaker() as session:
         config = await resolve_config(session, context=scope, default=deps.deployment_default)
@@ -105,14 +114,16 @@ async def admit(
     # always passes cached_id=None, so the resolver's own liveness step never
     # runs here, and its short TTL cache can hand back an id for an agent
     # archived since it was cached -- the retrieve below is what settles it. ---
-    agent_id = await resolve_agent(
-        deps.anthropic,
-        tenant_id=tenant_id,
-        daimon_tag=config.agent_name,
-        cached_id=None,
-        apply_callable=_apply,
-        cache=deps.resolver_cache,
-    )
+    agent_id = config.responder_ma_agent_id
+    if agent_id is None:
+        agent_id = await resolve_agent(
+            deps.anthropic,
+            tenant_id=tenant_id,
+            daimon_tag=config.agent_name,
+            cached_id=None,
+            apply_callable=_apply,
+            cache=deps.resolver_cache,
+        )
     env_id = await resolve_environment(
         deps.anthropic,
         tenant_id=tenant_id,
@@ -122,7 +133,10 @@ async def admit(
         cache=deps.resolver_cache,
     )
 
-    agent = await deps.anthropic.beta.agents.retrieve(agent_id)
+    if config.thread_binding_id is not None:
+        agent = await get_setup_responder(deps.anthropic, tenant_id=tenant_id, ma_agent_id=agent_id)
+    else:
+        agent = await deps.anthropic.beta.agents.retrieve(agent_id)
     environment = await deps.anthropic.beta.environments.retrieve(env_id)
 
     # --- Liveness check on the already-retrieved agent: it was archived out of
@@ -154,5 +168,5 @@ async def admit(
         account_id=principal.account_id,
         agent=agent,
         environment=environment,
-        config=config,
+        config=config.model_copy(update={"responder_ma_agent_id": agent.id}),
     )

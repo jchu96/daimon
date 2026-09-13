@@ -16,12 +16,7 @@ Reuses the read tools' channel-visibility discipline (`conversations.info` →
 `check_channel_access`) so posting a credential button proves the requester
 may see the channel before anything lands in it.
 
-The button posts at the channel's top level, never in a thread. On Discord a
-thread IS a channel, so `channel_id` alone lands the button where the
-conversation is; a Slack thread is a (channel, ts) pair and the four request
-tools' shared contract carries no `thread_ts`. Threading the button means
-widening that cross-platform tool schema — until then, a request made
-mid-thread posts its button to the channel root.
+The validated turn origin supplies the parent channel and thread timestamp.
 """
 
 from __future__ import annotations
@@ -92,6 +87,7 @@ async def _post_slack_credential_button_impl(  # pyright: ignore[reportUnusedFun
     token: str,
     agent_name: str,
     purpose: str,
+    thread_ts: str | None = None,
 ) -> str:
     """Post a target-naming credential button. Returns the sent message ts."""
     requester_id = _require_slack_identity(auth)
@@ -111,6 +107,7 @@ async def _post_slack_credential_button_impl(  # pyright: ignore[reportUnusedFun
         )
         sent = await client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id,
+            thread_ts=thread_ts,
             text=text,
             blocks=[
                 {"type": "section", "text": {"type": "mrkdwn", "text": text}},

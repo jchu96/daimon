@@ -312,6 +312,7 @@ class ThreadSession(Base):
     thread_id: Mapped[str] = mapped_column(Text, nullable=False)
     account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     ma_session_id: Mapped[str] = mapped_column(Text, nullable=False)
+    ma_agent_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     watermark_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'live'"))
     # Set while a turn is running, cleared when it reaches a terminal state.
@@ -949,6 +950,10 @@ class CredentialRequest(Base):
     mcp_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     requester_platform_user_id: Mapped[str] = mapped_column(Text, nullable=False)
     channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parent_channel_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    origin_thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    posted_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1303,3 +1308,76 @@ class ThreadAutoResponse(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class ThreadAgentBinding(Base):
+    """Shared conversation routing, independent of each participant's session."""
+
+    __tablename__ = "thread_agent_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "platform",
+            "parent_channel_id",
+            "thread_id",
+            name="uq_thread_agent_bindings_location",
+        ),
+        CheckConstraint("kind = 'setup'", name="ck_thread_agent_bindings_kind"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    parent_channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'setup'"))
+    responder_ma_agent_id: Mapped[str] = mapped_column(Text, nullable=False)
+    responder_name: Mapped[str] = mapped_column(Text, nullable=False)
+    configuration_target_ma_agent_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    configuration_target_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    creator_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    locked: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class TurnOrigin(Base):
+    """Expiring control authority and target snapshot for one caller's running turn."""
+
+    __tablename__ = "turn_origins"
+    __table_args__ = (Index("turn_origins_expiry_idx", "expires_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    parent_channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_id: Mapped[str] = mapped_column(Text, nullable=False)
+    responder_ma_agent_id: Mapped[str] = mapped_column(Text, nullable=False)
+    responder_name: Mapped[str] = mapped_column(Text, nullable=False)
+    configuration_target_ma_agent_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    configuration_target_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_setup: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

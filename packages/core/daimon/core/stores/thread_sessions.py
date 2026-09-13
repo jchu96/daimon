@@ -109,6 +109,7 @@ async def create_thread_session(
     thread_id: str,
     account_id: _uuid.UUID,
     ma_session_id: str,
+    ma_agent_id: str | None = None,
     watermark_message_id: str | None = None,
     created_at: datetime | None = None,
 ) -> ThreadSessionRow:
@@ -127,6 +128,7 @@ async def create_thread_session(
         "thread_id": thread_id,
         "account_id": account_id,
         "ma_session_id": ma_session_id,
+        "ma_agent_id": ma_agent_id,
         "watermark_message_id": watermark_message_id,
     }
     if created_at is not None:
@@ -305,3 +307,11 @@ async def get_thread_session_by_id(
     if orm is None:
         return None
     return ThreadSessionRow.model_validate(orm)
+
+
+async def update_agent_identity(session: AsyncSession, *, id: _uuid.UUID, ma_agent_id: str) -> None:
+    """Record the identity observed on MA without replacing session history."""
+    await session.execute(
+        update(ThreadSession).where(ThreadSession.id == id).values(ma_agent_id=ma_agent_id)
+    )
+    await session.flush()

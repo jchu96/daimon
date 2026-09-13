@@ -619,11 +619,12 @@ def test_picker_marks_selected_as_default(account_id: uuid.UUID) -> None:
     state = PanelState.initial(
         roster=roster, account_id=account_id, platform_principal_id=uuid.uuid4(), is_admin=True
     )
+    state.select("b")
     view = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
     picker = _find_select(view)
     defaulted = [o for o in picker.options if o.default]
-    assert len(defaulted) == 1 and defaulted[0].value == "a", (
-        "the first roster entry must be the default-selected option"
+    assert len(defaulted) == 1 and defaulted[0].value == "b", (
+        "the explicitly selected entry must remain the default-selected option"
     )
 
 
@@ -691,6 +692,7 @@ def test_initial_render_admin_enables_buttons(account_id: uuid.UUID) -> None:
     state = PanelState.initial(
         roster=roster, account_id=account_id, platform_principal_id=uuid.uuid4(), is_admin=True
     )
+    state.select("a")
     view = AgentSetupView(state, runtime=_make_runtime(), allowed_user_id=42)
 
     edit_btn = _find_button(view, "Edit")
@@ -769,6 +771,7 @@ def test_admin_view_has_set_default_button(account_id: uuid.UUID) -> None:
         platform_principal_id=uuid.uuid4(),
         is_admin=True,
     )
+    state2.select("alice")
     view2 = AgentSetupView(state2, runtime=_make_runtime(), allowed_user_id=42)
     btn2 = _find_button(view2, "Set as default…")
     assert btn2.disabled is False, "'Set as default…' must be enabled when an agent is selected"
@@ -819,6 +822,7 @@ def test_read_only_body_contains_view_only_line(account_id: uuid.UUID) -> None:
         platform_principal_id=uuid.uuid4(),
         is_admin=False,
     )
+    state.select("alice")
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
     assert "View only — ask an admin to change defaults" in text, (

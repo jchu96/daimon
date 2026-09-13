@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -38,7 +38,8 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.credential_requests import peek_credential_request
 from daimon.core.stores.domain import Role
-from daimon.testing.factories import make_tenant
+from daimon.core.stores.turn_origins import create_origin
+from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -299,6 +300,24 @@ async def test_request_agent_key_creates_row_and_posts_button(
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
     before = datetime.now(UTC)
     posted: dict[str, Any] = {}
     _patch_successful_post(monkeypatch, message_id="9201", posted=posted)
@@ -306,10 +325,12 @@ async def test_request_agent_key_creates_row_and_posts_button(
     result = await _request_agent_key_impl(
         runtime,
         auth,
+        origin_context_id=str(origin.id),
+        expected_ma_agent_id="ag_env",
         agent_name="daimon",
         key="OPENAI_API_KEY",
         purpose="calling the OpenAI API",
-        channel_id="222",
+        channel_id="999-untrusted",
     )
 
     assert result.kind == "env", "result must report the env kind"
@@ -327,6 +348,11 @@ async def test_request_agent_key_creates_row_and_posts_button(
         "row must stamp the caller's platform_user_id"
     )
     assert row.tenant_id == tenant.id
+
+    assert row.platform == "discord", "request retains platform after the turn ends"
+    assert row.channel_id == "222" and row.origin_thread_id == "222", "origin controls destination"
+    assert row.parent_channel_id == "1111", "parent and thread remain separately identifiable"
+    assert row.posted_message_id == "9201", "durable outcomes target the actual card"
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +372,32 @@ async def test_request_mcp_token_creates_row_and_posts_button(
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
     posted: dict[str, Any] = {}
     _patch_successful_post(monkeypatch, message_id="9202", posted=posted)
 
     result = await _request_mcp_token_impl(
         runtime,
         auth,
+        origin_context_id=str(origin.id),
+        expected_ma_agent_id="ag_mcp",
         agent_name="daimon",
         server_name="linear",
         url="https://mcp.linear.app/sse",
@@ -420,11 +466,31 @@ async def test_request_agent_key_succeeds_for_non_admin_caller(
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id, is_admin=False)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
     _patch_successful_post(monkeypatch, message_id="9203")
 
     result = await _request_agent_key_impl(
         runtime,
         auth,
+        origin_context_id=str(origin.id),
+        expected_ma_agent_id="ag_nonadmin",
         agent_name="daimon",
         key="TOGGL_TOKEN",
         purpose="tracking time",
@@ -521,9 +587,34 @@ async def test_request_agent_key_rejects_unknown_agent(
     client = _ma_client_with_agents([])  # no agents in the tenant
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id)
-    with pytest.raises(ToolError, match="not found in this tenant"):
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
+    with pytest.raises(ToolError, match="missing"):
         await _request_agent_key_impl(
-            runtime, auth, agent_name="ghost", key="OPENAI_API_KEY", purpose="x", channel_id="222"
+            runtime,
+            auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_missing",
+            agent_name="ghost",
+            key="OPENAI_API_KEY",
+            purpose="x",
+            channel_id="222",
         )
     assert await _row_count(db_session) == 0
 
@@ -568,6 +659,24 @@ async def test_request_repo_binding_creates_row_and_posts_button(
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
     before = datetime.now(UTC)
     posted: dict[str, Any] = {}
     _patch_successful_post(monkeypatch, message_id="9204", posted=posted)
@@ -575,6 +684,8 @@ async def test_request_repo_binding_creates_row_and_posts_button(
     result = await _request_repo_binding_impl(
         runtime,
         auth,
+        origin_context_id=str(origin.id),
+        expected_ma_agent_id="ag_repo",
         agent_name="daimon",
         repo_url="https://github.com/clsandoval/daimon-qa-scratch",
         purpose="binding the QA scratch repo",
@@ -610,10 +721,30 @@ async def test_request_repo_binding_rejects_unknown_agent(
     client = _ma_client_with_agents([])  # no agents in the tenant
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id)
-    with pytest.raises(ToolError, match="not found in this tenant"):
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
+    with pytest.raises(ToolError, match="missing"):
         await _request_repo_binding_impl(
             runtime,
             auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_missing",
             agent_name="ghost",
             repo_url="https://github.com/clsandoval/daimon-qa-scratch",
             purpose="x",
@@ -668,12 +799,32 @@ async def test_request_repo_binding_posts_message_naming_agent_and_repo(
     )
     runtime = _runtime(committing_sessionmaker, client=client)
     auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
     posted: dict[str, Any] = {}
     _patch_successful_post(monkeypatch, message_id="9205", posted=posted)
 
     await _request_repo_binding_impl(
         runtime,
         auth,
+        origin_context_id=str(origin.id),
+        expected_ma_agent_id="ag_repo_msg",
         agent_name="daimon",
         repo_url="https://github.com/clsandoval/daimon-qa-scratch",
         purpose="binding the QA scratch repo",
@@ -708,10 +859,35 @@ async def test_request_agent_key_raises_when_button_post_fails(
     # already minted.
     runtime = _runtime(committing_sessionmaker, client=client, with_discord=False)
     auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
 
     with pytest.raises(ToolError, match="posting the button failed"):
         await _request_agent_key_impl(
-            runtime, auth, agent_name="daimon", key="OPENAI_API_KEY", purpose="x", channel_id="222"
+            runtime,
+            auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_fail",
+            agent_name="daimon",
+            key="OPENAI_API_KEY",
+            purpose="x",
+            channel_id="222",
         )
 
     # The row is minted before the post is attempted — a failed post leaves it
@@ -815,16 +991,36 @@ async def test_request_agent_key_posts_slack_button_carrying_the_token(
         platform_user_id=_SLACK_USER_ID,
         tenant_id=tenant.id,
     )
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
 
     with aioresponses() as m:
         _register_slack_post_defaults(m)
         result = await _request_agent_key_impl(
             runtime,
             auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_env_slack",
             agent_name="daimon",
             key="OPENAI_API_KEY",
             purpose="calling the OpenAI API",
-            channel_id="C_CRED",
+            channel_id="C_UNTRUSTED",
         )
         import yarl
 
@@ -846,6 +1042,13 @@ async def test_request_agent_key_posts_slack_button_carrying_the_token(
     assert "OPENAI_API_KEY" in button["text"]["text"]
     assert len(button["text"]["text"]) <= 75, "Slack caps button text at 75 characters"
 
+    assert body["channel"] == "C_CRED", "tool arguments cannot redirect a card"
+    assert body["thread_ts"] == "1700000000.000001", "private input stays in the origin thread"
+    assert row.origin_thread_id == body["thread_ts"], (
+        "submission retains the thread after origin expiry"
+    )
+    assert row.posted_message_id == result.message_id, "outcomes retain the posted card identity"
+
 
 async def test_request_repo_binding_posts_slack_button(
     committing_sessionmaker: async_sessionmaker[AsyncSession],
@@ -866,12 +1069,32 @@ async def test_request_repo_binding_posts_slack_button(
         platform_user_id=_SLACK_USER_ID,
         tenant_id=tenant.id,
     )
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform=auth.platform or "discord",
+            parent_channel_id="C_CRED" if auth.platform == "slack" else "1111",
+            thread_id="1700000000.000001" if auth.platform == "slack" else "222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
 
     with aioresponses() as m:
         _register_slack_post_defaults(m)
         result = await _request_repo_binding_impl(
             runtime,
             auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_repo_slack",
             agent_name="daimon",
             repo_url="https://github.com/owner/repo",
             purpose="cloning the project",

@@ -1,0 +1,187 @@
+"""Slack setup conversation creation and lifecycle, without executing agent turns."""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Any
+
+import aiohttp
+from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.mrkdwn import escape_mrkdwn
+from daimon.adapters.slack.runtime import SlackRuntime
+from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED, MA_METADATA_KEY_NAME
+from daimon.core.errors import DaimonError
+from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.setup_conversations import build_setup_opener, resolve_setup_agents
+from daimon.core.stores.agent_repo_binding import get_binding as get_repo_binding
+from daimon.core.stores.identity import get_or_create_platform_principal
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
+from daimon.core.stores.thread_agent_bindings import (
+    create_binding,
+    update_channel_lifecycle,
+    update_lifecycle,
+)
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
+
+
+def setup_button(target_ma_agent_id: str | None) -> dict[str, Any]:
+    return {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": "agent_setup__conversation",
+                "text": {"type": "plain_text", "text": "💬 Set up with Daimon"},
+                "value": target_ma_agent_id or "choose",
+            }
+        ],
+    }
+
+
+def setup_link(team_id: str, channel_id: str, thread_id: str) -> str:
+    return f"https://app.slack.com/client/{team_id}/{channel_id}/thread/{channel_id}-{thread_id}"
+
+
+async def create_setup_conversation(
+    runtime: SlackRuntime,
+    client: AsyncWebClient,
+    *,
+    team_id: str,
+    channel_id: str,
+    user_id: str,
+    target_ma_agent_id: str | None,
+) -> str:
+    """Validate immutable identities, persist a public root, then announce readiness."""
+    if not channel_id.startswith(("C", "G")):
+        raise DaimonError("Open /agent-setup in a workspace channel to start a setup conversation.")
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    responder, target = await resolve_setup_agents(
+        runtime.anthropic, tenant_id=tenant_id, target_ma_agent_id=target_ma_agent_id
+    )
+    auth = await client.auth_test()  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+    bot_user_id = str(auth.get("user_id") or "")
+    if not bot_user_id:
+        raise DaimonError("Slack did not identify the bot. Retry opening setup.")
+    is_admin = await resolve_is_admin(client, user_id=user_id)
+    target_name = str(target.metadata.get(MA_METADATA_KEY_NAME) or target.name) if target else None
+    has_repo = False
+    can_customize = is_admin
+    async with runtime.sessionmaker.begin() as session:
+        principal = await get_or_create_platform_principal(
+            session, tenant_id=tenant_id, platform="slack", external_id=user_id
+        )
+        if target is not None:
+            can_customize = is_admin or not await is_agent_reachable_in_tenant(
+                session,
+                tenant_id=tenant_id,
+                agent_name=target_name or target.name,
+                default=runtime.deployment_default,
+            )
+            has_repo = (
+                await get_repo_binding(
+                    session,
+                    tenant_id=tenant_id,
+                    agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(target.id)),
+                )
+                is not None
+            )
+    opener = build_setup_opener(
+        target_name=escape_mrkdwn(target_name) if target_name else None,
+        opener_mention=f"<@{user_id}>",
+        bot_mention=f"<@{bot_user_id}>",
+        has_repo=has_repo,
+        has_external_connection=bool(
+            target and any(server.name != "daimon" for server in target.mcp_servers)
+        ),
+        can_customize=can_customize
+        and target is not None
+        and target.metadata.get(MA_METADATA_KEY_MANAGED) != "true",
+    )
+    posted = await client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+        channel=channel_id, text="Opening setup with Daimon…"
+    )
+    thread_id = str(posted.get("ts") or "")
+    if not thread_id:
+        raise DaimonError("Slack did not return the setup message identity. Please retry.")
+    try:
+        async with runtime.sessionmaker.begin() as session:
+            await create_binding(
+                session,
+                tenant_id=tenant_id,
+                platform="slack",
+                parent_channel_id=channel_id,
+                thread_id=thread_id,
+                responder_ma_agent_id=str(responder.id),
+                responder_name=str(responder.metadata.get(MA_METADATA_KEY_NAME) or responder.name),
+                configuration_target_ma_agent_id=str(target.id) if target else None,
+                configuration_target_name=target_name,
+                creator_account_id=principal.account_id,
+            )
+        await client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+            channel=channel_id,
+            ts=thread_id,
+            text=opener,
+        )
+    except Exception:
+        try:
+            await client.chat_delete(channel=channel_id, ts=thread_id)  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+        except (SlackApiError, aiohttp.ClientError, TimeoutError):
+            with contextlib.suppress(SlackApiError, aiohttp.ClientError, TimeoutError):
+                await client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                    channel=channel_id,
+                    ts=thread_id,
+                    text="Setup failed. Reopen /agent-setup to try again.",
+                )
+        async with runtime.sessionmaker.begin() as session:
+            await update_lifecycle(
+                session,
+                tenant_id=tenant_id,
+                platform="slack",
+                parent_channel_id=channel_id,
+                thread_id=thread_id,
+                deleted=True,
+            )
+        raise
+    return setup_link(team_id, channel_id, thread_id)
+
+
+async def handle_setup_lifecycle(
+    runtime: SlackRuntime, event: dict[str, Any], *, team_id: str
+) -> None:
+    """Only change binding state; ordinary subscribed messages never run turns."""
+    event_type = str(event.get("type") or "")
+    channel_id = str(event.get("channel") or "")
+    if not team_id or not channel_id:
+        return
+    tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
+    async with runtime.sessionmaker.begin() as session:
+        if event_type == "message" and event.get("subtype") == "message_deleted":
+            deleted_ts = str(event.get("deleted_ts") or "")
+            if deleted_ts:
+                await update_lifecycle(
+                    session,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    parent_channel_id=channel_id,
+                    thread_id=deleted_ts,
+                    deleted=True,
+                )
+        elif event_type in {
+            "channel_archive",
+            "channel_unarchive",
+            "channel_deleted",
+            "group_archive",
+            "group_unarchive",
+            "group_deleted",
+        }:
+            await update_channel_lifecycle(
+                session,
+                tenant_id=tenant_id,
+                platform="slack",
+                parent_channel_id=channel_id,
+                archived=event_type.endswith("_archive")
+                if not event_type.endswith("_deleted")
+                else None,
+                deleted=True if event_type.endswith("_deleted") else None,
+            )

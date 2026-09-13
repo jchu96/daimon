@@ -23,9 +23,9 @@ from daimon.adapters.mcp.tools._ctx import (
     _auth,  # pyright: ignore[reportPrivateUsage]
     _require_admin,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core.constants import AGENT_SKILL_CAP
 from daimon.core.defaults.ma_index import (
-    find_agent_by_daimon_tag,
     find_attach_mount_collision,
     find_skill_by_display_title,
     list_agents_by_tenant,
@@ -213,6 +213,7 @@ async def _attach_synced_skills(
     *,
     agent_name: str,
     skill_ids: set[str],
+    expected_ma_agent_id: str | None = None,
 ) -> str:
     """Attach ``skill_ids`` to ``agent_name``, returning a one-line outcome.
 
@@ -221,11 +222,12 @@ async def _attach_synced_skills(
     and the caller must report both halves truthfully rather than lose the
     successful import behind an exception.
     """
-    agent = await find_agent_by_daimon_tag(
-        runtime.client, tenant_id=auth.tenant_id, name=agent_name
-    )
-    if agent is None:
-        return f"Could not attach: agent '{agent_name}' not found. The skills are in the registry."
+    try:
+        agent = await resolve_setup_agent(
+            runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
+        )
+    except ToolError as exc:
+        return f"Could not attach: {exc} The skills are in the registry."
 
     new_skills: list[BetaManagedAgentsSkillParams] = [
         {"type": "custom", "skill_id": skill_id} for skill_id in sorted(skill_ids)
@@ -261,8 +263,14 @@ async def _sync_impl(
     branch: str,
     path: str,
     agent_name: str | None = None,
+    expected_ma_agent_id: str | None = None,
 ) -> SkillSyncResult:
     _require_admin(auth)
+    if agent_name is not None:
+        agent = await resolve_setup_agent(
+            runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
+        )
+        expected_ma_agent_id = agent.id
     async with httpx.AsyncClient(timeout=30.0) as http:
         token = await _resolve_sync_token(runtime, auth, url, http)
         try:
@@ -310,7 +318,11 @@ async def _sync_impl(
     attach_note = ""
     if agent_name is not None and registry_ids:
         attach_note = " " + await _attach_synced_skills(
-            runtime, auth, agent_name=agent_name, skill_ids=registry_ids
+            runtime,
+            auth,
+            agent_name=agent_name,
+            skill_ids=registry_ids,
+            expected_ma_agent_id=expected_ma_agent_id,
         )
 
     # Recounted AFTER any attach so this call's own attach is included. Note the
@@ -405,6 +417,7 @@ def register_skill_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         branch: str = "main",
         path: str = "",
         agent_name: str | None = None,
+        expected_ma_agent_id: str | None = None,
     ) -> SkillSyncResult:
         """Install skills from a GitHub repo into the workspace's shared skill library.
 
@@ -417,7 +430,9 @@ def register_skill_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         Importing alone attaches nothing. Report returned source, branch, path and
         summary. Inspect the repo to choose ``path`` (empty means root); ``branch``
         defaults to main. Importing is admin-only."""
-        return await _sync_impl(runtime, await _auth(ctx), url, branch, path, agent_name)
+        return await _sync_impl(
+            runtime, await _auth(ctx), url, branch, path, agent_name, expected_ma_agent_id
+        )
 
     @mcp.tool
     async def list_skills(ctx: Context) -> list[SkillInfo]:  # pyright: ignore[reportUnusedFunction]

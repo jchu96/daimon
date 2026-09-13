@@ -183,6 +183,7 @@ async def test_bind_session_reuses_live_row_when_reuse_existing_true_and_row_exi
         platform="discord",
         thread_id="thread-1",
         ma_session_id="sess_existing",
+        ma_agent_id="ag_1",
         watermark_message_id="msg-99",
     )
     await db_session.commit()
@@ -387,6 +388,7 @@ async def test_bind_session_syncs_agent_mcp_credential_into_a_reused_session_vau
         platform="discord",
         thread_id="thread-reuse-mcp",
         ma_session_id="sess_live",
+        ma_agent_id="ag_reuse",
         watermark_message_id="msg-1",
     )
     await db_session.commit()
@@ -526,6 +528,7 @@ async def test_bind_session_reuse_skips_mcp_sync_when_agent_has_no_stored_creden
         platform="discord",
         thread_id="thread-reuse-plain",
         ma_session_id="sess_live",
+        ma_agent_id="ag_plain",
         watermark_message_id="msg-1",
     )
     await db_session.commit()
@@ -655,6 +658,7 @@ async def test_bind_session_reuse_path_raises_ceiling_error_when_deadline_alread
         platform="discord",
         thread_id="thread-ceiling-reuse",
         ma_session_id="sess_existing",
+        ma_agent_id="ag_1",
         watermark_message_id="msg-1",
     )
     await db_session.commit()
