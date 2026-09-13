@@ -39,6 +39,7 @@ from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields, unset_fields
 from daimon.core.stores.thread_agent_bindings import get_binding, list_active_bindings
 from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
 
 
 @dataclass(frozen=True)
@@ -210,7 +211,18 @@ async def _explain_agent_resolution_impl(
                     thread_id=thread_id,
                 )
                 if binding is not None and binding.deleted:
-                    binding = None
+                    target = (
+                        f"{binding.configuration_target_name} "
+                        f"({binding.configuration_target_ma_agent_id})"
+                        if binding.configuration_target_ma_agent_id is not None
+                        else "not selected"
+                    )
+                    raise ToolError(
+                        f"Setup conversation '{thread_id}' in '{channel_id}' was deleted. "
+                        f"Its recorded responder is {binding.responder_name} "
+                        f"({binding.responder_ma_agent_id}); configuration target: {target}. "
+                        "Open a new setup conversation to continue."
+                    )
             recent = await list_active_bindings(
                 session,
                 tenant_id=tenant_id,

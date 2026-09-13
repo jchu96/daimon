@@ -395,3 +395,50 @@ async def test_explanation_separates_setup_responder_target_and_parent_defaults(
     assert all(row.parent_channel_id == "parent" for row in explained.recent_setup_conversations), (
         "recent setup conversations must be restricted to the requested parent"
     )
+
+
+@pytest.mark.parametrize("platform", ["discord", "slack"])
+async def test_explanation_reports_deleted_setup_without_parent_fallback(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    platform: str,
+) -> None:
+    from daimon.core.stores.thread_agent_bindings import create_binding, update_lifecycle
+
+    async with committing_sessionmaker.begin() as session:
+        tenant = await make_tenant(session, platform=platform)
+        account = await make_account(session, tenant=tenant)
+        await create_binding(
+            session,
+            tenant_id=tenant.id,
+            platform=platform,
+            parent_channel_id="parent",
+            thread_id="deleted-thread",
+            responder_ma_agent_id="agent_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id="agent_specialist",
+            configuration_target_name="specialist",
+            creator_account_id=account.id,
+        )
+        await update_lifecycle(
+            session,
+            tenant_id=tenant.id,
+            platform=platform,
+            parent_channel_id="parent",
+            thread_id="deleted-thread",
+            deleted=True,
+        )
+    runtime = _runtime_with_default(committing_sessionmaker, "parent-responder")
+    auth = AuthIdentity(
+        account_id=account.id, tenant_id=tenant.id, role=Role.USER, platform=platform
+    )
+    with pytest.raises(ToolError, match="deleted-thread.*was deleted") as error:
+        await _explain_agent_resolution_impl(runtime, auth, "parent", "deleted-thread")
+    explanation = str(error.value)
+    assert "Daimon (agent_daimon)" in explanation, "retain the recorded responder identity"
+    assert "specialist (agent_specialist)" in explanation, (
+        "retain the configuration target identity"
+    )
+    assert "Open a new setup conversation" in explanation, "provide the supported continuation path"
+    assert "parent-responder" not in explanation, (
+        "a deleted setup cannot silently resume parent routing"
+    )
