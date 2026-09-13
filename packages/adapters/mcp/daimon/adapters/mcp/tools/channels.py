@@ -228,7 +228,9 @@ def register_channel_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         (a cdn.discordapp.com or media.discordapp.net link); png, jpeg, gif
         and webp work. Both apply to the whole server: Discord has no
         per-channel identity, so tell the user when they asked for one
-        channel. Needs a server admin. Discord-only.
+        channel. There is no reset yet: an empty ``display_name`` is treated
+        as omitted, so a name cannot be cleared back to the default. Needs a
+        server admin. Discord-only.
         """
         auth = await _auth(ctx)
         if auth.platform == "slack":
