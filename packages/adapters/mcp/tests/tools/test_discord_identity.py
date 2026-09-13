@@ -168,16 +168,17 @@ def _handler(
     captured_patch: dict[str, Any] | None = None,
     patch_error: Exception | None = None,
 ) -> Any:
-    """Routes the impl's locked sequence: guild, roles, caller member, bot
-    member, then the self PATCH. Echoes the PATCH body back as the member."""
+    """Routes the impl's sequence: guild, bot member, then the self PATCH.
+    Echoes the PATCH body back as the member."""
 
     async def handler(route: discord.http.Route, kwargs: dict[str, Any]) -> Any:
         if route.path == "/guilds/{guild_id}":
             return _guild_payload()
-        if route.path == "/guilds/{guild_id}/roles":
-            return []
         if route.path == "/guilds/{guild_id}/members/{member_id}":
-            return _member_payload(route.url.rsplit("/", 1)[-1])
+            assert route.url.endswith(f"/members/{_BOT_USER_ID}"), (
+                "only the bot's own member is fetched; the caller is vouched for by the JWT"
+            )
+            return _member_payload(_BOT_USER_ID)
         if route.method == "PATCH" and route.path == "/guilds/{guild_id}/members/@me":
             if patch_error is not None:
                 raise patch_error
@@ -201,6 +202,13 @@ def _forbidden() -> discord.Forbidden:
     return discord.Forbidden(response, {"message": "Missing Permissions", "code": 50013})
 
 
+def _bad_request() -> discord.HTTPException:
+    response = MagicMock()
+    response.status = 400
+    response.reason = "Bad Request"
+    return discord.HTTPException(response, {"message": "Invalid Form Body", "code": 50035})
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -218,6 +226,9 @@ async def test_set_display_identity_sets_nickname_on_self(monkeypatch: pytest.Mo
 
     assert captured["json"] == {"nick": "Daimon (open source)"}, (
         "the PATCH body must carry only the stripped nickname"
+    )
+    assert captured["reason"] == "set_display_identity requested by user 42", (
+        "the audit log must record who asked for a server-wide change"
     )
     assert row.display_name == "Daimon (open source)", "row must carry the new nickname"
     assert row.guild_id == "111", "row must name the guild the change applied to"
@@ -313,6 +324,59 @@ async def test_set_display_identity_maps_forbidden_to_permission_hint(
 ) -> None:
     patch_discord_http(monkeypatch, _handler(patch_error=_forbidden()))
     with pytest.raises(ToolError, match="change_nickname"):
+        await _set_display_identity_impl(
+            _runtime_with_discord_token(), _auth(), display_name="Daimon"
+        )
+
+
+async def test_set_display_identity_sends_name_and_avatar_in_one_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    patch_discord_http(monkeypatch, _handler(captured_patch=captured))
+    fake_session = _FakeAiohttpSession(_FakeAiohttpResponse(chunks=[_PNG_BYTES]))
+
+    row = await _set_display_identity_impl(
+        _runtime_with_discord_token(),
+        _auth(),
+        display_name="Daimon",
+        avatar_url=_CDN_URL,
+        session=fake_session,  # type: ignore[arg-type]
+    )
+
+    assert set(captured["json"]) == {"nick", "avatar"}, "both fields must land in one PATCH"
+    assert row.display_name == "Daimon", "row must carry the new nickname"
+
+
+async def test_set_display_identity_refuses_whitespace_only_nickname() -> None:
+    with pytest.raises(ToolError, match="must not be empty"):
+        await _set_display_identity_impl(_runtime_with_discord_token(), _auth(), display_name="   ")
+
+
+async def test_set_display_identity_avatar_only_forbidden_does_not_blame_nickname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """change_nickname governs only the nick field; an avatar-only 403 must
+    not send the admin off to grant an unrelated permission."""
+    patch_discord_http(monkeypatch, _handler(patch_error=_forbidden()))
+    fake_session = _FakeAiohttpSession(_FakeAiohttpResponse(chunks=[_PNG_BYTES]))
+    with pytest.raises(ToolError, match="avatar") as excinfo:
+        await _set_display_identity_impl(
+            _runtime_with_discord_token(),
+            _auth(),
+            avatar_url=_CDN_URL,
+            session=fake_session,  # type: ignore[arg-type]
+        )
+    assert "change_nickname" not in str(excinfo.value), (
+        "an avatar-only refusal must not mention the nickname permission"
+    )
+
+
+async def test_set_display_identity_maps_http_error_to_discord_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_discord_http(monkeypatch, _handler(patch_error=_bad_request()))
+    with pytest.raises(ToolError, match="discord refused the change: .*Invalid Form Body"):
         await _set_display_identity_impl(
             _runtime_with_discord_token(), _auth(), display_name="Daimon"
         )

@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import daimon.adapters.mcp.tools.discord._identity
 import daimon.adapters.slack
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.channels import register_channel_tools
@@ -25,11 +26,24 @@ def test_slack_adapter_source_never_reaches_for_display_identity() -> None:
     offenders = sorted(
         str(path.relative_to(slack_root))
         for path in slack_root.rglob("*.py")
-        if "display_identity" in path.read_text()
+        if any(
+            term in path.read_text()
+            for term in ("display_identity", "users.profile.set", "bot_display_name_edit")
+        )
     )
     assert offenders == [], (
         f"Slack adapter files reference display identity: {offenders} -- Slack bots cannot "
         "rename themselves; if that changed, replace this record rather than deleting it"
+    )
+
+
+def test_identity_impl_documents_the_discord_only_scope() -> None:
+    doc = daimon.adapters.mcp.tools.discord._identity.__doc__  # pyright: ignore[reportPrivateUsage]
+
+    assert doc is not None, "the identity module must carry a module docstring"
+    assert "Discord-only" in doc, "the docstring must state the Discord-only scope"
+    assert "test_display_identity_discord_only" in doc, (
+        "the docstring must name this test file as the executable record"
     )
 
 
