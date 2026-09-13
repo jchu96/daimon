@@ -3392,6 +3392,48 @@
         'type': 'object',
       }),
     }),
+    'set_display_identity': dict({
+      'description': '''
+        Change how daimon appears in this Discord server: its display name,
+        its avatar, or both.
+        
+        Use when the user asks you to rename yourself or change your profile
+        picture. ``display_name`` is the new nickname (1-32 characters).
+        ``avatar_url`` is the URL of an image the user attached to a message
+        (a cdn.discordapp.com or media.discordapp.net link); png, jpeg, gif
+        and webp work. Both apply to the whole server: Discord has no
+        per-channel identity, so tell the user when they asked for one
+        channel. Needs a server admin. Discord-only.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'avatar_url': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+          'display_name': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+          }),
+        }),
+        'type': 'object',
+      }),
+    }),
     'set_repo_binding': dict({
       'description': '''
         Bind your agent to a git repo.

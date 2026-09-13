@@ -70,6 +70,13 @@ class SearchResult(BaseModel):
     hint: str | None = None
 
 
+class DisplayIdentityRow(BaseModel):
+    guild_id: str
+    display_name: str
+    avatar_url: str
+    hint: str
+
+
 def _to_message_row(m: discord.Message) -> MessageRow:  # pyright: ignore[reportUnusedFunction]  # imported by _read/_send
     return MessageRow(
         id=str(m.id),
