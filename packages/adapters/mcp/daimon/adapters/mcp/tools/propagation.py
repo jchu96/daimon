@@ -179,6 +179,26 @@ class AgentResolutionExplanation:
     can answer 'why that one' without re-deriving the cascade."""
 
 
+def _thread_explanation(binding: ThreadAgentBindingRow) -> str:
+    """Say why this thread has its own responder, in the words that thread's kind earns.
+
+    A setup conversation and a handed-over task both outrank channel routing,
+    but for opposite reasons: one is a place to configure another agent, the
+    other is that other agent now doing the work. Reporting both as "setup
+    thread" would tell somebody asking "why is this agent answering?" a
+    confident falsehood.
+    """
+    if binding.kind == "handoff":
+        return (
+            f"{binding.responder_name} answers in this thread because this task was handed "
+            "to it; the channel's own default is unchanged."
+        )
+    return (
+        f"{binding.responder_name} answers in this setup thread; configuring "
+        f"{binding.configuration_target_name or 'an agent not yet selected'}."
+    )
+
+
 async def _explain_agent_resolution_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -217,11 +237,19 @@ async def _explain_agent_resolution_impl(
                         if binding.configuration_target_ma_agent_id is not None
                         else "not selected"
                     )
+                    kind_label = (
+                        "Setup conversation" if binding.kind == "setup" else "Handoff conversation"
+                    )
+                    next_step = (
+                        "Open a new setup conversation to continue."
+                        if binding.kind == "setup"
+                        else "Start the task again in a new thread to continue."
+                    )
                     raise ToolError(
-                        f"Setup conversation '{thread_id}' in '{channel_id}' was deleted. "
+                        f"{kind_label} '{thread_id}' in '{channel_id}' was deleted. "
                         f"Its recorded responder is {binding.responder_name} "
                         f"({binding.responder_ma_agent_id}); configuration target: {target}. "
-                        "Open a new setup conversation to continue."
+                        f"{next_step}"
                     )
             recent = await list_active_bindings(
                 session,
@@ -250,10 +278,7 @@ async def _explain_agent_resolution_impl(
         else None,
         configuration_target_name=binding.configuration_target_name if binding else None,
         recent_setup_conversations=tuple(recent),
-        explanation=(
-            f"{binding.responder_name} answers in this setup thread; configuring "
-            f"{binding.configuration_target_name or 'an agent not yet selected'}."
-        )
+        explanation=_thread_explanation(binding)
         if binding
         else build_resolution_note(
             agent_name=resolved.agent_name,

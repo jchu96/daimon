@@ -27,7 +27,7 @@ from daimon.core.billing import is_over_cap
 from daimon.core.defaults.provisioning import reconcile_tenant_defaults
 from daimon.core.ma_resolver import MAResolverMissError, resolve_agent, resolve_environment
 from daimon.core.scope import ResolvedConfig, ScopeContext
-from daimon.core.setup_conversations import get_setup_responder
+from daimon.core.setup_conversations import get_setup_agent, get_setup_responder
 from daimon.core.stores.accounts import set_role
 from daimon.core.stores.domain import Role
 from daimon.core.stores.identity import get_or_create_platform_principal
@@ -133,7 +133,15 @@ async def admit(
         cache=deps.resolver_cache,
     )
 
-    if config.thread_binding_id is not None:
+    # A bound thread resolves its responder by concrete id, never by name: a
+    # recreated namesake must not inherit the conversation. Which concrete
+    # lookup depends on why the thread is bound -- a setup conversation must
+    # answer as the built-in Daimon (`get_setup_responder` asserts that), while
+    # a thread whose task was handed to another agent answers as that agent,
+    # which is an ordinary tenant-and-archive-checked retrieve.
+    if config.thread_binding_kind == "handoff":
+        agent = await get_setup_agent(deps.anthropic, tenant_id=tenant_id, ma_agent_id=agent_id)
+    elif config.thread_binding_id is not None:
         agent = await get_setup_responder(deps.anthropic, tenant_id=tenant_id, ma_agent_id=agent_id)
     else:
         agent = await deps.anthropic.beta.agents.retrieve(agent_id)

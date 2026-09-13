@@ -51,10 +51,13 @@ import anthropic as _anthropic
 import httpx
 import structlog
 from anthropic import AsyncAnthropic
+from anthropic.types.beta import BetaManagedAgentsSystemContentBlockParam
 from anthropic.types.beta.sessions import (
+    BetaManagedAgentsEventParams,
     BetaManagedAgentsImageBlockParam,
     BetaManagedAgentsSessionStatusIdleEvent,
     BetaManagedAgentsStreamSessionEvents,
+    BetaManagedAgentsSystemMessageEventParams,
     BetaManagedAgentsTextBlockParam,
     BetaManagedAgentsUserMessageEventParams,
 )
@@ -235,6 +238,7 @@ async def run_turn(
     billing: BillingPosture,
     tool_confirmation: ToolConfirmation = _DEFAULT_TOOL_CONFIRMATION,
     image_blocks: Sequence[BetaManagedAgentsImageBlockParam] | None = None,
+    system_blocks: Sequence[BetaManagedAgentsSystemContentBlockParam] = (),
     deadline: datetime | None = None,
 ) -> TurnState:
     """Open the SSE stream, post the user message, and pump to terminal idle.
@@ -249,6 +253,16 @@ async def run_turn(
     close, not this timeout. Both numbers are non-contractual measurements,
     which is why this is an injectable param rather than a constant or an
     env setting.
+
+    `system_blocks` (default empty) is daimon-authored privileged framing
+    for the FIRST send only — the handoff context a replacement session
+    needs before its first user message. When non-empty the initial batch is
+    `[user.message, system.message]`, in that order: the API accepts at most
+    one `system.message` per request, requires it to be the final event, and
+    requires it to immediately follow the `user.message` it accompanies. Only
+    daimon's own words belong here; quoted material from a previous session
+    travels in the user message (see `daimon.core.handoff_context`). Empty is
+    byte-identical to the pre-existing single-event send.
 
     `deadline` (default `None`) is an optional core-owned wall-clock bound
     (`daimon.core.turn.ceiling`). `None` means the driver enforces NOTHING —
@@ -290,7 +304,17 @@ async def run_turn(
             "type": "user.message",
             "content": content,
         }
-        await anthropic.beta.sessions.events.send(session_id, events=[event])
+        batch: list[BetaManagedAgentsEventParams] = [event]
+        if system_blocks:
+            # LAST, and immediately after the user.message: the live API
+            # rejects the whole request otherwise (at most one per request,
+            # must be final, must follow a user.message / tool result).
+            system_event: BetaManagedAgentsSystemMessageEventParams = {
+                "type": "system.message",
+                "content": list(system_blocks),
+            }
+            batch.append(system_event)
+        await anthropic.beta.sessions.events.send(session_id, events=batch)
 
     pump_coro = _pump(
         anthropic=anthropic,

@@ -30,6 +30,7 @@ import pytest
 import structlog.testing
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
+    BetaManagedAgentsAgent,
     BetaManagedAgentsModelConfig,
     BetaManagedAgentsSession,
     BetaManagedAgentsSessionAgent,
@@ -45,6 +46,12 @@ from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
+from daimon.core.session_snapshot import (
+    SessionSnapshot,
+    desired_snapshot,
+    fingerprint_identity,
+    fingerprint_mutable,
+)
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import ThreadSessionRow
 from daimon.core.stores.scoped_config_write import set_fields
@@ -76,6 +83,26 @@ from yarl import URL
 # ---------------------------------------------------------------------------
 
 _APP_PY_PATH = pathlib.Path(__file__).parent.parent / "daimon/adapters/slack/app.py"
+
+
+def _seeded_snapshot(*, agent_id: str, environment_id: str) -> SessionSnapshot:
+    """The configuration a session created for this agent and environment froze.
+
+    A mapping row seeded without one reads as pre-continuity: the bind reads the
+    session from MA, finds a configuration belonging to nobody in particular,
+    and replaces the session instead of reusing it. Seeding what the session
+    would actually have frozen keeps these tests about what they test.
+    """
+    agent = BetaManagedAgentsAgent.model_validate(_agent_response(agent_id=agent_id))
+    return desired_snapshot(
+        agent,
+        environment_id=environment_id,
+        env_sha256=None,
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id=None,
+        vault_id=None,
+    )
 
 
 def _make_agent_env_handler() -> Callable[[httpx.Request], httpx.Response]:
@@ -991,6 +1018,7 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
         await s.commit()
 
     # Pre-create a live thread_sessions row (as if a first turn already ran).
+    _cont_snapshot = _seeded_snapshot(agent_id="agent_test_id", environment_id="env_test_id")
     async with db_session_factory() as s:
         await create_thread_session(
             s,
@@ -1001,6 +1029,9 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
             ma_session_id="sess-cont-existing",
             ma_agent_id="agent_test_id",
             watermark_message_id=prior_watermark,
+            effective_config=_cont_snapshot,
+            identity_fingerprint=fingerprint_identity(_cont_snapshot),
+            mutable_fingerprint=fingerprint_mutable(_cont_snapshot),
         )
         await s.commit()
 
@@ -3210,6 +3241,7 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
             s, tenant_id=tenant_id, platform="slack", external_id="U_TEST_REUSED_BILLED"
         )
         await s.commit()
+    _billed_snapshot = _seeded_snapshot(agent_id="agent_test_id", environment_id="env_test_id")
     async with db_session_factory() as s:
         await create_thread_session(
             s,
@@ -3220,6 +3252,9 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
             ma_session_id=seeded_session_id,
             ma_agent_id="agent_test_id",
             watermark_message_id="9000000032.000000",
+            effective_config=_billed_snapshot,
+            identity_fingerprint=fingerprint_identity(_billed_snapshot),
+            mutable_fingerprint=fingerprint_mutable(_billed_snapshot),
         )
         await s.commit()
 

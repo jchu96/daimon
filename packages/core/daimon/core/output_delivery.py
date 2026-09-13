@@ -31,6 +31,7 @@ import anthropic
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import FileMetadata
+from daimon.core.checkpoint_prompt import HANDOFF_FILENAME_PREFIX
 from daimon.core.errors import DaimonError
 
 _log = structlog.get_logger(__name__)
@@ -139,17 +140,36 @@ async def sweep_session_outputs(
     on_skip: Callable[[SkippedFile], Awaitable[None]] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     max_bytes: int = MAX_BYTES_PER_FILE,
+    exclude_filename_prefixes: tuple[str, ...] = (HANDOFF_FILENAME_PREFIX,),
 ) -> int:
     """Deliver the session's output files via ``post``; return how many posted.
 
     Raises :class:`OutputPostingUnavailable` when ``post`` signals that
     delivery is impossible for the whole workspace — nothing further is
     downloaded or deleted; files already posted-and-deleted stay deleted.
+
+    ``exclude_filename_prefixes`` names outputs this sweep must not touch at
+    all: neither posted nor deleted, so they stay in the listing for the
+    machinery that owns them. The default excludes workspace-transfer
+    bundles, which are written into the same outputs directory but belong to
+    :mod:`daimon.core.workspace_transfer`, not to the user. The listing is
+    basename-only (capability matrix P4.a), so a name prefix is the whole
+    available key.
     """
     settled = await _poll_until_settled(anthropic_client, session_id=session_id, sleep=sleep)
 
     posted = 0
     for meta in settled.values():
+        if exclude_filename_prefixes and meta.filename.startswith(exclude_filename_prefixes):
+            # Left listed on purpose: the owner of this file deletes it.
+            _log.info(
+                "output_delivery.skipped_excluded",
+                session_id=session_id,
+                file_id=meta.id,
+                filename=meta.filename,
+            )
+            continue
+
         if meta.size_bytes == 0:
             # Snapshot-at-first-write means a 0-byte entry can never gain
             # content; it is permanent noise unless deleted.

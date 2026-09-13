@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import time
 import uuid
+from collections.abc import Sequence
 
 import anthropic as anthropic_pkg
 import httpx
@@ -55,6 +56,7 @@ async def create_session(
     github_app_id: str | None = None,
     github_app_private_key: str | None = None,
     http_client: httpx.AsyncClient | None = None,
+    extra_resources: Sequence[Resource] = (),
 ) -> BetaManagedAgentsSession:
     """Create an MA session. Returns the SDK session object directly.
 
@@ -107,6 +109,11 @@ async def create_session(
     silently-omitted clone resource (never an empty ``authorization_token``).
     ``http_client`` is test-injectable; when omitted, a short-lived
     ``httpx.AsyncClient`` is constructed for the resolution.
+
+    ``extra_resources`` are mounted alongside everything this function
+    assembles, for a caller that has a file the new session must start with —
+    today, the bundle carrying a replaced session's work. They are passed
+    through untouched; this function never inspects or filters them.
 
     On MA failure: ``anthropic.APIError`` propagates uncaught.
     """
@@ -194,7 +201,7 @@ async def create_session(
             ),
         )
 
-    resources: list[Resource] = []
+    resources: list[Resource] = list(extra_resources)
     if tenant_id is not None and agent_uuid is not None and session_factory is not None:
         mount = await upload_env_and_mount(
             anthropic, session_factory, tenant_id=tenant_id, agent_id=agent_uuid

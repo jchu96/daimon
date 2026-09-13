@@ -108,6 +108,12 @@ class ResolvedConfig(BaseModel):
     configuration_target_ma_agent_id: str | None = None
     configuration_target_name: str | None = None
     thread_binding_id: uuid.UUID | None = None
+    # Why this thread has its own responder: a setup conversation, or a task
+    # handed to another agent. None when no binding applies. The two resolve
+    # their responder differently -- a setup thread must answer as the built-in
+    # Daimon, a handoff thread answers as whatever agent received the task --
+    # so the kind has to survive as far as admission.
+    thread_binding_kind: Literal["setup", "handoff"] | None = None
 
 
 class PropagateOutcome(BaseModel):

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from daimon.core._models import ThreadAgentBinding
+from daimon.core.continuity.handoff import HandoffRefusedInSetupThread
 from daimon.core.errors import DaimonError
 from daimon.core.scope import DeploymentDefault, ScopeContext
 from daimon.core.stores.accounts import delete_account
@@ -14,10 +17,13 @@ from daimon.core.stores.thread_agent_bindings import (
     list_active_bindings,
     update_channel_lifecycle,
     update_lifecycle,
+    upsert_responder_binding,
 )
 from daimon.testing.factories import make_account, make_tenant
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
 
 
 async def test_thread_wins_without_changing_environment_or_reachability(
@@ -259,4 +265,153 @@ async def test_listing_setups_never_surfaces_a_handoff_binding(
 
     assert [row.thread_id for row in listed] == ["setup-thread"], (
         "a handed-over ordinary thread is not a setup conversation and must not be listed as one"
+    )
+
+
+async def test_upsert_responder_binding_creates_a_handoff_row_in_an_unbound_thread(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+
+    row = await upsert_responder_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+        responder_ma_agent_id="agent_stats",
+        responder_name="stats-bot",
+        created_by_account_id=None,
+        now=_NOW,
+    )
+
+    assert row.kind == "handoff", "a task handed over in an ordinary thread binds as a handoff"
+    assert row.responder_ma_agent_id == "agent_stats", "the destination answers from now on"
+    assert row.configuration_target_ma_agent_id is None, (
+        "a handoff thread configures nothing, so it carries no target"
+    )
+
+
+async def test_upsert_responder_binding_moves_a_task_on_and_clears_the_stale_target(
+    db_session: AsyncSession,
+) -> None:
+    """A task may be handed on again; the row follows it rather than stacking."""
+    tenant = await make_tenant(db_session)
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+        responder_ma_agent_id="agent_stats",
+        responder_name="stats-bot",
+        configuration_target_ma_agent_id="agent_stale",
+        configuration_target_name="stale",
+        kind="handoff",
+    )
+
+    row = await upsert_responder_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+        responder_ma_agent_id="agent_research",
+        responder_name="research-bot",
+        created_by_account_id=None,
+        now=_NOW,
+    )
+
+    assert row.responder_name == "research-bot", "the newest destination answers"
+    assert row.configuration_target_ma_agent_id is None, (
+        "the previous thread's configuration target must not survive the move"
+    )
+    listed = await get_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+    )
+    assert listed is not None and listed.id == row.id, "one location still holds exactly one row"
+
+
+async def test_upsert_responder_binding_refuses_over_a_setup_conversation(
+    db_session: AsyncSession,
+) -> None:
+    """Setup conversations answer as Daimon; overwriting the responder would break
+    the admission path that asserts exactly that."""
+    tenant = await make_tenant(db_session)
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="setup-thread",
+        responder_ma_agent_id="agent_daimon",
+        responder_name="daimon",
+    )
+
+    with pytest.raises(HandoffRefusedInSetupThread):
+        await upsert_responder_binding(
+            db_session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="channel",
+            thread_id="setup-thread",
+            responder_ma_agent_id="agent_stats",
+            responder_name="stats-bot",
+            created_by_account_id=None,
+            now=_NOW,
+        )
+
+    unchanged = await get_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="setup-thread",
+    )
+    assert unchanged is not None and unchanged.responder_ma_agent_id == "agent_daimon", (
+        "a refused handoff leaves the setup conversation exactly as it was"
+    )
+
+
+async def test_upsert_responder_binding_is_scoped_to_one_tenant_and_location(
+    db_session: AsyncSession,
+) -> None:
+    first = await make_tenant(db_session)
+    second = await make_tenant(db_session)
+    await create_binding(
+        db_session,
+        tenant_id=second.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+        responder_ma_agent_id="agent_other",
+        responder_name="other-bot",
+        kind="handoff",
+    )
+
+    await upsert_responder_binding(
+        db_session,
+        tenant_id=first.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+        responder_ma_agent_id="agent_stats",
+        responder_name="stats-bot",
+        created_by_account_id=None,
+        now=_NOW,
+    )
+
+    neighbour = await get_binding(
+        db_session,
+        tenant_id=second.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ordinary-thread",
+    )
+    assert neighbour is not None and neighbour.responder_ma_agent_id == "agent_other", (
+        "another workspace's identically-named thread is untouched"
     )

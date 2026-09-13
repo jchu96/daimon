@@ -529,3 +529,76 @@ async def test_is_agent_reachable_in_tenant_is_isolated_per_tenant(
     )
     assert reachable_t1, "the tenant that scoped agent Y must answer True for Y"
     assert not reachable_t2, "a sibling tenant that never scoped agent Y must answer False for Y"
+
+
+async def test_resolve_reports_setup_as_the_thread_binding_kind(db_session: AsyncSession) -> None:
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="c1",
+        thread_id="setup-thread",
+        responder_ma_agent_id="ag_daimon",
+        responder_name="daimon",
+    )
+
+    resolved = await resolve(
+        db_session,
+        context=ScopeContext(
+            tenant_id=tenant.id, channel_id="c1", platform="discord", thread_id="setup-thread"
+        ),
+        default=_DEFAULT,
+    )
+
+    assert resolved.thread_binding_kind == "setup", (
+        "the cascade must carry why the thread has its own responder"
+    )
+    assert resolved.agent_name_tier == "thread", "the thread tier still wins"
+
+
+async def test_resolve_reports_handoff_as_the_thread_binding_kind(db_session: AsyncSession) -> None:
+    """Both kinds win the cascade; only the kind tells them apart downstream."""
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="c1",
+        thread_id="handed-over",
+        responder_ma_agent_id="ag_stats",
+        responder_name="stats-bot",
+        kind="handoff",
+    )
+
+    resolved = await resolve(
+        db_session,
+        context=ScopeContext(
+            tenant_id=tenant.id, channel_id="c1", platform="discord", thread_id="handed-over"
+        ),
+        default=_DEFAULT,
+    )
+
+    assert resolved.thread_binding_kind == "handoff", "a handed-over task is not a setup thread"
+    assert resolved.agent_name == "stats-bot", "the agent holding the task answers"
+    assert resolved.responder_ma_agent_id == "ag_stats", "the concrete identity comes through"
+
+
+async def test_resolve_reports_no_binding_kind_for_an_ordinary_thread(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+
+    resolved = await resolve(
+        db_session,
+        context=ScopeContext(
+            tenant_id=tenant.id, channel_id="c1", platform="discord", thread_id="ordinary"
+        ),
+        default=_DEFAULT,
+    )
+
+    assert resolved.thread_binding_kind is None, "an unbound thread has no binding kind"

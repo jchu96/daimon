@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from typing import Literal
 
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
@@ -30,6 +31,13 @@ from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.tenant_balance import debit_amount
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+TurnLedgerReason = Literal["turn_debit", "checkpoint_debit"]
+"""`tenant_ledger.reason` values a turn-shaped debit may carry.
+
+The column is free text in the schema (no CHECK constraint), so this literal
+is the only gate — keep it closed.
+"""
+
 
 async def record_turn_usage(
     *,
@@ -41,6 +49,7 @@ async def record_turn_usage(
     event: BetaManagedAgentsSpanModelRequestEndEvent,
     markup: Decimal = Decimal("1.0"),
     pricing: ModelRates | None = None,
+    reason: TurnLedgerReason = "turn_debit",
 ) -> None:
     """Write one usage_events row and one debit ledger row.
 
@@ -48,6 +57,15 @@ async def record_turn_usage(
     (TOPUP-01). Writes a negative delta_usd row to tenant_ledger in the SAME
     transaction as the usage write. The debit is idempotent on
     (managed_session_id, event.id) — mirroring the usage_events dedup grain.
+
+    `reason` names the ledger row's kind. It is a closed literal, not free
+    text: a new debit kind is a deliberate, reviewable edit here rather than
+    something a caller invents inline. `checkpoint_debit` is the billed
+    checkpoint turn a workspace transfer spends on the OLD session
+    (`daimon.core.workspace_transfer`) — real model work the tenant pays for,
+    but not a turn anyone asked for in a thread, so it is separable in the
+    ledger. The idempotency key keeps the `turn:` prefix for every reason:
+    it is keyed on (session, event), which is already unique per debit.
 
     tenant_id=None is the DM signal — no tenant, no usage row, no ledger row.
     """
@@ -69,7 +87,7 @@ async def record_turn_usage(
             s,
             tenant_id=tenant_id,
             delta_usd=-debit,
-            reason="turn_debit",
+            reason=reason,
             idempotency_key=f"turn:{managed_session_id}:{event.id}",
         )
 

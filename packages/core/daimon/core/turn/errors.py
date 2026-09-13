@@ -9,6 +9,7 @@ unchanged; adapters add specific handlers on top in the cutover plans.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Literal
 
 from daimon.core.errors import DaimonError
@@ -50,6 +51,31 @@ class MissingTurnConfigError(DaimonError):
         self.missing: tuple[MissingConfigPart, ...] = missing
         self.agent_name_tier: ConfigTier | None = agent_name_tier
         self.environment_name_tier: ConfigTier | None = environment_name_tier
+
+
+class SessionPreparationFailed(DaimonError):
+    """A configuration change could not be applied, so the turn did not run.
+
+    Deliberately not a `TurnError`: nothing was attempted upstream. The old
+    session was never torn down either, which is what `preserved` asserts and
+    what the adapter's copy rests on — the caller's work is where they left it,
+    and the change will be retried at their next message once `retry_after`
+    has passed.
+    """
+
+    def __init__(
+        self,
+        *,
+        reasons: tuple[str, ...],
+        stage: str,
+        retry_after: datetime,
+        preserved: bool = True,
+    ) -> None:
+        super().__init__(f"session preparation failed at {stage}: {reasons!r}")
+        self.reasons: tuple[str, ...] = reasons
+        self.stage: str = stage
+        self.retry_after: datetime = retry_after
+        self.preserved: bool = preserved
 
 
 class SessionAgentMismatch(DaimonError):
