@@ -206,6 +206,7 @@ async def test_register_channel_tools_registers_shared_names() -> None:
         "search_messages",
         "create_thread",
         "rename_thread",
+        "set_display_identity",
     } <= tool_names, "all shared channel tool names must be registered once"
 
 
