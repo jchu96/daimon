@@ -58,8 +58,8 @@ def test_parse_thread_name_drops_wrapping_quotes_when_model_quotes_title() -> No
     )
 
 
-@pytest.mark.parametrize("raw", ["NONE", "none\n", "", "   ", "\n\n"])
-def test_parse_thread_name_returns_none_when_model_declines_or_answers_blank(raw: str) -> None:
+@pytest.mark.parametrize("raw", ["", "   ", "\n\n", '""'])
+def test_parse_thread_name_returns_none_when_model_answers_blank(raw: str) -> None:
     assert parse_thread_name(raw) is None, f"{raw!r} carries no title and must map to None"
 
 
@@ -109,7 +109,7 @@ def _message_payload(text: str) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
-async def test_suggest_thread_name_calls_haiku_with_truncated_message_and_maps_usage() -> None:
+async def test_suggest_thread_name_wraps_truncated_message_as_data_and_maps_usage() -> None:
     seen: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -129,20 +129,24 @@ async def test_suggest_thread_name_calls_haiku_with_truncated_message_and_maps_u
     ), "usage must come from the response, with an absent cache count mapped to 0"
     assert len(seen) == 1, "exactly one model call per suggestion"
     assert seen[0]["model"] == THREAD_NAMING_MODEL, "the pinned, priced model must be requested"
-    assert seen[0]["messages"][0]["content"] == message_text[:40], (
-        "the opening message must be cut at max_input_chars before it is sent"
+    assert seen[0]["messages"][0]["content"] == f"<message>\n{message_text[:40]}\n</message>", (
+        "the opening message must be cut at max_input_chars and wrapped in <message> tags, "
+        "so the model summarizes it instead of answering it"
+    )
+    assert "NONE" not in seen[0]["system"] and "Always produce a title" in seen[0]["system"], (
+        "the prompt must offer no escape hatch: every message gets a title"
     )
 
 
-async def test_suggest_thread_name_returns_none_name_but_usage_when_model_says_none() -> None:
+async def test_suggest_thread_name_returns_none_name_but_usage_when_model_answers_blank() -> None:
     suggestion = await suggest_thread_name(
-        build_fake_anthropic(lambda _r: httpx.Response(200, json=_message_payload("NONE"))),
+        build_fake_anthropic(lambda _r: httpx.Response(200, json=_message_payload(" \n"))),
         message_text="hey",
         max_input_chars=2000,
     )
-    assert suggestion.name is None, "NONE must map to no title"
+    assert suggestion.name is None, "a blank answer must map to no title"
     assert suggestion.usage.output_tokens == 9, (
-        "a declined title still cost tokens; usage must be reported so the caller meters it"
+        "a blank answer still cost tokens; usage must be reported so the caller meters it"
     )
 
 

@@ -756,9 +756,10 @@ class ThreadNamingSettings(BaseModel):
     enabled: bool = Field(
         default=True,
         description=(
-            "Rename bot-created Discord threads from the opening message with a "
-            "short Haiku-generated title. The call is metered to the tenant like "
-            "any other model call. Set false to keep the static 'Chat with <agent>' title."
+            "Title bot-created Discord threads from the opening message with a short "
+            "Haiku-generated name, chosen before the thread is created. The call is "
+            "metered to the tenant like any other model call. Set false to keep the "
+            "static 'Chat with <agent>' title."
         ),
     )
     max_input_chars: int = Field(
@@ -768,6 +769,16 @@ class ThreadNamingSettings(BaseModel):
         description=(
             "Characters of the opening message sent to the naming model; longer "
             "messages are cut here. Bounds the per-thread naming cost."
+        ),
+    )
+    timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description=(
+            "Seconds to wait for the naming model before the thread opens under the "
+            "static title. The thread is created only after this call, so this is "
+            "the most a mention can wait before anything appears."
         ),
     )
 
