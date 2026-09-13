@@ -397,16 +397,48 @@ def _validate_mcp_toolset_crossref(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def make_fake_ma_handler() -> Callable[[httpx.Request], httpx.Response]:
+@dataclass
+class FakeMAState:
+    """In-memory agent store shared between the MA agent-CRUD fake and other
+    fakes that need to read agent specs (e.g. the sessions fake freezing an
+    agent snapshot at session-create time).
+
+    Extracted from `make_fake_ma_handler`'s local closure so it can be
+    injected and shared — `make_fake_ma_handler(state=None)` keeps today's
+    behaviour (a private, handler-local store) unchanged.
+
+    `agent_versions` is a full history keyed by (agent_id, version number):
+    `agents` alone only ever holds the LATEST version (each `agents.update`
+    overwrites it in place), so a caller pinning an explicit prior version
+    (e.g. `make_fake_sessions_handler`'s session-create, which accepts
+    `{"type": "agent", "id": ..., "version": N}`) needs the historical
+    snapshot, not whatever is current.
+    """
+
+    agents: dict[str, dict[str, object]] = field(default_factory=dict[str, dict[str, object]])
+    agent_versions: dict[str, dict[int, dict[str, object]]] = field(
+        default_factory=dict[str, dict[int, dict[str, object]]]
+    )
+
+
+def make_fake_ma_handler(
+    state: FakeMAState | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
     """Stateful fake handler for MA agent CRUD.
 
     Tracks created agents in memory so PATCH can update them. Validates the
     mcp_servers <-> mcp_toolset cross-reference on POST and PATCH.
 
+    Pass a `FakeMAState` to share the agent store with another fake (e.g.
+    `make_fake_sessions_handler`, which reads agent specs at session-create
+    time to freeze a session's agent snapshot). Omit it for today's
+    behaviour: a private store scoped to this handler.
+
     Returns a plain callable (not decorated) — wrap with build_fake_anthropic
     to get an AsyncAnthropic client.
     """
-    store: dict[str, dict[str, object]] = {}
+    st = state if state is not None else FakeMAState()
+    store = st.agents
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -444,6 +476,7 @@ def make_fake_ma_handler() -> Callable[[httpx.Request], httpx.Response]:
                 version=1,
             )
             store[agent["id"]] = agent  # pyright: ignore[reportArgumentType]
+            st.agent_versions.setdefault(str(agent["id"]), {})[1] = dict(agent)
             return httpx.Response(200, json=agent)
 
         # GET /v1/environments/{id} — retrieve single environment
@@ -493,6 +526,7 @@ def make_fake_ma_handler() -> Callable[[httpx.Request], httpx.Response]:
                 )
             merged["version"] = existing.get("version", 1) + 1  # pyright: ignore[reportOperatorIssue]
             store[agent_id] = merged
+            st.agent_versions.setdefault(agent_id, {})[merged["version"]] = dict(merged)  # pyright: ignore[reportArgumentType]
             return httpx.Response(200, json=merged)
 
         return httpx.Response(404, json={"error": f"unhandled {method} {path}"})

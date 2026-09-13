@@ -13,12 +13,22 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
+from daimon.core.session_snapshot import SessionSnapshot
 from pydantic import BaseModel, ConfigDict
 
 # NOTE: Adding a platform requires updating this Literal AND the DB column
 # (currently untyped Text). If mismatched, Pydantic model_validate raises
 # ValidationError on read — keep in sync.
 Platform = Literal["discord", "cli", "slack"]
+
+# Session-continuity vocabularies. Same contract as `Platform` above: the
+# columns are untyped Text, so a value outside the Literal raises on read.
+# `transfer_kind` says how much of a task survived a session replacement;
+# a preparation's `stage` is its resume point.
+TransferKind = Literal["full", "transcript", "history"]
+PreparationStage = Literal["decided", "checkpointed", "uploaded", "created", "completed", "failed"]
+ContinuationReason = Literal["task_handoff", "private_input_applied"]
+ContinuationStatus = Literal["pending", "claimed", "delivered", "skipped"]
 
 
 class Role(enum.StrEnum):
@@ -180,6 +190,54 @@ class ThreadSessionRow(BaseModel):
     active_turn_message_id: str | None = None
     active_turn_started_at: datetime | None = None
     active_turn_channel_id: str | None = None
+    # The configuration the MA session froze at create time. NULL on rows
+    # written before continuity existed — callers read that as "unknown".
+    effective_config: SessionSnapshot | None = None
+    identity_fingerprint: str | None = None
+    mutable_fingerprint: str | None = None
+    predecessor_id: uuid.UUID | None = None
+    replaced_by_id: uuid.UUID | None = None
+    transfer_file_id: str | None = None
+    transfer_kind: TransferKind | None = None
+    fresh_start_requested_at: datetime | None = None
+
+
+class SessionPreparationRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: uuid.UUID
+    mapping_id: uuid.UUID
+    target_fingerprint: str
+    stage: PreparationStage
+    transfer_file_id: str | None
+    transfer_kind: TransferKind | None
+    new_mapping_id: uuid.UUID | None
+    failure_reason: str | None
+    attempts: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class TaskContinuationRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    platform: str
+    thread_id: str
+    parent_channel_id: str
+    requester_account_id: uuid.UUID
+    requester_external_user_id: str
+    target_ma_agent_id: str
+    target_name: str
+    requested_work: str | None
+    reason: ContinuationReason
+    status: ContinuationStatus
+    skip_reason: str | None
+    idempotency_key: uuid.UUID
+    created_at: datetime
+    claimed_at: datetime | None
+    delivered_at: datetime | None
 
 
 class GitHubOauthStateRow(BaseModel):
@@ -602,7 +660,7 @@ class ThreadAgentBindingRow(BaseModel):
     platform: str
     parent_channel_id: str
     thread_id: str
-    kind: Literal["setup"] = "setup"
+    kind: Literal["setup", "handoff"] = "setup"
     responder_ma_agent_id: str
     responder_name: str
     configuration_target_ma_agent_id: str | None

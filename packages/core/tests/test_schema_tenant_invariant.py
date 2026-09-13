@@ -51,6 +51,11 @@ _TENANT_ID_EXEMPT: dict[str, str] = {
     # File-GC queue keyed by server-minted file_id; rows are transient and
     # reference no tenant-owned data beyond the opaque handle.
     "pending_file_deletes": "keyed by server-minted file_id; transient GC queue",
+    # Keyed by mapping_id, an FK to thread_sessions.id — a globally unique UUID
+    # that belongs to exactly one tenant, and the only way a preparation is ever
+    # looked up. The row holds no tenant-owned data of its own beyond opaque
+    # MA handles, and it cascades away with the mapping.
+    "session_preparations": "keyed by mapping_id (FK to thread_sessions.id, globally unique, one tenant)",
     # Cross-tenant BY DESIGN: links a CLI principal to a platform principal for
     # operator impersonation. Both endpoints are globally unique principal UUIDs.
     "principal_links": "cross-principal link table (both PKs globally unique UUIDs)",

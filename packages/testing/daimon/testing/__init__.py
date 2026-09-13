@@ -18,6 +18,8 @@ from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     EMPTY_SESSION_STATS,
     EMPTY_SESSION_USAGE,
+    FakeMAState,
+    FakeMemoryStoreState,
     MARouter,
     NotHandled,
     build_fake_anthropic,
@@ -26,16 +28,25 @@ from daimon.testing.ma import (
     json_body,
     list_response,
     make_fake_ma_handler,
+    make_fake_memory_store_handler,
     send_events_response,
     session_response,
     sse_response,
     stub_anthropic,
+)
+from daimon.testing.ma_sessions import (
+    FakeSessionsState,
+    make_fake_sessions_handler,
+    session_turn_sse,
 )
 
 __all__ = [
     "EMPTY_CLOUD_CONFIG",
     "EMPTY_SESSION_STATS",
     "EMPTY_SESSION_USAGE",
+    "FakeMAState",
+    "FakeMemoryStoreState",
+    "FakeSessionsState",
     "MARouter",
     "NotHandled",
     "build_fake_anthropic",
@@ -47,6 +58,8 @@ __all__ = [
     "make_agent_memory_store",
     "make_agent_repo_binding",
     "make_fake_ma_handler",
+    "make_fake_memory_store_handler",
+    "make_fake_sessions_handler",
     "make_ledger_entry",
     "make_mcp_token",
     "make_routine",
@@ -58,6 +71,7 @@ __all__ = [
     "make_wizard_session",
     "send_events_response",
     "session_response",
+    "session_turn_sse",
     "sse_response",
     "stub_anthropic",
 ]

@@ -14,7 +14,15 @@ from datetime import UTC, datetime
 
 import pytest_asyncio
 from daimon.core._models import ThreadSession
+from daimon.core.session_snapshot import SessionSnapshot
 from daimon.core.stores.domain import ThreadSessionRow
+from daimon.core.stores.thread_session_lineage import (
+    clear_fresh_start,
+    get_lineage,
+    mark_retired,
+    mark_superseded,
+    request_fresh_start,
+)
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
     clear_active_turn_if_message_id,
@@ -25,6 +33,8 @@ from daimon.core.stores.thread_sessions import (
     list_orphaned_turns,
     mark_dead,
     mark_turn_active,
+    record_snapshot,
+    update_mutable_fingerprint,
     update_watermark,
 )
 from daimon.testing.factories import make_tenant
@@ -739,3 +749,318 @@ async def test_clear_active_turn_if_message_id_never_touches_another_row(
     assert orphans[0].active_turn_channel_id == "C_ROW_B", (
         "the other row's channel id must also survive untouched"
     )
+
+
+def _snapshot(*, model_id: str = "claude-sonnet-5") -> SessionSnapshot:
+    """A minimal but fully-validated snapshot; only `model_id` ever varies here."""
+    return SessionSnapshot(
+        ma_agent_id="agent_research",
+        model_id=model_id,
+        system_sha256="sys",
+        skills_sha256="skills",
+        environment_id="env_science",
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id="memstore_7",
+        vault_id="vault_9",
+        tools_sha256="tools",
+        mcp_servers_sha256="mcp",
+        env_sha256="env",
+        env_file_id="file_env",
+        env_resource_id="res_env",
+        agent_version=3,
+        agent_name="research-bot",
+    )
+
+
+async def test_created_row_returns_the_snapshot_it_was_given(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    snapshot = _snapshot()
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="snapshot-on-create",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_snapshot_create",
+        effective_config=snapshot,
+        identity_fingerprint="ident-1",
+        mutable_fingerprint="mut-1",
+    )
+
+    assert row.effective_config == snapshot, (
+        "the snapshot must survive the JSONB write and come back as a SessionSnapshot"
+    )
+    assert row.identity_fingerprint == "ident-1", "the identity fingerprint must persist"
+    assert row.mutable_fingerprint == "mut-1", "the mutable fingerprint must persist"
+
+
+async def test_record_snapshot_backfills_a_row_that_had_none(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="snapshot-backfill",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_snapshot_backfill",
+    )
+    assert row.effective_config is None, "a pre-continuity row starts with no snapshot"
+
+    snapshot = _snapshot()
+    await record_snapshot(
+        db_session,
+        id=row.id,
+        snapshot=snapshot,
+        identity_fingerprint="ident-backfill",
+        mutable_fingerprint="mut-backfill",
+    )
+
+    refreshed = await get_thread_session_by_id(db_session, id=row.id)
+    assert refreshed is not None, "the row must still exist after a backfill"
+    assert refreshed.effective_config == snapshot, "the backfilled snapshot must be readable back"
+    assert refreshed.identity_fingerprint == "ident-backfill", "both fingerprints are written"
+
+
+async def test_update_mutable_fingerprint_leaves_the_identity_fingerprint_alone(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="in-place-refresh",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_in_place",
+        effective_config=_snapshot(),
+        identity_fingerprint="ident-frozen",
+        mutable_fingerprint="mut-old",
+    )
+    refreshed_snapshot = _snapshot().model_copy(update={"env_sha256": "env-new"})
+
+    await update_mutable_fingerprint(
+        db_session,
+        id=row.id,
+        snapshot=refreshed_snapshot,
+        mutable_fingerprint="mut-new",
+    )
+
+    stored = await get_thread_session_by_id(db_session, id=row.id)
+    assert stored is not None, "the refreshed row must still exist"
+    assert stored.mutable_fingerprint == "mut-new", "an in-place refresh moves the mutable axis"
+    assert stored.identity_fingerprint == "ident-frozen", (
+        "an in-place refresh must never rewrite the identity the session froze"
+    )
+    assert stored.effective_config == refreshed_snapshot, (
+        "the stored configuration must reflect what the live session now runs"
+    )
+
+
+async def test_exactly_one_row_stays_live_when_a_session_is_superseded(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    account_id = uuid.uuid4()
+    old = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="supersede",
+        account_id=account_id,
+        ma_session_id="sess_old",
+        created_at=datetime(2026, 9, 13, 10, 0, tzinfo=UTC),
+    )
+    new = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="supersede",
+        account_id=account_id,
+        ma_session_id="sess_new",
+        predecessor_id=old.id,
+        transfer_file_id="file_bundle",
+        transfer_kind="full",
+        created_at=datetime(2026, 9, 13, 11, 0, tzinfo=UTC),
+    )
+
+    await mark_superseded(db_session, id=old.id, replaced_by_id=new.id)
+
+    live_ids = (
+        (
+            await db_session.execute(
+                select(ThreadSession.id).where(
+                    ThreadSession.tenant_id == tenant_id,
+                    ThreadSession.thread_id == "supersede",
+                    ThreadSession.status == "live",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert list(live_ids) == [new.id], "supersede must leave exactly the successor live"
+
+    bound = await get_live_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="supersede",
+        account_id=account_id,
+    )
+    assert bound is not None and bound.id == new.id, "the caller must bind to the successor"
+    assert bound.transfer_kind == "full", "the successor records how much of the task it carries"
+
+    superseded = await get_thread_session_by_id(db_session, id=old.id)
+    assert superseded is not None, "the superseded row is kept, never deleted"
+    assert superseded.status == "superseded", "the old row records why it stopped being live"
+    assert superseded.replaced_by_id == new.id, "the old row must name its successor"
+
+
+async def test_a_retired_row_is_invisible_to_the_caller_scoped_lookup(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    account_id = uuid.uuid4()
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="fresh-start",
+        account_id=account_id,
+        ma_session_id="sess_retired",
+    )
+
+    await mark_retired(db_session, id=row.id)
+
+    assert (
+        await get_live_thread_session(
+            db_session,
+            tenant_id=tenant_id,
+            platform="discord",
+            thread_id="fresh-start",
+            account_id=account_id,
+        )
+        is None
+    ), "a retired session must never be bound again"
+    kept = await get_thread_session_by_id(db_session, id=row.id)
+    assert kept is not None and kept.status == "retired", "the retired row survives as audit"
+
+
+async def test_fresh_start_request_is_recorded_then_cleared(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="fresh-start-flag",
+        account_id=uuid.uuid4(),
+        ma_session_id="sess_fresh_flag",
+    )
+    requested_at = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
+
+    await request_fresh_start(db_session, id=row.id, at=requested_at)
+    flagged = await get_thread_session_by_id(db_session, id=row.id)
+    assert flagged is not None, "the flagged row must still exist"
+    assert flagged.fresh_start_requested_at == requested_at, (
+        "the request is recorded without touching the session, which stays usable"
+    )
+    assert flagged.status == "live", "requesting a fresh start must not retire anything yet"
+
+    await clear_fresh_start(db_session, id=row.id)
+    cleared = await get_thread_session_by_id(db_session, id=row.id)
+    assert cleared is not None and cleared.fresh_start_requested_at is None, (
+        "an honoured request must be cleared so it is not honoured twice"
+    )
+
+
+async def test_lineage_returns_the_whole_chain_oldest_first(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    account_id = uuid.uuid4()
+    first = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="lineage",
+        account_id=account_id,
+        ma_session_id="sess_lineage_1",
+    )
+    second = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="lineage",
+        account_id=account_id,
+        ma_session_id="sess_lineage_2",
+        predecessor_id=first.id,
+    )
+    third = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="lineage",
+        account_id=account_id,
+        ma_session_id="sess_lineage_3",
+        predecessor_id=second.id,
+    )
+
+    lineage = await get_lineage(db_session, id=third.id)
+
+    assert [row.ma_session_id for row in lineage] == [
+        "sess_lineage_1",
+        "sess_lineage_2",
+        "sess_lineage_3",
+    ], "a lineage reads oldest first and ends at the row asked about"
+    assert await get_lineage(db_session, id=first.id) == [
+        await get_thread_session_by_id(db_session, id=first.id)
+    ], "a session with no predecessor is a lineage of one"
+    assert await get_lineage(db_session, id=uuid.uuid4()) == [], (
+        "an unknown id is an empty lineage, not an error"
+    )
+
+
+async def test_mark_dead_still_only_changes_status(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> None:
+    """Regression guard: continuity added statuses, it did not touch recovery."""
+    account_id = uuid.uuid4()
+    row = await create_thread_session(
+        db_session,
+        tenant_id=tenant_id,
+        platform="discord",
+        thread_id="dead-unchanged",
+        account_id=account_id,
+        ma_session_id="sess_dead",
+        effective_config=_snapshot(),
+        identity_fingerprint="ident-1",
+        mutable_fingerprint="mut-1",
+    )
+
+    await mark_dead(db_session, id=row.id)
+
+    dead = await get_thread_session_by_id(db_session, id=row.id)
+    assert dead is not None, "mark_dead keeps the row"
+    assert dead.status == "dead", "mark_dead still writes exactly 'dead'"
+    assert dead.replaced_by_id is None, "a dead session has no successor recorded by mark_dead"
+    assert dead.effective_config is not None, (
+        "a dead row keeps the configuration it ran, for the recovery path to read"
+    )
+    assert (
+        await get_live_thread_session(
+            db_session,
+            tenant_id=tenant_id,
+            platform="discord",
+            thread_id="dead-unchanged",
+            account_id=account_id,
+        )
+        is None
+    ), "a dead row stays invisible to the caller-scoped lookup"
