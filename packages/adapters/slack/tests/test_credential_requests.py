@@ -879,9 +879,10 @@ async def test_skill_repo_submission_binds_and_attaches_the_imported_skills(
     assert "skill_01imported" in attached_ids, (
         "the newly imported skill must be attached to the agent the request named"
     )
-    assert any("Attached 1 to `daimon`" in t for t in _ephemeral_texts(fake_slack_web_client)), (
-        "the success ephemeral must report the attach half, not just the import"
-    )
+    assert any(
+        "daimon has the 1 skill(s) from o/attach-repo skill." in t
+        for t in _ephemeral_texts(fake_slack_web_client)
+    ), "the success ephemeral must report the attach half via the shared change-confirmation copy"
 
 
 @pytest.mark.parametrize("fails_after_storage", [False, True])

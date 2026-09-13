@@ -472,6 +472,19 @@ async def test_handoff_asks_once_about_uncommitted_work_then_proceeds_with_the_a
 
     assert result.destination_ma_agent_id == _DESTINATION_ID, "the answered retry goes through"
 
+    async with committing_sessionmaker() as session:
+        row = await get_live_thread_session(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            thread_id="T_THREAD",
+            account_id=caller.id,
+        )
+    assert row is not None and row.pending_unsaved_work == "leave", (
+        "the replacement happens at the caller's next message, so the answer has to be stored "
+        "rather than lost with this turn"
+    )
+
 
 async def test_handoff_never_asks_about_uncommitted_work_when_no_repo_is_bound(
     db_session: AsyncSession,
@@ -729,3 +742,55 @@ async def test_fresh_start_does_not_change_who_answers_in_the_thread(
         "who answers here does not change"
     )
     assert (channels, tenants) == (0, 0), "and neither does channel or workspace routing"
+
+
+async def test_handoff_with_an_answer_and_no_live_session_still_switches_the_responder(
+    db_session: AsyncSession,
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A caller who has no session yet has no row to hold the answer. The
+    switch must still happen: their first message starts a clean workspace,
+    which is what an answer about uncommitted work would have governed."""
+    tenant = await make_tenant(db_session)
+    caller = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    runtime = _runtime(committing_sessionmaker, _client([_destination(tenant.id)]))
+    auth = AuthIdentity(
+        account_id=caller.id,
+        tenant_id=tenant.id,
+        role=Role.USER,
+        platform="discord",
+        platform_user_id="42",
+    )
+
+    async with turn_origin(
+        committing_sessionmaker,
+        tenant_id=tenant.id,
+        account_id=caller.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="T_THREAD",
+        responder_ma_agent_id=_RESPONDER_ID,
+        responder_name="daimon",
+        role=Role.USER,
+    ) as origin:
+        result = await _hand_off_task_impl(
+            runtime,
+            auth,
+            origin_context_id=str(origin.id),
+            agent_id=_DESTINATION_ID,
+            unsaved_work="copy",
+        )
+
+    assert result.destination_ma_agent_id == _DESTINATION_ID
+    async with committing_sessionmaker() as session:
+        binding = await get_binding(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="C_PARENT",
+            thread_id="T_THREAD",
+        )
+    assert binding is not None and binding.kind == "handoff", (
+        "the responder switch is the part that must not depend on a session existing"
+    )

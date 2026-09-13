@@ -40,7 +40,10 @@ from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from daimon.core.stores.task_continuations import record_continuation
 from daimon.core.stores.thread_agent_bindings import get_binding, upsert_responder_binding
 from daimon.core.stores.thread_session_lineage import request_fresh_start
-from daimon.core.stores.thread_sessions import get_live_thread_session
+from daimon.core.stores.thread_sessions import (
+    get_live_thread_session,
+    set_pending_unsaved_work,
+)
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
@@ -192,6 +195,12 @@ async def _hand_off_task_impl(
         # continuation, so a thread must never end up switched with the work
         # it was told would be picked up missing.
         async with runtime.session_factory.begin() as session:
+            if unsaved_work is not None and live_session is not None:
+                # The answer outlives this turn: the replacement it governs
+                # happens at this caller's NEXT message, when the destination
+                # binds. Written in the same transaction as the binding so a
+                # thread can never end up switched with the answer lost.
+                await set_pending_unsaved_work(session, id=live_session.id, choice=unsaved_work)
             await upsert_responder_binding(
                 session,
                 tenant_id=auth.tenant_id,

@@ -1714,6 +1714,45 @@ async def test_agent_section_submit_returns_to_edit_view(
 
 
 @pytest.mark.asyncio
+async def test_agent_section_submit_posts_model_and_instructions_acks_matching_core_renderer(
+    monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
+) -> None:
+    """Changing both the model and the prompt must post exactly the two acks
+    `render_change_confirmation` itself produces -- byte-for-byte, not
+    adapter-side hand-written copy."""
+    from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
+
+    async def fake_reconcile(runtime: Any, state: PanelState, *, tenant_id: uuid.UUID) -> Any:
+        return MagicMock()
+
+    monkeypatch.setattr(modals_mod, "call_reconcile_for_panel", fake_reconcile)
+
+    selected = _entry("immutable-name")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    runtime = _runtime_for_view(anthropic=build_stub_anthropic(), tenant_id=tenant_id)
+
+    modal = AgentSectionModal(state, runtime=runtime, allowed_user_id=99)
+    modal.model_in._value = "claude-opus-5"  # pyright: ignore[reportPrivateUsage]
+    modal.prompt_in._value = "You are a helpful assistant."  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    posted = [c.args[0] for c in interaction.followup.send.call_args_list if c.args]
+    expected_model = render_change_confirmation(
+        ConfigurationChange(target_name="immutable-name", kind="model", availability="next_message")
+    )
+    expected_instructions = render_change_confirmation(
+        ConfigurationChange(
+            target_name="immutable-name", kind="instructions", availability="next_message"
+        )
+    )
+    assert posted == [expected_model, expected_instructions], (
+        f"expected exactly the model then instructions acks, got {posted!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_repo_auth_submit_returns_to_edit_view(
     monkeypatch: pytest.MonkeyPatch, tenant_id: uuid.UUID, account_id: uuid.UUID
 ) -> None:
@@ -1893,7 +1932,9 @@ async def test_pat_only_submit_stores_pat_and_writes_no_binding(
     assert state.bound_repo_url is None, "a PAT-only submit must not pin a repo"
     interaction.followup.send.assert_called_once()
     call_text = str(interaction.followup.send.call_args)
-    assert "GitHub MCP" in call_text, "the user must see the GitHub MCP explanation"
+    assert "GitHub connection uses it from your next message here" in call_text, (
+        "the user must see that the stored token is what the GitHub connection now uses"
+    )
 
 
 @pytest.mark.asyncio

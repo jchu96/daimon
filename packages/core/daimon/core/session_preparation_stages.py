@@ -36,7 +36,12 @@ from daimon.core.session_snapshot import (
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.agent_memory_stores import get_memory_store_id
 from daimon.core.stores.agent_repo_binding import get_binding
-from daimon.core.stores.domain import SessionPreparationRow, ThreadSessionRow, TransferKind
+from daimon.core.stores.domain import (
+    SessionPreparationRow,
+    ThreadSessionRow,
+    TransferKind,
+    UnsavedWorkChoice,
+)
 from daimon.core.stores.thread_sessions import record_snapshot
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.ceiling import TURN_CEILING_S
@@ -79,6 +84,10 @@ class WorkspaceTransfer(Protocol):
     `transfer_id` is stable across retries of the same preparation, so an
     implementation that already produced a bundle for it can return that one
     instead of paying for a second checkpoint turn.
+
+    `unsaved_work` is the caller's standing answer about uncommitted changes in
+    a mounted repository, read off their mapping row. None means they were
+    never asked, which carries the same meaning as `"copy"`: capture the work.
     """
 
     async def __call__(
@@ -91,6 +100,7 @@ class WorkspaceTransfer(Protocol):
         destination_model_id: str,
         destination_agent_name: str,
         requested_work: str | None,
+        unsaved_work: UnsavedWorkChoice | None = None,
     ) -> PreparedReplacement: ...
 
 

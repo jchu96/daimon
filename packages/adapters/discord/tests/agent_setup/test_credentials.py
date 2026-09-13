@@ -416,7 +416,7 @@ async def test_paste_modal_stores_each_pair_and_never_logs_value(
     )
 
     toast = interaction.followup.send.call_args.args[0]
-    assert "Added 2 keys" in toast, "multi-key success copy"
+    assert "2 keys saved for bot." in toast, "multi-key success copy"
     assert _SECRET_VALUE not in toast, "toast never echoes a value"
     # The re-render callback fires after a successful paste, carrying the COUNT
     # the collapsed render needs — never a key name and never a value.

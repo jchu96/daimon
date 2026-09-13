@@ -34,6 +34,7 @@ from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core import agent_lifecycle
 from daimon.core.agent_guidance import apply_credential_guidance
 from daimon.core.constants import AGENT_MCP_CAP, AGENT_SKILL_CAP, ALLOWED_MODEL_IDS
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import (
     find_agents_by_daimon_tag,
     list_agents_by_tenant,
@@ -100,6 +101,10 @@ class AgentInfo(BaseModel):
     mcp_servers: list[AgentMcpServerInfo]
     skills: list[AgentSkillInfo]
     sync_warnings: list[SyncRepoFailure] | None = None
+    applies: str | None = None
+    """Set only by ``update_agent`` when it changed ``model`` and/or ``system``:
+    person-facing confirmation that the change reaches this conversation on
+    its next message, not the one running now."""
 
     @classmethod
     def from_ma(
@@ -588,7 +593,25 @@ async def _update_agent_impl(
                 f"use remove_skill on '{name}' before adding more."
             ) from exc
         raise
-    return await _build_agent_info(runtime.client, updated, tenant_id=auth.tenant_id)
+    result = await _build_agent_info(runtime.client, updated, tenant_id=auth.tenant_id)
+    applies_lines: list[str] = []
+    if model is not None:
+        applies_lines.append(
+            render_change_confirmation(
+                ConfigurationChange(target_name=name, kind="model", availability="next_message")
+            )
+        )
+    if system is not None:
+        applies_lines.append(
+            render_change_confirmation(
+                ConfigurationChange(
+                    target_name=name, kind="instructions", availability="next_message"
+                )
+            )
+        )
+    if applies_lines:
+        result = result.model_copy(update={"applies": "\n".join(applies_lines)})
+    return result
 
 
 async def _attach_mcp_server_impl(
@@ -839,9 +862,11 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         lists remove nothing. Use ``remove_skill`` or ``detach_mcp_server`` to remove.
         Daimon requires ``fork_agent`` first; channel/workspace defaults require admin.
 
-        Prompt changes replace the system prompt immediately. ``skills`` accepts names such as
+        Prompt, model and skill changes reach a conversation on its next message, not the
+        one running now. ``skills`` accepts names such as
         ``["build-models", "compare-models"]``, resolved server-side; explicit
-        ``{"type": "custom", "skill_id": "skill_..."}`` entries also work."""
+        ``{"type": "custom", "skill_id": "skill_..."}`` entries also work. A model or
+        prompt change also returns ``applies``: post it verbatim as part of the reply."""
         return await _update_agent_impl(
             runtime,
             await _auth(ctx),
@@ -870,8 +895,9 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ``detach_mcp_server`` disconnects it. Fork Daimon with ``fork_agent`` before
         directly changing its setup. Channel or workspace defaults need admin.
 
-        Connects the server and its tools immediately. Reusing a server name replaces
-        the URL; the same name and URL is a no-op. Other connections are preserved."""
+        Connects the server; its tools are available from the agent's next message,
+        not the one running now. Reusing a server name replaces the URL; the same
+        name and URL is a no-op. Other connections are preserved."""
         return await _attach_mcp_server_impl(
             runtime,
             await _auth(ctx),

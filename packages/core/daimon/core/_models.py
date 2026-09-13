@@ -353,6 +353,13 @@ class ThreadSession(Base):
     fresh_start_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # What this caller answered when asked whether uncommitted repository
+    # changes should be copied into the successor's working files ('copy') or
+    # left in the old checkout ('leave'). Held here because the question is
+    # asked in one turn and the replacement it governs happens in a later one;
+    # cleared when the row stops being live. No CHECK; the vocabulary is pinned
+    # by `stores.domain.UnsavedWorkChoice`.
+    pending_unsaved_work: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Set while a turn is running, cleared when it reaches a terminal state.
     # Distinct from `status`, which is about the session mapping and stays
     # 'live' on every healthy thread forever. Slack needs the channel because a

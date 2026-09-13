@@ -28,7 +28,7 @@ from typing import Any, cast
 
 from daimon.core._models import ThreadSession
 from daimon.core.session_snapshot import SessionSnapshot
-from daimon.core.stores.domain import ThreadSessionRow, TransferKind
+from daimon.core.stores.domain import ThreadSessionRow, TransferKind, UnsavedWorkChoice
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -361,6 +361,26 @@ async def record_snapshot(
             identity_fingerprint=identity_fingerprint,
             mutable_fingerprint=mutable_fingerprint,
         )
+    )
+    await session.flush()
+
+
+async def set_pending_unsaved_work(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+    choice: UnsavedWorkChoice,
+) -> None:
+    """Record what this caller said to do with uncommitted repository changes.
+
+    Written when the answer arrives, read by the replacement it governs, and
+    cleared the moment the row stops being live (`mark_superseded` /
+    `mark_retired`) so an answer can never be applied to a second, unrelated
+    replacement. A later answer overwrites an earlier one: the last thing the
+    caller said is the one that holds.
+    """
+    await session.execute(
+        update(ThreadSession).where(ThreadSession.id == id).values(pending_unsaved_work=choice)
     )
     await session.flush()
 

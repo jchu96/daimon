@@ -257,7 +257,12 @@ async def _run_replacement(
     deadline: dt.datetime,
     now: dt.datetime,
 ) -> _Replaced | PreparationFailure:
-    """Create the successor, carry the work into it, then retire the old row."""
+    """Create the successor, carry the work into it, then retire the old row.
+
+    The caller's answer about uncommitted repository changes rides on `row`
+    and reaches the transfer hook from here; `_close_out` clears it, so one
+    answer governs exactly one replacement.
+    """
     async with deps.sessionmaker() as session, session.begin():
         preparation = await upsert_preparation(
             session, mapping_id=row.id, target_fingerprint=fingerprint_identity(desired)
@@ -284,6 +289,7 @@ async def _run_replacement(
                 destination_model_id=admission.agent.model.id,
                 destination_agent_name=admission.agent.name,
                 requested_work=None,
+                unsaved_work=row.pending_unsaved_work,
             )
             stage = "upload"
             await _advance(

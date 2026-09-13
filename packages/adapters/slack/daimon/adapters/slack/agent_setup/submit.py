@@ -42,7 +42,7 @@ from __future__ import annotations
 import dataclasses
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import anthropic
 import structlog
@@ -61,6 +61,7 @@ from daimon.adapters.slack.agent_setup.write import (
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.adapters.slack.setup_conversations import setup_button
 from daimon.core.constants import DEFAULT_AGENT_MODEL
+from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
@@ -766,13 +767,23 @@ async def run_edit_agent_submission(
             team_id=team_id,
             agent_name=agent_name,
         )
+        changed_kinds: list[Literal["model", "instructions"]] = []
+        if updates.get("model"):
+            changed_kinds.append("model")
+        if updates.get("system"):
+            changed_kinds.append("instructions")
+        confirmation = "\n\n".join(
+            render_change_confirmation(
+                ConfigurationChange(target_name=agent_name, kind=kind, availability="next_message")
+            )
+            for kind in changed_kinds
+        )
         await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id,
             user=user_id,
-            text=(
-                f":white_check_mark: Updated `{agent_name}`. "
-                "Existing sessions may still use the previous setup."
-            ),
+            text=f":white_check_mark: {confirmation}"
+            if confirmation
+            else (f":white_check_mark: Updated `{agent_name}`."),
         )
     except (DaimonError, anthropic.APIError, SlackApiError, SQLAlchemyError) as exc:
         log.error(
@@ -997,7 +1008,16 @@ async def run_edit_repo_submission(
         await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id,
             user=user_id,
-            text=f":white_check_mark: Saved working repo access for `{agent_name}`.",
+            text=":white_check_mark: "
+            + render_change_confirmation(
+                ConfigurationChange(
+                    target_name=agent_name,
+                    kind="repo",
+                    repo=repo_url,
+                    branch="main" if repo_url is not None else None,
+                    availability="next_message",
+                )
+            ),
         )
     except (DaimonError, anthropic.APIError, SlackApiError, SQLAlchemyError) as exc:
         log.error(
@@ -1375,14 +1395,22 @@ async def run_paste_secrets_submission(
 
         n = len(key_names_written)
         if n == 1:
-            confirm_text = (
-                f":white_check_mark: Added `{key_names_written[0]}`. "
-                "Existing sessions may still use the previous setup."
+            confirm_text = ":white_check_mark: " + render_change_confirmation(
+                ConfigurationChange(
+                    target_name=agent_name,
+                    kind="key",
+                    detail=key_names_written[0],
+                    availability="next_message",
+                )
             )
         else:
-            confirm_text = (
-                f":white_check_mark: Added {n} keys. "
-                "Existing sessions may still use the previous setup."
+            confirm_text = ":white_check_mark: " + render_change_confirmation(
+                ConfigurationChange(
+                    target_name=agent_name,
+                    kind="keys_bulk",
+                    count=n,
+                    availability="next_message",
+                )
             )
         await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id,

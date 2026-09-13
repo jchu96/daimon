@@ -374,6 +374,16 @@ async def test_edit_view_skill_remove_select_mutates_and_reconciles_and_rerender
     view_kwarg = mock_interaction.edit_original_response.call_args.kwargs["view"]
     assert isinstance(view_kwarg, EditView), "re-render must pass a fresh EditView"
 
+    from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
+
+    posted = mock_interaction.followup.send.call_args.args[0]
+    expected = render_change_confirmation(
+        ConfigurationChange(
+            target_name="agent", kind="skill_removed", availability="saved", detail="skill-a"
+        )
+    )
+    assert posted == expected, f"expected the renderer's own copy, got {posted!r}"
+
 
 @pytest.mark.asyncio
 async def test_edit_view_mcp_remove_select_rollback_on_reconcile_failure(
@@ -449,6 +459,16 @@ async def test_edit_view_mcp_remove_select_success_path(
     mock_interaction.edit_original_response.assert_called_once()
     view_kwarg = mock_interaction.edit_original_response.call_args.kwargs["view"]
     assert isinstance(view_kwarg, EditView), "re-render must pass a fresh EditView"
+
+    from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
+
+    posted = mock_interaction.followup.send.call_args.args[0]
+    expected = render_change_confirmation(
+        ConfigurationChange(
+            target_name="agent", kind="mcp_removed", availability="saved", detail="user-a"
+        )
+    )
+    assert posted == expected, f"expected the renderer's own copy, got {posted!r}"
 
 
 def test_edit_view_skills_empty_disables_skill_select(account_id: uuid.UUID) -> None:

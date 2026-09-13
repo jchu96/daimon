@@ -562,7 +562,7 @@ async def test_env_modal_confirmation_states_shared_agent_exposure(
     await modal.on_submit(interaction)
 
     toast = interaction.followup.send.call_args.args[0]
-    assert "anyone who talks to this agent" in toast, (
+    assert "Anyone who talks to test-agent can use it." in toast, (
         "confirmation must disclose the credential is usable by every caller of the agent"
     )
 
@@ -725,7 +725,7 @@ async def test_mcp_modal_submit_consumes_token_and_writes_vault_credential(
     ), "MA rejects an mcp_servers entry with no matching mcp_toolset, so both must be written"
 
     toast = interaction.followup.send.call_args.args[0]
-    assert "anyone who talks to this agent" in toast.lower(), (
+    assert "its tools are available from your next message here" in toast.lower(), (
         "confirmation must disclose the credential is usable by every caller of the agent"
     )
 

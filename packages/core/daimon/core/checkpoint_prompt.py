@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from typing import Literal
 
 HANDOFF_FILENAME_PREFIX = "daimon-handoff-"
 
@@ -98,17 +99,28 @@ def build_checkpoint_prompt(
     repo_mount_path: str | None,
     max_bundle_mib: int,
     home_dir: str = "/root",
+    unsaved_work: Literal["copy", "leave"] | None = None,
 ) -> str:
     """The single user message sent to the old session's checkpoint turn.
 
     Deterministic: same inputs, same bytes. ``repo_mount_path`` adds the
     git-state step and the prohibition on changing the repository; without a
     repo neither appears.
+
+    ``unsaved_work`` is what the person answered when asked about uncommitted
+    changes in that repository, and only matters when one is mounted. The
+    default (and ``"copy"``) captures them: the patch, the untracked list, and
+    the checkout itself all travel in the archive. ``"leave"`` is the person
+    saying those changes stay where they are, so the prompt neither captures
+    them nor packs the checkout — the successor clones the repository fresh,
+    and the copy that promises "the uncommitted changes stay in the old
+    checkout" stays true.
     """
 
     archive_path = f"/mnt/session/outputs/{handoff_filename(transfer_id)}"
+    leave_unsaved = repo_mount_path is not None and unsaved_work == "leave"
     roots = [_relative_to_root(home_dir)]
-    if repo_mount_path is not None:
+    if repo_mount_path is not None and not leave_unsaved:
         roots.append(_relative_to_root(repo_mount_path))
     roots_argument = " ".join(roots)
 
@@ -150,19 +162,32 @@ def build_checkpoint_prompt(
     )
 
     if repo_mount_path is not None:
+        git_commands = [
+            f"  git -C {repo_mount_path} rev-parse HEAD",
+            f"  git -C {repo_mount_path} status --porcelain",
+        ]
+        if not leave_unsaved:
+            git_commands += [
+                f"  git -C {repo_mount_path} diff HEAD > {home_dir}/uncommitted.patch",
+                f"  git -C {repo_mount_path} ls-files --others --exclude-standard"
+                f" > {home_dir}/untracked.txt",
+            ]
+        disposition = (
+            "The uncommitted changes in this checkout are deliberately being left behind: "
+            "the person was asked and chose to leave them here, so do not save them to a "
+            "file and do not copy them anywhere else."
+            if leave_unsaved
+            else "The uncommitted work is captured as a patch on purpose."
+        )
+        count = "two" if leave_unsaved else "four"
         steps.append(
             "\n".join(
                 [
-                    f"{step('record the repository state.')} Run these four commands, in order:",
-                    f"  git -C {repo_mount_path} rev-parse HEAD",
-                    f"  git -C {repo_mount_path} status --porcelain",
-                    f"  git -C {repo_mount_path} diff HEAD > {home_dir}/uncommitted.patch",
-                    f"  git -C {repo_mount_path} ls-files --others --exclude-standard"
-                    f" > {home_dir}/untracked.txt",
+                    f"{step('record the repository state.')} Run these {count} commands, in order:",
+                    *git_commands,
                     "NEVER RUN GIT COMMIT, GIT PUSH, GIT STASH, OR ANY OTHER COMMAND THAT "
-                    "CHANGES THIS REPOSITORY'S HISTORY, INDEX, WORKING TREE, OR REMOTE. The "
-                    "uncommitted work is captured as a patch on purpose. Leave the tree exactly "
-                    "as you found it.",
+                    "CHANGES THIS REPOSITORY'S HISTORY, INDEX, WORKING TREE, OR REMOTE. "
+                    f"{disposition} Leave the tree exactly as you found it.",
                 ]
             )
         )

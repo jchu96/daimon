@@ -1708,9 +1708,10 @@ async def test_run_edit_repo_submission_blank_pat_binds_anon_when_repo_public(
     assert row.proof_at is not None, "proof_at must be recorded"
 
     texts = _ephemeral_texts_for(client_fake)
-    assert any("Saved working repo access" in t for t in texts), (
-        "user should see the plain save confirmation"
-    )
+    assert any(
+        f"{_AGENT_NAME} now works in https://github.com/example/verified-public.git on main." in t
+        for t in texts
+    ), "user should see the shared change-confirmation save copy"
     assert not any("App-covered" in t for t in texts), (
         "Slack panel must never advertise App coverage as proof of access"
     )
