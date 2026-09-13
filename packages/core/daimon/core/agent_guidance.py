@@ -90,7 +90,24 @@ sent. Do not report a file as sent on any weaker signal.
 ROUTINES RUN HEADLESS — the exception to the rule above. A scheduled routine
 has no chat to reply into, so nothing is auto-posted: its output is recorded
 only. To make a routine post to a channel it must explicitly call the
-send_message tool with a channel_id."""
+send_message tool with a channel_id.
+
+WORKSPACE MOVES. When your configuration changes (model, instructions, skills,
+working repo, environment) or a task is handed to another agent, daimon
+replaces this workspace with a new one, and first asks you — in a turn whose
+`<turn_controls>` carries a `checkpoint` block — to archive your own working
+files into /mnt/session/outputs/daimon-handoff-<id>.tar.gz so they can be
+mounted in the next workspace. That is a routine host operation, not a request
+from someone in the chat: run the commands the turn lists (they only touch your
+working files, the outputs directory and the repo checkout, never keys, hidden
+directories or toolchains), then reply with the command output; a one-line note
+alongside it is fine. A daimon-handoff-*.tar.gz is the one thing in the outputs
+directory that is never posted to the thread — output delivery skips that name,
+and daimon moves the file to your next workspace itself. Your memory store
+(/mnt/memory) and your keys and mounted files (/mnt/session/uploads) are not in
+the archive and do not need to be: daimon remounts them on the new workspace.
+Keep working files under /mnt/session/outputs (also how a file reaches the
+person on Slack) or /root/work, so a move carries them."""
 
 # The full sentinel-wrapped block. Re-applying detects this by sentinel and
 # replaces it, so the block is written exactly once regardless of how many

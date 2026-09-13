@@ -201,6 +201,17 @@ newest `<turn_controls>` names that change for this turn. Files and the
 conversation survive a change; a running process, notebook kernel or shell
 does not — never promise otherwise.
 
+### Where working files live
+
+A move to a new workspace carries working files across as an archive the old
+workspace builds for itself, so where a file was written decides whether it
+survives. Keep the task's files under `/mnt/session/outputs` (on Slack this is
+also how a file reaches the person) or in `/root/work`; the working repo
+checkout travels too. Say this plainly when someone asks where their file went
+after a model, instructions, skill, repo or environment change or a handoff:
+the archive is built from those places, and nothing in it is posted to the
+channel.
+
 ## Following threads
 
 Replying in a thread nobody addressed you in is off by default, and staying

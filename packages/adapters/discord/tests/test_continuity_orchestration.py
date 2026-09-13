@@ -851,6 +851,70 @@ async def test_replaced_falls_back_to_its_own_message_when_no_answer_is_revealed
 @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
+@patch("daimon.adapters.discord.bot.build_context_xml", new_callable=AsyncMock)
+async def test_replaced_with_no_transfer_kind_posts_no_summary_prefix(
+    mock_build_context_xml: AsyncMock,
+    mock_resolve_config: AsyncMock,
+    mock_resolve_env: AsyncMock,
+    mock_resolve_agent: AsyncMock,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A fresh start (`transfer_kind=None`) is a `replaced` bind with nothing
+    carried across -- not a transfer whose contents need summarizing. The old
+    `transfer_kind or "history"` fallback rendered a transfer summary on a
+    fresh start, contradicting the fresh-start confirmation already posted.
+    No prefix should be rendered at all."""
+    mock_build_context_xml.return_value = ("<user_query>hello</user_query>", [])
+    guild_id = "700000010"
+    await _seed_tenant(db_session, guild_id=guild_id)
+    mock_resolve_config.return_value = _stub_resolved_config()
+    mock_resolve_agent.return_value = "ag_test"
+    mock_resolve_env.return_value = "env_test"
+
+    runtime = _make_runtime(db_session_factory)
+    bot = _make_bot(runtime)
+    message = _make_thread_message(guild_id=int(guild_id))
+    mapping_id = uuid.uuid4()
+    prepared = _make_prepared_turn(
+        continuity=ContinuityOutcome(state="replaced", transfer_kind=None),
+        account_id=uuid.uuid4(),
+        mapping_id=mapping_id,
+    )
+    run_outcome = RunOutcome(
+        state=TurnState(),
+        ma_session_id="sess_test",
+        mapping_id=mapping_id,
+        recovered=False,
+        continuity=prepared.continuity,
+    )
+
+    with (
+        patch(
+            "daimon.adapters.discord.bot.bind_session",
+            new_callable=AsyncMock,
+            return_value=prepared,
+        ),
+        patch(
+            "daimon.adapters.discord.bot.run_prepared_turn",
+            new_callable=AsyncMock,
+            side_effect=_run_turn_revealing_answer(run_outcome),
+        ),
+    ):
+        await bot.on_message(message)
+
+    assert _final_answer_text(message) == _ANSWER, (
+        "a fresh start must not prefix the answer with a replacement summary"
+    )
+    sent_texts = [c.args[0] for c in message.channel.send.call_args_list if c.args]
+    assert render_replacement_summary("full", []) not in sent_texts
+    assert render_replacement_summary("transcript", []) not in sent_texts
+    assert render_replacement_summary("history", []) not in sent_texts
+
+
+@patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
+@patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
 async def test_session_busy_posts_must_finish_copy_and_runs_no_turn(
     mock_resolve_config: AsyncMock,
     mock_resolve_env: AsyncMock,

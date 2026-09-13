@@ -1852,16 +1852,21 @@ class DaimonBot(commands.Bot):
         # recovery cycle recreates the session mid-call). That notice is
         # posted after the turn instead, once the outcome is known.
         replacement_summary: str | None = None
-        if prepared.continuity.state == "replaced":
+        if (
+            prepared.continuity.state == "replaced"
+            and prepared.continuity.transfer_kind is not None
+        ):
             # Not a separate message: the answer is an in-place edit of the
             # embed posted at mention time, so a summary sent at any point
             # after that lands BELOW the answer it explains ("the file
             # vanished" above "here is why"). It becomes the answer's first
             # paragraph instead. The fallback after the turn covers an answer
             # that never arrives to carry it.
-            replacement_summary = render_replacement_summary(
-                prepared.continuity.transfer_kind or "history", []
-            )
+            #
+            # A `None` transfer_kind here means a fresh start (no prior
+            # session to summarize a transfer from) -- that path already
+            # announces itself elsewhere, so no prefix is rendered.
+            replacement_summary = render_replacement_summary(prepared.continuity.transfer_kind, [])
             lifecycle.answer_prefix = replacement_summary
         session_state = (
             None

@@ -1591,7 +1591,10 @@ class SlackApp:
             # mid-call). That notice is posted after the turn instead, once
             # the outcome is known.
             replacement_summary: str | None = None
-            if prepared.continuity.state == "replaced":
+            if (
+                prepared.continuity.state == "replaced"
+                and prepared.continuity.transfer_kind is not None
+            ):
                 # Not a separate message: the answer is an in-place edit of the
                 # status card posted at mention time, and Slack orders by the
                 # original ts -- so a summary posted at any point after that
@@ -1599,8 +1602,12 @@ class SlackApp:
                 # above "here is why"). It becomes the answer's first paragraph
                 # instead. The fallback after the turn covers an answer that
                 # never arrives to carry it.
+                #
+                # A `None` transfer_kind here means a fresh start (no prior
+                # session to summarize a transfer from) -- that path already
+                # announces itself elsewhere, so no prefix is rendered.
                 replacement_summary = render_replacement_summary(
-                    prepared.continuity.transfer_kind or "full", lost=[]
+                    prepared.continuity.transfer_kind, lost=[]
                 )
                 lifecycle.answer_prefix = replacement_summary
 

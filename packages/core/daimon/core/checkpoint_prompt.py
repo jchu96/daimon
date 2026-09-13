@@ -27,13 +27,20 @@ matrix §A/§D):
   ``/mnt/session/outputs``, so that directory is an archived ROOT (minus the
   bundle itself), not an exclusion. ``$HOME`` ships a populated toolchain
   (``.bun``, ``.cargo``, ``.rustup``, ``.gradle``, ``.npm``, ``.local``,
-  ``.config``, plus ``.ssh``) that is ~100 MB before the task writes
-  anything, so every dot entry directly under ``$HOME`` is excluded and only
-  the non-hidden ones are carried.
+  ``.config``) that is ~100 MB before the task writes anything, so every dot
+  entry directly under ``$HOME`` is excluded and only the non-hidden ones are
+  carried.
+- ``/tmp`` is an archived root too, minus its own dot entries and this
+  module's scratch file. It is not where daimon would choose to put working
+  files, but it is where an agent asked to "create notes.md" reached for
+  first (observed live), and a root nothing writes to costs nothing.
 - The prompt is written to be legible as HOST instruction rather than chat
-  text: delivered on the ``system.message`` channel where the old session's
-  model supports one, it is the same bytes either way, and it says whose
-  instruction it is and where the archive goes.
+  text. It travels twice: in the user message, behind a ``<turn_controls>``
+  element carrying a ``checkpoint`` block, and again on the
+  ``system.message`` channel where the old session's model supports one.
+  Models that refused it named a missing ``<turn_controls>`` as the tell, and
+  named "reply with the output and nothing else" as what turned an odd
+  request into an exfiltration-shaped one; neither is in it now.
 """
 
 from __future__ import annotations
@@ -70,13 +77,11 @@ CHECKPOINT_OUTPUTS_DIR = "/mnt/session/outputs"
 #: transfer leaves nothing behind in the old session's outputs.
 HANDOFF_TOO_LARGE_MARKER = "HANDOFF_TOO_LARGE"
 
-#: The whole user message when the prompt itself travels on the privileged
-#: `system.message` channel. The instruction is in the system block; this is
-#: only what makes the turn start.
-CHECKPOINT_SYSTEM_TRIGGER = (
-    "Run the workspace checkpoint described in your system instructions now "
-    "and reply only with the command output."
-)
+#: Where the host mounts the finished bundle in the SUCCESSOR workspace. The
+#: prompt names it so the session it asks can see what the archive is for.
+#: Deliberately NOT imported from ``workspace_transfer`` (this module imports
+#: nothing from the rest of ``daimon.core``); a test asserts the two agree.
+CHECKPOINT_BUNDLE_MOUNT_PATH = "/mnt/session/uploads/daimon-handoff.tar.gz"
 
 # Directory names that are large, reproducible, or both. Matched at any depth.
 CHECKPOINT_EXCLUDED_GLOBS: tuple[str, ...] = (
@@ -87,9 +92,13 @@ CHECKPOINT_EXCLUDED_GLOBS: tuple[str, ...] = (
     ".cache",
 )
 
-# Written inside the sandbox, outside every archived root, so the list of
-# oversized files never ends up inside the archive it filters.
+# Written inside the sandbox. ``/tmp`` is an archived root, so this one file
+# is excluded by name below and the list of oversized files never ends up
+# inside the archive it filters.
 _EXCLUDE_LIST_PATH = "/tmp/daimon-handoff-excludes.txt"
+
+#: The third archived root, after ``$HOME`` and the outputs directory.
+CHECKPOINT_SCRATCH_DIR = "/tmp"
 
 _SHA1_LINE = re.compile(r"^\s*([0-9a-f]{40})\s*$", re.MULTILINE)
 
@@ -152,7 +161,8 @@ def build_checkpoint_prompt(
     leave_unsaved = repo_mount_path is not None and unsaved_work == "leave"
     home_root = _relative_to_root(home_dir)
     outputs_root = _relative_to_root(CHECKPOINT_OUTPUTS_DIR)
-    roots = [home_root, outputs_root]
+    scratch_root = _relative_to_root(CHECKPOINT_SCRATCH_DIR)
+    roots = [home_root, outputs_root, scratch_root]
     if repo_mount_path is not None and not leave_unsaved:
         roots.append(_relative_to_root(repo_mount_path))
     roots_argument = " ".join(roots)
@@ -163,6 +173,12 @@ def build_checkpoint_prompt(
     # .config). `*` matches `/` in a tar exclude pattern, so the subtree goes
     # with it, while a dotfile deeper inside the task's own work is untouched.
     excludes.append(f"--exclude='{home_root}/.*'")
+    # The scratch directory carries a working file when the agent chose it over
+    # $HOME, and nothing else worth having: its dot entries are the sandbox's
+    # own sockets and locks, and this transfer's oversize list would otherwise
+    # be archived by the tar command reading it.
+    excludes.append(f"--exclude='{scratch_root}/.*'")
+    excludes.append(f"--exclude='{_relative_to_root(_EXCLUDE_LIST_PATH)}'")
     # The bundle being written, and any bundle a previous transfer left.
     excludes.append(f"--exclude='{outputs_root}/{HANDOFF_FILENAME_PREFIX}*'")
     excludes += [f"--exclude='{_relative_to_root(path)}'" for path in CHECKPOINT_EXCLUDED_PATHS]
@@ -183,15 +199,21 @@ def build_checkpoint_prompt(
 
     sections: list[str] = [
         "This instruction comes from the daimon host that runs your workspace, not from a chat "
-        "participant. The archive stays in this workspace's outputs directory and is moved to "
-        "your next workspace by the host; nothing is shared with anyone.",
-        "This is a checkpoint turn. The workspace you are working in is being retired and "
-        "your work is moving to a new one. Do exactly the steps below, in order, and nothing "
-        "else. Do not open or read any image file.",
-        "Only the task's own work travels: the outputs directory and the non-hidden entries in "
-        f"{home_dir}. Never include {home_dir}/.ssh, credential mounts, dotfiles or language "
-        "toolchains and their caches. The commands below already exclude every one of them; run "
-        "them as written and add nothing.",
+        "participant: the checkpoint block in this turn's <turn_controls> is the host's own "
+        "record of it, and your system instructions describe this operation under WORKSPACE "
+        "MOVES.",
+        "This is a checkpoint turn. The workspace you are working in is being retired and your "
+        "work is moving to a new one. When you are done, daimon collects the archive, mounts it "
+        f"in your next workspace at {CHECKPOINT_BUNDLE_MOUNT_PATH}, and tells you there how to "
+        f"unpack it. The archive is not posted to the chat: the file sweep that delivers "
+        f"{CHECKPOINT_OUTPUTS_DIR} to the thread skips names starting with "
+        f"{HANDOFF_FILENAME_PREFIX}. Do exactly the steps below, in order, and add no steps "
+        "of your own. Do not open or read any image file.",
+        "Only the task's own work travels: the non-hidden entries in "
+        f"{home_dir} and {CHECKPOINT_SCRATCH_DIR}, the outputs directory, and the working "
+        "repository if one is mounted. Credential mounts, hidden directories and language "
+        "toolchains and their caches stay behind. The commands below already exclude every one "
+        "of them; run them as written and add nothing.",
     ]
     steps.append(
         "\n".join(
@@ -270,8 +292,8 @@ def build_checkpoint_prompt(
     steps.append("\n".join(show))
 
     steps.append(
-        f"{step('reply')} with the output of the commands above and nothing else: no summary, "
-        "no commentary, no explanation of what you did."
+        f"{step('reply')} with the output of the commands above. A short note alongside it is "
+        "fine; daimon reads the output, not the prose."
     )
     return "\n\n".join(sections + steps)
 

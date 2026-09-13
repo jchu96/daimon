@@ -58,15 +58,18 @@ from anthropic.types.beta.beta_managed_agents_file_resource_params import (
     BetaManagedAgentsFileResourceParams,
 )
 from daimon.core.checkpoint_prompt import (
-    CHECKPOINT_SYSTEM_TRIGGER,
+    CHECKPOINT_BUNDLE_MOUNT_PATH,
+    CHECKPOINT_OUTPUTS_DIR,
     HANDOFF_MAX_BYTES,
     build_checkpoint_prompt,
     checkpoint_head_lines,
     checkpoint_too_large_bytes,
+    handoff_filename,
     is_handoff_filename,
 )
 from daimon.core.handoff_context import (
     is_worth_checkpointing,
+    render_checkpoint_controls,
     render_handoff_framing,
     render_previous_session,
     select_recent_turns,
@@ -94,6 +97,12 @@ _MIB = 1024 * 1024
 #: so the extraction command in the framing text is one line; MA joins any
 #: mount path under `/mnt/session/uploads/` regardless (P4.d).
 HANDOFF_MOUNT_PATH = "/daimon-handoff.tar.gz"
+
+#: Why the workspace is being replaced, as the checkpoint controls report it.
+#: Not a reason code: the model on the giving side reads it.
+CHECKPOINT_REASON_HANDOFF = "handoff"
+CHECKPOINT_REASON_MODEL_CHANGE = "model change"
+CHECKPOINT_REASON_CONFIGURATION_CHANGE = "configuration change"
 
 #: How long the re-uploaded bundle survives in the Files API. Long enough to
 #: outlive a failed replacement and a retry, short enough not to accumulate.
@@ -357,6 +366,7 @@ async def transfer_workspace(
     markup: Decimal,
     checkpoint_deadline: datetime,
     from_agent_name: str,
+    reason: str = CHECKPOINT_REASON_CONFIGURATION_CHANGE,
     unsaved_work: UnsavedWorkChoice | None = None,
     max_bundle_bytes: int = HANDOFF_MAX_BYTES,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -368,6 +378,9 @@ async def transfer_workspace(
     session actually produced work (`is_worth_checkpointing`). Never
     archives or deletes the old session: retiring the mapping row is the
     caller's job, and the old session stays readable.
+
+    `reason` is why the workspace is being replaced, in words, and reaches the
+    old session in the checkpoint turn's controls.
 
     `unsaved_work` is the person's answer about uncommitted changes in the
     mounted repository: `"leave"` keeps them in the old checkout and out of the
@@ -403,11 +416,19 @@ async def transfer_workspace(
     )
     # The instruction is the host's, not a chat participant's, and a model
     # that cannot tell the two apart is right to refuse it: observed live,
-    # sonnet-5 read the checkpoint as an injected request to tar `.ssh` into
-    # a delivery directory and declined, costing a billed turn and the work.
-    # Where the old session's model accepts a `system.message`, the prompt
-    # travels there and the user message is only the trigger. Same bytes on
-    # either channel — only the envelope differs.
+    # sonnet-5 read the checkpoint as an injected request to tar a home
+    # directory into a delivery folder and declined, costing a billed turn and
+    # the work. Delivering the prompt on `system.message` alone did not fix
+    # that — the refusals then named a missing `<turn_controls>` as the tell —
+    # so the user message now leads with the checkpoint controls and carries
+    # the prompt behind them, and the system block repeats it where the model
+    # takes one.
+    controls = render_checkpoint_controls(
+        transfer_id=transfer_id,
+        reason=reason,
+        archive_path=f"{CHECKPOINT_OUTPUTS_DIR}/{handoff_filename(transfer_id)}",
+        carried_to=CHECKPOINT_BUNDLE_MOUNT_PATH,
+    )
     privileged = supports_system_message(old_snapshot.model_id)
     checkpoint_system_blocks: tuple[BetaManagedAgentsSystemContentBlockParam, ...] = (
         ({"type": "text", "text": prompt},) if privileged else ()
@@ -415,7 +436,7 @@ async def transfer_workspace(
     state = await run_turn(
         anthropic=client,
         session_id=old_session_id,
-        user_message=CHECKPOINT_SYSTEM_TRIGGER if privileged else prompt,
+        user_message=f"{controls}\n\n{prompt}",
         system_blocks=checkpoint_system_blocks,
         lifecycle=_NoOpLifecycle(),
         cancel=asyncio.Event(),
@@ -580,6 +601,30 @@ def as_prepared_replacement(
     )
 
 
+def _checkpoint_reason(
+    *,
+    old_snapshot: SessionSnapshot,
+    from_agent_name: str,
+    destination_model_id: str,
+    destination_agent_name: str,
+) -> str:
+    """Why this workspace is being replaced, derived from what changed.
+
+    The `WorkspaceTransfer` protocol carries no reason, so the runner reads
+    one off the destination it was handed. A different responder is checked
+    first: when the agent changes it is a handoff whatever else moved with it,
+    while a different model under the same responder can only be a model
+    change. Anything else — instructions, skills, repo, environment — reduces
+    to one honest phrase rather than a guess at which of them it was.
+    """
+
+    if destination_agent_name != from_agent_name:
+        return CHECKPOINT_REASON_HANDOFF
+    if destination_model_id != old_snapshot.model_id:
+        return CHECKPOINT_REASON_MODEL_CHANGE
+    return CHECKPOINT_REASON_CONFIGURATION_CHANGE
+
+
 @dataclass(frozen=True)
 class WorkspaceTransferRunner:
     """`transfer_workspace` + `as_prepared_replacement`, bound to one caller.
@@ -622,6 +667,12 @@ class WorkspaceTransferRunner:
             markup=self.markup,
             checkpoint_deadline=deadline,
             from_agent_name=from_agent_name,
+            reason=_checkpoint_reason(
+                old_snapshot=old_snapshot,
+                from_agent_name=from_agent_name,
+                destination_model_id=destination_model_id,
+                destination_agent_name=destination_agent_name,
+            ),
             unsaved_work=unsaved_work,
         )
         return as_prepared_replacement(
