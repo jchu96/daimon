@@ -51,6 +51,7 @@ from daimon.core.stores.thread_sessions import (
     create_thread_session,
     get_live_thread_session,
     get_thread_session_by_id,
+    mark_turn_active,
 )
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
@@ -154,17 +155,24 @@ async def _make_snapshotted_thread_session(
     ma_session_id: str,
     ma_agent_id: str,
     model_id: str = "claude-sonnet-4-6",
+    environment_id: str = "env_1",
     watermark_message_id: str | None = None,
+    active_turn: bool = False,
 ) -> ThreadSessionRow:
     """A live mapping row that already records what its session runs.
 
     `make_thread_session` writes the pre-continuity shape (no
     `effective_config`), which now costs a backfilling `sessions.retrieve` on
     reuse. Tests about anything else use this instead, so their routers stay
-    about the thing they test.
+    about the thing they test, and `environment_id` must match the admission's
+    environment or the bind reads the row as configuration drift.
+
+    `active_turn` marks the row as mid-turn, which defers every configuration
+    change to the caller's next message — the state a test needs when it wants
+    the drifted session reused rather than replaced.
     """
-    snapshot = _snapshot(ma_agent_id=ma_agent_id, model_id=model_id)
-    return await create_thread_session(
+    snapshot = _snapshot(ma_agent_id=ma_agent_id, model_id=model_id, environment_id=environment_id)
+    row = await create_thread_session(
         session,
         tenant_id=tenant.id,
         platform="discord",
@@ -177,6 +185,11 @@ async def _make_snapshotted_thread_session(
         identity_fingerprint=fingerprint_identity(snapshot),
         mutable_fingerprint=fingerprint_mutable(snapshot),
     )
+    if active_turn:
+        await mark_turn_active(
+            session, id=row.id, active_turn_message_id="msg-in-flight", now=datetime.now(UTC)
+        )
+    return row
 
 
 def _router_with_session_create(*, session_bodies: list[dict[str, object]]) -> MARouter:
@@ -446,6 +459,7 @@ def test_prepared_turn_public_fields_exclude_recorder() -> None:
         "watermark",
         "reused",
         "session_account_id",
+        "continuity",
     }, "PreparedTurn must expose exactly the documented public fields"
 
 
@@ -467,6 +481,7 @@ async def test_bind_session_syncs_agent_mcp_credential_into_a_reused_session_vau
         thread_id="thread-reuse-mcp",
         ma_session_id="sess_live",
         ma_agent_id="ag_reuse",
+        environment_id="env_reuse",
         watermark_message_id="msg-1",
     )
     await db_session.commit()
@@ -606,6 +621,7 @@ async def test_bind_session_reuse_skips_mcp_sync_when_agent_has_no_stored_creden
         thread_id="thread-reuse-plain",
         ma_session_id="sess_live",
         ma_agent_id="ag_plain",
+        environment_id="env_plain",
         watermark_message_id="msg-1",
     )
     await db_session.commit()
@@ -847,7 +863,12 @@ async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_mod
     froze at creation, so a session created while the agent was on sonnet keeps
     running sonnet after the agent is moved to opus. Billing the agent's
     CURRENT model would price that turn at opus rates for work done at sonnet
-    rates."""
+    rates.
+
+    A model change now replaces the session — but not while a turn is in
+    flight, which is the state here: the replacement waits for the caller's
+    next message and this turn still runs, and must still be billed, on the
+    session that froze sonnet."""
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
     await _make_snapshotted_thread_session(
@@ -858,6 +879,7 @@ async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_mod
         ma_session_id="sess_frozen_on_sonnet",
         ma_agent_id="ag_1",
         model_id="claude-sonnet-4-6",
+        active_turn=True,
     )
     await db_session.commit()
 
@@ -989,6 +1011,13 @@ async def test_legacy_row_without_snapshot_is_backfilled_with_one_retrieve(
         thread_id="thread-legacy",
         ma_session_id="sess_legacy",
         ma_agent_id=legacy_ma_agent_id,
+    )
+    # The session this row points at froze a different model and environment,
+    # so without a turn in flight the bind would replace it rather than read
+    # it. The marker defers that to the caller's next message and leaves this
+    # test about the backfill.
+    await mark_turn_active(
+        db_session, id=row.id, active_turn_message_id="msg-in-flight", now=datetime.now(UTC)
     )
     await db_session.commit()
     assert row.effective_config is None, "the legacy shape is a row with no recorded configuration"

@@ -369,3 +369,71 @@ async def test_model_change_uses_specialist_identity_and_retains_admin_gate(
                 skills=None,
             )
         assert not updates, "setup entry does not grant members new editing permissions"
+
+
+async def test_setup_target_refuses_in_a_handoff_thread_and_names_who_answers(
+    db_session: AsyncSession,
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A handed-over thread has a responder but no configuration target; saying
+    'this is not a setup conversation' would leave the caller guessing why."""
+    tenant = await make_tenant(db_session)
+    caller = await make_account(db_session, tenant=tenant)
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="parent",
+        thread_id="handed-over",
+        responder_ma_agent_id="agent_research",
+        responder_name="research-bot",
+        kind="handoff",
+    )
+    await db_session.commit()
+    target = BetaManagedAgentsAgent(
+        id="agent_new",
+        type="agent",
+        name="new",
+        version=1,
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
+        metadata={MA_METADATA_KEY_TENANT: str(tenant.id), MA_METADATA_KEY_NAME: "new"},
+        mcp_servers=[],
+        tools=[],
+        skills=[],
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response([target.model_dump(mode="json")]))
+    runtime = _runtime(committing_sessionmaker, build_fake_anthropic(router.dispatch))
+    auth = AuthIdentity(
+        account_id=caller.id, tenant_id=tenant.id, role=Role.USER, platform="discord"
+    )
+
+    async with turn_origin(
+        committing_sessionmaker,
+        tenant_id=tenant.id,
+        account_id=caller.id,
+        platform="discord",
+        parent_channel_id="parent",
+        thread_id="handed-over",
+        responder_ma_agent_id="agent_research",
+        responder_name="research-bot",
+        role=Role.USER,
+    ) as origin:
+        with pytest.raises(ToolError, match="handoff conversation: research-bot answers here"):
+            await _set_setup_target_impl(
+                runtime, auth, origin_context_id=str(origin.id), agent_id="agent_new"
+            )
+
+    async with committing_sessionmaker() as session:
+        binding = await get_binding(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="parent",
+            thread_id="handed-over",
+        )
+    assert binding is not None and binding.configuration_target_ma_agent_id is None, (
+        "a handoff thread must not acquire a configuration target"
+    )

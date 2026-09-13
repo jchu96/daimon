@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Literal
 
 from daimon.core._models import ThreadAgentBinding
+from daimon.core.continuity.handoff import HandoffRefusedInSetupThread
 from daimon.core.stores.domain import ThreadAgentBindingRow
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +70,20 @@ async def get_binding(
             )
         )
     ).scalar_one_or_none()
+    return ThreadAgentBindingRow.model_validate(binding) if binding is not None else None
+
+
+async def get_binding_by_id(
+    session: AsyncSession, *, id: uuid.UUID
+) -> ThreadAgentBindingRow | None:
+    """Read a binding the config cascade already resolved, by its row id.
+
+    The turn pipeline carries `thread_binding_id` on the resolved config, so a
+    caller that needs the binding itself (to see whether this thread's task was
+    handed over) has the id and not the location the location-scoped
+    `get_binding` above requires.
+    """
+    binding = await session.get(ThreadAgentBinding, id)
     return ThreadAgentBindingRow.model_validate(binding) if binding is not None else None
 
 
@@ -190,3 +206,75 @@ async def update_channel_lifecycle(
         .values(**values)
     )
     await session.flush()
+
+
+async def upsert_responder_binding(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    platform: str,
+    parent_channel_id: str,
+    thread_id: str,
+    responder_ma_agent_id: str,
+    responder_name: str,
+    created_by_account_id: uuid.UUID | None,
+    now: datetime,
+) -> ThreadAgentBindingRow:
+    """Record that this thread's task was handed to `responder_ma_agent_id`.
+
+    The location row is taken `FOR UPDATE` first, so two handoffs racing in one
+    thread serialize instead of colliding on the unique location constraint,
+    and a setup conversation opened in between is still seen. Over a
+    `kind='setup'` row this raises `HandoffRefusedInSetupThread`: a setup
+    conversation has to answer as the built-in Daimon, and overwriting its
+    responder would break the admission path that asserts exactly that.
+
+    Handing a task on again just rewrites the existing handoff row, and clears
+    its configuration target -- a target belongs to a setup conversation, and a
+    stale one here would tell the next turn to configure an agent nobody chose.
+    """
+    existing = (
+        await session.execute(
+            select(ThreadAgentBinding)
+            .where(
+                ThreadAgentBinding.tenant_id == tenant_id,
+                ThreadAgentBinding.platform == platform,
+                ThreadAgentBinding.parent_channel_id == parent_channel_id,
+                ThreadAgentBinding.thread_id == thread_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing is not None and existing.kind == "setup":
+        raise HandoffRefusedInSetupThread(
+            "This is a setup conversation; it always answers as Daimon."
+        )
+    if existing is None:
+        return await create_binding(
+            session,
+            tenant_id=tenant_id,
+            platform=platform,
+            parent_channel_id=parent_channel_id,
+            thread_id=thread_id,
+            responder_ma_agent_id=responder_ma_agent_id,
+            responder_name=responder_name,
+            creator_account_id=created_by_account_id,
+            kind="handoff",
+        )
+    updated = (
+        await session.execute(
+            update(ThreadAgentBinding)
+            .where(ThreadAgentBinding.id == existing.id)
+            .values(
+                responder_ma_agent_id=responder_ma_agent_id,
+                responder_name=responder_name,
+                configuration_target_ma_agent_id=None,
+                configuration_target_name=None,
+                deleted=False,
+                updated_at=now,
+            )
+            .returning(ThreadAgentBinding)
+        )
+    ).scalar_one()
+    await session.flush()
+    return ThreadAgentBindingRow.model_validate(updated)

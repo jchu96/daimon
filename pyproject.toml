@@ -98,6 +98,9 @@ source_modules = [
     "daimon.core.reports",
     "daimon.core.scope",
     "daimon.core.session_compat",
+    "daimon.core.session_preparation",
+    "daimon.core.session_preparation_stages",
+    "daimon.core.session_update_ops",
     "daimon.core.session_snapshot",
     "daimon.core.skill_sync",
     "daimon.core.skill_zip",
@@ -109,6 +112,7 @@ source_modules = [
     "daimon.core.turn_origin",
     "daimon.core.wizard",
     "daimon.core.wizard_sweep",
+    "daimon.core.workspace_transfer",
 ]
 forbidden_modules = ["daimon.core._models"]
 # Stores are the sanctioned abstraction layer between adapters and the ORM.

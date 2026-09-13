@@ -57,6 +57,8 @@ async def resolve(
             if binding.deleted:
                 raise DaimonError(
                     "This setup conversation was deleted. Open a new setup conversation."
+                    if binding.kind == "setup"
+                    else "This conversation was deleted. Start the task again in a new thread."
                 )
             return config.model_copy(
                 update={
@@ -66,6 +68,7 @@ async def resolve(
                     "configuration_target_ma_agent_id": binding.configuration_target_ma_agent_id,
                     "configuration_target_name": binding.configuration_target_name,
                     "thread_binding_id": binding.id,
+                    "thread_binding_kind": binding.kind,
                 }
             )
     return config

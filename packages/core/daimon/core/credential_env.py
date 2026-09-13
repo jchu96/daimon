@@ -41,6 +41,33 @@ def assemble_env_bytes(rows: list[AgentFileRow]) -> bytes:
     return ("\n".join(lines) + "\n").encode() if lines else b""
 
 
+async def upload_env_file(
+    anthropic: AsyncAnthropic,
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    rows: list[AgentFileRow],
+    ttl_hours: int = 1,
+) -> str:
+    """Upload the `.env` these rows assemble to, enqueue its TTL delete, return its file id.
+
+    The upload half of `upload_env_and_mount`, split out because a live
+    session's `.env` is replaced by mounting the new file with
+    `sessions.resources.add` rather than through `sessions.create` — same
+    bytes, same disposable-object retention, different mount call.
+    """
+    content = assemble_env_bytes(rows)
+    uploaded: FileMetadata = await anthropic.beta.files.upload(
+        file=(_MOUNT_PATH, io.BytesIO(content), "text/plain"),
+    )
+
+    delete_after = dt.datetime.now(dt.UTC) + dt.timedelta(hours=ttl_hours)
+    async with session_factory() as session, session.begin():
+        await enqueue_pending_file_delete(session, file_id=uploaded.id, delete_after=delete_after)
+
+    _log.info("credential_env.uploaded", file_id=uploaded.id, key_count=len(rows))
+    return uploaded.id
+
+
 async def upload_env_and_mount(
     anthropic: AsyncAnthropic,
     session_factory: async_sessionmaker[AsyncSession],
@@ -66,14 +93,6 @@ async def upload_env_and_mount(
     if not rows:
         return None
 
-    content = assemble_env_bytes(rows)
-    uploaded: FileMetadata = await anthropic.beta.files.upload(
-        file=(".env", io.BytesIO(content), "text/plain"),
-    )
-
-    delete_after = dt.datetime.now(dt.UTC) + dt.timedelta(hours=ttl_hours)
-    async with session_factory() as session, session.begin():
-        await enqueue_pending_file_delete(session, file_id=uploaded.id, delete_after=delete_after)
-
-    _log.info("credential_env.mounted", file_id=uploaded.id, key_count=len(rows))
-    return {"type": "file", "file_id": uploaded.id, "mount_path": _MOUNT_PATH}
+    file_id = await upload_env_file(anthropic, session_factory, rows=rows, ttl_hours=ttl_hours)
+    _log.info("credential_env.mounted", file_id=file_id, key_count=len(rows))
+    return {"type": "file", "file_id": file_id, "mount_path": _MOUNT_PATH}

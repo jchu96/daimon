@@ -49,7 +49,9 @@ def _make_fake_session(session_id: str = "sess_test") -> BetaManagedAgentsSessio
     return BetaManagedAgentsSession(
         id=session_id,
         agent=BetaManagedAgentsSessionAgent(
-            id="agent_test",
+            # The id the resolver hands the bind: a session's frozen agent id
+            # and the responder's must agree, or a reuse reads as a handoff.
+            id="ag_test",
             mcp_servers=[],
             model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
             name="test-agent",

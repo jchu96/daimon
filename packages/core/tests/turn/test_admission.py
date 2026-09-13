@@ -664,3 +664,111 @@ async def test_setup_admission_uses_bound_identity_and_leaves_missing_target_unc
         "missing target remains identifiable"
     )
     assert admission.environment.id == "env_science", "environment retains its existing resolution"
+
+
+async def test_handoff_thread_admits_the_agent_the_task_was_handed_to(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A handed-over task answers as its new agent, not as Daimon and not as the
+    channel default. The responder is resolved by concrete id, with no
+    built-in-Daimon assertion — that assertion belongs to setup conversations,
+    and applying it here would refuse every handoff."""
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    await make_tenant_config(
+        db_session, tenant=tenant, agent_name="daimon", environment_name="default"
+    )
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="HANDED_OVER",
+        responder_ma_agent_id="ag_stats",
+        responder_name="stats-bot",
+        kind="handoff",
+    )
+    await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
+    await db_session.commit()
+    stats = _agent(agent_id="ag_stats", name="stats-bot", tenant_id=tenant.id)
+    env = _env(env_id="env_1", name="default", tenant_id=tenant.id)
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents/ag_stats",
+        lambda _r, _m: httpx.Response(200, json=_agent_payload(stats)),
+    )
+    router.add("GET", r"/v1/environments", lambda _r, _m: list_response([_env_payload(env)]))
+    router.add(
+        "GET", r"/v1/environments/env_1", lambda _r, _m: httpx.Response(200, json=_env_payload(env))
+    )
+
+    admission = await admit(
+        _deps(sessionmaker=db_session_factory, router=router, defaults_root=tmp_path),
+        tenant_id=tenant.id,
+        platform="discord",
+        external_user_id="MEMBER",
+        channel_id="C_PARENT",
+        thread_id="HANDED_OVER",
+        now=_NOW,
+    )
+
+    assert admission.agent.id == "ag_stats", "the agent the task was handed to answers here"
+    assert admission.config.thread_binding_kind == "handoff", (
+        "adapters need the kind to tell a handoff thread from a setup conversation"
+    )
+    assert admission.config.agent_name == "stats-bot", "the thread tier wins over the workspace"
+
+
+async def test_handoff_thread_refuses_an_agent_from_another_workspace(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """The concrete lookup is still tenant-checked: a handoff cannot reach across
+    workspaces just because a thread row names an id."""
+    from daimon.core.errors import DaimonError
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    await make_tenant_config(
+        db_session, tenant=tenant, agent_name="daimon", environment_name="default"
+    )
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="C_PARENT",
+        thread_id="HANDED_OVER",
+        responder_ma_agent_id="ag_foreign",
+        responder_name="stats-bot",
+        kind="handoff",
+    )
+    await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
+    await db_session.commit()
+    foreign = _agent(agent_id="ag_foreign", name="stats-bot", tenant_id=uuid.uuid4())
+    env = _env(env_id="env_1", name="default", tenant_id=tenant.id)
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/agents/ag_foreign",
+        lambda _r, _m: httpx.Response(200, json=_agent_payload(foreign)),
+    )
+    router.add("GET", r"/v1/environments", lambda _r, _m: list_response([_env_payload(env)]))
+    router.add(
+        "GET", r"/v1/environments/env_1", lambda _r, _m: httpx.Response(200, json=_env_payload(env))
+    )
+
+    with pytest.raises(DaimonError, match="no longer available in this workspace"):
+        await admit(
+            _deps(sessionmaker=db_session_factory, router=router, defaults_root=tmp_path),
+            tenant_id=tenant.id,
+            platform="discord",
+            external_user_id="MEMBER",
+            channel_id="C_PARENT",
+            thread_id="HANDED_OVER",
+            now=_NOW,
+        )

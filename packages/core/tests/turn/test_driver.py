@@ -804,3 +804,57 @@ def test_driver_source_contains_no_except_cancelled_error() -> None:
     src = path.read_text()
     assert "except asyncio.CancelledError" not in src
     assert "except CancelledError" not in src
+
+
+async def test_run_turn_sends_system_message_after_user_message_when_blocks_given() -> None:
+    """Handoff framing rides a `system.message` on the FIRST send only, and the
+    live API rejects the whole batch unless it is last and directly follows the
+    `user.message` — so order here is a wire contract, not a preference."""
+    fa = FakeAnthropic()
+    fa.beta.sessions.events.stream_scripts = [
+        [YieldEvent(make_status_idle(event_id="sevt_1", stop_reason=make_end_turn()))]
+    ]
+
+    await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="continue the task",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+        system_blocks=({"type": "text", "text": "you inherited a workspace"},),
+    )
+
+    assert len(fa.beta.sessions.events.sent_events) == 1, "one initial batch, not two sends"
+    session_id, sent = fa.beta.sessions.events.sent_events[0]
+    assert session_id == "sess_1"
+    assert [event["type"] for event in sent] == ["user.message", "system.message"], (
+        "system.message must be the final event of the batch"
+    )
+    assert sent[1]["content"] == [{"type": "text", "text": "you inherited a workspace"}]
+
+
+async def test_run_turn_sends_only_the_user_message_when_system_blocks_are_empty() -> None:
+    """The default is byte-identical to the pre-handoff single-event send."""
+    fa = FakeAnthropic()
+    fa.beta.sessions.events.stream_scripts = [
+        [YieldEvent(make_status_idle(event_id="sevt_1", stop_reason=make_end_turn()))]
+    ]
+
+    await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="hi",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+    )
+
+    _, sent = fa.beta.sessions.events.sent_events[0]
+    assert [event["type"] for event in sent] == ["user.message"], (
+        "no system.message when no blocks were supplied"
+    )

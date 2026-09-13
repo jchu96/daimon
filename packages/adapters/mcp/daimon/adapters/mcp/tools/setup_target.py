@@ -129,6 +129,12 @@ async def _set_setup_target_impl(
             raise ToolError(
                 "This is not an active setup conversation. Open Set up with Daimon first."
             )
+        if binding.kind == "handoff":
+            raise ToolError(
+                f"This is a handoff conversation: {binding.responder_name} answers here "
+                "because this task was handed to it, so there is no setup target to "
+                "change. Open Set up with Daimon to configure an agent. Nothing was changed."
+            )
         updated_binding = await update_target(
             session,
             tenant_id=origin.tenant_id,

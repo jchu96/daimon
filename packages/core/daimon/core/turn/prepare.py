@@ -8,6 +8,13 @@ a non-public field. Adapters never see or construct billing wiring.
 `fernet=deps.fernet` is unconditional here: this is the fix for SPEC Req
 7(a), the historical Slack gap where `create_session` was called without a
 `fernet` argument.
+
+The decision of whether the existing session may be reused, refreshed in
+place or must be replaced lives in `daimon.core.session_preparation`; this
+module keeps the two primitives that decision drives — creating a session and
+binding its recorder — and hands them over as `SessionOps`. The dependency
+runs one way, and `create_session` stays a name in THIS module, which is what
+every adapter test patches.
 """
 
 from __future__ import annotations
@@ -19,48 +26,66 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 import structlog
-from anthropic import APIStatusError
-from anthropic.types.beta import BetaManagedAgentsSession
+from anthropic.types.beta.beta_managed_agents_system_content_block_param import (
+    BetaManagedAgentsSystemContentBlockParam,
+)
+from anthropic.types.beta.session_create_params import Resource
 from anthropic.types.beta.sessions.beta_managed_agents_github_repository_resource import (
     BetaManagedAgentsGitHubRepositoryResource,
 )
-from daimon.core.agent_mcp_credentials import sync_agent_mcp_credentials
 from daimon.core.credential_env import assemble_env_bytes
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.pricing import MODEL_PRICING
+from daimon.core.session_compat import DEFAULT_MA_CAPABILITIES, ChangeReason, MaCapabilities
 from daimon.core.session_snapshot import (
     SessionSnapshot,
     fingerprint_identity,
     fingerprint_mutable,
     hash_env_bytes,
     snapshot_from_created_session,
-    snapshot_from_retrieved_session,
 )
 from daimon.core.sessions import create_session
 from daimon.core.stores.agent_files import list_agent_files
-from daimon.core.stores.domain import ThreadSessionRow
-from daimon.core.stores.thread_sessions import (
-    create_thread_session,
-    get_live_thread_session,
-    record_snapshot,
-)
+from daimon.core.stores.domain import TransferKind
+from daimon.core.stores.thread_sessions import create_thread_session, get_live_thread_session
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.ceiling import ceiling_error, remaining_s, turn_deadline
 from daimon.core.turn.deps import TurnDeps
+from daimon.core.turn.errors import SessionPreparationFailed
 from daimon.core.turn.posture import UsageRecorder
-from daimon.core.turn.session_identity import check_session_agent
 from daimon.core.usage_recording import record_turn_usage
+
+if TYPE_CHECKING:
+    from daimon.core.session_preparation_stages import WorkspaceTransfer
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["FreshSession", "PreparedTurn", "bind_session"]
+
+@dataclass(frozen=True, slots=True)
+class ContinuityOutcome:
+    """What this bind did to the caller's session, for the adapter to say so.
+
+    The default is the honest description of every turn before this existed and
+    of every turn where nothing changed: the session continued.
+    """
+
+    state: Literal["continued", "updated", "replaced", "replaced_after_loss"] = "continued"
+    applied: tuple[ChangeReason, ...] = ()
+    pending: tuple[ChangeReason, ...] = ()
+    transfer_kind: TransferKind | None = None
+    user_prefix: str = ""
+    system_blocks: tuple[BetaManagedAgentsSystemContentBlockParam, ...] = ()
+
+
+CONTINUED = ContinuityOutcome()
 
 
 @dataclass(frozen=True)
 class PreparedTurn:
-    """Everything `run_prepared_turn` (06-05) needs to drive a turn.
+    """Everything `run_prepared_turn` needs to drive a turn.
 
     `_record` is intentionally underscore-prefixed and excluded from the
     public contract adapters consume — the recorder is reachable only
@@ -74,6 +99,7 @@ class PreparedTurn:
     reused: bool
     session_account_id: uuid.UUID
     _record: UsageRecorder
+    continuity: ContinuityOutcome = CONTINUED
 
 
 @dataclass(frozen=True)
@@ -88,6 +114,17 @@ class FreshSession:
     ma_session_id: str
     mapping_id: uuid.UUID
     snapshot: SessionSnapshot
+
+
+__all__ = [
+    "ContinuityOutcome",
+    "FreshSession",
+    "PreparedTurn",
+    "bind_recorder",
+    "bind_session",
+    "create_fresh_session",
+    "get_live_thread_session",
+]
 
 
 async def _env_bytes_sha256(
@@ -118,6 +155,10 @@ async def create_fresh_session(
     platform: str,
     thread_id: str,
     session_account_id: uuid.UUID,
+    extra_resources: tuple[Resource, ...] = (),
+    predecessor_id: uuid.UUID | None = None,
+    transfer_file_id: str | None = None,
+    transfer_kind: TransferKind | None = None,
 ) -> FreshSession:
     """Create a brand-new MA session and its `thread_sessions` mapping row.
 
@@ -130,6 +171,11 @@ async def create_fresh_session(
     The configuration the new session froze is snapshotted from the object
     `sessions.create` returned — the authority on what it will execute — and
     persisted on the mapping row with both fingerprints.
+
+    The last four arguments belong to a session that REPLACES another: the
+    resources carrying the old session's work, and the lineage the new row
+    records about where that work came from. A first session for a thread
+    passes none of them.
     """
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(admission.agent.id))
     env_sha256 = await _env_bytes_sha256(deps, tenant_id=tenant_id, agent_uuid=agent_uuid)
@@ -146,6 +192,7 @@ async def create_fresh_session(
         github_fallback_pat=deps.github_fallback_pat,
         github_app_id=deps.github_app_id,
         github_app_private_key=deps.github_app_private_key,
+        extra_resources=extra_resources,
     )
     ma_session_id = ma_session.id
 
@@ -178,6 +225,9 @@ async def create_fresh_session(
             effective_config=snapshot,
             identity_fingerprint=fingerprint_identity(snapshot),
             mutable_fingerprint=fingerprint_mutable(snapshot),
+            predecessor_id=predecessor_id,
+            transfer_file_id=transfer_file_id,
+            transfer_kind=transfer_kind,
         )
         await session.commit()
 
@@ -224,48 +274,6 @@ def bind_recorder(
     )
 
 
-async def _executing_model_id(
-    deps: TurnDeps,
-    *,
-    existing: ThreadSessionRow,
-    observed: BetaManagedAgentsSession | None,
-    fallback_model_id: str,
-) -> str:
-    """The model a REUSED session is actually running, backfilling if needed.
-
-    The recorded snapshot answers this without any MA call. A row written
-    before snapshots existed has none, so the session is read once and the
-    snapshot backfilled onto the row — `check_session_agent` hands over the
-    response when its own legacy `ma_agent_id` branch already fetched it, so a
-    legacy row costs at most one `sessions.retrieve` per bind.
-
-    A 404 on that read means the session is gone; the turn's existing
-    dead-session recovery will create a replacement and rebind the recorder to
-    it, so this returns the caller's fallback rather than failing the bind.
-    """
-    if existing.effective_config is not None:
-        return existing.effective_config.model_id
-
-    if observed is None:
-        try:
-            observed = await deps.anthropic.beta.sessions.retrieve(existing.ma_session_id)
-        except APIStatusError as error:
-            if error.status_code == 404:
-                return fallback_model_id
-            raise
-
-    snapshot = snapshot_from_retrieved_session(observed)
-    async with deps.sessionmaker() as session, session.begin():
-        await record_snapshot(
-            session,
-            id=existing.id,
-            snapshot=snapshot,
-            identity_fingerprint=fingerprint_identity(snapshot),
-            mutable_fingerprint=fingerprint_mutable(snapshot),
-        )
-    return snapshot.model_id
-
-
 async def bind_session(
     deps: TurnDeps,
     admission: Admission,
@@ -276,14 +284,24 @@ async def bind_session(
     thread_id: str,
     session_account_id: uuid.UUID,
     reuse_existing: bool,
+    capabilities: MaCapabilities = DEFAULT_MA_CAPABILITIES,
+    transfer: WorkspaceTransfer | None = None,
     deadline: dt.datetime | None = None,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
 ) -> PreparedTurn:
     """Find-or-create the MA session for this turn and bind its recorder.
 
+    A thin wrapper over `prepare_session_for_turn` for callers that want a
+    `PreparedTurn` or an exception. A deferred preparation returns the turn it
+    prepared against the current session — the change lands at the caller's
+    next message, and `prepared.continuity.pending` says which — while a failed
+    one raises `SessionPreparationFailed`, because the turn must not run
+    against a configuration nobody asked for.
+
     When `reuse_existing` is True, a live `thread_sessions` row for
-    (tenant_id, platform, thread_id, session_account_id) is reused verbatim
-    (no `create_session` call). Otherwise (no live row, or
+    (tenant_id, platform, thread_id, session_account_id) is reused, refreshed
+    in place, or replaced according to how far its frozen configuration has
+    drifted from the caller's. Otherwise (no live row, or
     `reuse_existing=False` for Discord's channel-mention path) a fresh
     session is created via the single shared `create_session` call site,
     always passing `fernet=deps.fernet`, and a new `thread_sessions` mapping
@@ -296,9 +314,9 @@ async def bind_session(
 
     `deadline`/`now` bound this whole body against the per-turn ceiling
     (D-03): the MA `sessions.create` call and the mapping write, and on the
-    reuse path `sync_agent_mcp_credentials`. This does NOT cover `admit()`,
-    which runs before `bind_session` and is deliberately unbounded (D-04).
-    `deadline=None` is fail-safe, not off -- it computes
+    reuse path the compatibility check and whatever it applies. This does NOT
+    cover `admit()`, which runs before `bind_session` and is deliberately
+    unbounded (D-04). `deadline=None` is fail-safe, not off -- it computes
     `turn_deadline(now=now())` so every caller (including one that never
     passes a deadline) is still ceiling-covered.
 
@@ -317,102 +335,60 @@ async def bind_session(
     effective_deadline = deadline if deadline is not None else turn_deadline(now=now())
 
     async def _bind() -> PreparedTurn:
-        ma_session_id: str | None = None
-        mapping_id: uuid.UUID | None = None
-        watermark: str | None = None
-        reused = False
-        # Only ever the billed model for a session we cannot read: a reused
-        # session resolves it from its snapshot, a fresh one from what MA
-        # actually froze.
-        model_id = admission.agent.model.id
+        # Imported here, not at module scope: `session_preparation` imports
+        # this module for the types above, and importing it back at module
+        # scope would make either module unimportable first. The import is
+        # cached after the first bind.
+        from daimon.core.session_preparation import (
+            PreparationDeferred,
+            PreparationFailure,
+            SessionOps,
+            prepare_session_for_turn,
+        )
+        from daimon.core.workspace_transfer import WorkspaceTransferRunner
 
-        if reuse_existing:
-            async with deps.sessionmaker() as session:
-                existing = await get_live_thread_session(
-                    session,
-                    tenant_id=tenant_id,
-                    platform=platform,
-                    thread_id=thread_id,
-                    account_id=session_account_id,
-                )
-            if existing is not None:
-                identity = await check_session_agent(
-                    deps.anthropic,
-                    deps.sessionmaker,
-                    mapping=existing,
-                    responder_ma_agent_id=admission.agent.id,
-                )
-                session_exists = identity.session_exists
-                ma_session_id = existing.ma_session_id
-                mapping_id = existing.id
-                watermark = existing.watermark_message_id
-                reused = True
-                if session_exists:
-                    model_id = await _executing_model_id(
-                        deps,
-                        existing=existing,
-                        observed=identity.observed,
-                        fallback_model_id=model_id,
-                    )
-                # A reused session skips create_session, so it would never pick
-                # up an external MCP credential added to the agent after it was
-                # created — the caller would keep failing at MCP init until
-                # their session happened to be recreated. The vault this
-                # session already mounts is read at each turn's MCP init, so
-                # writing into it here reaches this session on this turn.
-                if (
-                    session_exists
-                    and deps.fernet is not None
-                    and deps.mcp.public_url is not None
-                    and deps.mcp.jwt_secret is not None
-                ):
-                    await sync_agent_mcp_credentials(
-                        deps.anthropic,
-                        sessionmaker=deps.sessionmaker,
-                        fernet=deps.fernet,
-                        tenant_id=tenant_id,
-                        agent_id=derive_agent_uuid(
-                            tenant_id=tenant_id, ma_agent_id=str(admission.agent.id)
-                        ),
-                        account_id=admission.account_id,
-                        jwt_secret=deps.mcp.jwt_secret.get_secret_value().encode(),
-                        public_url=str(deps.mcp.public_url),
-                        now=dt.datetime.now(dt.UTC),
-                    )
-
-        if not reused:
-            fresh = await create_fresh_session(
-                deps,
-                admission,
-                tenant_id=tenant_id,
-                platform=platform,
-                thread_id=thread_id,
-                session_account_id=session_account_id,
-            )
-            ma_session_id = fresh.ma_session_id
-            mapping_id = fresh.mapping_id
-            model_id = fresh.snapshot.model_id
-            watermark = None
-
-        assert ma_session_id is not None, "ma_session_id must be resolved on every code path"
-
-        record = bind_recorder(
-            deps,
+        # Chat callers get the checkpoint-and-bundle transfer by default; a
+        # caller that must never spend a checkpoint turn passes its own hook.
+        effective_transfer = transfer or WorkspaceTransferRunner(
+            anthropic=deps.anthropic,
+            sessionmaker=deps.sessionmaker,
             tenant_id=tenant_id,
             external_user_id=external_user_id,
-            ma_session_id=ma_session_id,
-            model_id=model_id,
+            markup=deps.markup,
         )
 
-        return PreparedTurn(
-            admission=admission,
-            ma_session_id=ma_session_id,
-            mapping_id=mapping_id,
-            watermark=watermark,
-            reused=reused,
+        # `SessionOps` is built here rather than at import time so that
+        # `create_session` and the store helpers resolve from this module's
+        # globals when the bind runs, which is what keeps them patchable.
+        outcome = await prepare_session_for_turn(
+            deps,
+            admission,
+            ops=SessionOps(
+                read_live_row=get_live_thread_session,
+                create_fresh=create_fresh_session,
+                bind_record=bind_recorder,
+            ),
+            tenant_id=tenant_id,
+            platform=platform,
+            external_user_id=external_user_id,
+            thread_id=thread_id,
             session_account_id=session_account_id,
-            _record=record,
+            reuse_existing=reuse_existing,
+            capabilities=capabilities,
+            transfer=effective_transfer,
+            deadline=effective_deadline,
+            now=now,
         )
+        if isinstance(outcome, PreparationDeferred):
+            return outcome.prepared
+        if isinstance(outcome, PreparationFailure):
+            raise SessionPreparationFailed(
+                reasons=outcome.reasons,
+                stage=outcome.stage,
+                retry_after=outcome.retry_after,
+                preserved=outcome.preserved,
+            )
+        return outcome
 
     try:
         return await asyncio.wait_for(_bind(), timeout=remaining_s(effective_deadline, now=now()))

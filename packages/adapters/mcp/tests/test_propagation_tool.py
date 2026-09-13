@@ -442,3 +442,48 @@ async def test_explanation_reports_deleted_setup_without_parent_fallback(
     assert "parent-responder" not in explanation, (
         "a deleted setup cannot silently resume parent routing"
     )
+
+
+async def test_explanation_calls_a_handed_over_thread_a_handoff_not_a_setup(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    """Both kinds outrank channel routing; only one of them is a setup conversation."""
+    from daimon.core.stores.thread_agent_bindings import create_binding
+
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    runtime = _runtime(committing_sessionmaker)
+    await _set_agent_default_impl(
+        runtime, _admin_auth(tenant_id=tenant.id, account_id=account.id), "specialist", "parent"
+    )
+    async with committing_sessionmaker.begin() as session:
+        await create_binding(
+            session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="parent",
+            thread_id="handed-over",
+            responder_ma_agent_id="agent_research",
+            responder_name="research-bot",
+            kind="handoff",
+        )
+    auth = AuthIdentity(
+        account_id=account.id, tenant_id=tenant.id, role=Role.USER, platform="discord"
+    )
+
+    explained = await _explain_agent_resolution_impl(runtime, auth, "parent", "handed-over")
+
+    assert explained.effective_agent_name == "research-bot", "the agent holding the task answers"
+    assert explained.winning_tier == "thread", "the thread still outranks the channel default"
+    assert "this task was handed to it" in explained.explanation, (
+        "the reason the thread has its own responder must be stated accurately"
+    )
+    assert "setup thread" not in explained.explanation, (
+        "a handed-over thread is not a setup conversation"
+    )
+    assert explained.channel_default == "specialist", "the channel's own routing is unchanged"
+    assert explained.recent_setup_conversations == (), (
+        "a handoff binding is not a setup conversation and must not be listed as one"
+    )

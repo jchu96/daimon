@@ -656,3 +656,125 @@ async def test_sweep_aborts_and_deletes_nothing_when_posting_unavailable() -> No
 
     assert deletes == [], "an aborted sweep must delete nothing"
     assert downloads == ["file_first"], "the second file must never be downloaded after the abort"
+
+
+async def test_sweep_skips_handoff_bundles_and_leaves_them_listed() -> None:
+    """A workspace-transfer bundle shares the outputs directory with real user
+    files but belongs to `daimon.core.workspace_transfer`, which downloads and
+    deletes it itself. Posting it would hand the user a tarball they never
+    asked for; deleting it would destroy the handoff. So the sweep does
+    neither, and the entry is still listed afterwards."""
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    deleted: set[str] = set()
+
+    def on_list(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        rows = [
+            FileMetadata(
+                id="file_bundle",
+                created_at=NOW,
+                filename="daimon-handoff-0f9d1c4e.tar.gz",
+                mime_type="application/gzip",
+                size_bytes=2048,
+                type="file",
+                downloadable=True,
+            ),
+            FileMetadata(
+                id="file_report",
+                created_at=NOW,
+                filename="report.csv",
+                mime_type="text/csv",
+                size_bytes=3,
+                type="file",
+                downloadable=True,
+            ),
+        ]
+        return list_response([row.model_dump(mode="json") for row in rows if row.id not in deleted])
+
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deleted.add(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    downloaded: list[str] = []
+
+    def on_download(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        downloaded.append(match.group(1))
+        return httpx.Response(200, content=b"csv")
+
+    router = MARouter()
+    router.add("GET", r"/v1/files", on_list)
+    router.add("GET", r"/v1/files/([^/]+)/content", on_download)
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    client = build_fake_anthropic(router.dispatch)
+
+    posted: list[str] = []
+
+    async def post(file: DeliverableFile) -> None:
+        posted.append(file.filename)
+
+    count = await sweep_session_outputs(client, session_id="sesn_1", post=post, sleep=sleep)
+
+    assert count == 1, "only the real output counts as posted"
+    assert posted == ["report.csv"], "the handoff bundle must never be posted"
+    assert downloaded == ["file_report"], "an excluded entry is not even downloaded"
+    assert deleted == {"file_report"}, "the handoff bundle must survive the sweep"
+
+    listing = await client.beta.files.list(scope_id="sesn_1", limit=1000)
+    assert [meta.id for meta in listing.data] == ["file_bundle"], (
+        "the skipped bundle is still listed for its owner to collect"
+    )
+
+
+async def test_sweep_posts_handoff_bundle_when_exclusions_are_cleared() -> None:
+    """The exclusion is a parameter, not a hard-coded name filter: a caller
+    that passes no prefixes sweeps the bundle like any other output."""
+
+    async def sleep(delay: float) -> None:
+        pass
+
+    deleted: set[str] = set()
+
+    def on_list(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        row = FileMetadata(
+            id="file_bundle",
+            created_at=NOW,
+            filename="daimon-handoff-0f9d1c4e.tar.gz",
+            mime_type="application/gzip",
+            size_bytes=4,
+            type="file",
+            downloadable=True,
+        )
+        return list_response([] if row.id in deleted else [row.model_dump(mode="json")])
+
+    def on_delete(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        deleted.add(match.group(1))
+        return httpx.Response(200, json={"id": match.group(1), "type": "file_deleted"})
+
+    router = MARouter()
+    router.add("GET", r"/v1/files", on_list)
+    router.add(
+        "GET",
+        r"/v1/files/([^/]+)/content",
+        lambda request, match: httpx.Response(200, content=b"gzip"),
+    )
+    router.add("DELETE", r"/v1/files/([^/]+)", on_delete)
+    client = build_fake_anthropic(router.dispatch)
+
+    posted: list[str] = []
+
+    async def post(file: DeliverableFile) -> None:
+        posted.append(file.filename)
+
+    count = await sweep_session_outputs(
+        client,
+        session_id="sesn_1",
+        post=post,
+        sleep=sleep,
+        exclude_filename_prefixes=(),
+    )
+
+    assert count == 1, "with no exclusions the bundle is an ordinary output"
+    assert posted == ["daimon-handoff-0f9d1c4e.tar.gz"]
+    assert deleted == {"file_bundle"}

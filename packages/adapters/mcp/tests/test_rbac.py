@@ -468,3 +468,54 @@ async def test_admin_list_tools_returns_meta_tools(
         f"list_credentials is agent-chat-tagged and must not appear for an "
         f"admin session with no agent identity; got: {tool_names}"
     )
+
+
+CONTINUITY_TOOL_NAMES = ("hand_off_task", "start_fresh_task")
+"""Handing a task over and starting fresh: untagged, like the chat-removal
+tools. Any member who can post in a thread may do either — the blast radius is
+that one thread — so they must be discoverable by a non-admin session, and,
+being untagged, must stay out of a narrowed agent-chat session's tools/list."""
+
+
+@pytest.mark.parametrize("tool_name", CONTINUITY_TOOL_NAMES)
+async def test_non_admin_search_includes_continuity_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tool_name: str,
+) -> None:
+    """Each continuity tool is discoverable by a non-admin session via search_tools."""
+    _, user_token = await _seed_admin_and_user(sessionmaker)
+    app = _make_app(sessionmaker)
+
+    result = await mcp_session(
+        app,
+        token=user_token,
+        method="tools/call",
+        params={"name": "search_tools", "arguments": {"query": tool_name.replace("_", " ")}},
+    )
+    call_result = result.get("result", result)
+    content = call_result.get("content", [])  # type: ignore[union-attr]
+    output_text = " ".join(item.get("text", "") for item in content if isinstance(item, dict))
+    assert f"### {tool_name}" in output_text, (
+        f"{tool_name} must be discoverable by a non-admin session; got: {output_text!r}"
+    )
+
+
+async def test_agent_id_claim_session_discovers_neither_continuity_tool(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A narrowed agent-chat session has no turn origin to act on, so neither
+    continuity tool belongs on its surface — untagged must not read as
+    agent-chat visible."""
+    async with sessionmaker() as s, s.begin():
+        tenant = await make_tenant(s, platform="discord", workspace_id="agent-chat-continuity-rbac")
+        account = await make_account(s, tenant=tenant)
+    token = mint_jwt(account_id=account.id, secret=SECRET.encode(), now=_NOW, agent_id=uuid.uuid4())
+    app = _make_app(sessionmaker)
+
+    result = await mcp_session(app, token=token, method="tools/list")
+    payload = result.get("result", result)
+    tool_names = {t["name"] for t in payload.get("tools", [])}  # type: ignore[union-attr]
+
+    assert not (set(CONTINUITY_TOOL_NAMES) & tool_names), (
+        f"an agent_id-claim session must not discover a continuity tool; got: {tool_names}"
+    )
