@@ -5,7 +5,7 @@ billed turn on the OLD session asking it to write down what it was doing and
 tar its own files into the session's outputs directory. That archive is the
 only way working files cross into the successor: the Files API lists
 ``/mnt/session/outputs/*`` and mounted uploads and nothing else, so the
-working directory, ``/tmp`` and the repo checkout are invisible to daimon
+working directory, ``/tmp/work`` and the repo checkout are invisible to daimon
 unless the session itself packs them (capability matrix P4.b).
 
 Everything here is pure string work. The module deliberately imports nothing
@@ -30,7 +30,7 @@ matrix §A/§D):
   ``.config``) that is ~100 MB before the task writes anything, so every dot
   entry directly under ``$HOME`` is excluded and only the non-hidden ones are
   carried.
-- ``/tmp`` is an archived root too, minus its own dot entries and this
+- ``/tmp/work`` is an archived root too, minus its own dot entries and this
   module's scratch file. It is not where daimon would choose to put working
   files, but it is where an agent asked to "create notes.md" reached for
   first (observed live), and a root nothing writes to costs nothing.
@@ -92,13 +92,16 @@ CHECKPOINT_EXCLUDED_GLOBS: tuple[str, ...] = (
     ".cache",
 )
 
-# Written inside the sandbox. ``/tmp`` is an archived root, so this one file
-# is excluded by name below and the list of oversized files never ends up
-# inside the archive it filters.
+# Written inside the sandbox, outside every archived root (``/tmp`` itself is
+# not archived — only ``/tmp/work`` is), so the list of oversized files never
+# ends up inside the archive it filters.
 _EXCLUDE_LIST_PATH = "/tmp/daimon-handoff-excludes.txt"
 
-#: The third archived root, after ``$HOME`` and the outputs directory.
-CHECKPOINT_SCRATCH_DIR = "/tmp"
+#: The third archived root, after ``$HOME`` and the outputs directory. Only this
+#: subdirectory of ``/tmp``: the base image ships ~60 MB of non-hidden browser
+#: and compile-cache trees directly under ``/tmp`` (observed on staging), which
+#: pushed an otherwise empty archive over the 20 MiB cap.
+CHECKPOINT_SCRATCH_DIR = "/tmp/work"
 
 _SHA1_LINE = re.compile(r"^\s*([0-9a-f]{40})\s*$", re.MULTILINE)
 
@@ -268,6 +271,7 @@ def build_checkpoint_prompt(
                 "written flat into the outputs directory. Run these three commands, in order, "
                 "exactly as written:",
                 "  cd /",
+                f"  mkdir -p {home_dir}/work {CHECKPOINT_SCRATCH_DIR}",
                 f"  find {roots_argument} -type f -size +{max_bundle_mib}M > {_EXCLUDE_LIST_PATH}",
                 tar_command,
                 "The find step lists files too large to carry so tar skips them; do not edit "

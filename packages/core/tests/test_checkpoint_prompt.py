@@ -78,7 +78,7 @@ def test_prompt_writes_an_oversize_exclude_list_before_tarring() -> None:
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=7
     )
     find_index = prompt.index(
-        "find root mnt/session/outputs tmp mnt/repo/analytics -type f -size +7M"
+        "find root mnt/session/outputs tmp/work mnt/repo/analytics -type f -size +7M"
     )
     tar_index = prompt.index("tar czf")
     assert find_index < tar_index, "the exclude list must exist before tar reads it"
@@ -119,7 +119,7 @@ def test_prompt_captures_repo_state_without_a_repo_omitting_the_git_steps() -> N
     assert with_repo.count(f"git -C {REPO} rev-parse HEAD") == 2, (
         "HEAD is echoed before and after the archive so a commit is detectable"
     )
-    assert "-C / root mnt/session/outputs tmp mnt/repo/analytics" in with_repo, (
+    assert "-C / root mnt/session/outputs tmp/work mnt/repo/analytics" in with_repo, (
         "the repo mount is archived alongside $HOME, the outputs directory and /tmp"
     )
 
@@ -128,7 +128,7 @@ def test_prompt_captures_repo_state_without_a_repo_omitting_the_git_steps() -> N
     )
     assert "git -C" not in without_repo, "no repo means no git commands"
     assert "NEVER RUN GIT" not in without_repo, "and no repo prohibition to state"
-    assert "-C / root mnt/session/outputs tmp" in without_repo, (
+    assert "-C / root mnt/session/outputs tmp/work" in without_repo, (
         "the home directory, the outputs directory and /tmp are archived either way"
     )
 
@@ -150,7 +150,7 @@ def test_prompt_honours_a_non_default_home_dir() -> None:
     )
     assert "/home/claude/HANDOFF.md" in prompt, "the note goes in the given home directory"
     assert "/home/claude/uncommitted.patch" in prompt, "so does the patch"
-    assert "-C / home/claude mnt/session/outputs tmp mnt/repo/analytics" in prompt, (
+    assert "-C / home/claude mnt/session/outputs tmp/work mnt/repo/analytics" in prompt, (
         "the tar roots are the given home directory, the outputs directory, /tmp and the "
         "repo, relative to /"
     )
@@ -246,7 +246,7 @@ def test_prompt_captures_uncommitted_changes_when_the_answer_is_copy_or_absent()
         assert f"git -C {REPO} ls-files --others --exclude-standard" in prompt, (
             "untracked files are part of the work being captured"
         )
-        assert "-C / root mnt/session/outputs tmp mnt/repo/analytics" in prompt, (
+        assert "-C / root mnt/session/outputs tmp/work mnt/repo/analytics" in prompt, (
             "and the checkout itself travels"
         )
 
@@ -259,11 +259,11 @@ def test_prompt_leaves_uncommitted_changes_behind_when_the_answer_is_leave() -> 
         "the person chose to leave the changes, so nothing captures them as a patch"
     )
     assert "ls-files --others" not in prompt, "nor lists the untracked files to carry"
-    assert "-C / root mnt/session/outputs tmp\n" in f"{prompt}\n", (
+    assert "-C / root mnt/session/outputs tmp/work\n" in f"{prompt}\n", (
         "the checkout must not be tarred either, or the changes would come across anyway"
     )
     assert "-C / root mnt/session/outputs mnt/repo" not in prompt, "the repo is not a root here"
-    assert "find root mnt/session/outputs tmp -type f" in prompt, (
+    assert "find root mnt/session/outputs tmp/work -type f" in prompt, (
         "and the oversize scan covers only what is archived"
     )
     assert "deliberately being left behind" in prompt, (
@@ -328,7 +328,7 @@ def test_prompt_names_what_travels_and_what_stays_behind_in_words() -> None:
         transfer_id=TRANSFER_ID, repo_mount_path=REPO, max_bundle_mib=20
     )
     assert (
-        "Only the task's own work travels: the non-hidden entries in /root and /tmp, the "
+        "Only the task's own work travels: the non-hidden entries in /root and /tmp/work, the "
         "outputs directory, and the working repository if one is mounted." in prompt
     ), "the prompt must name what travels, not only pass it to tar"
     assert (
@@ -348,7 +348,7 @@ def test_prompt_archives_the_outputs_directory_and_skips_only_the_bundles() -> N
     assert CHECKPOINT_OUTPUTS_DIR not in CHECKPOINT_EXCLUDED_PATHS, (
         "the outputs directory is where the task's own files are, not a destination mount"
     )
-    assert "-C / root mnt/session/outputs tmp" in prompt, "so it is a tar root"
+    assert "-C / root mnt/session/outputs tmp/work" in prompt, "so it is a tar root"
     assert f"--exclude='mnt/session/outputs/{HANDOFF_FILENAME_PREFIX}*'" in prompt, (
         "the archive being written, and any bundle an earlier transfer left, stay out"
     )
@@ -380,7 +380,7 @@ def test_prompt_generates_the_whole_tar_command_exactly() -> None:
             f"  tar czf {archive} \\",
             "    --exclude-from=/tmp/daimon-handoff-excludes.txt \\",
             "    --exclude='root/.*' \\",
-            "    --exclude='tmp/.*' \\",
+            "    --exclude='tmp/work/.*' \\",
             "    --exclude='tmp/daimon-handoff-excludes.txt' \\",
             "    --exclude='mnt/session/outputs/daimon-handoff-*' \\",
             "    --exclude='mnt/session/uploads' \\",
@@ -392,7 +392,7 @@ def test_prompt_generates_the_whole_tar_command_exactly() -> None:
             "    --exclude='*/__pycache__' \\",
             "    --exclude='*/.cache' \\",
             "    --exclude='*.env' \\",
-            "    -C / root mnt/session/outputs tmp mnt/repo/analytics",
+            "    -C / root mnt/session/outputs tmp/work mnt/repo/analytics",
         ]
     )
     assert expected in prompt, "the generated tar command changed"
@@ -453,16 +453,16 @@ def test_prompt_archives_the_scratch_directory_minus_its_own_exclude_list() -> N
     prompt = build_checkpoint_prompt(
         transfer_id=TRANSFER_ID, repo_mount_path=None, max_bundle_mib=20
     )
-    assert CHECKPOINT_SCRATCH_DIR == "/tmp"
-    assert "-C / root mnt/session/outputs tmp" in prompt, (
+    assert CHECKPOINT_SCRATCH_DIR == "/tmp/work"
+    assert "-C / root mnt/session/outputs tmp/work" in prompt, (
         "a working file the agent put in /tmp/work has to travel with the rest"
     )
-    assert "--exclude='tmp/.*'" in prompt, (
+    assert "--exclude='tmp/work/.*'" in prompt, (
         "only the non-hidden entries travel, exactly as under $HOME"
     )
     assert "--exclude='tmp/daimon-handoff-excludes.txt'" in prompt, (
         "the list tar is reading must not end up inside the archive tar is writing"
     )
-    assert "find root mnt/session/outputs tmp -type f -size +20M" in prompt, (
+    assert "find root mnt/session/outputs tmp/work -type f -size +20M" in prompt, (
         "and the oversize scan covers every root it will tar"
     )
