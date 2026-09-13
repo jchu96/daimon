@@ -1,10 +1,10 @@
-"""Tests for the Discord auto-naming task and its wiring in ``DaimonBot``.
+"""Tests for the Discord thread title and its wiring in ``DaimonBot``.
 
-``auto_name_thread`` runs against a real ``AsyncAnthropic`` over
+``generate_thread_name`` runs against a real ``AsyncAnthropic`` over
 ``httpx.MockTransport`` and a real Postgres, so the metering path is the
-production one. The ``discord.Thread`` is a ``MagicMock(spec=...)`` — the
-edit is discord.py glue at the system boundary, like ``create_thread`` in the
-sibling bot tests.
+production one. The ``discord.Thread`` returned by ``create_thread`` is a
+``MagicMock(spec=...)`` — discord.py glue at the system boundary, like
+``create_thread`` in the sibling bot tests.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import httpx
 import pytest
+from anthropic import AsyncAnthropic
 from anthropic.types import Message, TextBlock, Usage
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
@@ -27,7 +28,7 @@ from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAg
 from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
-from daimon.adapters.discord.thread_naming import auto_name_thread
+from daimon.adapters.discord.thread_naming import generate_thread_name
 from daimon.core.config import McpSettings, ThreadNamingSettings
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.ma_identity import derive_tenant_uuid
@@ -64,23 +65,23 @@ def _naming_router(text: str) -> MARouter:
     return router
 
 
-_PLACEHOLDER = "Chat with test-agent"
+_FALLBACK = "Chat with test-agent"
 
 
-def _thread(thread_id: int = 4242, *, name: str = _PLACEHOLDER) -> Any:
+def _thread(thread_id: int = 4242) -> Any:
     thread = MagicMock(spec=discord.Thread)
     thread.id = thread_id
-    thread.name = name
-    thread.edit = AsyncMock()
+    thread.name = _FALLBACK
+    thread.send = AsyncMock()
     return thread
 
 
 # ---------------------------------------------------------------------------
-# auto_name_thread
+# generate_thread_name
 # ---------------------------------------------------------------------------
 
 
-async def test_auto_name_thread_renames_and_meters_haiku_call_to_author(
+async def test_generate_thread_name_returns_title_and_meters_haiku_call_to_author(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -93,12 +94,11 @@ async def test_auto_name_thread_renames_and_meters_haiku_call_to_author(
         idempotency_key=f"trial:{tenant.id}",
     )
     await db_session.commit()
-    thread = _thread()
 
-    await auto_name_thread(
-        thread=thread,
-        expected_name=_PLACEHOLDER,
-        message_text="<@999> why does my PyMC model diverge on the M2 Mac?",
+    name = await generate_thread_name(
+        fallback=_FALLBACK,
+        message_text="why does my PyMC model diverge on the M2 Mac?",
+        message_id=4242,
         anthropic=build_fake_anthropic(_naming_router("PyMC Divergences on M2 Mac").dispatch),
         sessionmaker=db_session_factory,
         tenant_id=tenant.id,
@@ -107,28 +107,27 @@ async def test_auto_name_thread_renames_and_meters_haiku_call_to_author(
         max_input_chars=2000,
     )
 
-    thread.edit.assert_awaited_once_with(name="PyMC Divergences on M2 Mac")
+    assert name == "PyMC Divergences on M2 Mac", "the model's title is what the thread opens under"
     rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert [(r.model, r.platform_user_id, r.input_tokens, r.managed_session_id) for r in rows] == [
         (THREAD_NAMING_MODEL, "555", 120, "thread-naming:4242")
-    ], "the naming call must be metered to the tenant under the author, keyed on the thread"
+    ], "the naming call must be metered to the tenant under the author, keyed on the message"
     balance = await tenant_ledger.get_balance(db_session, tenant_id=tenant.id)
     assert balance < Decimal("5.00"), "the tenant ledger must carry the naming debit"
 
 
-async def test_auto_name_thread_keeps_placeholder_but_still_meters_when_model_declines(
+async def test_generate_thread_name_falls_back_but_still_meters_when_model_answers_blank(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant = await make_tenant(db_session)
     await db_session.commit()
-    thread = _thread()
 
-    await auto_name_thread(
-        thread=thread,
-        expected_name=_PLACEHOLDER,
-        message_text="<@999> hey",
-        anthropic=build_fake_anthropic(_naming_router("NONE").dispatch),
+    name = await generate_thread_name(
+        fallback=_FALLBACK,
+        message_text="hey",
+        message_id=4242,
+        anthropic=build_fake_anthropic(_naming_router("").dispatch),
         sessionmaker=db_session_factory,
         tenant_id=tenant.id,
         platform_user_id="555",
@@ -136,18 +135,17 @@ async def test_auto_name_thread_keeps_placeholder_but_still_meters_when_model_de
         max_input_chars=2000,
     )
 
-    thread.edit.assert_not_awaited()
+    assert name == _FALLBACK, "a blank answer leaves the static title"
     rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert len(rows) == 1, "tokens were spent even though no title came back; meter them"
 
 
-async def test_auto_name_thread_swallows_api_error_without_metering_or_rename(
+async def test_generate_thread_name_falls_back_without_metering_on_api_error(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant = await make_tenant(db_session)
     await db_session.commit()
-    thread = _thread()
     router = MARouter()
     router.add(
         "POST",
@@ -155,10 +153,10 @@ async def test_auto_name_thread_swallows_api_error_without_metering_or_rename(
         lambda _req, _m: httpx.Response(400, json={"type": "error", "error": {"message": "x"}}),
     )
 
-    await auto_name_thread(
-        thread=thread,
-        expected_name=_PLACEHOLDER,
-        message_text="<@999> help with sampling",
+    name = await generate_thread_name(
+        fallback=_FALLBACK,
+        message_text="help with sampling",
+        message_id=4242,
         anthropic=build_fake_anthropic(router.dispatch),
         sessionmaker=db_session_factory,
         tenant_id=tenant.id,
@@ -167,71 +165,51 @@ async def test_auto_name_thread_swallows_api_error_without_metering_or_rename(
         max_input_chars=2000,
     )
 
-    thread.edit.assert_not_awaited()
+    assert name == _FALLBACK, "a failed call leaves the static title"
     rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert rows == [], "a failed call produced no usage and must not be billed"
 
 
-async def test_auto_name_thread_meters_even_when_discord_rejects_the_edit(
+async def test_generate_thread_name_falls_back_without_metering_when_model_is_too_slow(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """The thread waits on this call, so a stalled API yields the static title
+    instead of a thread that appears minutes late."""
     tenant = await make_tenant(db_session)
     await db_session.commit()
-    thread = _thread()
-    thread.edit.side_effect = discord.HTTPException(
-        SimpleNamespace(status=429, reason="Too Many Requests"),  # pyright: ignore[reportArgumentType]
-        "rate limited",
+
+    async def stall(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(200, json=_message_payload("Too Late"))
+
+    anthropic = AsyncAnthropic(
+        api_key="test",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(stall), base_url="https://api.anthropic.com"
+        ),
     )
 
-    await auto_name_thread(
-        thread=thread,
-        expected_name=_PLACEHOLDER,
-        message_text="<@999> help with sampling",
-        anthropic=build_fake_anthropic(_naming_router("Sampling Help").dispatch),
-        sessionmaker=db_session_factory,
-        tenant_id=tenant.id,
-        platform_user_id="555",
-        markup=Decimal("1.0"),
-        max_input_chars=2000,
-    )
-
-    rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
-    assert len(rows) == 1, "the Haiku tokens were spent before Discord refused the rename"
-
-
-async def test_auto_name_thread_skips_call_when_thread_already_renamed(
-    db_session: AsyncSession,
-    db_session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """A member or the agent renamed the thread before Haiku answered: the
-    deliberate title wins, and no tokens are spent finding out."""
-    tenant = await make_tenant(db_session)
-    await db_session.commit()
-    thread = _thread(name="My Own Title")
-
-    def refuse(_request: httpx.Request) -> httpx.Response:
-        raise AssertionError("no model call is allowed once the placeholder is gone")
-
-    await auto_name_thread(
-        thread=thread,
-        expected_name=_PLACEHOLDER,
+    name = await generate_thread_name(
+        fallback=_FALLBACK,
         message_text="help with sampling",
-        anthropic=build_fake_anthropic(refuse),
+        message_id=4242,
+        anthropic=anthropic,
         sessionmaker=db_session_factory,
         tenant_id=tenant.id,
         platform_user_id="555",
         markup=Decimal("1.0"),
         max_input_chars=2000,
+        timeout_seconds=0.05,
     )
 
-    thread.edit.assert_not_awaited()
+    assert name == _FALLBACK, "past the timeout the static title wins"
     rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
-    assert rows == [], "no call, no usage row"
+    assert rows == [], "no answer arrived, so there is nothing to meter"
 
 
 # ---------------------------------------------------------------------------
-# Bot wiring: on_message spawns the rename after create_thread
+# Bot wiring: on_message titles the thread before create_thread
 # ---------------------------------------------------------------------------
 
 
@@ -362,30 +340,30 @@ def _channel_message(*, guild_id: int, content: str) -> Any:
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-@patch("daimon.adapters.discord.bot.auto_name_thread", new_callable=AsyncMock)
+@patch("daimon.adapters.discord.bot.generate_thread_name", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_environment", new_callable=AsyncMock)
 @patch("daimon.core.turn.run.run_turn", new_callable=AsyncMock)
 @patch("daimon.core.turn.prepare.create_session", new_callable=AsyncMock)
 @patch("daimon.core.turn.admission.resolve_config", new_callable=AsyncMock)
-async def test_on_message_spawns_rename_of_new_thread_only_when_naming_enabled(
+async def test_on_message_creates_thread_under_generated_title_only_when_naming_enabled(
     mock_resolve_config: AsyncMock,
     mock_create_session: AsyncMock,
     mock_run_turn: AsyncMock,
     mock_resolve_environment: AsyncMock,
     mock_resolve_agent: AsyncMock,
-    mock_auto_name: AsyncMock,
+    mock_generate_name: AsyncMock,
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     enabled: bool,
 ) -> None:
-    """The thread opens under the placeholder, then the rename is spawned in
-    the background with the turn's tenant, author and settings — and only
-    when ``DAIMON_THREAD_NAMING__ENABLED`` is on.
+    """The title is generated with the turn's tenant, author and settings and
+    the thread is created under it — no rename, so no "renamed the thread"
+    notice — and only when ``DAIMON_THREAD_NAMING__ENABLED`` is on.
 
-    ``auto_name_thread`` itself is covered above against a real DB; here it
-    is patched because the test session factory shares ONE connection, which
-    a concurrent background write would trip over (production pools).
+    ``generate_thread_name`` itself is covered above against a real DB; here
+    it is patched so the wiring test asserts only what ``on_message`` hands it
+    and does with the answer.
     """
     guild_id = "801000777" if enabled else "801000778"
     await provision_tenant(
@@ -404,6 +382,7 @@ async def test_on_message_spawns_rename_of_new_thread_only_when_naming_enabled(
     mock_create_session.return_value = _fake_session()
     mock_resolve_agent.return_value = "ag_test"
     mock_resolve_environment.return_value = "env_test"
+    mock_generate_name.return_value = "PyMC Divergences"
 
     runtime = _runtime(
         db_session_factory,
@@ -412,31 +391,31 @@ async def test_on_message_spawns_rename_of_new_thread_only_when_naming_enabled(
     )
     bot = _bot(runtime)
     message = _channel_message(guild_id=int(guild_id), content="<@999> my PyMC model diverges")
-    thread = _thread(thread_id=8001)
-    thread.send = AsyncMock()
-    message.create_thread.return_value = thread
+    message.id = 8001
+    message.create_thread.return_value = _thread(thread_id=8001)
 
     await bot.on_message(message)
     await asyncio.gather(*bot._bg_tasks)  # pyright: ignore[reportPrivateUsage]
 
     message.create_thread.assert_awaited_once()
-    assert message.create_thread.await_args.kwargs["name"] == "Chat with test-agent", (
-        "the thread must open instantly under the placeholder; the title arrives later"
-    )
+    created_name = message.create_thread.await_args.kwargs["name"]
     if not enabled:
-        mock_auto_name.assert_not_awaited()
+        mock_generate_name.assert_not_awaited()
+        assert created_name == "Chat with test-agent", "naming off keeps the static title"
         return
-    mock_auto_name.assert_awaited_once()
-    spawned = mock_auto_name.await_args.kwargs
-    assert spawned["thread"] is thread, "the rename must target the thread just created"
-    assert spawned["message_text"] == "my PyMC model diverges", (
+    assert created_name == "PyMC Divergences", (
+        "the thread must be created under the generated title, not renamed into it"
+    )
+    mock_generate_name.assert_awaited_once()
+    assert mock_generate_name.await_args is not None, "asserted awaited above"
+    handed = mock_generate_name.await_args.kwargs
+    assert handed["fallback"] == "Chat with test-agent", "the static title is the fallback"
+    assert handed["message_text"] == "my PyMC model diverges", (
         "the opening message, minus the bot mention, is what gets titled"
     )
-    assert spawned["expected_name"] == "Chat with test-agent", (
-        "the task must know the placeholder so it never overwrites a deliberate rename"
-    )
-    assert (spawned["tenant_id"], spawned["platform_user_id"]) == (tenant_id, "555"), (
+    assert handed["message_id"] == 8001, "metering is keyed on the opening message"
+    assert (handed["tenant_id"], handed["platform_user_id"]) == (tenant_id, "555"), (
         "the naming call must be billed to the turn's tenant under the message author"
     )
-    assert spawned["max_input_chars"] == 321, "settings must reach the task unchanged"
-    assert spawned["anthropic"] is runtime.anthropic, "the runtime client is reused"
+    assert handed["max_input_chars"] == 321, "settings must reach the call unchanged"
+    assert handed["anthropic"] is runtime.anthropic, "the runtime client is reused"
