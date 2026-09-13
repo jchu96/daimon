@@ -333,6 +333,10 @@ async def test_live_request_clicked_by_requester_opens_the_kind_modal(
     assert len(opens) == 1, "a live request clicked by its requester must open the modal"
     view = opens[0].kwargs["json"]["view"]
     assert view["callback_id"] == f"{CRED_CALLBACK_PREFIX}env"
+    for block in view["blocks"]:
+        assert 1 <= block["element"]["max_length"] <= 3000, (
+            "Slack rejects plain-text inputs whose maximum length exceeds 3000"
+        )
     meta = json.loads(view["private_metadata"])
     assert meta["token"] == token
 
