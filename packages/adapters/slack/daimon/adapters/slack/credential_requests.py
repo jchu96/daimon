@@ -196,7 +196,7 @@ def build_credential_modal(
                     "type": "plain_text_input",
                     "action_id": _VALUE_BLOCK,
                     "multiline": kind == "env",
-                    "max_length": 4000 if kind == "env" else 255,
+                    "max_length": 3000 if kind == "env" else 255,
                     "placeholder": {
                         "type": "plain_text",
                         # Slack caps plain_text placeholders at 150 chars.
