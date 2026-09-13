@@ -47,6 +47,7 @@ from daimon.core.session_snapshot import (
 )
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import AccountRow, TenantRow, ThreadSessionRow
+from daimon.core.stores.thread_agent_bindings import create_binding
 from daimon.core.stores.thread_sessions import (
     create_thread_session,
     get_live_thread_session,
@@ -55,6 +56,7 @@ from daimon.core.stores.thread_sessions import (
 )
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
+from daimon.core.turn.errors import SessionBusyError
 from daimon.core.turn.prepare import PreparedTurn, bind_session
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
@@ -1114,4 +1116,77 @@ async def test_legacy_row_without_snapshot_is_backfilled_with_one_retrieve(
         rows = await usage_events.list_for_tenant(s, tenant_id=tenant.id)
     assert [usage.model for usage in rows] == ["claude-haiku-4-5"], (
         "a backfilled row must bill the model the session was found to be running"
+    )
+
+
+async def test_bind_session_raises_session_busy_when_a_handoff_lands_mid_turn(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The destination agent's turn must not run inside the source agent's
+    session. `bind_session` turns that into an error rather than a
+    `PreparedTurn`, so an adapter cannot accidentally run the turn anyway."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await _make_snapshotted_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        thread_id="thread-handoff-busy",
+        ma_session_id="sess_source",
+        ma_agent_id="ag_source",
+        active_turn=True,
+    )
+    binding = await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel-1",
+        thread_id="thread-handoff-busy",
+        responder_ma_agent_id="ag_destination",
+        responder_name="research-bot",
+        kind="handoff",
+    )
+    await db_session.commit()
+
+    def _explode(request: httpx.Request, _match: object) -> httpx.Response:
+        raise AssertionError(f"unexpected MA call: {request.method} {request.url.path}")
+
+    router = MARouter()
+    router.add("POST", r"/v1/sessions", _explode)
+    router.add("GET", r"/v1/sessions/sess_source", _explode)
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    destination = Admission(
+        account_id=account.id,
+        agent=_agent(agent_id="ag_destination", tenant_id=tenant.id, name="research-bot"),
+        environment=_env(env_id="env_1", tenant_id=tenant.id),
+        config=ResolvedConfig(
+            agent_name="research-bot",
+            environment_name="default",
+            thread_binding_id=binding.id,
+        ),
+    )
+
+    before = datetime.now(UTC)
+    with pytest.raises(SessionBusyError) as caught:
+        await bind_session(
+            deps,
+            destination,
+            tenant_id=tenant.id,
+            platform="discord",
+            external_user_id="user-1",
+            thread_id="thread-handoff-busy",
+            session_account_id=account.id,
+            reuse_existing=True,
+        )
+
+    assert caught.value.pending_reasons == ("agent_identity",), (
+        "the adapter is told which change is waiting, so it can say what happens next"
+    )
+    assert caught.value.retry_after > before, "and when it will be made"
+
+    async with db_session_factory() as s:
+        untouched = await get_thread_session_by_id(s, id=row.id)
+    assert untouched is not None and untouched.status == "live", (
+        "the source agent's session keeps running its own turn"
     )

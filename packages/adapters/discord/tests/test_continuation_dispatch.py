@@ -21,7 +21,11 @@ from daimon.adapters.discord.continuation_dispatch import dispatch_pending_conti
 from daimon.core.continuity.continuation import ContinuationDecision
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores.domain import TaskContinuationRow
-from daimon.core.stores.task_continuations import get_continuation, record_continuation
+from daimon.core.stores.task_continuations import (
+    get_continuation,
+    list_pending_continuations,
+    record_continuation,
+)
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -178,6 +182,56 @@ async def test_preparation_failure_settles_skipped_not_delivered(
     assert settled is not None
     assert settled.status == "skipped"
     assert settled.skip_reason == "blocked_preparation_failed"
+
+
+async def test_a_busy_session_settles_skipped_and_requeues_under_a_new_key(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A follow-up that cannot bind because a turn is still running is not lost.
+
+    `claim_continuation` has no inverse, so the claimed row is settled
+    `skipped`/`turn_running` and the same request is queued again under a NEW
+    idempotency key. At-most-once still holds per key -- the settled row can
+    never dispatch again -- while the work the person asked for survives to be
+    picked up by the next turn that finishes in this thread.
+    """
+    from daimon.core.turn.errors import SessionBusyError
+
+    tenant_id, account_id, thread_id, key = await _seed_pending_row(
+        db_session_factory, requested_work="continue"
+    )
+    thread = _make_thread()
+    anthropic = build_stub_anthropic(_reachable_agent_handler(tenant_id, ma_agent_id="ag_target"))
+
+    async def _busy_follow_up(row: object, decision: object) -> None:
+        raise SessionBusyError(pending_reasons=("agent_identity",), retry_after=datetime.now(UTC))
+
+    await dispatch_pending_continuations(
+        db_session_factory,
+        anthropic,
+        tenant_id=tenant_id,
+        thread=thread,
+        run_follow_up=_busy_follow_up,
+    )
+
+    async with db_session_factory() as session:
+        settled = await get_continuation(session, idempotency_key=key)
+        pending = await list_pending_continuations(
+            session, tenant_id=tenant_id, platform="discord", thread_id=thread_id
+        )
+    assert settled is not None
+    assert settled.status == "skipped", "the claimed row must not be left claimed"
+    assert settled.skip_reason == "turn_running"
+
+    assert len(pending) == 1, f"the request must be re-queued exactly once, got {pending}"
+    requeued = pending[0]
+    assert requeued.idempotency_key != key, (
+        "the re-queued row must carry a NEW key, so the settled row's at-most-once still holds"
+    )
+    assert requeued.requested_work == "continue", "the person's own words must survive the requeue"
+    assert requeued.target_ma_agent_id == "ag_target"
+    assert requeued.requester_account_id == account_id
+    assert requeued.reason == "task_handoff"
 
 
 def _reachable_agent_handler(

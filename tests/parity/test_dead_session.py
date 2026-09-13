@@ -39,6 +39,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
     BetaManagedAgentsSpanModelUsage,
 )
 from anthropic.types.beta.sessions.beta_managed_agents_text_block import BetaManagedAgentsTextBlock
+from daimon.core.continuity.messages import render_unexpected_loss
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.identity import get_or_create_platform_principal
@@ -217,6 +218,25 @@ async def test_dead_session_recreates_marks_old_row_dead_and_bills_new_session(
     )
     assert posted, f"expected the recovered turn's reply to be posted, got: {posted}"
 
+    # A dead-session recovery must tell the person their workspace was lost,
+    # exactly once, and ABOVE the answer it explains -- the answer is an
+    # in-place edit of the embed posted at mention time, so a notice sent as
+    # its own message would always sort below it. This scenario's dead-session
+    # signal is a 404 (deleted session), never the archived-400 signature the
+    # transcript rescue targets, so the history variant is the one that
+    # must appear.
+    expected_notice = render_unexpected_loss("history")
+    carrying = [text for text in posted if expected_notice in text]
+    assert len(carrying) == 1, (
+        f"expected exactly one unexpected-loss notice (history variant), got: {posted}"
+    )
+    assert carrying[0].startswith(expected_notice + "\n\n"), (
+        f"the loss notice must be the first paragraph of the answer, got: {carrying[0]!r}"
+    )
+    assert carrying[0] != expected_notice, (
+        "the notice must ride the answer, not stand alone as a trailing message"
+    )
+
     # The stale mapping is marked dead.
     dead_row = await get_thread_session_by_id(db_session, id=old_row.id)
     assert dead_row is not None, "the pre-existing mapping row must still exist"
@@ -311,6 +331,20 @@ async def test_dead_session_recreates_marks_old_row_dead_and_bills_new_session_s
         thread_ts=thread_id,
     )
     assert posted, f"expected the recovered turn's reply to be posted, got: {posted}"
+
+    # A dead-session recovery must tell the person their workspace was lost,
+    # exactly once and above the answer it explains, matching Discord.
+    expected_notice = render_unexpected_loss("history")
+    carrying = [text for text in posted if expected_notice in text]
+    assert len(carrying) == 1, (
+        f"expected exactly one unexpected-loss notice (history variant), got: {posted}"
+    )
+    assert carrying[0].startswith(expected_notice + "\n\n"), (
+        f"the loss notice must be the first paragraph of the answer, got: {carrying[0]!r}"
+    )
+    assert carrying[0] != expected_notice, (
+        "the notice must ride the answer, not stand alone as a trailing message"
+    )
 
     # The stale mapping is marked dead.
     dead_row = await get_thread_session_by_id(db_session, id=old_row.id)

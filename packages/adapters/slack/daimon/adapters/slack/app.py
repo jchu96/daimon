@@ -128,13 +128,18 @@ from daimon.core.stores.slack_user_tokens import get_slack_user_token
 from daimon.core.stores.thread_agent_bindings import get_binding as get_setup_binding
 from daimon.core.stores.thread_sessions import (
     clear_active_turn,
+    get_live_thread_session,
     mark_turn_active,
     update_watermark,
 )
 from daimon.core.stores.turn_origins import get_active_origin
 from daimon.core.turn import turn_deadline
 from daimon.core.turn.admission import AdmissionDenied, MissingTurnConfigError, admit
-from daimon.core.turn.errors import SessionAgentMismatch, SessionPreparationFailed
+from daimon.core.turn.errors import (
+    SessionAgentMismatch,
+    SessionBusyError,
+    SessionPreparationFailed,
+)
 from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import ContinuityOutcome, bind_session
@@ -1511,6 +1516,29 @@ class SlackApp:
                         text=explanation,
                     )
                 return
+            except SessionBusyError:
+                # Nothing failed and nothing is misconfigured: the previous
+                # turn in this thread is simply still running, and the session
+                # it is running in belongs to the OUTGOING responder. Making
+                # the change around it would answer as one agent inside
+                # another agent's workspace, so no turn runs here -- the
+                # person is told the in-flight message finishes first and the
+                # switch takes effect at their next message.
+                busy_text = render_current_work_must_finish(admission.agent.name, handoff=True)
+                if lifecycle.status_ts is not None:
+                    await web_client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                        channel=channel,
+                        ts=lifecycle.status_ts,
+                        text=busy_text,
+                        blocks=[],
+                    )
+                else:
+                    await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                        channel=channel,
+                        thread_ts=thread_id,
+                        text=busy_text,
+                    )
+                return
             except SessionAgentMismatch as error:
                 # The recorded (previous) responder's display name is a
                 # best-effort live lookup -- it is purely cosmetic copy, so a
@@ -1556,21 +1584,25 @@ class SlackApp:
                 if prepared.continuity.state != "continued"
                 else None
             )
-            if prepared.continuity.state == "replaced_after_loss":
-                loss_kind: Literal["transcript", "history"] = (
-                    "transcript" if prepared.continuity.transfer_kind == "transcript" else "history"
+            # `prepared.continuity` is the bind's OWN decision, taken before
+            # the turn runs -- it can never be "replaced_after_loss" (that
+            # state only exists on the post-turn `RunOutcome`, set when
+            # `run_prepared_turn`'s recovery cycle recreates the session
+            # mid-call). That notice is posted after the turn instead, once
+            # the outcome is known.
+            replacement_summary: str | None = None
+            if prepared.continuity.state == "replaced":
+                # Not a separate message: the answer is an in-place edit of the
+                # status card posted at mention time, and Slack orders by the
+                # original ts -- so a summary posted at any point after that
+                # card reads BELOW the answer it explains ("the file vanished"
+                # above "here is why"). It becomes the answer's first paragraph
+                # instead. The fallback after the turn covers an answer that
+                # never arrives to carry it.
+                replacement_summary = render_replacement_summary(
+                    prepared.continuity.transfer_kind or "full", lost=[]
                 )
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel, thread_ts=thread_id, text=render_unexpected_loss(loss_kind)
-                )
-            elif prepared.continuity.state == "replaced":
-                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
-                    channel=channel,
-                    thread_ts=thread_id,
-                    text=render_replacement_summary(
-                        prepared.continuity.transfer_kind or "full", lost=[]
-                    ),
-                )
+                lifecycle.answer_prefix = replacement_summary
 
             # Turn marker: message ts + channel + start time, written as soon as
             # the mapping row is known and the card exists. Slack passes
@@ -1741,6 +1773,10 @@ class SlackApp:
                     # second, successful card.
                     adopt_status_ts=lifecycle.status_ts,
                 )
+                # The replacement summary belongs to the turn, not to the
+                # lifecycle object that happens to render it -- a recovery
+                # cycle swaps the lifecycle and would otherwise drop it.
+                new_lifecycle.answer_prefix = lifecycle.answer_prefix
                 lifecycle_holder[0] = new_lifecycle
                 # An adopting lifecycle never posts, so it never re-registers
                 # itself -- the entry left by the original post is still bound
@@ -1811,6 +1847,34 @@ class SlackApp:
 
             mapping_id = outcome.mapping_id
             final_lifecycle = lifecycle_holder[0]
+
+            # The recovery cycle inside run_prepared_turn only learns a
+            # session was lost mid-call, after the turn has already run -- so
+            # unlike the planned-replacement summary above, this notice can
+            # only be posted here, once `outcome.continuity` is known. Posted
+            # regardless of whether the recovered turn itself then answered
+            # or errored: the person needs to know the workspace was lost
+            # either way.
+            if outcome.continuity.state == "replaced_after_loss":
+                loss_kind: Literal["transcript", "history"] = (
+                    "transcript" if outcome.continuity.transfer_kind == "transcript" else "history"
+                )
+                loss_notice = render_unexpected_loss(loss_kind)
+                # Edited in above the answer rather than posted under it, for
+                # the same ordering reason as the planned summary above. Falls
+                # back to a message when there is no answer to sit above (a
+                # tool-only or failed turn) or it will not fit.
+                if not await final_lifecycle.prepend_revealed_answer(loss_notice):
+                    await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                        channel=channel, thread_ts=thread_id, text=loss_notice
+                    )
+            if replacement_summary is not None and not final_lifecycle.answer_prefix_applied:
+                # The turn produced no answer to carry the summary (tool-only,
+                # cancelled, or failed). The person still has to be told what
+                # the replacement carried across, so it goes out on its own.
+                await web_client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                    channel=channel, thread_ts=thread_id, text=replacement_summary
+                )
 
             # --- Watermark --- Preserves Slack's original gate exactly (unconditional
             # on final_ts, no state.error branch) -- Discord's inline sequence had an
@@ -2028,6 +2092,35 @@ class SlackApp:
                                 )
                                 await _clear_session.commit()
 
+            # This turn's own marker is cleared BEFORE anything is dispatched.
+            # A continuation's `bind_session` treats a marker on the thread's
+            # live row as "a turn is still running", and a responder change
+            # that cannot be made yet is deferred onto the session that is
+            # running -- which is the OUTGOING agent's. Dispatching first
+            # therefore ran the handoff's first turn inside the source agent's
+            # workspace while the card credited the destination. The `finally`
+            # below still clears every id; `clear_active_turn` is idempotent,
+            # and a clear failure there is recovered by the next boot sweep.
+            for _marker_id in _marker_mapping_ids:
+                with contextlib.suppress(SQLAlchemyError):
+                    async with self.runtime.sessionmaker() as _clear_session:
+                        await clear_active_turn(_clear_session, id=_marker_id)
+                        await _clear_session.commit()
+
+            # Read the marker state back rather than passing a constant. The
+            # clears above should have settled it, so this is False in
+            # practice -- but `decide_continuation`'s turn-running gate has to
+            # reflect the row, not this caller's expectation of it (a
+            # suppressed clear, or a turn that landed on a mapping row this
+            # caller never tracked, both leave the marker standing).
+            async with self.runtime.sessionmaker() as _live_session:
+                _live_row = await get_live_thread_session(
+                    _live_session,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    thread_id=thread_id,
+                    account_id=admission.account_id,
+                )
             await dispatch_pending_continuations(
                 self.runtime.sessionmaker,
                 self.runtime.anthropic,
@@ -2035,7 +2128,7 @@ class SlackApp:
                 tenant_id=tenant_id,
                 channel=channel,
                 thread_id=thread_id,
-                active_turn=False,
+                active_turn=_live_row is not None and _live_row.active_turn_message_id is not None,
                 run_follow_up=_run_continuation_follow_up,
             )
 

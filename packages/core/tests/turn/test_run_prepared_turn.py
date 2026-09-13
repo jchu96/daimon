@@ -21,23 +21,35 @@ import pytest
 from anthropic.types import RawMessageStreamEvent
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
+from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
+    BetaManagedAgentsAgentMessageEvent,
+)
+from anthropic.types.beta.sessions.beta_managed_agents_text_block import BetaManagedAgentsTextBlock
+from anthropic.types.beta.sessions.beta_managed_agents_user_message_event import (
+    BetaManagedAgentsUserMessageEvent,
+)
 from daimon.core.config import McpSettings
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.errors import TurnError
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.core.stores import usage_events
-from daimon.core.stores.thread_sessions import get_live_thread_session
+from daimon.core.stores.domain import ThreadSessionRow
+from daimon.core.stores.thread_sessions import (
+    get_live_thread_session,
+    get_thread_session_by_id,
+)
 from daimon.core.turn.admission import Admission
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.lifecycle import InterruptSource, ReconnectReason, TurnLifecycle
 from daimon.core.turn.prepare import ContinuityOutcome, PreparedTurn, bind_recorder
-from daimon.core.turn.run import _is_dead_session, run_prepared_turn
+from daimon.core.turn.run import RunOutcome, _is_dead_session, run_prepared_turn
 from daimon.core.turn.state import TurnState
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
     MARouter,
     build_fake_anthropic,
+    list_response,
     make_fake_memory_store_handler,
     not_found_response,
     send_events_response,
@@ -161,11 +173,27 @@ def _router(
     session_bodies: list[dict[str, object]],
     dead_session_ids: set[str],
     sent_batches: list[tuple[str, list[dict[str, object]]]] | None = None,
+    archived_session_ids: set[str] | None = None,
+    events_by_session: dict[str, list[dict[str, object]]] | None = None,
+    created_model: str = "claude-sonnet-4-6",
 ) -> MARouter:
     """A router serving memory-store cold-provision, session-create (each
-    call assigns the next `sess_N` id), events.send, and events.stream --
-    returning a 404 not_found for any session id in `dead_session_ids`, else
-    one terminal `session.status_idle` (end_turn) event."""
+    call assigns the next `sess_N` id), events.send, events.list and
+    events.stream -- returning a 404 not_found for any session id in
+    `dead_session_ids`, else one terminal `session.status_idle` (end_turn)
+    event.
+
+    `archived_session_ids` is the OTHER dead-session signature: the stream
+    opens, and `events.send` answers with MA's archived-session 400. That is
+    the signature whose event log is still readable (capability matrix
+    P9.d/P9.c), which `events_by_session` supplies -- a session absent from
+    that mapping 404s on `events.list`, exactly as a deleted one does.
+
+    `created_model` is the model every session created through this router
+    freezes; it decides whether the replacement can be sent a
+    `system.message` at all."""
+    archived = archived_session_ids or set()
+    listable_events = events_by_session or {}
     router = MARouter()
     memory_handler = make_fake_memory_store_handler()
 
@@ -186,7 +214,7 @@ def _router(
                 "agent": {
                     "id": body["agent"],
                     "mcp_servers": [],
-                    "model": {"id": "claude-sonnet-4-6"},
+                    "model": {"id": created_model},
                     "name": "daimon",
                     "skills": [],
                     "tools": [],
@@ -209,11 +237,31 @@ def _router(
     router.add("POST", r"/v1/sessions", _session_create)
 
     def _send(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        sid = match.group("sid")
+        if sid in archived:
+            return httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"Cannot send events to archived session: {sid}",
+                    },
+                },
+            )
         if sent_batches is not None:
-            sent_batches.append((match.group("sid"), json.loads(request.content)["events"]))
+            sent_batches.append((sid, json.loads(request.content)["events"]))
         return send_events_response()
 
     router.add("POST", r"/v1/sessions/(?P<sid>[^/]+)/events", _send)
+
+    def _events_list(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
+        sid = match.group("sid")
+        if sid not in listable_events:
+            return not_found_response("session gone")
+        return list_response(listable_events[sid])
+
+    router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events", _events_list)
 
     def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
         sid = match.group("sid")
@@ -946,6 +994,11 @@ async def test_second_consecutive_dead_session_does_not_loop(
         return send_events_response()
 
     router.add("POST", r"/v1/sessions/[^/]+/events", _send)
+
+    def _events_gone(_request: httpx.Request, _match: object) -> httpx.Response:
+        return not_found_response("session gone")  # deleted: its log went with it
+
+    router.add("GET", r"/v1/sessions/[^/]+/events", _events_gone)
 
     def _stream(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
         sid = match.group("sid")
@@ -1934,21 +1987,288 @@ async def test_recovery_reports_a_replacement_after_loss_and_keeps_the_framing_p
     assert outcome.continuity.state == "replaced_after_loss", (
         "the session was lost, so the copy must not claim a planned replacement"
     )
-    assert outcome.continuity.user_prefix == continuity.user_prefix, (
-        "what the bind decided is restated, not discarded"
+    assert outcome.continuity.transfer_kind == "history", (
+        "a deleted session's log is gone too (P9.e), so nothing but the thread crossed"
+    )
+    assert continuity.user_prefix not in outcome.continuity.user_prefix, (
+        "the bind's framing described the workspace that just died; it is not restated"
     )
 
     recovery_session, recovery_batch = sent[-1]
     assert recovery_session == outcome.ma_session_id
     assert [event["type"] for event in recovery_batch] == ["user.message"], (
-        "the recreated session has no bundle mounted, so the framing that describes one "
-        "must not be sent to it"
+        "sonnet-4-6 rejects a system.message, so the framing travels in the message"
     )
     text = "".join(
         block["text"]
         for block in recovery_batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
         if block["type"] == "text"
     )
-    assert text == f"{continuity.user_prefix}\nfull history reseed", (
-        "the quoted conversation still leads the reseeded message"
+    assert text == f"{outcome.continuity.user_prefix}\nfull history reseed", (
+        "the loss framing leads the reseeded message"
+    )
+    assert text.startswith("The workspace this conversation was running in was lost"), (
+        "and it is this loss's framing, not the overtaken bind's"
+    )
+    assert "<previous_session" not in text, "there was no readable log to quote"
+
+
+def _archived_session_log() -> list[dict[str, object]]:
+    """The lost session's event log, still listable because MA archived it
+    rather than deleting it (capability matrix P9.d)."""
+    return [
+        BetaManagedAgentsUserMessageEvent(
+            id="sevt_user_1",
+            type="user.message",
+            content=[BetaManagedAgentsTextBlock(type="text", text="remember MARKER-K7VD22")],
+            processed_at=None,
+        ).model_dump(mode="json"),
+        BetaManagedAgentsAgentMessageEvent(
+            id="sevt_agent_1",
+            type="agent.message",
+            content=[BetaManagedAgentsTextBlock(type="text", text="Noted: MARKER-K7VD22")],
+            processed_at=_NOW,
+        ).model_dump(mode="json"),
+    ]
+
+
+async def _recover_from_archived_session(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    thread_id: str,
+    created_model: str,
+    events_by_session: dict[str, list[dict[str, object]]],
+) -> tuple[RunOutcome, list[tuple[str, list[dict[str, object]]]], ThreadSessionRow]:
+    """Drive one recovery whose dead-session signal is MA's archived-400."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await make_thread_session(
+        db_session,
+        tenant=tenant,
+        account=account,
+        platform="discord",
+        thread_id=thread_id,
+        ma_session_id="sess_archived",
+    )
+    await db_session.commit()
+
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    router = _router(
+        session_bodies=[],
+        dead_session_ids=set(),
+        sent_batches=sent,
+        archived_session_ids={"sess_archived"},
+        events_by_session=events_by_session,
+        created_model=created_model,
+    )
+    deps = _deps(sessionmaker=db_session_factory, router=router)
+    prepared = _prepared_turn(
+        deps=deps,
+        admission=_admission(
+            account_id=account.id,
+            agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
+            env=_env(env_id="env_1", tenant_id=tenant.id),
+        ),
+        tenant_id=tenant.id,
+        external_user_id="user-1",
+        ma_session_id="sess_archived",
+        mapping_id=row.id,
+        session_account_id=account.id,
+    )
+
+    outcome = await run_prepared_turn(
+        deps,
+        prepared,
+        tenant_id=tenant.id,
+        platform="discord",
+        thread_id=thread_id,
+        external_user_id="user-1",
+        user_message="what was the marker?",
+        lifecycle=RecordingLifecycle(),
+        cancel=asyncio.Event(),
+        reseed_user_message=_reseed,
+        recovery_lifecycle=_recovery_lifecycle,
+        render_interval_s=0.001,
+    )
+    return outcome, sent, row
+
+
+async def test_recovery_quotes_the_archived_sessions_transcript_to_the_replacement(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Observed on staging: a session archived out from under a live thread
+    healed silently, and the replacement was handed the platform history and
+    nothing else -- it answered correctly only because the marker happened to
+    be visible in the Discord thread. An archived session's event log is still
+    listable, so the conversation can cross, quoted and untrusted, and the
+    replacement can be told what it lost."""
+    outcome, sent, _row = await _recover_from_archived_session(
+        db_session,
+        db_session_factory,
+        thread_id="thread-archived-transcript",
+        created_model="claude-sonnet-5",
+        events_by_session={"sess_archived": _archived_session_log()},
+    )
+
+    assert outcome.recovered is True
+    assert outcome.continuity.state == "replaced_after_loss", (
+        "the workspace was lost, not handed over"
+    )
+    assert outcome.continuity.transfer_kind == "transcript", (
+        "the conversation crossed and the files did not -- the middle rung, not the bottom one"
+    )
+
+    _, recovery_batch = sent[-1]
+    assert [event["type"] for event in recovery_batch] == ["user.message", "system.message"], (
+        "daimon's own words about the loss ride the privileged channel on a model that takes one"
+    )
+    text = "".join(
+        block["text"]
+        for block in recovery_batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert "<previous_session" in text, "the quoted conversation leads the reseeded message"
+    assert "MARKER-K7VD22" in text, "including the exchange the person is about to ask about"
+    assert text.endswith("\nfull history reseed"), "and the reseeded message follows it"
+
+    system_text = "".join(
+        block["text"]
+        for block in recovery_batch[1]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert "was lost" in system_text, "the replacement is told what happened"
+    assert "say plainly what is missing" in system_text, "and told to say so before continuing"
+    assert "MARKER-K7VD22" not in system_text, (
+        "quoted material never reaches the privileged channel"
+    )
+
+
+async def test_recovery_puts_the_loss_framing_in_the_message_without_system_support(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """haiku rejects a request carrying a `system.message`, so the framing has
+    to degrade onto the ordinary channel rather than fail the recovered turn."""
+    outcome, sent, _row = await _recover_from_archived_session(
+        db_session,
+        db_session_factory,
+        thread_id="thread-archived-haiku",
+        created_model="claude-haiku-4-5",
+        events_by_session={"sess_archived": _archived_session_log()},
+    )
+
+    assert outcome.continuity.transfer_kind == "transcript"
+    _, recovery_batch = sent[-1]
+    assert [event["type"] for event in recovery_batch] == ["user.message"], (
+        "a system.message would 400 the whole recovered turn on this model"
+    )
+    text = "".join(
+        block["text"]
+        for block in recovery_batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert text.startswith("The workspace this conversation was running in was lost"), (
+        "the framing still reaches the model, just on the ordinary channel"
+    )
+    assert "<previous_session" in text, "with the quoted conversation after it"
+
+
+async def test_recovery_falls_back_to_history_when_the_log_cannot_be_read(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The bottom rung: nothing readable is left of the old session, so the
+    platform-history reseed is all the replacement gets -- and the copy says
+    `history`, never `transcript`."""
+    outcome, sent, _row = await _recover_from_archived_session(
+        db_session,
+        db_session_factory,
+        thread_id="thread-archived-gone",
+        created_model="claude-sonnet-5",
+        events_by_session={},
+    )
+
+    assert outcome.recovered is True
+    assert outcome.continuity.transfer_kind == "history", (
+        "an unreadable log is a worse gap than a quoted one and must not be described as one"
+    )
+    _, recovery_batch = sent[-1]
+    text = "".join(
+        block["text"]
+        for block in recovery_batch[0]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert text == "full history reseed", (
+        "with a system.message available, the reseeded message carries no prefix at all"
+    )
+    system_text = "".join(
+        block["text"]
+        for block in recovery_batch[1]["content"]  # pyright: ignore[reportUnknownVariableType]
+        if block["type"] == "text"
+    )
+    assert "The previous session's log could not be read either" in system_text
+
+
+async def test_recovery_records_the_dead_session_as_the_replacements_predecessor(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Observed on staging: after an unexpected loss the two rows for the
+    thread sat side by side with no link between them — `predecessor_id=None`,
+    `replaced_by_id=None`, `transfer_kind=None` — so nothing downstream could
+    tell the successor apart from a first session, or say how much of the old
+    one reached it. A loss is a replacement too, and the chain must say so."""
+    outcome, _sent, dead_row = await _recover_from_archived_session(
+        db_session,
+        db_session_factory,
+        thread_id="thread-loss-lineage",
+        created_model="claude-sonnet-5",
+        events_by_session={"sess_archived": _archived_session_log()},
+    )
+
+    assert outcome.recovered is True
+    assert outcome.mapping_id is not None
+
+    async with db_session_factory() as s:
+        successor = await get_thread_session_by_id(s, id=outcome.mapping_id)
+        dead = await get_thread_session_by_id(s, id=dead_row.id)
+
+    assert successor is not None
+    assert successor.predecessor_id == dead_row.id, (
+        "the successor must point back at the session it was created to replace"
+    )
+    assert successor.transfer_kind == "transcript", (
+        "the row records the rung the successor actually came in on"
+    )
+    assert successor.transfer_file_id is None, "no bundle crosses an unexpected loss"
+    assert dead is not None
+    assert dead.replaced_by_id == outcome.mapping_id, "and the chain closes from the other end"
+    assert dead.status == "dead", (
+        "the old row still says the session was lost, not deliberately superseded"
+    )
+
+
+async def test_recovery_records_the_history_rung_when_the_old_log_is_unreadable(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The successor's row must not claim a transcript crossed when none did."""
+    outcome, _sent, dead_row = await _recover_from_archived_session(
+        db_session,
+        db_session_factory,
+        thread_id="thread-loss-lineage-history",
+        created_model="claude-sonnet-5",
+        events_by_session={},
+    )
+
+    assert outcome.mapping_id is not None
+    async with db_session_factory() as s:
+        successor = await get_thread_session_by_id(s, id=outcome.mapping_id)
+
+    assert successor is not None
+    assert successor.predecessor_id == dead_row.id
+    assert successor.transfer_kind == "history", (
+        "an unreadable log is the bottom rung and the row must say so"
     )

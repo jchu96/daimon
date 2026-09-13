@@ -14,6 +14,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import cast
 
+from daimon.core.continuity.messages import render_unexpected_loss
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.domain import Platform
 from daimon.testing.factories import make_tenant
@@ -56,6 +57,12 @@ async def test_turn_billed_when_unblocked_writes_usage_event_and_ledger_debit(
         text="hello",
     )
     assert posted, f"expected the agent's reply to be posted somewhere, got: {posted}"
+
+    # Issue 4 (staging QA, 2026-09-13): an ordinary turn (no dead-session
+    # recovery) must never post the unexpected-loss notice, on either
+    # platform.
+    assert render_unexpected_loss("history") not in posted
+    assert render_unexpected_loss("transcript") not in posted
 
     usage_rows = await usage_events.list_for_tenant(db_session, tenant_id=tenant.id)
     assert len(usage_rows) == 1, "unblocked turn must write exactly one usage_events row"

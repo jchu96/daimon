@@ -22,6 +22,7 @@ from daimon.core.handoff_context import (
     TranscriptTurn,
     is_worth_checkpointing,
     render_handoff_framing,
+    render_lost_workspace_framing,
     render_previous_session,
     select_recent_turns,
     supports_system_message,
@@ -433,3 +434,63 @@ def test_framing_stays_under_the_word_budget() -> None:
     assert len(system_text(framing_for("claude-sonnet-5")).split()) < 250, (
         "framing competes with the agent's own system prompt for attention"
     )
+
+
+def test_framing_tells_the_successor_where_each_half_of_the_archive_goes_back() -> None:
+    """The bundle now carries two trees - the previous home directory and the
+    outputs directory the file tool writes to - so "extract it" is not enough:
+    the successor has to be told which half goes back where, or the file the
+    person asked about stays inside ~/handoff."""
+    full = system_text(framing_for("claude-sonnet-5", transfer_kind="full"))
+
+    assert "paths inside start with `root/`" in full, "the home tree keeps its old prefix"
+    assert "`mnt/session/outputs/`" in full, "and so does the tree the file tool wrote"
+    assert "`handoff/root/...` under /root/" in full, "home files go back to the home directory"
+    assert "`handoff/mnt/session/outputs/...` under /mnt/session/outputs/" in full, (
+        "and delivered files go back to the outputs directory"
+    )
+    assert "delivered to this thread a second time, which is expected" in full, (
+        "the output sweep will re-post a restored output; the successor must not "
+        "avoid restoring files to dodge that"
+    )
+
+
+def test_lost_workspace_framing_rides_the_system_channel_on_a_supporting_model() -> None:
+    framing = render_lost_workspace_framing(model_id="claude-sonnet-5", previous_session=TRANSCRIPT)
+
+    text = system_text(framing)
+    assert "was lost" in text, "the successor is told the workspace is gone, not handed over"
+    assert "no working files" in text and "notebook kernels or shells" in text, (
+        "nothing came across, and the text says which nothings"
+    )
+    assert "untrusted record" in text, "the quoted conversation is evidence, not instruction"
+    assert "say plainly what is missing" in text, (
+        "the successor must name the gap before it continues"
+    )
+    assert framing.user_prefix == TRANSCRIPT, (
+        "the transcript travels in the user message, never on the privileged channel"
+    )
+    assert "fit the model" not in text, "and no quoted turn reaches the system block"
+
+
+def test_lost_workspace_framing_falls_back_to_the_user_prefix_without_support() -> None:
+    framing = render_lost_workspace_framing(
+        model_id="claude-haiku-4-5", previous_session=TRANSCRIPT
+    )
+
+    assert framing.system is None, "haiku rejects system.message, so nothing may be sent there"
+    assert framing.user_prefix.startswith("The workspace this conversation was running in"), (
+        "the framing still has to reach the model, just on the ordinary channel"
+    )
+    assert framing.user_prefix.endswith(TRANSCRIPT), "with the quoted conversation after it"
+
+
+def test_lost_workspace_framing_says_so_when_not_even_the_log_could_be_read() -> None:
+    framing = render_lost_workspace_framing(model_id="claude-sonnet-5", previous_session=None)
+
+    text = system_text(framing)
+    assert "The previous session's log could not be read either" in text, (
+        "the history rung is a different, worse gap and must not be described as a transcript"
+    )
+    assert "<previous_session>" not in text, "no transcript means no promise of one"
+    assert framing.user_prefix == "", "and nothing to prefix the reseeded message with"

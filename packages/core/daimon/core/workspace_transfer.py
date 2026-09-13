@@ -17,7 +17,10 @@ The ladder, best first, each rung the fallback for the one above:
    pack its own files has none that daimon can see (capability matrix P4.b).
 2. **Transcript only** — the old session is dead, the checkpoint failed or
    timed out, the bundle was oversized, or there was no work worth spending a
-   turn on. The conversation still crosses, quoted; the files do not.
+   turn on. The conversation still crosses, quoted; the files do not. An
+   oversized bundle is deleted on the way down this rung — by the checkpoint
+   turn itself where its own size guard caught it, by this module where the
+   listing did — so a rejected transfer leaves nothing behind.
 3. **History only** — even `events.list` is gone (the session was deleted).
    Nothing crosses here; the platform thread is all the successor has.
 
@@ -48,15 +51,18 @@ import anthropic
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
+    BetaManagedAgentsSystemContentBlockParam,
     FileMetadata,
 )
 from anthropic.types.beta.beta_managed_agents_file_resource_params import (
     BetaManagedAgentsFileResourceParams,
 )
 from daimon.core.checkpoint_prompt import (
+    CHECKPOINT_SYSTEM_TRIGGER,
     HANDOFF_MAX_BYTES,
     build_checkpoint_prompt,
     checkpoint_head_lines,
+    checkpoint_too_large_bytes,
     is_handoff_filename,
 )
 from daimon.core.handoff_context import (
@@ -64,6 +70,7 @@ from daimon.core.handoff_context import (
     render_handoff_framing,
     render_previous_session,
     select_recent_turns,
+    supports_system_message,
 )
 from daimon.core.ma import replay_events
 from daimon.core.pricing import MODEL_PRICING
@@ -388,15 +395,28 @@ async def transfer_workspace(
         log.info("workspace_transfer.skipped_checkpoint", session_id=old_session_id)
         return TranscriptOnly(transcript=transcript or "", gap_reason="not_worth_checkpointing")
 
+    prompt = build_checkpoint_prompt(
+        transfer_id=transfer_id,
+        repo_mount_path=old_snapshot.repo_mount_path,
+        max_bundle_mib=max_bundle_bytes // _MIB,
+        unsaved_work=unsaved_work,
+    )
+    # The instruction is the host's, not a chat participant's, and a model
+    # that cannot tell the two apart is right to refuse it: observed live,
+    # sonnet-5 read the checkpoint as an injected request to tar `.ssh` into
+    # a delivery directory and declined, costing a billed turn and the work.
+    # Where the old session's model accepts a `system.message`, the prompt
+    # travels there and the user message is only the trigger. Same bytes on
+    # either channel — only the envelope differs.
+    privileged = supports_system_message(old_snapshot.model_id)
+    checkpoint_system_blocks: tuple[BetaManagedAgentsSystemContentBlockParam, ...] = (
+        ({"type": "text", "text": prompt},) if privileged else ()
+    )
     state = await run_turn(
         anthropic=client,
         session_id=old_session_id,
-        user_message=build_checkpoint_prompt(
-            transfer_id=transfer_id,
-            repo_mount_path=old_snapshot.repo_mount_path,
-            max_bundle_mib=max_bundle_bytes // _MIB,
-            unsaved_work=unsaved_work,
-        ),
+        user_message=CHECKPOINT_SYSTEM_TRIGGER if privileged else prompt,
+        system_blocks=checkpoint_system_blocks,
         lifecycle=_NoOpLifecycle(),
         cancel=asyncio.Event(),
         now=now,
@@ -424,6 +444,21 @@ async def transfer_workspace(
         )
         return TranscriptOnly(transcript=transcript or "", gap_reason=failure)
 
+    reply = extract_final_response(state.content)
+    # The prompt's own size guard fired: the session deleted its archive and
+    # said how big it was, so there is nothing to poll for and nothing left
+    # behind in the old session's outputs.
+    reported_bytes = checkpoint_too_large_bytes(reply)
+    if reported_bytes is not None:
+        log.warning(
+            "workspace_transfer.bundle_oversize",
+            session_id=old_session_id,
+            size_bytes=reported_bytes,
+            max_bytes=max_bundle_bytes,
+            deleted_by="checkpoint_turn",
+        )
+        return TranscriptOnly(transcript=transcript or "", gap_reason="bundle_oversize")
+
     bundle = await _poll_for_bundle(client, session_id=old_session_id, sleep=sleep)
     if bundle is None:
         log.warning("workspace_transfer.no_bundle", session_id=old_session_id)
@@ -434,13 +469,20 @@ async def transfer_workspace(
             session_id=old_session_id,
             size_bytes=bundle.size_bytes,
             max_bytes=max_bundle_bytes,
+            deleted_by="transfer",
         )
+        # Nothing will ever read this archive: the sweep leaves anything named
+        # `daimon-handoff-` alone and the pending-delete queue is only fed on a
+        # successful upload, so without this the rejected bundle sits in the
+        # old session's outputs until the session itself is reclaimed.
+        with contextlib.suppress(anthropic.NotFoundError):
+            await client.beta.files.delete(bundle.id, betas=[_MA_BETA])
         return TranscriptOnly(transcript=transcript or "", gap_reason="bundle_oversize")
 
     # The prompt asks for `rev-parse HEAD` before and after the archive step.
     # Two different hashes mean the session committed despite being told not
     # to; that is recorded and told to the successor, not prevented.
-    first_head, last_head = checkpoint_head_lines(extract_final_response(state.content))
+    first_head, last_head = checkpoint_head_lines(reply)
     # Only meaningful with a repository mounted: without one there is no
     # checkout for anything to be left in, and the question is never asked.
     unpreserved: tuple[str, ...] = (

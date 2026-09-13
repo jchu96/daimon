@@ -158,6 +158,16 @@ class DiscordTurnLifecycle:
         self._cancel_view = cancel_view
         self._persisted_sealed_indices: set[int] = set()
         self._was_answered: bool = False
+        # A continuity notice that belongs ABOVE the answer it explains. The
+        # answer is an in-place edit of the embed posted at mention time, so a
+        # notice sent as its own message always lands below it. Set before the
+        # answer is revealed (a planned replacement, known at bind time);
+        # `prepend_revealed_answer` covers the fact learned only after the turn ran.
+        self.answer_prefix: str | None = None
+        self.answer_prefix_applied: bool = False
+        # The first chunk actually rendered into the message, kept so a late
+        # notice can be edited in above it exactly once.
+        self._revealed_first_chunk: str | None = None
 
     @property
     def message_ref(self) -> Any | None:
@@ -318,6 +328,9 @@ class DiscordTurnLifecycle:
             return
 
         self._was_answered = True
+        if self.answer_prefix is not None:
+            response_text = f"{self.answer_prefix}\n\n{response_text}"
+            self.answer_prefix_applied = True
         chunks = split_for_discord_safe(response_text)
         # Clean replace: first chunk replaces the embed
         await self._edit(
@@ -327,11 +340,42 @@ class DiscordTurnLifecycle:
             view=None,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        self._revealed_first_chunk = chunks[0]
         # Overflow: subsequent chunks posted as new messages
         for chunk in chunks[1:]:
             await self._send_message(content=chunk, allowed_mentions=discord.AllowedMentions.none())
 
         log.info("turn.terminal_success")
+
+    async def prepend_revealed_answer(self, notice: str) -> bool:
+        """Edit `notice` in above an answer already on screen; False if it cannot go there.
+
+        For a fact the turn only produces on its way out (an unexpected
+        workspace loss, discovered by the driver's mid-call recovery): by the
+        time the caller knows it, the answer has already replaced the embed.
+        Sending the notice afterwards puts it below the answer it explains, so
+        instead the message is edited once with the notice on top.
+
+        Returns False -- caller sends it as an ordinary message instead -- when
+        there is no revealed answer to sit above, or when the notice would push
+        the first chunk past Discord's message limit (re-splitting would strand
+        the overflow messages already posted).
+        """
+        if self._revealed_first_chunk is None or self._message_ref is None:
+            return False
+        updated = f"{notice}\n\n{self._revealed_first_chunk}"
+        if len(split_for_discord_safe(updated)) > 1:
+            return False
+        await self._edit(
+            self._message_ref,
+            content=updated,
+            embed=None,
+            view=None,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        self._revealed_first_chunk = updated
+        self.answer_prefix_applied = True
+        return True
 
     async def on_terminal_failure(self, state: TurnState, err: Exception) -> None:
         if self._unprompted and self._message_ref is None:

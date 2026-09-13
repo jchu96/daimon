@@ -78,6 +78,28 @@ class SessionPreparationFailed(DaimonError):
         self.preserved: bool = preserved
 
 
+class SessionBusyError(DaimonError):
+    """A responder change reached a thread whose previous turn is still running.
+
+    Distinct from `SessionPreparationFailed`: nothing failed and nothing is
+    wrong with the configuration. The change simply cannot be made yet, and it
+    must not be made *around* — the session still in flight belongs to the
+    outgoing responder, so running this turn on it would answer as one agent
+    inside another agent's workspace. No turn runs; the caller's next message
+    after `retry_after` makes the switch.
+    """
+
+    def __init__(
+        self,
+        *,
+        pending_reasons: tuple[str, ...],
+        retry_after: datetime,
+    ) -> None:
+        super().__init__(f"session busy, pending {pending_reasons!r}")
+        self.pending_reasons: tuple[str, ...] = pending_reasons
+        self.retry_after: datetime = retry_after
+
+
 class SessionAgentMismatch(DaimonError):
     """An existing workspace belongs to a different responder; leave it intact."""
 

@@ -30,12 +30,13 @@ from daimon.core.continuity.continuation import (
     ContinuationRequest,
     claim_continuation,
     decide_continuation,
+    record_continuation,
     settle_continuation,
 )
 from daimon.core.errors import DaimonError
 from daimon.core.stores.domain import TaskContinuationRow
 from daimon.core.stores.task_continuations import list_pending_continuations
-from daimon.core.turn.errors import SessionPreparationFailed
+from daimon.core.turn.errors import SessionBusyError, SessionPreparationFailed
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -105,8 +106,10 @@ async def dispatch_pending_continuations(
     Each row is claimed before it is decided, so a decision to skip is still
     only ever made by the one process that will also settle it. A dispatch
     settles `delivered` only after `run_follow_up` returns without raising;
-    a preparation failure settles `skipped`/`blocked_preparation_failed` and any
-    other boundary error settles `skipped`/`dispatch_failed`, so a claimed row is
+    a preparation failure settles `skipped`/`blocked_preparation_failed`, a
+    thread whose previous turn is still running settles `skipped`/`turn_running`
+    and re-queues the same request under a new idempotency key, and any other
+    boundary error settles `skipped`/`dispatch_failed` -- so a claimed row is
     never left behind by the process that claimed it.
     """
     async with sessionmaker() as session:
@@ -169,6 +172,29 @@ async def dispatch_pending_continuations(
                     status="skipped",
                     now=now(),
                     skip_reason="blocked_preparation_failed",
+                )
+                continue
+            except SessionBusyError:
+                # Same outcome as `skip_turn_running`, reached one step later:
+                # a turn was still running in this thread when the follow-up
+                # tried to bind, so the destination could not take the session
+                # over. The store has no "unclaim", so the claimed row is
+                # settled `skipped` and the SAME request is queued again under
+                # a NEW idempotency key. At-most-once still holds per key (the
+                # settled row can never dispatch again) while the work the
+                # person asked for is not dropped -- the next turn to finish in
+                # this thread picks the new row up.
+                log.warning("slack.continuation.dispatch_turn_running", row_id=str(row.id))
+                await settle_continuation(
+                    sessionmaker,
+                    idempotency_key=row.idempotency_key,
+                    status="skipped",
+                    now=now(),
+                    skip_reason="turn_running",
+                )
+                await record_continuation(
+                    sessionmaker,
+                    request.model_copy(update={"idempotency_key": uuid.uuid4()}),
                 )
                 continue
             except (DaimonError, anthropic_pkg.APIError, SlackApiError) as exc:

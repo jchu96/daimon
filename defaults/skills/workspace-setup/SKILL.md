@@ -179,13 +179,17 @@ promise a running conversation will switch responders or continue automatically.
 `hand_off_task(origin_context_id, agent_id, continuation)` makes another agent
 answer in this conversation from the next message. The conversation, decisions
 and working files move with the person who asked; the destination uses its own
-keys, connections and memory. Pass `continuation` only when they asked for the
-work to carry on, in their words. Post the returned `confirmation` verbatim and
-end the turn. The destination must already answer somewhere; if it does not,
-give the admin handoff sentence instead. Setup conversations always answer as
-Daimon and cannot hand a task over. This changes no channel routing. If the
-tool asks the uncommitted-work question, ask the person that one question and
-nothing else, then call it again with `unsaved_work`.
+keys, connections and memory. `continuation` is null unless they explicitly
+asked the destination to continue or finish NAMED work ("let it finish the
+chart", "have it continue the analysis"), in their own words. "Take over",
+"take over this task", and "answer here from now on" name no work — pass null.
+Never restate or summarize work that already finished into a continuation;
+that bills an unrequested second turn. Post the returned `confirmation`
+verbatim and end the turn. The destination must already answer somewhere; if
+it does not, give the admin handoff sentence instead. Setup conversations
+always answer as Daimon and cannot hand a task over. This changes no channel
+routing. If the tool asks the uncommitted-work question, ask the person that
+one question and nothing else, then call it again with `unsaved_work`.
 
 `start_fresh_task(origin_context_id)` begins with an empty workspace. Only
 when someone asks for a clean slate — a key, model, repo or handoff never

@@ -52,6 +52,26 @@ async def mark_superseded(
     await session.flush()
 
 
+async def link_replacement(
+    session: AsyncSession,
+    *,
+    id: _uuid.UUID,
+    replaced_by_id: _uuid.UUID,
+) -> None:
+    """Point a row at the session that took its task over, leaving status alone.
+
+    For the row whose status already says what happened to it — the dead one
+    the turn pipeline recreates after an unexpected loss. `mark_superseded` is
+    the wrong call there: it would relabel a session that MA deleted or
+    archived as a deliberate handover, and the chain would no longer say which
+    of the two a lineage walk is looking at.
+    """
+    await session.execute(
+        update(ThreadSession).where(ThreadSession.id == id).values(replaced_by_id=replaced_by_id)
+    )
+    await session.flush()
+
+
 async def mark_retired(session: AsyncSession, *, id: _uuid.UUID) -> None:
     """Retire a row abandoned on an explicit fresh start.
 

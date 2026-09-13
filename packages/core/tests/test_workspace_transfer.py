@@ -41,7 +41,12 @@ from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
 from anthropic.types.beta.sessions.beta_managed_agents_user_message_event import (
     BetaManagedAgentsUserMessageEvent,
 )
-from daimon.core.checkpoint_prompt import CHECKPOINT_EXCLUDED_PATHS, handoff_filename
+from daimon.core.checkpoint_prompt import (
+    CHECKPOINT_EXCLUDED_PATHS,
+    CHECKPOINT_SYSTEM_TRIGGER,
+    HANDOFF_TOO_LARGE_MARKER,
+    handoff_filename,
+)
 from daimon.core.session_snapshot import SessionSnapshot
 from daimon.core.stores.pending_file_deletes import list_due_pending_file_deletes
 from daimon.core.workspace_transfer import (
@@ -180,6 +185,17 @@ def _script_checkpoint_reply(state: FakeSessionsState, session_id: str, reply: s
     ]
 
 
+def _checkpoint_instruction(state: FakeSessionsState) -> str:
+    """The checkpoint prompt as it was actually sent.
+
+    It travels in the LAST event of the first batch either way: the system
+    block on a model that accepts one (the API requires it last), the user
+    message on a model that does not.
+    """
+    _, batch = state.sent_batches[0]
+    return "".join(block["text"] for block in batch[-1]["content"] if block["type"] == "text")
+
+
 # ---------------------------------------------------------------------------
 # Rung 1: the full handoff
 # ---------------------------------------------------------------------------
@@ -281,7 +297,10 @@ async def test_checkpoint_prompt_names_every_excluded_path(
     memory store and the platform skills belong to the destination, never to
     the task. Daimon cannot inspect the archive the session builds, so the
     prompt naming every excluded root IS the contract — asserted on the bytes
-    actually sent to the old session."""
+    actually sent to the old session.
+
+    On a model that takes a `system.message` those bytes ride the privileged
+    channel, so the assertions read the system block."""
     state = FakeSessionsState(ma=FakeMAState())
     client = _client(state)
     old_session = await _make_session(client)
@@ -306,10 +325,10 @@ async def test_checkpoint_prompt_names_every_excluded_path(
 
     sent_session, batch = state.sent_batches[0]
     assert sent_session == old_session
-    assert [event["type"] for event in batch] == ["user.message"], (
-        "the checkpoint turn is a plain user message — no privileged framing"
+    assert [event["type"] for event in batch] == ["user.message", "system.message"], (
+        "sonnet-5 takes a system.message, so the instruction travels there"
     )
-    prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    prompt = "".join(block["text"] for block in batch[1]["content"] if block["type"] == "text")
     for excluded in CHECKPOINT_EXCLUDED_PATHS:
         assert excluded.strip("/") in prompt, f"{excluded} must be excluded from the archive"
     assert "NEVER RUN GIT COMMIT" in prompt, "the prompt must forbid changing the repository"
@@ -525,7 +544,10 @@ async def test_transfer_degrades_to_transcript_when_the_bundle_is_oversize(
 
     assert isinstance(outcome, TranscriptOnly)
     assert outcome.gap_reason == "bundle_oversize"
-    assert output.id in state.files, "an oversize bundle is left alone, not deleted"
+    assert output.id not in state.files, (
+        "nothing will ever read a rejected bundle: the sweep skips handoff files and the "
+        "delete queue is only fed after a successful upload, so the transfer deletes it here"
+    )
 
 
 async def test_transfer_degrades_to_transcript_when_the_checkpoint_wrote_no_archive(
@@ -784,8 +806,7 @@ async def test_transfer_leaves_uncommitted_work_behind_and_names_it_when_asked_t
         now=_now,
     )
 
-    _, batch = state.sent_batches[0]
-    prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    prompt = _checkpoint_instruction(state)
     assert "diff HEAD" not in prompt, "the changes the person left are never captured as a patch"
     assert "deliberately being left behind" in prompt
 
@@ -821,8 +842,7 @@ async def test_transfer_captures_uncommitted_work_when_the_answer_is_copy(
         now=_now,
     )
 
-    _, batch = state.sent_batches[0]
-    prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    prompt = _checkpoint_instruction(state)
     assert "diff HEAD > /root/uncommitted.patch" in prompt, "copy means capture the patch"
 
     assert isinstance(outcome, FullHandoff)
@@ -850,3 +870,123 @@ def test_as_prepared_replacement_tells_the_successor_the_changes_were_left_behin
     assert "Not carried over: uncommitted repository changes were left in the old checkout" in (
         system_text
     ), "the not-carried line is where an honest handoff names what is missing"
+
+
+async def test_checkpoint_rides_the_system_channel_on_a_model_that_takes_one(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The refusal this fixes was observed live on sonnet-5: delivered as an
+    ordinary user message, the checkpoint reads as an instruction injected by
+    whoever is in the chat, and an agent that treats it as untrusted is right
+    to refuse to tar its home directory into a delivery folder. The privileged
+    channel is what makes it distinguishable from chat text — and the billed
+    turn still only starts because a user message accompanies it."""
+    state = FakeSessionsState(ma=FakeMAState())
+    client = _client(state)
+    old_session = await _make_session(client, model="claude-sonnet-5")
+    _seed_conversation(state, old_session, with_reply=True)
+    _script_checkpoint_reply(state, old_session, "-rw-r--r-- 1 root root 42 handoff.tar.gz")
+    state.write_output(old_session, handoff_filename(TRANSFER_ID), TARBALL)
+
+    outcome = await transfer_workspace(
+        client,
+        db_session_factory,
+        old_session_id=old_session,
+        old_snapshot=_snapshot(model_id="claude-sonnet-5"),
+        tenant_id=TENANT_ID,
+        external_user_id="U123",
+        transfer_id=TRANSFER_ID,
+        markup=Decimal("1.0"),
+        checkpoint_deadline=DEADLINE,
+        from_agent_name="analysis-bot",
+        sleep=_no_sleep,
+        now=_now,
+    )
+
+    assert isinstance(outcome, FullHandoff), f"expected a full handoff, got {outcome!r}"
+    _, batch = state.sent_batches[0]
+    assert [event["type"] for event in batch] == ["user.message", "system.message"], (
+        "the API takes at most one system.message and it must come last"
+    )
+    trigger = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    assert trigger == CHECKPOINT_SYSTEM_TRIGGER, (
+        "the user message is only the trigger; it carries no instruction of its own"
+    )
+    instruction = "".join(block["text"] for block in batch[1]["content"] if block["type"] == "text")
+    assert instruction.startswith("This instruction comes from the daimon host"), (
+        "the host-originated prompt is what rides the privileged channel"
+    )
+    assert "tar czf" in instruction, "in full — the trigger does not repeat any of it"
+
+
+async def test_checkpoint_stays_a_user_message_on_a_model_without_system_support(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """haiku rejects the whole request when a `system.message` is present, so
+    the checkpoint degrades to the ordinary channel — same bytes, worse
+    envelope — rather than failing and losing the work outright."""
+    state = FakeSessionsState(ma=FakeMAState())
+    client = _client(state)
+    old_session = await _make_session(client, model="claude-haiku-4-5")
+    _seed_conversation(state, old_session, with_reply=True)
+    _script_checkpoint_reply(state, old_session, "-rw-r--r-- 1 root root 42 handoff.tar.gz")
+    state.write_output(old_session, handoff_filename(TRANSFER_ID), TARBALL)
+
+    outcome = await transfer_workspace(
+        client,
+        db_session_factory,
+        old_session_id=old_session,
+        old_snapshot=_snapshot(model_id="claude-haiku-4-5"),
+        tenant_id=TENANT_ID,
+        external_user_id="U123",
+        transfer_id=TRANSFER_ID,
+        markup=Decimal("1.0"),
+        checkpoint_deadline=DEADLINE,
+        from_agent_name="analysis-bot",
+        sleep=_no_sleep,
+        now=_now,
+    )
+
+    assert isinstance(outcome, FullHandoff), f"expected a full handoff, got {outcome!r}"
+    _, batch = state.sent_batches[0]
+    assert [event["type"] for event in batch] == ["user.message"], (
+        "a system.message would 400 the whole request on this model"
+    )
+    prompt = "".join(block["text"] for block in batch[0]["content"] if block["type"] == "text")
+    assert prompt.startswith("This instruction comes from the daimon host"), (
+        "so the instruction itself is the user message, unchanged"
+    )
+
+
+async def test_transfer_degrades_to_transcript_when_the_checkpoint_rejects_its_own_archive(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The prompt's own size guard deletes an over-cap archive and prints the
+    size instead. That reply is the whole answer: there is nothing to poll for,
+    and nothing oversized is left in the old session's outputs."""
+    state = FakeSessionsState(ma=FakeMAState())
+    client = _client(state)
+    old_session = await _make_session(client)
+    _seed_conversation(state, old_session, with_reply=True)
+    _script_checkpoint_reply(state, old_session, f"{HANDOFF_TOO_LARGE_MARKER} 108097268")
+
+    outcome = await transfer_workspace(
+        client,
+        db_session_factory,
+        old_session_id=old_session,
+        old_snapshot=_snapshot(),
+        tenant_id=TENANT_ID,
+        external_user_id="U123",
+        transfer_id=TRANSFER_ID,
+        markup=Decimal("1.0"),
+        checkpoint_deadline=DEADLINE,
+        from_agent_name="analysis-bot",
+        sleep=_no_sleep,
+        now=_now,
+    )
+
+    assert isinstance(outcome, TranscriptOnly), f"expected a transcript rung, got {outcome!r}"
+    assert outcome.gap_reason == "bundle_oversize", (
+        "the size is why the files did not cross, and the copy has to say so"
+    )
+    assert "fit the hierarchical model" in outcome.transcript, "the conversation still crosses"
