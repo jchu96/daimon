@@ -31,7 +31,7 @@ from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwo
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.feedback_seed import seed_feedback_reactions
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
-from daimon.core.config import McpSettings
+from daimon.core.config import McpSettings, ThreadNamingSettings
 from daimon.core.errors import TurnError
 from daimon.core.ma_resolver import ResolverCache, new_resolver_cache
 from daimon.core.message_feedback import THUMBS_DOWN, THUMBS_UP
@@ -217,6 +217,7 @@ def _make_turn_deps(
 def _make_runtime(sessionmaker: async_sessionmaker[AsyncSession]) -> DiscordRuntime:
     settings = MagicMock()
     settings.mcp = McpSettings()
+    settings.thread_naming = ThreadNamingSettings(enabled=False)
     settings.billing.markup = Decimal("1.0")
     settings.billing.signup_credit = Decimal("0")
     discord_settings = MagicMock()
