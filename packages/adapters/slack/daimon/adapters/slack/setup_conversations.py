@@ -43,6 +43,21 @@ def setup_link(team_id: str, channel_id: str, thread_id: str) -> str:
     return f"https://app.slack.com/client/{team_id}/{channel_id}/thread/{channel_id}-{thread_id}"
 
 
+def setup_reply_button(link: str) -> dict[str, object]:
+    return {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": "setup_conversation_reply",
+                "text": {"type": "plain_text", "text": "Reply to Daimon"},
+                "style": "primary",
+                "url": link,
+            }
+        ],
+    }
+
+
 async def create_setup_conversation(
     runtime: SlackRuntime,
     client: AsyncWebClient,
@@ -104,6 +119,7 @@ async def create_setup_conversation(
     thread_id = str(posted.get("ts") or "")
     if not thread_id:
         raise DaimonError("Slack did not return the setup message identity. Please retry.")
+    opener_ts: str | None = None
     try:
         async with runtime.sessionmaker.begin() as session:
             await create_binding(
@@ -118,21 +134,51 @@ async def create_setup_conversation(
                 configuration_target_name=target_name,
                 creator_account_id=principal.account_id,
             )
+        reply = await client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+            channel=channel_id,
+            thread_ts=thread_id,
+            text=f"Reply here in this thread.\n\n{opener}",
+        )
+        opener_ts = str(reply.get("ts") or "")
+        if not opener_ts:
+            raise DaimonError("Slack did not return the setup reply identity. Please retry.")
+        permalink = await client.chat_getPermalink(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+            channel=channel_id, message_ts=opener_ts
+        )
+        link = str(permalink.get("permalink") or "")
+        if not link:
+            raise DaimonError(
+                "Slack did not return a link to the setup conversation. Please retry."
+            )
+        heading = (
+            f"Set up {escape_mrkdwn(target_name)} with Daimon"
+            if target_name
+            else "Set up an agent with Daimon"
+        )
+        launcher = f"{heading} · opened by <@{user_id}>\nOpen this thread to reply to Daimon."
         await client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
             channel=channel_id,
             ts=thread_id,
-            text=opener,
+            text=f"{launcher}\n<{link}|Reply to Daimon>",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": launcher}},
+                setup_reply_button(link),
+            ],
         )
     except Exception:
-        try:
-            await client.chat_delete(channel=channel_id, ts=thread_id)  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
-        except (SlackApiError, aiohttp.ClientError, TimeoutError):
-            with contextlib.suppress(SlackApiError, aiohttp.ClientError, TimeoutError):
-                await client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
-                    channel=channel_id,
-                    ts=thread_id,
-                    text="Setup failed. Reopen /agent-setup to try again.",
-                )
+        for message_ts in (opener_ts, thread_id):
+            if not message_ts:
+                continue
+            try:
+                await client.chat_delete(channel=channel_id, ts=message_ts)  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+            except (SlackApiError, aiohttp.ClientError, TimeoutError):
+                with contextlib.suppress(SlackApiError, aiohttp.ClientError, TimeoutError):
+                    await client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                        channel=channel_id,
+                        ts=message_ts,
+                        text="Setup failed. Reopen /agent-setup to try again.",
+                        blocks=[],
+                    )
         async with runtime.sessionmaker.begin() as session:
             await update_lifecycle(
                 session,
@@ -143,7 +189,7 @@ async def create_setup_conversation(
                 deleted=True,
             )
         raise
-    return setup_link(team_id, channel_id, thread_id)
+    return link
 
 
 async def handle_setup_lifecycle(

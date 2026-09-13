@@ -2,40 +2,67 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
+from typing import Literal
 
 import httpx
 import pytest
 from aioresponses import aioresponses
 from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
+from cryptography.fernet import Fernet
+from daimon.adapters.slack.agent_setup.actions import handle_agent_setup_action
 from daimon.adapters.slack.app import SlackApp
 from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
 from daimon.adapters.slack.setup_conversations import (
     create_setup_conversation,
     handle_setup_lifecycle,
 )
-from daimon.core.config import AnthropicSettings, DatabaseSettings, Settings
+from daimon.core.config import AnthropicSettings, CryptoSettings, DatabaseSettings, Settings
 from daimon.core.errors import DaimonError
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault
+from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
 from daimon.core.stores.thread_agent_bindings import get_binding
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic, list_response
 from pydantic import PostgresDsn, SecretStr
+from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
-@pytest.mark.parametrize("is_admin", [False, True])
-@pytest.mark.parametrize("target_deleted", [False, True])
+@pytest.mark.parametrize(
+    ("is_admin", "target_deleted", "handoff_failure", "entry_surface"),
+    [
+        (False, False, None, "direct"),
+        (True, False, None, "direct"),
+        (False, True, None, "direct"),
+        (True, True, None, "direct"),
+        (False, False, "permalink", "direct"),
+        (False, False, "launcher", "direct"),
+        (False, False, None, "modal"),
+        (True, False, None, "modal"),
+        (False, False, None, "message"),
+        (True, False, None, "message"),
+    ],
+)
 async def test_setup_root_routes_daimon_and_retains_target_through_archive_and_delete(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
     is_admin: bool,
     target_deleted: bool,
+    handoff_failure: Literal["permalink", "launcher"] | None,
+    entry_surface: Literal["direct", "modal", "message"],
 ) -> None:
     tenant = await make_tenant(db_session, platform="slack", workspace_id="T_SETUP")
+    fernet_key = Fernet.generate_key()
+    await upsert_slack_bot_token(
+        db_session,
+        team_id="T_SETUP",
+        encrypted_token=Fernet(fernet_key).encrypt(b"xoxb-test"),
+    )
     await db_session.commit()
     now = datetime.now(UTC)
     responder = BetaManagedAgentsAgent(
@@ -93,6 +120,7 @@ async def test_setup_root_routes_daimon_and_retains_target_through_archive_and_d
         _env_file=None,  # pyright: ignore[reportCallIssue]  # BaseSettings runtime option
         database=DatabaseSettings(url=PostgresDsn("postgresql+asyncpg://test:test@localhost/test")),
         anthropic=AnthropicSettings(api_key=SecretStr("test")),
+        crypto=CryptoSettings(keys=(SecretStr(fernet_key.decode()),)),
     )
     cache = new_resolver_cache()
     default = DeploymentDefault(agent_name="specialist")
@@ -115,7 +143,11 @@ async def test_setup_root_routes_daimon_and_retains_target_through_archive_and_d
             ),
         )
         with aioresponses() as slack:
-            slack.post("https://slack.com/api/auth.test", payload={"ok": True, "user_id": "U_BOT"})
+            slack.post(
+                "https://slack.com/api/auth.test",
+                payload={"ok": True, "user_id": "U_BOT"},
+                repeat=True,
+            )
             slack.get(
                 re.compile(r"https://slack.com/api/users.info.*"),
                 payload={"ok": True, "user": {"is_admin": is_admin}},
@@ -123,7 +155,32 @@ async def test_setup_root_routes_daimon_and_retains_target_through_archive_and_d
             slack.post(
                 "https://slack.com/api/chat.postMessage", payload={"ok": True, "ts": "123.456"}
             )
-            slack.post("https://slack.com/api/chat.update", payload={"ok": True})
+            slack.post(
+                "https://slack.com/api/chat.postMessage", payload={"ok": True, "ts": "123.457"}
+            )
+            thread_link = (
+                "https://workspace.slack.com/archives/C_PARENT/p123457"
+                "?thread_ts=123.456&cid=C_PARENT"
+            )
+            slack.get(
+                re.compile(r"https://slack.com/api/chat.getPermalink.*"),
+                payload={"ok": False, "error": "message_not_found"}
+                if handoff_failure == "permalink"
+                else {"ok": True, "permalink": thread_link},
+            )
+            slack.post(
+                "https://slack.com/api/chat.update",
+                payload={"ok": False, "error": "channel_not_found"}
+                if handoff_failure == "launcher"
+                else {"ok": True},
+            )
+            slack.post(
+                re.compile(r"https://slack.com/api/chat.delete.*"),
+                payload={"ok": True},
+                repeat=True,
+            )
+            slack.post("https://slack.com/api/views.update", payload={"ok": True})
+            slack.post("https://slack.com/api/chat.postEphemeral", payload={"ok": True})
             if target_deleted:
                 with pytest.raises(DaimonError, match="no longer exists"):
                     await create_setup_conversation(
@@ -136,15 +193,87 @@ async def test_setup_root_routes_daimon_and_retains_target_through_archive_and_d
                     )
                 assert not slack.requests, "deleted target must fail before platform creation"
                 return
-            link = await create_setup_conversation(
-                runtime,
-                AsyncWebClient(token="xoxb-test"),
-                team_id="T_SETUP",
-                channel_id="C_PARENT",
-                user_id="U_OPENER",
-                target_ma_agent_id=target.id,
-            )
-            assert "C_PARENT-123.456" in link, "entry should return a link to the created thread"
+            if handoff_failure:
+                with pytest.raises(SlackApiError):
+                    await create_setup_conversation(
+                        runtime,
+                        AsyncWebClient(token="xoxb-test"),
+                        team_id="T_SETUP",
+                        channel_id="C_PARENT",
+                        user_id="U_OPENER",
+                        target_ma_agent_id=target.id,
+                    )
+                deleted_messages = [
+                    url.query["ts"]
+                    for (method, url), calls in slack.requests.items()
+                    if method == "POST" and url.path.endswith("chat.delete")
+                    for _call in calls
+                ]
+                assert deleted_messages == ["123.457", "123.456"], (
+                    "failed handoff must remove both bot-created messages"
+                )
+                async with db_session_factory() as session:
+                    binding = await get_binding(
+                        session,
+                        tenant_id=tenant.id,
+                        platform="slack",
+                        parent_channel_id="C_PARENT",
+                        thread_id="123.456",
+                    )
+                assert binding is not None and binding.deleted, (
+                    "failed setup must not remain an active conversation"
+                )
+                return
+            if entry_surface == "direct":
+                link = await create_setup_conversation(
+                    runtime,
+                    AsyncWebClient(token="xoxb-test"),
+                    team_id="T_SETUP",
+                    channel_id="C_PARENT",
+                    user_id="U_OPENER",
+                    target_ma_agent_id=target.id,
+                )
+            else:
+                await handle_agent_setup_action(
+                    runtime,
+                    {
+                        "team": {"id": "T_SETUP"},
+                        "user": {"id": "U_OPENER"},
+                        "channel": {"id": "C_PARENT"},
+                        "actions": [{"action_id": "agent_setup__conversation", "value": target.id}],
+                        "view": {
+                            "id": "V_PANEL",
+                            "private_metadata": json.dumps({"channel_id": "C_PARENT"}),
+                        }
+                        if entry_surface == "modal"
+                        else {},
+                    },
+                )
+                handoffs = [
+                    (url.path, call.kwargs["json"])
+                    for (method, url), calls in slack.requests.items()
+                    if method == "POST"
+                    and url.path.endswith(("views.update", "chat.postEphemeral"))
+                    for call in calls
+                ]
+                assert len(handoffs) == 1, "entry should deliver one visible handoff"
+                destination, handoff = handoffs[0]
+                if entry_surface == "modal":
+                    assert destination.endswith("views.update"), (
+                        "modal entry must show the reply button in the open panel"
+                    )
+                    assert handoff["view_id"] == "V_PANEL", (
+                        "handoff must replace the caller's panel"
+                    )
+                    handoff_blocks = handoff["view"]["blocks"]
+                else:
+                    assert destination.endswith("chat.postEphemeral"), (
+                        "message entry must return the reply button to its caller"
+                    )
+                    assert handoff["user"] == "U_OPENER", "handoff must reach the opener"
+                    handoff_blocks = handoff["blocks"]
+                link = handoff_blocks[1]["elements"][0]["url"]
+            assert link == thread_link, "handoff should use Slack's permalink to the opening reply"
             slack_requests_before = sum(len(calls) for calls in slack.requests.values())
             await SlackApp(runtime=runtime)._orchestrate(  # pyright: ignore[reportPrivateUsage]  # exercise listener turn boundary
                 {
@@ -163,14 +292,46 @@ async def test_setup_root_routes_daimon_and_retains_target_through_archive_and_d
             assert sum(len(calls) for calls in slack.requests.values()) == slack_requests_before, (
                 "echoed opener must never begin turn admission or Slack role lookup"
             )
+            await SlackApp(runtime=runtime)._orchestrate(  # pyright: ignore[reportPrivateUsage]  # exercise listener turn boundary
+                {
+                    "type": "app_mention",
+                    "ts": "123.457",
+                    "thread_ts": "123.456",
+                    "user": "U_BOT",
+                    "bot_id": "B_BOT",
+                    "text": "Reply here and mention <@U_BOT>",
+                },
+                team_id="T_SETUP",
+                channel="C_PARENT",
+                event_ts="123.457",
+                web_client=AsyncWebClient(token="xoxb-test"),
+                tenant_id=tenant.id,
+            )
+            assert (
+                sum(len(calls) for calls in slack.requests.values()) == slack_requests_before + 1
+            ), "echoed thread reply may verify bot identity but must never begin a turn"
             updates = [
                 call.kwargs["json"]
                 for (method, url), calls in slack.requests.items()
                 if method == "POST" and url.path.endswith("chat.update")
                 for call in calls
             ]
-            assert "specialist" in updates[0]["text"] and "<@U_BOT>" in updates[0]["text"], (
-                "opener should name target and actual bot mention"
+            assert "specialist" in updates[0]["text"], "launcher should name the target"
+            assert updates[0]["blocks"][1]["elements"][0]["url"] == link, (
+                "visible reply button must open the created thread"
+            )
+            posts = [
+                call.kwargs["json"]
+                for (method, url), calls in slack.requests.items()
+                if method == "POST" and url.path.endswith("chat.postMessage")
+                for call in calls
+            ]
+            assert posts[1]["thread_ts"] == "123.456", "welcome belongs inside the setup thread"
+            assert "Reply here in this thread" in posts[1]["text"], (
+                "welcome must make the reply location explicit"
+            )
+            assert "specialist" in posts[1]["text"] and "<@U_BOT>" in posts[1]["text"], (
+                "thread opener should name target and actual bot mention"
             )
         assert all(request.method == "GET" for request in requests), (
             "opening setup must not create a session or billed turn"
