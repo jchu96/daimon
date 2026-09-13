@@ -1037,9 +1037,9 @@ class SlackApp:
             log.warning("slack.event_dropped.no_ts", team_id=team_id, channel=channel)
             return
 
-        # The deterministic setup root mentions this bot as reply instructions.
-        # An echoed app_mention for that bot-authored root must not run a turn.
-        if event.get("bot_id") and str(event.get("ts") or "") == thread_id:
+        # Setup instructions mention this bot inside the thread. Its own echoed
+        # app_mention must not run a turn; other bots may still address Daimon.
+        if event.get("bot_id"):
             async with self.runtime.sessionmaker() as session:
                 setup_root = await get_setup_binding(
                     session,
@@ -1049,7 +1049,11 @@ class SlackApp:
                     thread_id=thread_id,
                 )
             if setup_root is not None:
-                return
+                if str(event.get("ts") or "") == thread_id:
+                    return
+                auth = await web_client.auth_test()  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                if event.get("user") == auth.get("user_id"):
+                    return
 
         # (1) Per-thread queue check — before cap so queued mentions don't consume a slot.
         if thread_id in self._processing:

@@ -105,7 +105,11 @@ from daimon.adapters.slack.errors import render_error
 from daimon.adapters.slack.interactions import resolve_web_client
 from daimon.adapters.slack.mrkdwn import escape_mrkdwn
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.adapters.slack.setup_conversations import create_setup_conversation, setup_link
+from daimon.adapters.slack.setup_conversations import (
+    create_setup_conversation,
+    setup_link,
+    setup_reply_button,
+)
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
     list_agents_by_tenant,
@@ -512,9 +516,33 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
                 user_id=user_id,
                 target_ma_agent_id=None if target_id == "choose" else target_id,
             )
-            await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
-                channel=channel_id, user=user_id, text=f"<{link}|Open setup with Daimon>"
-            )
+            handoff_blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "Your setup conversation is ready. Open it to reply to Daimon.",
+                    },
+                },
+                setup_reply_button(link),
+            ]
+            if view_id:
+                await client.views_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                    view_id=view_id,
+                    view={
+                        "type": "modal",
+                        "title": {"type": "plain_text", "text": "Setup ready"},
+                        "close": {"type": "plain_text", "text": "Close"},
+                        "blocks": handoff_blocks,
+                    },
+                )
+            else:
+                await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
+                    channel=channel_id,
+                    user=user_id,
+                    text=f"<{link}|Reply to Daimon in your setup conversation>",
+                    blocks=handoff_blocks,
+                )
             return
 
         # -----------------------------------------------------------------------
