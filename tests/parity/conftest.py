@@ -1,6 +1,6 @@
 """Shared fixtures for the adapter parity suite.
 
-Re-exports the standard schema-per-test DB fixtures from `daimon.testing.db`
+Re-exports the standard per-worker-schema DB fixtures from `daimon.testing.db`
 (the established pattern — no local Base import) and provides
 `build_turn_router`, the single MARouter builder both `DiscordDriver` and
 `SlackDriver` use to fake the MA transport for a turn (agent/environment
@@ -36,7 +36,9 @@ from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
     BetaManagedAgentsTextBlock,
 )
 from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
+from daimon.testing.db import db_clean as db_clean  # noqa: F401
 from daimon.testing.db import db_engine as db_engine  # noqa: F401
+from daimon.testing.db import db_schema as db_schema  # noqa: F401
 from daimon.testing.db import db_session as db_session  # noqa: F401
 from daimon.testing.db import db_session_factory as db_session_factory  # noqa: F401
 from daimon.testing.ma import (
