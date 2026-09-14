@@ -48,11 +48,16 @@ CUSTOM_ID_PATTERN: Final[re.Pattern[str]] = re.compile(CUSTOM_ID_TEMPLATE)
 
 CredentialRequestKind = Literal["env", "env_file", "mcp", "repo", "skill_repo"]
 
-# How a consumed request actually ended, recorded on the row after the click.
+# How a request actually ended, recorded on the row once it is spent.
 # "applied" — the write landed. "stale_replacement" — the compare-and-set
 # precondition the card promised no longer held (someone else wrote, or the
 # key was removed). "write_failed" — the write itself raised.
-CredentialRequestOutcome = Literal["applied", "stale_replacement", "write_failed"]
+# "replaced_by_newer" — nobody clicked it: the same person asked again in the
+# same thread for the same agent, and the newer form retired this one so the
+# thread never holds two live buttons for one intent.
+CredentialRequestOutcome = Literal[
+    "applied", "stale_replacement", "write_failed", "replaced_by_newer"
+]
 
 # `target` for kind='env_file'. The column is NOT NULL and a whole-file import
 # names no single key, so every env_file request carries this one sentinel.

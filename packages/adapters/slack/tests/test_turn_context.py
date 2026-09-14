@@ -81,6 +81,10 @@ async def test_turn_context_row_lives_exactly_during_run_turn(
         assert controls["responder"]["ma_agent_id"] == "agent_turn_ctx_id", (
             "controls carry concrete responder"
         )
+        assert controls["responder"]["handle"] == "@daimon", (
+            "controls carry the handle people mention beside the agent name, so an operator "
+            "renaming the bot account is never read as a second agent"
+        )
         async with db_session_factory() as s:
             origin = await get_active_origin(
                 s,

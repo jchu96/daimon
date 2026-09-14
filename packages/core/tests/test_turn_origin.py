@@ -265,3 +265,29 @@ def test_rendering_the_same_facts_twice_produces_the_same_bytes() -> None:
     second = render_turn_origin(_origin(), session_state=state, handoff=notice)
 
     assert first == second, "controls must be deterministic so identical turns cache identically"
+
+
+def test_responder_handle_renders_beside_the_agent_name_with_its_identity_instruction() -> None:
+    """D24-QA-01: a bot named `daimon-staging` answering as `daimon` is one agent."""
+    rendered = render_turn_origin(_origin(), responder_handle="@daimon-staging")
+
+    responder = _controls(rendered)["responder"]
+    assert responder == {
+        "name": "stats-bot",
+        "ma_agent_id": "agt_stats",
+        "handle": "@daimon-staging",
+    }, "the mention handle must reach the model inside the responder it belongs to"
+    assert "never ask whether they are the same" in rendered, (
+        "the controls must forbid reading a handle/name difference as target ambiguity"
+    )
+
+
+def test_controls_omit_the_handle_and_its_instruction_when_no_handle_is_supplied() -> None:
+    rendered = render_turn_origin(_origin())
+
+    assert "handle" not in _controls(rendered)["responder"], (
+        "a caller with no platform handle must not invent one"
+    )
+    assert "never ask whether they are the same" not in rendered, (
+        "the identity sentence points at a field that is not rendered"
+    )

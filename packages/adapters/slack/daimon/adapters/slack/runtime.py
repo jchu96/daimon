@@ -40,6 +40,16 @@ def resolve_bot_display_name(settings: Settings) -> str:
     return settings.slack.bot_display_name if settings.slack is not None else "daimon"
 
 
+def responder_handle(settings: Settings) -> str:
+    """The handle people mention this deployment by, for the turn controls.
+
+    The MA agent is named `daimon` while the Slack app may be installed under
+    whatever name the operator chose; the controls carry both under one
+    responder so the difference is never read as a second agent.
+    """
+    return f"@{resolve_bot_display_name(settings)}"
+
+
 def build_turn_deps(
     settings: Settings,
     anthropic: AsyncAnthropic,

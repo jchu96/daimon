@@ -14,6 +14,7 @@ from daimon.core.posted_controls.cards import (
     FOOTER_TEMPLATE,
     NO_LONGER_VALID_MESSAGE,
     RECEIVED_FOOTER,
+    REPLACED_HEADLINE,
     WRONG_REQUESTER_MESSAGE,
     CardButton,
     CardKind,
@@ -41,6 +42,7 @@ STATES: tuple[CardState, ...] = (
     "refused",
     "expired",
     "superseded",
+    "replaced",
 )
 
 TARGETS: dict[CardKind, str] = {
@@ -85,6 +87,7 @@ CLASSIFIED_AS: dict[CardState, CardState] = {
     "refused": "refused",
     "expired": "expired",
     "superseded": "partial",
+    "replaced": "replaced",
 }
 
 
@@ -389,6 +392,32 @@ def test_superseded_card_says_someone_else_got_there_first() -> None:
 
 
 @pytest.mark.parametrize("kind", KINDS)
+def test_replaced_card_points_at_the_newer_form_and_names_nothing_else(kind: CardKind) -> None:
+    card = build(kind, "replaced")
+
+    assert card.headline == REPLACED_HEADLINE, "every kind retires with the same one headline"
+    assert card.facts == ("Use the newer form below.",), (
+        "a retired form says only where the live one is"
+    )
+    assert TARGETS[kind] not in card_text(card), (
+        "the newer card names the target; repeating it here is what confused the reader"
+    )
+
+
+def test_replaced_is_told_apart_from_expired_despite_sharing_an_emoji() -> None:
+    replaced = build("env", "replaced")
+    expired = build("env", "expired")
+
+    assert replaced.headline[0] == expired.headline[0], "both retirements wear the hourglass"
+    assert classify_card_state(replaced.headline) == "replaced", (
+        "the replaced headline is one fixed string, so it classifies exactly"
+    )
+    assert classify_card_state(expired.headline) == "expired", (
+        "the expired headline must not be dragged along by the shared emoji"
+    )
+
+
+@pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("state", STATES)
 def test_no_card_string_uses_a_forbidden_token(kind: CardKind, state: CardState) -> None:
     card = build(kind, state)
@@ -404,7 +433,13 @@ def test_no_card_string_uses_a_forbidden_token(kind: CardKind, state: CardState)
 
 @pytest.mark.parametrize(
     "message",
-    [NO_LONGER_VALID_MESSAGE, WRONG_REQUESTER_MESSAGE, ALREADY_USED_MESSAGE, EXPIRED_HEADLINE],
+    [
+        NO_LONGER_VALID_MESSAGE,
+        WRONG_REQUESTER_MESSAGE,
+        ALREADY_USED_MESSAGE,
+        EXPIRED_HEADLINE,
+        REPLACED_HEADLINE,
+    ],
 )
 def test_shared_refusal_messages_avoid_forbidden_tokens(message: str) -> None:
     lowered = message.lower()

@@ -106,10 +106,18 @@ async def turn_origin(
 def render_turn_origin(
     origin: TurnOriginRow,
     *,
+    responder_handle: str | None = None,
     session_state: SessionState | None = None,
     handoff: HandoffNotice | None = None,
 ) -> str:
     """Render server-provided location and identity separately from user history.
+
+    `responder_handle` is the platform handle people mention this deployment
+    by (`@daimon-staging`). It is the bot account's display name, which an
+    operator may set to anything, while `responder.name` is the MA agent's
+    name — they are routinely different, and a model that sees only the name
+    reads the difference as two agents. Rendering both under one `responder`
+    says they are one identity.
 
     `session_state` and `handoff` are optional server-supplied facts about the
     workspace this turn runs in. They are rendered inside the same JSON object
@@ -121,6 +129,12 @@ def render_turn_origin(
     is the person's own words — it is truncated to `MAX_REQUESTED_WORK_CHARS`
     and JSON-encoded like everything else, never interpolated into the prose.
     """
+    responder: dict[str, object] = {
+        "name": origin.responder_name,
+        "ma_agent_id": origin.responder_ma_agent_id,
+    }
+    if responder_handle is not None:
+        responder["handle"] = responder_handle
     controls: dict[str, object] = {
         "origin_context_id": str(origin.id),
         "is_setup": origin.is_setup,
@@ -128,7 +142,7 @@ def render_turn_origin(
         "parent_channel_id": origin.parent_channel_id,
         "thread_id": origin.thread_id,
         "current_role": origin.role,
-        "responder": {"name": origin.responder_name, "ma_agent_id": origin.responder_ma_agent_id},
+        "responder": responder,
         "configuration_target": (
             {
                 "name": origin.configuration_target_name,
@@ -158,10 +172,18 @@ def render_turn_origin(
             "files": list(handoff.files),
             "not_carried": list(handoff.not_carried),
         }
-    rendered = (
-        "<turn_controls>\n"
-        + json.dumps(controls)
-        + "\nUse the explicitly requested target when named; otherwise configure the "
+    rendered = "<turn_controls>\n" + json.dumps(controls)
+    # Only say this when a handle is actually rendered: without one the
+    # sentence points at a key that is not there.
+    if responder_handle is not None:
+        rendered += (
+            "\nresponder.handle is how people mention the agent answering here. That handle, "
+            "responder.name, and any casing of either are the same agent — never ask whether "
+            "they are the same, and never treat that difference as target ambiguity. Ask about "
+            "the target only when a different agent is named."
+        )
+    rendered += (
+        "\nUse the explicitly requested target when named; otherwise configure the "
         "configuration_target. If is_setup is true and no target is selected, ask which "
         "agent to configure before mutation. Only ordinary chat defaults to the responder. "
         "Never substitute a "

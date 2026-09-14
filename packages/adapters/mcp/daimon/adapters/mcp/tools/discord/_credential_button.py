@@ -23,8 +23,10 @@ a credential card carries the same channel-visibility discipline as
 from __future__ import annotations
 
 from datetime import datetime
+from typing import cast
 
 import discord
+import structlog
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.discord._client import (
@@ -46,8 +48,11 @@ from daimon.core.credential_requests import (
     split_skill_repo_target,
 )
 from daimon.core.github_repo_auth import normalize_owner_repo
-from daimon.core.posted_controls import build_posted_card
+from daimon.core.posted_controls import CardKind, build_posted_card
+from daimon.core.stores.domain import CredentialRequestRow
 from fastmcp.exceptions import ToolError
+
+_log = structlog.get_logger()
 
 _REPO_KINDS: frozenset[CredentialRequestKind] = frozenset({"repo", "skill_repo"})
 
@@ -130,3 +135,37 @@ async def _post_credential_button_impl(  # pyright: ignore[reportUnusedFunction]
             ),
         )
         return str(sent.id)
+
+
+async def edit_card_replaced(runtime: McpRuntime, *, row: CredentialRequestRow) -> None:
+    """Edit one retired card into the `replaced` state. Never raises.
+
+    Runs right after a newer form for the same person, thread and agent was
+    posted, so the older card stops offering a button nobody should press.
+    The row is already spent by then: a card that cannot be edited (message
+    deleted, thread archived, permissions lost) costs feedback, not
+    correctness, so a Discord refusal is logged and the mint continues.
+
+    A row with no thread or message id never had a card to edit.
+    """
+    if row.origin_thread_id is None or row.posted_message_id is None:
+        return
+    card = build_posted_card(
+        kind=cast("CardKind", row.kind),
+        state="replaced",
+        agent_name=row.target_name or "the agent",
+        responder_name=row.responder_name or "Daimon",
+        target=row.target,
+        requester_platform_user_id=row.requester_platform_user_id,
+        expires_at=row.expires_at,
+        token=row.token,
+    )
+    view = build_card_view(card)
+    async with rest_client(_require_bot_token(runtime)) as c:
+        message = c.get_partial_messageable(int(row.origin_thread_id)).get_partial_message(
+            int(row.posted_message_id)
+        )
+        try:
+            await message.edit(view=view, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as err:
+            _log.warning("posted_card.replace_failed", err_type=type(err).__name__, kind=row.kind)

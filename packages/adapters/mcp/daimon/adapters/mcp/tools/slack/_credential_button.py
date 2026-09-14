@@ -25,8 +25,9 @@ The validated turn origin supplies the parent channel and thread timestamp.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
+import structlog
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.slack._client import (
@@ -41,12 +42,16 @@ from daimon.core.credential_requests import (
 )
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.posted_controls import (
+    CardKind,
     build_card_blocks,
     build_posted_card,
     card_notification_text,
 )
+from daimon.core.stores.domain import CredentialRequestRow
 from fastmcp.exceptions import ToolError
 from slack_sdk.errors import SlackApiError
+
+_log = structlog.get_logger()
 
 _REPO_KINDS: frozenset[CredentialRequestKind] = frozenset({"repo", "skill_repo"})
 
@@ -117,3 +122,43 @@ async def _post_slack_credential_button_impl(  # pyright: ignore[reportUnusedFun
         code = str(err.response.get("error", "slack_api_error"))  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # slack_sdk response is dict-like
         raise ToolError(f"posting to the channel failed ({code})") from err
     return str(sent.get("ts") or "")  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+
+
+async def edit_card_replaced(
+    runtime: McpRuntime, auth: AuthIdentity, *, row: CredentialRequestRow
+) -> None:
+    """Edit one retired card into the `replaced` state. Never raises.
+
+    Runs right after a newer form for the same person, thread and agent was
+    posted, so the older card stops offering a button nobody should press.
+    The row is already spent by then, so a Slack refusal is logged rather
+    than raised: the failure costs feedback, not correctness.
+
+    A row with no recorded `ts` never had a card to edit.
+    """
+    if row.posted_message_id is None:
+        return
+    card = build_posted_card(
+        kind=cast("CardKind", row.kind),
+        state="replaced",
+        agent_name=row.target_name or "the agent",
+        responder_name=row.responder_name or "Daimon",
+        target=row.target,
+        requester_platform_user_id=row.requester_platform_user_id,
+        expires_at=row.expires_at,
+        token=row.token,
+    )
+    client = await slack_web_client(runtime, team_id=_require_team_id(auth))
+    try:
+        await client.chat_update(  # pyright: ignore[reportUnknownMemberType]
+            channel=row.parent_channel_id or row.channel_id,
+            ts=row.posted_message_id,
+            text=card_notification_text(card),
+            blocks=build_card_blocks(card),
+        )
+    except SlackApiError as err:
+        _log.warning(
+            "posted_card.replace_failed",
+            kind=row.kind,
+            error=str(err.response.get("error", "slack_api_error")),  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # slack_sdk response is dict-like
+        )
