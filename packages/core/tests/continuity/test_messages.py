@@ -714,3 +714,16 @@ def test_other_render_functions_never_contain_forbidden_tokens_or_blank_lines() 
     }
     for label, rendered in other_rendered.items():
         _assert_clean(label, rendered)
+
+
+def test_handoff_acknowledged_does_not_double_the_full_stop_when_the_work_ends_a_sentence() -> None:
+    rendered = render_handoff_acknowledged(
+        target_name="research-bot",
+        from_name="Daimon",
+        channel="#data",
+        requested_work="add a second line and show the file.",
+    )
+    assert rendered.endswith("It will pick up with: add a second line and show the file."), (
+        "a trailing period in the person's words must not produce '..'"
+    )
+    assert ".." not in rendered, "no doubled full stop anywhere in the confirmation"

@@ -319,7 +319,8 @@ def render_handoff_acknowledged(
         f"Who answers in {channel} is unchanged.",
     ]
     if requested_work is not None:
-        lines.append(f"It will pick up with: {requested_work}.")
+        # The person's own words may already end a sentence; never double the stop.
+        lines.append(f"It will pick up with: {requested_work.rstrip().rstrip('.!?')}.")
     return "\n".join(lines)
 
 
