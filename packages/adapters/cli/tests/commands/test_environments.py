@@ -8,6 +8,7 @@ from typing import cast
 import httpx
 import pytest
 import typer
+from anthropic.types.beta import BetaCloudConfig, BetaPackages, BetaUnrestrictedNetwork
 from daimon.adapters.cli.commands.environments import (
     environments_archive,
     environments_create,
@@ -51,9 +52,16 @@ def _env_json(
     config = EMPTY_CLOUD_CONFIG
     if init_script is not None or environment is not None:
         # Retrieve-only fields the SDK does not declare on BetaCloudConfig;
-        # the model allows extras, so they ride along as such.
-        config = EMPTY_CLOUD_CONFIG.model_copy(
-            update={"init_script": init_script, "environment": environment}
+        # the model allows extras, so validate them in through a dict
+        # (the typed constructor rejects undeclared keyword arguments).
+        config = BetaCloudConfig.model_validate(
+            {
+                "type": "cloud",
+                "networking": BetaUnrestrictedNetwork(type="unrestricted"),
+                "packages": BetaPackages(apt=[], cargo=[], gem=[], go=[], npm=[], pip=[]),
+                "init_script": init_script,
+                "environment": environment,
+            }
         )
     return ma_environment(id=env_id, name=name, config=config, metadata=metadata).model_dump(
         mode="json"
