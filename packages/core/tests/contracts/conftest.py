@@ -25,7 +25,7 @@ from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import Settings
 from daimon.core.ma import delete_entire_workspace_for_testing
 from daimon.core.skill_zip import build_skill_zip
-from daimon.testing.ma import _require_api_key
+from daimon.testing.ma import require_api_key
 from daimon.testing.workspace_sentinel import require_disposable_workspace
 
 # Each test module in this package must set:
@@ -36,7 +36,7 @@ from daimon.testing.workspace_sentinel import require_disposable_workspace
 @pytest_asyncio.fixture(scope="module")
 async def anthropic_client() -> AsyncAnthropic:
     """Real AsyncAnthropic client from env var. Skips if key is missing."""
-    key = _require_api_key()
+    key = require_api_key()
     return AsyncAnthropic(api_key=key)
 
 
@@ -98,7 +98,7 @@ async def local_daimon_mcp() -> AsyncIterator[LocalDaimonMCP]:
     test_db_url = os.environ.get("DAIMON_DATABASE__TEST_URL")
     if not test_db_url:
         pytest.skip("DAIMON_DATABASE__TEST_URL not set — local_daimon_mcp fixture cannot boot")
-    api_key = _require_api_key()
+    api_key = require_api_key()
 
     port = _pick_free_port()
     public_url = f"http://127.0.0.1:{port}/mcp"
