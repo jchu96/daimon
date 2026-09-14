@@ -377,8 +377,8 @@ async def test_apply_sweeps_previously_seeded_brainstorming_skill(
     orphaned brainstorming skill (MA delete)."""
     _write_tree(tmp_path)  # skill-less tree
 
-    from daimon.core.defaults.provisioning import provision_tenant  # noqa: PLC0415
-    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+    from daimon.core.defaults.provisioning import provision_tenant
+    from daimon.core.ma_identity import derive_tenant_uuid
 
     await provision_tenant(db_session_factory, platform="cli", workspace_id="local")
     tenant_id = derive_tenant_uuid(platform="cli", workspace_id="local")

@@ -808,7 +808,7 @@ async def test_bind_session_with_generous_explicit_deadline_matches_no_deadline_
     assert prepared.ma_session_id == "sess_1"
 
 
-async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_model_changed_after_create(  # noqa: E501
+async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_model_changed_after_create(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

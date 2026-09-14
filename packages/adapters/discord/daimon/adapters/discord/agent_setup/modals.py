@@ -605,7 +605,7 @@ class AddSkillModal(discord.ui.Modal, title="Add skill repo"):
             )
             await interaction.followup.send(content, ephemeral=True)
 
-        asyncio.create_task(_run_and_toast())  # noqa: RUF006 — background toast; interaction token valid 15 min
+        asyncio.create_task(_run_and_toast())  # background toast; interaction token valid 15 min
 
 
 # AddMcpModal lives in modals_mcp.py (LD-04-03 split — modals.py LOC budget).

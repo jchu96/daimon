@@ -209,7 +209,9 @@ class CredentialRequestButton(
                 await interaction.response.send_message(_ALREADY_USED, ephemeral=True)
                 return False
             return True
-        except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own dispatcher swallows anything raised here
+        except Exception as err:
+            # dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own
+            # dispatcher swallows anything raised here
             _log.exception(
                 "credential_button.interaction_check_failed", err_type=type(err).__name__
             )
@@ -253,7 +255,9 @@ class CredentialRequestButton(
                 await interaction.response.send_modal(
                     McpCredentialModal(runtime=bot.runtime, request_row=request_row)
                 )
-        except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own dispatcher swallows anything raised here
+        except Exception as err:
+            # dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own
+            # dispatcher swallows anything raised here
             _log.exception("credential_button.callback_failed", err_type=type(err).__name__)
             await interaction.response.send_message(_CALLBACK_FAILED, ephemeral=True)
 

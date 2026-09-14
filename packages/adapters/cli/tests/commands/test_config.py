@@ -231,9 +231,9 @@ async def test_config_propagate_empty_source(db_session: AsyncSession) -> None:
 @pytest.mark.asyncio
 async def test_set_scope_tenant(db_session: AsyncSession) -> None:
     """config set --scope tenant writes a row to tenant_config (R6)."""
-    from daimon.adapters.cli.commands.config import _config_set_entry  # noqa: PLC0415
-    from daimon.core.scope import TenantScopeRef  # noqa: PLC0415
-    from daimon.core.stores.scoped_config_read import get_scope  # noqa: PLC0415
+    from daimon.adapters.cli.commands.config import _config_set_entry
+    from daimon.core.scope import TenantScopeRef
+    from daimon.core.stores.scoped_config_read import get_scope
 
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
@@ -258,9 +258,9 @@ async def test_set_scope_tenant(db_session: AsyncSession) -> None:
 @pytest.mark.asyncio
 async def test_set_scope_channel_writes_channel_config(db_session: AsyncSession) -> None:
     """config set --scope channel:<channel_id> writes channel_config (R6)."""
-    from daimon.adapters.cli.commands.config import _config_set_entry  # noqa: PLC0415
-    from daimon.core.scope import ChannelScopeRef  # noqa: PLC0415
-    from daimon.core.stores.scoped_config_read import get_scope  # noqa: PLC0415
+    from daimon.adapters.cli.commands.config import _config_set_entry
+    from daimon.core.scope import ChannelScopeRef
+    from daimon.core.stores.scoped_config_read import get_scope
 
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)
@@ -295,8 +295,8 @@ def test_set_scope_deployment_rejects() -> None:
     # For now (RED), we verify _parse_scope raises BadParameter (old behavior)
     # OR that the set entry raises Exit(1) (new behavior).
     # Either satisfies the intent. This test imports the new grammar symbols.
-    import typer  # noqa: PLC0415
-    from daimon.adapters.cli.commands.config import _parse_scope  # noqa: PLC0415
+    import typer
+    from daimon.adapters.cli.commands.config import _parse_scope
 
     with pytest.raises((typer.BadParameter, typer.Exit)):
         _parse_scope("deployment", tenant_id=uuid.uuid4(), account_id=uuid.uuid4())
@@ -304,8 +304,8 @@ def test_set_scope_deployment_rejects() -> None:
 
 def test_scope_tenant_system_rejected() -> None:
     """_parse_scope('tenant_system', ...) raises BadParameter in the new grammar (R6)."""
-    import typer  # noqa: PLC0415
-    from daimon.adapters.cli.commands.config import _parse_scope  # noqa: PLC0415
+    import typer
+    from daimon.adapters.cli.commands.config import _parse_scope
 
     with pytest.raises(typer.BadParameter):
         _parse_scope("tenant_system", tenant_id=uuid.uuid4(), account_id=uuid.uuid4())
@@ -313,8 +313,8 @@ def test_scope_tenant_system_rejected() -> None:
 
 def test_scope_workspace_rejected() -> None:
     """_parse_scope('workspace:discord/123', ...) raises BadParameter in the new grammar (R6)."""
-    import typer  # noqa: PLC0415
-    from daimon.adapters.cli.commands.config import _parse_scope  # noqa: PLC0415
+    import typer
+    from daimon.adapters.cli.commands.config import _parse_scope
 
     with pytest.raises(typer.BadParameter):
         _parse_scope("workspace:discord/123", tenant_id=uuid.uuid4(), account_id=uuid.uuid4())
@@ -323,10 +323,10 @@ def test_scope_workspace_rejected() -> None:
 @pytest.mark.asyncio
 async def test_get_scope_deployment(db_session: AsyncSession) -> None:
     """config get --scope deployment prints the injected rt.deployment_default values (R6)."""
-    from io import StringIO  # noqa: PLC0415
+    from io import StringIO
 
-    from daimon.adapters.cli.commands.config import _config_get_entry  # noqa: PLC0415
-    from daimon.core.scope import DeploymentDefault  # noqa: PLC0415
+    from daimon.adapters.cli.commands.config import _config_get_entry
+    from daimon.core.scope import DeploymentDefault
 
     tenant = await make_tenant(db_session)
     account = await make_account(db_session, tenant=tenant)

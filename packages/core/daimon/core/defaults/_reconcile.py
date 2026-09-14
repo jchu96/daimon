@@ -83,7 +83,7 @@ async def _run_per_resource(
             action=Action.FAILED,
             error=str(err),
         )
-    except Exception as err:  # noqa: BLE001 — per-resource isolation boundary
+    except Exception as err:  # per-resource isolation boundary
         _log.exception("defaults.reconcile_unexpected", kind=kind, name=name)
         outcome = ResourceOutcome(
             kind=kind,

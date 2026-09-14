@@ -44,11 +44,12 @@ target-version = "py312"
 extend-exclude = ["defaults/skills/**"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I", "UP", "B", "SIM", "PGH", "ANN401", "RUF100"]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests favour long, descriptive assert messages over a hard column cap.
-"**/tests/**" = ["E501"]
+# Tests favour long, descriptive assert messages over a hard column cap, and
+# fake callables in tests may take `Any` where source may not.
+"**/tests/**" = ["E501", "ANN401"]
 
 [tool.pyright]
 include = ["packages/core/daimon", "packages/adapters/cli/daimon", "packages/adapters/mcp/daimon", "packages/adapters/discord/daimon", "packages/adapters/scheduler/daimon", "packages/adapters/slack/daimon", "packages/testing/daimon", "apps/notebook-host/src/notebook_host", "apps/report-host/src/report_host"]

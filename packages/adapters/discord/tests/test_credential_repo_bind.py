@@ -171,7 +171,8 @@ def _repo_probe_transport(
     return httpx.MockTransport(handler)
 
 
-def _sent_message(interaction: MagicMock) -> Any:  # noqa: ANN401 -- MagicMock call_args positional arg is untyped by construction
+# MagicMock call_args positional arg is untyped by construction.
+def _sent_message(interaction: MagicMock) -> Any:
     """Return the ephemeral message text an interaction was sent, on whichever half fired."""
     if interaction.response.send_message.called:
         return interaction.response.send_message.call_args.args[0]

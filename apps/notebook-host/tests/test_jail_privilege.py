@@ -51,7 +51,7 @@ def _run_as_uid(
     uid: int, code: str, *, cwd: str | None = None, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Run ``code`` in a child process dropped into ``uid`` via preexec_fn."""
-    return subprocess.run(  # noqa: S603
+    return subprocess.run(
         [sys.executable, "-c", code],
         cwd=cwd,
         env=env,
@@ -256,7 +256,7 @@ def test_proc_environ_closed_across_uids(tmp_path: Path) -> None:
     the uid split is what actually denies it, verified here directly rather
     than assumed.
     """
-    long_lived = subprocess.Popen(  # noqa: S603
+    long_lived = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(20)"],
         preexec_fn=build_jailed_preexec(_UID_A, rlimit_as_bytes=None, rlimit_cpu_seconds=None),
     )
@@ -296,7 +296,7 @@ def test_uv_and_marimo_run_under_the_dropped_uid(tmp_path: Path) -> None:
     env = scrub_env(dict(os.environ))
     env["HOME"] = str(paths.home)
 
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(
         [uv, "run", "--with", "marimo", "marimo", "--version"],
         cwd=str(paths.workspace),
         env=env,

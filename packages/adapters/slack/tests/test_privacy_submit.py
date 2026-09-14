@@ -190,7 +190,7 @@ async def test_run_purge_and_update_deletes_account_rows_and_calls_views_update(
     # Fake Anthropic that returns an empty agents list (no MA sessions to delete).
     router = MARouter()
 
-    def handle_agents_list(request: httpx.Request, match: Any) -> httpx.Response:  # noqa: ANN401
+    def handle_agents_list(request: httpx.Request, match: Any) -> httpx.Response:
         return list_response([])
 
     router.add("GET", r"/v1/agents", handle_agents_list)

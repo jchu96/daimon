@@ -71,6 +71,6 @@ async def classify(
         )
         text = "".join(b.text for b in response.content if isinstance(b, TextBlock))
         return ClassifierOutcome(parse_classifier_response(text), usage)
-    except Exception:  # noqa: BLE001 -- fail-closed boundary: any failure means silence
+    except Exception:  # fail-closed boundary: any failure means silence
         log.warning("thread_participation.classifier_failed", exc_info=True)
         return ClassifierOutcome(SILENCE_ON_ERROR, usage)

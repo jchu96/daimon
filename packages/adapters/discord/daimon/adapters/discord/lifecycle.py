@@ -48,9 +48,9 @@ import discord
 
 log = structlog.get_logger()
 
-SendFn = Callable[..., Awaitable[Any]]
+SendFn = Callable[..., Awaitable[discord.Message]]
 EditFn = Callable[..., Awaitable[None]]
-DeleteFn = Callable[[Any], Awaitable[None]]
+DeleteFn = Callable[[discord.Message], Awaitable[None]]
 
 _DEBOUNCE_S = 10.0
 
@@ -124,7 +124,7 @@ class DiscordTurnLifecycle:
         model_id: str,
         cancel_view: discord.ui.View | None = None,
         clock: Callable[[], float] = time.monotonic,
-        adopt_message_ref: Any | None = None,
+        adopt_message_ref: discord.Message | None = None,
         delete: DeleteFn | None = None,
         unprompted: bool = False,
     ) -> None:
@@ -152,7 +152,7 @@ class DiscordTurnLifecycle:
         # followed by a working answer, and cannot tell that the error was
         # retracted. Adopting the ref means the recovered turn edits that embed
         # into the real answer, so a recovered turn looks like a normal one.
-        self._message_ref: Any | None = adopt_message_ref
+        self._message_ref: discord.Message | None = adopt_message_ref
         self._last_flush: float = 0.0
         self._terminal: bool = False
         self._cancel_view = cancel_view
@@ -170,7 +170,7 @@ class DiscordTurnLifecycle:
         self._revealed_first_chunk: str | None = None
 
     @property
-    def message_ref(self) -> Any | None:
+    def message_ref(self) -> discord.Message | None:
         """The message this lifecycle is rendering into, if it has posted one.
 
         Public so dead-session recovery can hand it to the replacement
@@ -205,8 +205,10 @@ class DiscordTurnLifecycle:
             return
         self._state = update(self._state, embed_event)
 
-    async def _send_message(self, **kwargs: Any) -> Any:
+    async def _send_message(self, **kwargs: Any) -> discord.Message:  # noqa: ANN401
         """Send through the injected callable, silencing unprompted turns.
+
+        ``kwargs`` are forwarded verbatim to discord.py's overloaded ``send()``.
 
         `silent=True` is Discord's suppress-notification flag: a reply nobody
         asked for shows up in the thread without pinging anyone.

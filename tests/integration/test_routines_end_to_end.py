@@ -167,7 +167,7 @@ def _build_fake_anthropic_factory(
         def __init__(self, evts: list[BetaManagedAgentsSessionEvent]) -> None:
             self._evts = evts
 
-        def __await__(self):  # noqa: ANN204
+        def __await__(self):
             async def _self() -> _FakeAsyncIter:
                 return self
 
@@ -515,7 +515,7 @@ def _build_archived_agent_factory(
         def __init__(self, evts: list[BetaManagedAgentsSessionEvent]) -> None:
             self._evts = evts
 
-        def __await__(self):  # noqa: ANN204
+        def __await__(self):
             async def _self() -> _FakeAsyncIter:
                 return self
 
@@ -746,7 +746,7 @@ def _build_two_tenant_fake_anthropic_factory(
         ]
 
         class _FakeAsyncIter:
-            def __await__(self):  # noqa: ANN204
+            def __await__(self):
                 async def _self() -> _FakeAsyncIter:
                     return self
 

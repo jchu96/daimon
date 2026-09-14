@@ -535,7 +535,7 @@ async def test_run_turn_repushes_expired_bundle_once_and_retries_the_send(
     def start_turn(args: dict[str, object]) -> dict[str, object]:
         start_calls.append(args)
         if len(start_calls) == 1:
-            raise Exception("bundle expired; re-upload")  # noqa: TRY002
+            raise Exception("bundle expired; re-upload")
         return {
             "handle": "ses-1",
             "turn_event_id": "evt-0",
@@ -603,7 +603,7 @@ async def test_run_turn_with_deleted_archive_stores_bundle_missing_message(
     Path(report.archive_path).unlink()
 
     def start_turn(_args: dict[str, object]) -> dict[str, object]:
-        raise Exception("bundle expired; re-upload")  # noqa: TRY002
+        raise Exception("bundle expired; re-upload")
 
     push_calls: list[bytes] = []
 
@@ -652,7 +652,7 @@ async def test_run_turn_with_null_archive_path_stores_bundle_missing_message(
     thread = _begin(conn, thread, deadline_at=NOW + timedelta(seconds=1200))
 
     def start_turn(_args: dict[str, object]) -> dict[str, object]:
-        raise Exception("bundle expired; re-upload")  # noqa: TRY002
+        raise Exception("bundle expired; re-upload")
 
     push_calls: list[bytes] = []
 
@@ -704,7 +704,7 @@ async def test_run_turn_bundle_expired_twice_gives_up_with_one_repush(
 
     def start_turn(args: dict[str, object]) -> dict[str, object]:
         start_calls.append(args)
-        raise Exception("bundle expired; re-upload")  # noqa: TRY002
+        raise Exception("bundle expired; re-upload")
 
     push_calls: list[bytes] = []
 
@@ -924,7 +924,7 @@ async def test_run_turn_with_generic_seam_error_releases_the_reservation(
     thread = _begin(conn, thread, deadline_at=NOW + timedelta(seconds=1200))
 
     def start_turn(_args: dict[str, object]) -> dict[str, object]:
-        raise Exception("seam is temporarily unavailable")  # noqa: TRY002
+        raise Exception("seam is temporarily unavailable")
 
     app = build_fake_seam(behaviors={"start_turn": start_turn}, captured_auth=[])
     settings = _settings(tmp_path=tmp_path, monkeypatch=monkeypatch)

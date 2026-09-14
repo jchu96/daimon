@@ -82,7 +82,7 @@ from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import RunOutcome, run_prepared_turn
 from daimon.core.turn_origin import HandoffNotice, SessionState, render_turn_origin, turn_origin
-from sqlalchemy.exc import SQLAlchemyError  # noqa: TCH002
+from sqlalchemy.exc import SQLAlchemyError
 
 import discord
 from discord.ext import commands
@@ -545,7 +545,7 @@ class DaimonBot(commands.Bot):
             )
             if not was_ready:
                 await self._post_to_guild(guild, _build_snag_embed())
-        except Exception as exc:  # noqa: BLE001 — background-task supervisor boundary
+        except Exception as exc:  # background-task supervisor boundary
             log.exception("guild_seed_unexpected", tenant_id=str(tenant_id))
             # This branch's message body may carry anything (an unclassified bug,
             # not a known API/Daimon error), and the reason column is read by an
@@ -858,7 +858,7 @@ class DaimonBot(commands.Bot):
             tr = await get_tenant_liveness(self.runtime.sessionmaker, tenant_id)
             if tr is None or tr.archived_at is not None or tr.provision_status != "ready":
                 return
-        except Exception as exc:  # noqa: BLE001 -- unasked-for turn: log, stay silent
+        except Exception as exc:  # unasked-for turn: log, stay silent
             log.exception("thread_participation.decision_failed", thread_id=str(thread_id))
             sentry_sdk.capture_exception(exc)
             return
@@ -927,7 +927,7 @@ class DaimonBot(commands.Bot):
                 thread, candidates, trigger=trigger, tenant_id=tenant_id, resolved=resolved
             ):
                 return
-        except Exception as exc:  # noqa: BLE001 -- unasked-for turn: log, stay silent
+        except Exception as exc:  # unasked-for turn: log, stay silent
             log.exception("thread_participation.decision_failed", thread_id=str(thread_id))
             sentry_sdk.capture_exception(exc)
             return
@@ -956,7 +956,7 @@ class DaimonBot(commands.Bot):
                 await responder.record(
                     tenant_id=tenant_id, thread_id=thread_id, message_id=str(trigger.id)
                 )
-            except Exception:  # noqa: BLE001 -- best-effort ledger: a miss loosens the cap by one
+            except Exception:  # best-effort ledger: a miss loosens the cap by one
                 log.exception("thread_participation.record_failed", thread_id=str(thread_id))
             # The newest message is the trigger; the delta context carries the
             # rest of the batch, since they all landed after the watermark.
@@ -1153,7 +1153,7 @@ class DaimonBot(commands.Bot):
                 self._release_inflight(tenant_id)
         except (DaimonError, _anthropic.APIError, discord.HTTPException, SQLAlchemyError) as exc:
             await self._handle_prologue_failure(message, exc, guild_id)
-        except Exception as exc:  # noqa: BLE001 — on_message event-handler boundary
+        except Exception as exc:  # on_message event-handler boundary
             await self._handle_prologue_failure(message, exc, guild_id)
 
     async def _handle_prologue_failure(
@@ -1257,7 +1257,7 @@ class DaimonBot(commands.Bot):
         except (DaimonError, _anthropic.APIError, discord.HTTPException, SQLAlchemyError) as exc:
             log.warning("turn.failed", error=str(exc), channel_id=str(message.channel.id))
             await self._render_turn_error(message, tenant_id, guild_id, rid, exc)
-        except Exception as exc:  # noqa: BLE001 — mention-turn adapter boundary
+        except Exception as exc:  # mention-turn adapter boundary
             log.exception(
                 "turn.failed.unexpected", error=str(exc), channel_id=str(message.channel.id)
             )
@@ -1343,10 +1343,11 @@ class DaimonBot(commands.Bot):
         turn_deadline_at = turn_deadline(now=datetime.now(UTC))
         agent = admission.agent
 
-        async def _send_embed(**kwargs: Any) -> discord.Message:
+        # kwargs are forwarded verbatim to discord.py's overloaded send()/edit().
+        async def _send_embed(**kwargs: Any) -> discord.Message:  # noqa: ANN401
             return await thread.send(**kwargs)
 
-        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:
+        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:  # noqa: ANN401
             await msg.edit(**kwargs)
 
         async def _delete_message(msg: discord.Message) -> None:
@@ -1731,10 +1732,11 @@ class DaimonBot(commands.Bot):
                 created_thread_ids.append(thread.id)
 
         # --- Wire lifecycle with send/edit callables ---
-        async def _send_embed(**kwargs: Any) -> discord.Message:
+        # kwargs are forwarded verbatim to discord.py's overloaded send()/edit().
+        async def _send_embed(**kwargs: Any) -> discord.Message:  # noqa: ANN401
             return await thread.send(**kwargs)
 
-        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:
+        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:  # noqa: ANN401
             await msg.edit(**kwargs)
 
         async def _delete_message(msg: discord.Message) -> None:

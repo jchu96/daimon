@@ -384,7 +384,7 @@ def validate_notebook(
             cmd.append("--sandbox")
         cmd += [paths.notebook.name, "-o", str(Path(tmp) / "check.html")]
         try:
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 cmd,
                 cwd=str(workspace),
                 env=env,

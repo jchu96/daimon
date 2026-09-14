@@ -468,7 +468,7 @@ class SlackTurnLifecycle:
             self._apply_usage(state)
             await self._flush_terminal()
             self.final_ts = self._status_ts
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.warning("turn.terminal_failure.flush_failed", exc_info=True)
             await self._repair_terminal_flush("⚠️ Something went wrong finishing this turn.")
         finally:

@@ -195,7 +195,7 @@ def _compute_next_fire_at(cron_expr: str, timezone_: str) -> datetime | None:
         return None
     try:
         return next_slot_at_or_after(cron_expr, timezone_, datetime.now(UTC))
-    except Exception:  # noqa: BLE001  # croniter raises mixed types; named boundary
+    except Exception:  # croniter raises mixed types; named boundary
         return None
 
 

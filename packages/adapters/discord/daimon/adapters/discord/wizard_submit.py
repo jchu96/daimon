@@ -160,7 +160,9 @@ class WizardSubmitButton(
     ) -> bool:
         try:
             return await _authorize_tap(self.wizard_row, interaction)
-        except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own dispatcher swallows anything raised here
+        except Exception as err:
+            # dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own
+            # dispatcher swallows anything raised here
             _log.exception("wizard_submit.interaction_check_failed", err_type=type(err).__name__)
             await interaction.response.send_message(_CHECK_FAILED, ephemeral=True)
             return False
@@ -241,7 +243,9 @@ class WizardSubmitButton(
                 )
             except discord.HTTPException:
                 _log.exception("wizard_submit.collapse_edit_failed", short_id=row.id)
-        except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own dispatcher swallows anything raised here
+        except Exception as err:
+            # dynamic-item dispatch is an adapter boundary (see module docstring); discord.py's own
+            # dispatcher swallows anything raised here
             _log.exception("wizard_submit.callback_failed", err_type=type(err).__name__)
             await _reply_or_followup(interaction, _CALLBACK_FAILED)
 
@@ -464,10 +468,11 @@ async def run_wizard_submit_turn(
 
         user_message = format_answer_block(spec, state)
 
-        async def _send_embed(**kwargs: Any) -> discord.Message:
+        # kwargs are forwarded verbatim to discord.py's overloaded send()/edit().
+        async def _send_embed(**kwargs: Any) -> discord.Message:  # noqa: ANN401
             return await channel.send(**kwargs)
 
-        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:
+        async def _edit_message(msg: discord.Message, **kwargs: Any) -> None:  # noqa: ANN401
             await msg.edit(**kwargs)
 
         cancel = asyncio.Event()
@@ -554,7 +559,9 @@ async def run_wizard_submit_turn(
     except (DaimonError, _anthropic.APIError, discord.HTTPException, SQLAlchemyError) as exc:
         _log.warning("wizard_submit.turn_failed", error=str(exc), short_id=row.id)
         await _render_wizard_turn_error(interaction, tenant_id=row.tenant_id, rid=rid, exc=exc)
-    except Exception as exc:  # noqa: BLE001 -- background-task adapter boundary (see module docstring); nothing above this task will otherwise report the failure
+    except Exception as exc:
+        # background-task adapter boundary (see module docstring); nothing above this task will
+        # otherwise report the failure
         _log.exception("wizard_submit.turn_failed_unexpected", error=str(exc), short_id=row.id)
         await _render_wizard_turn_error(interaction, tenant_id=row.tenant_id, rid=rid, exc=exc)
     finally:

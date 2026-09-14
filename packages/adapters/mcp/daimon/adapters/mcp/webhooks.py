@@ -16,7 +16,7 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from anthropic import AsyncAnthropic
@@ -33,10 +33,14 @@ from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import Response
 
+if TYPE_CHECKING:
+    # Billing is optional; ``stripe`` is imported lazily at runtime inside the handler.
+    import stripe
+
 log = structlog.get_logger(__name__)
 
 
-def _get(d: dict[str, Any], key: str) -> Any:  # pyright: ignore[reportExplicitAny]
+def _get(d: dict[str, Any], key: str) -> object:
     """Type-safe dict.get wrapper for JSON payload dicts.
 
     Pyright strict mode reports 'partially unknown' on dict[str, Any].get() because
@@ -350,7 +354,7 @@ def build_stripe_webhook(
 async def _handle_completed(
     sessionmaker: async_sessionmaker[AsyncSession],
     event_id: str,
-    event: Any,  # pyright: ignore[reportExplicitAny]
+    event: stripe.Event,
 ) -> Response:
     """Credit the tenant balance for a completed Checkout Session.
 
@@ -437,7 +441,7 @@ async def _handle_completed(
 
 def _clawback_amount_from_event(
     event_type: str,
-    charge: Any,  # pyright: ignore[reportExplicitAny]
+    charge: dict[str, Any],  # Stripe declares Event.Data.object as Dict[str, Any]
     original_credit: Decimal,
 ) -> Decimal:
     """Return the actual money to claw back (positive Decimal, in USD).
@@ -468,7 +472,7 @@ async def _handle_clawback(
     sessionmaker: async_sessionmaker[AsyncSession],
     event_id: str,
     event_type: str,
-    event: Any,  # pyright: ignore[reportExplicitAny]
+    event: stripe.Event,
 ) -> Response:
     """Append a clawback ledger row on charge.refunded / charge.dispute.created.
 

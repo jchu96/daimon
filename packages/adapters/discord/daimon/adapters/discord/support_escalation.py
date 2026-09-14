@@ -38,6 +38,7 @@ later; a dropped one cannot.
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any, Self, cast
 
 import structlog
@@ -175,7 +176,7 @@ class SupportModal(discord.ui.Modal, title="Ask a human"):
         )
         await interaction.followup.send(_RECEIVED.format(remaining=remaining), ephemeral=True)
 
-    async def _used(self, tenant_id: Any, user_id: str) -> int:
+    async def _used(self, tenant_id: uuid.UUID, user_id: str) -> int:
         from daimon.core.stores.support_escalation import count_escalations_for_user
 
         async with self._runtime.sessionmaker() as session:
@@ -290,7 +291,9 @@ class SupportEscalateButton(
                     message_id=self.message_id,
                 )
             )
-        except Exception as err:  # noqa: BLE001 -- dynamic-item dispatch is an adapter boundary; discord.py's dispatcher swallows anything raised here
+        except Exception as err:
+            # dynamic-item dispatch is an adapter boundary; discord.py's dispatcher swallows
+            # anything raised here
             _log.exception("support_button.callback_failed", err_type=type(err).__name__)
             if interaction.response.is_done():
                 await interaction.followup.send(_CALLBACK_FAILED, ephemeral=True)

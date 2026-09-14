@@ -153,10 +153,14 @@ class FakeEventsResource:
         default_factory=list[tuple[str, list[dict[str, Any]]]]
     )
     stream_calls: int = 0
-    stream_timeouts: list[Any] = field(default_factory=list[Any])
+    stream_timeouts: list[float | httpx.Timeout | anthropic.NotGiven | None] = field(
+        default_factory=list[float | httpx.Timeout | anthropic.NotGiven | None]
+    )
     streams: list[_FakeEventStream] = field(default_factory=list["_FakeEventStream"])
 
-    async def stream(self, *, session_id: str, timeout: Any = None) -> _FakeEventStream:
+    async def stream(
+        self, *, session_id: str, timeout: float | httpx.Timeout | anthropic.NotGiven | None = None
+    ) -> _FakeEventStream:
         if not self.stream_scripts:
             raise AssertionError("FakeEventsResource: no stream_scripts left")
         script = self.stream_scripts.pop(0)

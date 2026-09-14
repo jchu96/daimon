@@ -262,7 +262,7 @@ async def find_workspace_disposable_sentinel(
     The sentinel is workspace-wide, not tenant-scoped: it answers "may the test
     suite destroy everything reachable from this API key?" and nothing else.
     """
-    from daimon.core.defaults.metadata import (  # noqa: PLC0415
+    from daimon.core.defaults.metadata import (
         MA_METADATA_KEY_WORKSPACE,
         MA_METADATA_VALUE_WORKSPACE_DISPOSABLE,
     )
@@ -308,7 +308,7 @@ async def delete_entire_workspace_for_testing(
     # Skills: versions first (MA requires this), then skill.
     # 400 = built-in workspace skill with non-UUID id (xlsx, pdf, etc.) — skip.
     # list_skills_lenient: test-only best-effort cleanup; degrade mode is safe here.
-    from daimon.core.defaults.ma_index import list_skills_lenient  # noqa: PLC0415
+    from daimon.core.defaults.ma_index import list_skills_lenient
 
     skills, _truncated = await list_skills_lenient(client)
     for skill in skills:
@@ -369,8 +369,8 @@ async def delete_sessions_for_account(
     """
     # Local imports break the circular dependency:
     # ma.py <-> defaults/__init__ -> apply -> reconcile_skills -> ma.py
-    from daimon.core.defaults.ma_index import list_agents_by_tenant  # noqa: PLC0415
-    from daimon.core.defaults.metadata import MA_METADATA_KEY_ACCOUNT  # noqa: PLC0415
+    from daimon.core.defaults.ma_index import list_agents_by_tenant
+    from daimon.core.defaults.metadata import MA_METADATA_KEY_ACCOUNT
 
     agents = await list_agents_by_tenant(client, tenant_id=tenant_id)
 
