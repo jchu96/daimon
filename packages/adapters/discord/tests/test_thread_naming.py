@@ -36,8 +36,6 @@ from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 def _message_payload(text: str) -> dict[str, Any]:
     return Message(

@@ -15,7 +15,6 @@ from typing import Any
 
 import httpx
 import jwt as pyjwt
-import pytest
 from daimon.adapters.mcp.auth.resolver import AuthIdentity, resolve_role
 from daimon.adapters.mcp.auth.verifier import DaimonJWTVerifier
 from daimon.core.config import McpSettings
@@ -31,8 +30,6 @@ from daimon.testing import (
 from daimon.testing.factories import make_account, make_tenant
 from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 TEST_GUILD_ID = 123456789012345678  # arbitrary placeholder guild id
 SECRET = b"a" * 32

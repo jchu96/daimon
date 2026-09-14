@@ -49,8 +49,6 @@ from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic, build_stub_anthropic, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 # `make_tenant` derives the tenant id from `workspace_id` the exact same way
 # `derive_tenant_uuid(platform="discord", workspace_id=str(interaction.guild_id))`
 # does — see `daimon.testing.factories.make_tenant` and

@@ -32,8 +32,6 @@ from daimon.testing.ma import (
     make_fake_memory_store_handler,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_delete_agent_archives_memory_store(db_session, db_session_factory) -> None:
     tenant = await make_tenant(db_session)
