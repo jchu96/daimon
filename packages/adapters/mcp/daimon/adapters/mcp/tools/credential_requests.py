@@ -623,7 +623,8 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         who talks to the agent can use added keys. Members can add new keys, including
         to built-in Daimon; replacing one a shared agent already has needs an admin.
         Pass the waiting task as `pending_task` so it resumes after the value is
-        saved."""
+        saved; call this before any clarifying question about that task, even when
+        the task is underspecified."""
         return await _request_agent_key_impl(
             runtime,
             await _auth(ctx),
