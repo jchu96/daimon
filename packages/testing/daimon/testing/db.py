@@ -72,6 +72,7 @@ _INTERVAL_PATTERN = re.compile(r"^\d+(ms|s|min)?$")
 _SWEEP_LOCK_KEY = "daimon:test-schema-sweep"
 _LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 _CREATE_CHUNK_SIZE = 8
+_DROP_CHUNK_SIZE = 4
 
 # nodeid of the last test that used the DB in this worker; named in the error
 # when the next test's wipe times out on a lock that test left behind.
@@ -294,16 +295,21 @@ async def _create_schema_with_tables(engine: AsyncEngine, schema: str) -> None:
 
 
 async def _drop_schema(engine: AsyncEngine, schema: str) -> None:
-    """Drop ``schema`` one table per transaction, child-first, then the schema itself.
+    """Drop ``schema`` a few tables per transaction, child-first, then the schema itself.
 
-    Keeps every transaction's lock footprint tiny so many workers can tear
-    down at once; the final ``DROP SCHEMA ... CASCADE`` only has non-ORM
-    leftovers (sequences, tables a test created) to clean up.
+    Keeps every transaction's lock footprint small so many workers can tear
+    down at once, with few enough commits that their WAL fsyncs don't pile
+    up; the final ``DROP SCHEMA ... CASCADE`` only has non-ORM leftovers
+    (sequences, tables a test created) to clean up.
     """
     _check_identifier(schema)
-    for table in reversed(Base.metadata.sorted_tables):
+    tables = list(reversed(Base.metadata.sorted_tables))
+    for start in range(0, len(tables), _DROP_CHUNK_SIZE):
+        names = ", ".join(
+            f'"{schema}"."{table.name}"' for table in tables[start : start + _DROP_CHUNK_SIZE]
+        )
         async with engine.begin() as conn:
-            await conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{table.name}" CASCADE'))
+            await conn.execute(text(f"DROP TABLE IF EXISTS {names} CASCADE"))
     async with engine.begin() as conn:
         await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
 
