@@ -24,11 +24,6 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 from aioresponses import aioresponses as AioResponsesMock
-from anthropic.types.beta import BetaManagedAgentsSession
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.agent_setup import write as slack_write
 from daimon.adapters.slack.app import SlackApp
@@ -41,6 +36,7 @@ from daimon.core.purge import AccountPurgeResult
 from daimon.core.purge import purge_account as core_purge_account
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
+from daimon.testing import ma_session
 from daimon.testing.ma import MARouter, build_fake_anthropic
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -114,36 +110,6 @@ def _extract_posted_texts(mock: AioResponsesMock) -> list[str]:
             if isinstance(text, str):
                 posted.append(text)
     return posted
-
-
-def _make_fake_session(
-    *, session_id: str, agent_id: str, model_id: str
-) -> BetaManagedAgentsSession:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsSession(
-        outcome_evaluations=[],
-        id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            id=agent_id,
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id=model_id),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=now,
-        environment_id="env_parity_test",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
-    )
 
 
 @dataclass
@@ -247,10 +213,11 @@ class SlackDriver:
             patch("daimon.core.turn.prepare.create_session") as mock_create_session,
         ):
             _register_slack_defaults(mock)
-            mock_create_session.return_value = _make_fake_session(
-                session_id="sess_parity_test",
+            mock_create_session.return_value = ma_session(
+                id="sess_parity_test",
                 agent_id="ag_parity_test",
-                model_id="claude-sonnet-4-6",
+                model="claude-sonnet-4-6",
+                environment_id="env_parity_test",
             )
             await app._handle_app_mention(event, team_id=workspace_id)  # pyright: ignore[reportPrivateUsage]
             posted = _extract_posted_texts(mock)

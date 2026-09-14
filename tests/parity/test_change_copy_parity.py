@@ -37,6 +37,7 @@ from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.credential_requests import create_credential_request
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -82,30 +83,6 @@ def _make_runtime(
     )
 
 
-def _make_ma_agent(ma_agent_id: str, *, name: str, tenant_id: uuid.UUID) -> object:
-    from anthropic.types.beta import BetaManagedAgentsAgent
-    from anthropic.types.beta.beta_managed_agents_model_config import (
-        BetaManagedAgentsModelConfig,
-    )
-    from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
-
-    return BetaManagedAgentsAgent(
-        id=ma_agent_id,
-        type="agent",
-        name=name,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        description=None,
-        created_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        updated_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    )
-
-
 def _interaction(*, user_id: int = 100000000000000001, guild_id: int | None = None) -> MagicMock:
     """A live guild-admin interaction by default -- every write below routes
     through `refuse_if_shared_and_not_admin`, which admits a guild admin
@@ -145,7 +122,7 @@ async def test_discord_env_key_add_ack_matches_core_renderer(
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
         )
 
-    agent = _make_ma_agent(ma_agent_id, name="stripe-bot", tenant_id=tenant.id)
+    agent = ma_agent(id=ma_agent_id, name="stripe-bot", tenant_id=tenant.id)
     runtime = _make_runtime(db_session_factory, agents=[agent])
     modal = EnvCredentialModal(runtime=runtime, request_row=row)
     modal.value_input._value = "sk_live_do_not_leak"  # pyright: ignore[reportPrivateUsage]

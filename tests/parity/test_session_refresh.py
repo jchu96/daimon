@@ -20,34 +20,15 @@ from decimal import Decimal
 from typing import Literal
 
 import httpx
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from anthropic.types.beta.beta_file_scope import BetaFileScope
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.file_metadata import FileMetadata
-from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
-    BetaManagedAgentsAgentMessageEvent,
-)
 from anthropic.types.beta.sessions.beta_managed_agents_delete_session_resource import (
     BetaManagedAgentsDeleteSessionResource,
 )
 from anthropic.types.beta.sessions.beta_managed_agents_file_resource import (
     BetaManagedAgentsFileResource,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_session_end_turn import (
-    BetaManagedAgentsSessionEndTurn,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event import (
-    BetaManagedAgentsSessionStatusIdleEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
-    BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_text_block import BetaManagedAgentsTextBlock
 from daimon.core.credential_env import assemble_env_bytes
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.session_snapshot import (
     SessionSnapshot,
@@ -64,17 +45,12 @@ from daimon.core.stores.thread_sessions import (
     get_live_thread_session,
     get_thread_session_by_id,
 )
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
-    MARouter,
-    list_response,
-    send_events_response,
-    sse_response,
-)
+from daimon.testing.ma import MARouter, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .conftest import AGENT_ID, AGENT_TEXT, ENV_ID, MODEL_ID
+from .conftest import AGENT_ID, ENV_ID, MODEL_ID, build_turn_router
 from .drivers.discord_driver import DiscordDriver
 from .drivers.slack_driver import SlackDriver
 
@@ -83,71 +59,6 @@ from .drivers.slack_driver import SlackDriver
 _REPLACEMENT_SESSION_ID = "sess_parity_test"
 _LIVE_SESSION_ID = "sess_before_the_change"
 _OLD_ENV_RESOURCE_ID = "res_env_old"
-_NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
-
-
-def _agent(*, tenant_id_str: str = "", model_id: str = MODEL_ID) -> BetaManagedAgentsAgent:
-    return BetaManagedAgentsAgent(
-        id=AGENT_ID,
-        type="agent",
-        name="test-agent",
-        model=BetaManagedAgentsModelConfig(id=model_id),
-        # The tenant tag is what `resolve_agent` matches on; it is not part of
-        # the configuration a session freezes, so it never reaches a snapshot.
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-agent"},
-        description=None,
-        created_at=_NOW,
-        updated_at=_NOW,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    )
-
-
-def _environment(tenant_id_str: str) -> BetaEnvironment:
-    return BetaEnvironment(
-        id=ENV_ID,
-        type="environment",
-        name="test-env",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-env"},
-        description="",
-        created_at="2026-09-13T00:00:00Z",
-        updated_at="2026-09-13T00:00:00Z",
-    )
-
-
-def _turn_events() -> list[dict[str, object]]:
-    now = datetime.now(UTC)
-    return [
-        BetaManagedAgentsAgentMessageEvent(
-            id="evt_refresh_msg",
-            type="agent.message",
-            processed_at=now,
-            content=[BetaManagedAgentsTextBlock(type="text", text=AGENT_TEXT)],
-        ).model_dump(mode="json"),
-        BetaManagedAgentsSpanModelRequestEndEvent(
-            id=f"evt_refresh_usage_{uuid.uuid4().hex[:8]}",
-            is_error=False,
-            model_request_start_id="start_refresh",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                input_tokens=100,
-                output_tokens=50,
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-            ),
-            processed_at=now,
-            type="span.model_request_end",
-        ).model_dump(mode="json"),
-        BetaManagedAgentsSessionStatusIdleEvent(
-            id="evt_refresh_idle",
-            type="session.status_idle",
-            processed_at=now,
-            stop_reason=BetaManagedAgentsSessionEndTurn(type="end_turn"),
-        ).model_dump(mode="json"),
-    ]
 
 
 def _build_router(
@@ -163,15 +74,10 @@ def _build_router(
     ran anywhere else has no route and fails the test loudly, which is how
     these scenarios prove which session the turn actually used.
     """
-    agent_item = _agent(tenant_id_str=str(tenant_id), model_id=model_id).model_dump(mode="json")
-    env_item = _environment(str(tenant_id)).model_dump(mode="json")
     calls = resource_calls if resource_calls is not None else []
-
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent_item]))
-    router.add("GET", r"/v1/agents/[^/]+", lambda req, _m: httpx.Response(200, json=agent_item))
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([env_item]))
-    router.add("GET", r"/v1/environments/[^/]+", lambda req, _m: httpx.Response(200, json=env_item))
+    router = build_turn_router(
+        str(tenant_id), session_id=turn_session_id, model_id=model_id, fresh_event_ids=True
+    )
 
     def _upload(request: httpx.Request, _match: object) -> httpx.Response:
         calls.append(("POST", "/v1/files"))
@@ -220,14 +126,6 @@ def _build_router(
     router.add("POST", r"/v1/files", _upload)
     router.add("DELETE", r"/v1/sessions/[^/]+/resources/[^/]+", _delete_resource)
     router.add("POST", r"/v1/sessions/[^/]+/resources", _add_resource)
-    router.add(
-        "POST", rf"/v1/sessions/{turn_session_id}/events", lambda req, _m: send_events_response()
-    )
-    router.add(
-        "GET",
-        rf"/v1/sessions/{turn_session_id}/events/stream",
-        lambda req, _m: sse_response(_turn_events()),
-    )
     return router
 
 
@@ -239,7 +137,7 @@ def _snapshot(
 ) -> SessionSnapshot:
     """What the session this row maps to froze when a previous turn created it."""
     snapshot = desired_snapshot(
-        _agent(model_id=model_id),
+        ma_agent(id=AGENT_ID, model=model_id),
         environment_id=ENV_ID,
         env_sha256=env_sha256,
         repo_url=None,

@@ -28,128 +28,21 @@ detect a superseding human message -- is boundary-stubbed here the same way
 
 from __future__ import annotations
 
-import itertools
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
-import httpx
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
-    BetaManagedAgentsAgentMessageEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_end_turn import (
-    BetaManagedAgentsSessionEndTurn,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event import (
-    BetaManagedAgentsSessionStatusIdleEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
-    BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_text_block import BetaManagedAgentsTextBlock
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.task_continuations import get_continuation, record_continuation
 from daimon.core.stores.thread_agent_bindings import upsert_responder_binding
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
-    MARouter,
-    list_response,
-    send_events_response,
-    sse_response,
-)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .conftest import AGENT_ID, AGENT_TEXT, ENV_ID, MODEL_ID
+from .conftest import AGENT_ID, AGENT_TEXT, build_turn_router
 from .drivers.discord_driver import DiscordDriver
 from .drivers.slack_driver import SlackDriver
-
-
-def _build_repeatable_turn_router(tenant_id_str: str) -> MARouter:
-    """Same shape as `conftest.build_turn_router`, but each SSE stream open
-    emits a FRESH `span.model_request_end` event id.
-
-    This scenario runs three turns against the SAME MA session id (turn 1
-    creates it, turns 2 and 3 reuse it), and `usage_events` idempotency keys
-    on `(managed_session_id, event_id)` -- three turns sharing one canned
-    event id would silently collapse to one billed row. A local router
-    (rather than the shared `conftest.build_turn_router`) is what lets each
-    call mint its own id via a closed-over counter.
-    """
-    agent_item = BetaManagedAgentsAgent(
-        id=AGENT_ID,
-        type="agent",
-        name="test-agent",
-        model=BetaManagedAgentsModelConfig(id=MODEL_ID),
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-agent"},
-        description=None,
-        created_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        updated_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    ).model_dump(mode="json")
-    env_item = BetaEnvironment(
-        id=ENV_ID,
-        type="environment",
-        name="test-env",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-env"},
-        description="",
-        created_at="2026-06-14T00:00:00Z",
-        updated_at="2026-06-14T00:00:00Z",
-    ).model_dump(mode="json")
-
-    counter = itertools.count()
-
-    def _stream(_req: httpx.Request, _m: object) -> httpx.Response:
-        now = datetime.now(UTC)
-        n = next(counter)
-        agent_message_event = BetaManagedAgentsAgentMessageEvent(
-            id=f"evt_handoff_msg_{n}",
-            type="agent.message",
-            processed_at=now,
-            content=[BetaManagedAgentsTextBlock(type="text", text=AGENT_TEXT)],
-        ).model_dump(mode="json")
-        model_request_end_event = BetaManagedAgentsSpanModelRequestEndEvent(
-            id=f"evt_handoff_usage_{n}",
-            is_error=False,
-            model_request_start_id=f"start_handoff_{n}",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                input_tokens=100,
-                output_tokens=50,
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-            ),
-            processed_at=now,
-            type="span.model_request_end",
-        ).model_dump(mode="json")
-        idle_event = BetaManagedAgentsSessionStatusIdleEvent(
-            id=f"evt_handoff_idle_{n}",
-            type="session.status_idle",
-            processed_at=now,
-            stop_reason=BetaManagedAgentsSessionEndTurn(type="end_turn"),
-        ).model_dump(mode="json")
-        return sse_response([agent_message_event, model_request_end_event, idle_event])
-
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent_item]))
-    router.add("GET", r"/v1/agents/[^/]+", lambda req, _m: httpx.Response(200, json=agent_item))
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([env_item]))
-    router.add("GET", r"/v1/environments/[^/]+", lambda req, _m: httpx.Response(200, json=env_item))
-    router.add("POST", r"/v1/sessions/[^/]+/events", lambda req, _m: send_events_response())
-    router.add("GET", r"/v1/sessions/[^/]+/events/stream", _stream)
-    return router
 
 
 async def test_discord_handoff_continuation_dispatches_exactly_one_follow_up_turn(
@@ -174,7 +67,11 @@ async def test_discord_handoff_continuation_dispatches_exactly_one_follow_up_tur
     )
     await db_session.commit()
 
-    router = _build_repeatable_turn_router(str(tenant.id))
+    # Three turns run against the SAME MA session id (turn 1 creates it,
+    # turns 2 and 3 reuse it) and `usage_events` idempotency keys on
+    # `(managed_session_id, event_id)`: without fresh event ids per stream
+    # open, three turns would silently collapse to one billed row.
+    router = build_turn_router(str(tenant.id), fresh_event_ids=True)
     driver = DiscordDriver()
 
     # Turn 1: an ordinary mention, no binding/continuation yet -- establishes
@@ -291,7 +188,11 @@ async def test_slack_handoff_continuation_dispatches_exactly_one_follow_up_turn(
     )
     await db_session.commit()
 
-    router = _build_repeatable_turn_router(str(tenant.id))
+    # Three turns run against the SAME MA session id (turn 1 creates it,
+    # turns 2 and 3 reuse it) and `usage_events` idempotency keys on
+    # `(managed_session_id, event_id)`: without fresh event ids per stream
+    # open, three turns would silently collapse to one billed row.
+    router = build_turn_router(str(tenant.id), fresh_event_ids=True)
     driver = SlackDriver()
 
     # Turn 1: an ordinary mention, no binding/continuation yet -- establishes

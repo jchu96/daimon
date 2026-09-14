@@ -21,11 +21,6 @@ from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
-from anthropic.types.beta import BetaManagedAgentsSession
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.adapters.discord.agent_setup import write as discord_write
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
@@ -38,6 +33,7 @@ from daimon.core.purge import purge_account as core_purge_account
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.tenants import set_provision_status
+from daimon.testing import ma_session
 from daimon.testing.ma import MARouter, build_fake_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -48,36 +44,6 @@ _CAP_BLOCKED_TEXT = (
     "Monthly usage cap reached for this guild. "
     "An admin can adjust the cap with `/billing` (when available)."
 )
-
-
-def _make_fake_session(
-    *, session_id: str, agent_id: str, model_id: str
-) -> BetaManagedAgentsSession:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsSession(
-        id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            id=agent_id,
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id=model_id),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=now,
-        environment_id="env_parity_test",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
-        outcome_evaluations=[],
-    )
 
 
 @dataclass
@@ -188,10 +154,11 @@ class DiscordDriver:
             patch("daimon.core.turn.prepare.create_session") as mock_create_session,
             patch("daimon.adapters.discord.bot.build_context_xml") as mock_build_context_xml,
         ):
-            mock_create_session.return_value = _make_fake_session(
-                session_id="sess_parity_test",
+            mock_create_session.return_value = ma_session(
+                id="sess_parity_test",
                 agent_id="ag_parity_test",
-                model_id="claude-sonnet-4-6",
+                model="claude-sonnet-4-6",
+                environment_id="env_parity_test",
             )
             mock_build_context_xml.return_value = (f"<user_query>{text}</user_query>", [])
             await bot.on_message(message)

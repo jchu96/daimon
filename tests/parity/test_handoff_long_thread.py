@@ -23,17 +23,6 @@ from unittest.mock import MagicMock
 
 import httpx
 from aioresponses import aioresponses as AioResponsesMock
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
-    BetaManagedAgentsAgentMessageEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_end_turn import (
-    BetaManagedAgentsSessionEndTurn,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event import (
-    BetaManagedAgentsSessionStatusIdleEvent,
-)
 from anthropic.types.beta.sessions.beta_managed_agents_text_block import BetaManagedAgentsTextBlock
 from anthropic.types.beta.sessions.beta_managed_agents_user_message_event import (
     BetaManagedAgentsUserMessageEvent,
@@ -43,7 +32,6 @@ from daimon.adapters.slack.app import SlackApp
 from daimon.adapters.slack.context import THREAD_PAGE_LIMIT
 from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
 from daimon.core.config import SlackSettings
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault
@@ -56,57 +44,18 @@ from daimon.core.stores.thread_sessions import (
     get_live_thread_session,
     get_thread_session_by_id,
 )
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
-    MARouter,
-    json_body,
-    list_response,
-    send_events_response,
-    session_response,
-    sse_response,
-)
+from daimon.testing.ma import MARouter, list_response, session_response
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .conftest import AGENT_ID, AGENT_TEXT, ENV_ID, MODEL_ID
+from .conftest import AGENT_ID, ENV_ID, build_turn_router
 
 _SLACK_API_BASE = "https://slack.com/api"
 _OLD_MODEL_ID = "claude-haiku-4-5"
 _OLD_SESSION_ID = "sess_long_thread_before"
 _NEW_SESSION_ID = "sess_long_thread_after"
-_NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
-
-
-def _agent_item(tenant_id_str: str) -> dict[str, object]:
-    return BetaManagedAgentsAgent(
-        id=AGENT_ID,
-        type="agent",
-        name="test-agent",
-        model=BetaManagedAgentsModelConfig(id=MODEL_ID),
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-agent"},
-        description=None,
-        created_at=_NOW,
-        updated_at=_NOW,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    ).model_dump(mode="json")
-
-
-def _environment_item(tenant_id_str: str) -> dict[str, object]:
-    return BetaEnvironment(
-        id=ENV_ID,
-        type="environment",
-        name="test-env",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-env"},
-        description="",
-        created_at="2026-09-13T00:00:00Z",
-        updated_at="2026-09-13T00:00:00Z",
-    ).model_dump(mode="json")
 
 
 def _old_session_events() -> list[dict[str, object]]:
@@ -125,37 +74,16 @@ def _old_session_events() -> list[dict[str, object]]:
     ]
 
 
-def _new_session_turn_events() -> list[dict[str, object]]:
-    now = datetime.now(UTC)
-    return [
-        BetaManagedAgentsAgentMessageEvent(
-            id="evt_long_thread_reply",
-            type="agent.message",
-            processed_at=now,
-            content=[BetaManagedAgentsTextBlock(type="text", text=AGENT_TEXT)],
-        ).model_dump(mode="json"),
-        BetaManagedAgentsSessionStatusIdleEvent(
-            id="evt_long_thread_idle",
-            type="session.status_idle",
-            processed_at=now,
-            stop_reason=BetaManagedAgentsSessionEndTurn(type="end_turn"),
-        ).model_dump(mode="json"),
-    ]
-
-
 def _build_router(tenant_id_str: str, *, sent_event_bodies: list[dict[str, Any]]) -> MARouter:
-    agent_item = _agent_item(tenant_id_str)
-    env_item = _environment_item(tenant_id_str)
-
-    def _capture_events_send(request: httpx.Request, _match: object) -> httpx.Response:
-        sent_event_bodies.append(json_body(request))
-        return send_events_response()
-
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent_item]))
-    router.add("GET", r"/v1/agents/[^/]+", lambda req, _m: httpx.Response(200, json=agent_item))
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([env_item]))
-    router.add("GET", r"/v1/environments/[^/]+", lambda req, _m: httpx.Response(200, json=env_item))
+    """The shared turn router scoped to the successor session (its reply
+    carries no usage event), plus the OLD session's event log and the
+    successor's creation."""
+    router = build_turn_router(
+        tenant_id_str,
+        session_id=_NEW_SESSION_ID,
+        usage_event_id=None,
+        sent_event_bodies=sent_event_bodies,
+    )
     # The OLD session's event log: read once by `transfer_workspace` to
     # decide the transcript and the checkpoint-worth gate.
     router.add(
@@ -172,12 +100,6 @@ def _build_router(tenant_id_str: str, *, sent_event_bodies: list[dict[str, Any]]
         lambda req, _m: session_response(
             session_id=_NEW_SESSION_ID, agent_id=AGENT_ID, environment_id=ENV_ID
         ),
-    )
-    router.add("POST", rf"/v1/sessions/{_NEW_SESSION_ID}/events", _capture_events_send)
-    router.add(
-        "GET",
-        rf"/v1/sessions/{_NEW_SESSION_ID}/events/stream",
-        lambda req, _m: sse_response(_new_session_turn_events()),
     )
     return router
 
@@ -281,21 +203,7 @@ async def test_slack_long_thread_replacement_stays_within_thread_page_limit_and_
     # the tenant's agent has since moved to MODEL_ID -- an identity-axis
     # mismatch that forces a replacement, not an in-place refresh.
     old_snapshot = desired_snapshot(
-        BetaManagedAgentsAgent(
-            id=AGENT_ID,
-            type="agent",
-            name="test-agent",
-            model=BetaManagedAgentsModelConfig(id=_OLD_MODEL_ID),
-            metadata={},
-            description=None,
-            created_at=_NOW,
-            updated_at=_NOW,
-            version=1,
-            mcp_servers=[],
-            skills=[],
-            tools=[],
-            system=None,
-        ),
+        ma_agent(id=AGENT_ID, model=_OLD_MODEL_ID),
         environment_id=ENV_ID,
         env_sha256=None,
         repo_url=None,
