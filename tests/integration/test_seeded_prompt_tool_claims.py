@@ -24,17 +24,14 @@ and in every skill it references (not just `workspace-setup`), is checked:
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import datetime as dt
 import itertools
-import json
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import httpx
-import pytest
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import (
     AnthropicSettings,
@@ -51,13 +48,12 @@ from daimon.core.defaults.loader import (
 from daimon.core.mcp_auth import mint_jwt
 from daimon.core.stores import accounts
 from daimon.core.stores.domain import Role
+from daimon.testing import INIT_BODY, INIT_HEADERS, asgi_lifespan, parse_jsonrpc_response
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.types import ASGIApp, Message
-
-pytestmark = pytest.mark.asyncio
+from starlette.types import ASGIApp
 
 SECRET = "a" * 32
 _NOW = dt.datetime(2026, 4, 24, tzinfo=dt.UTC)
@@ -133,70 +129,19 @@ def _collect_texts() -> tuple[str, dict[str, str]]:
 
 
 @contextlib.asynccontextmanager
-async def _lifespan(app: ASGIApp) -> AsyncIterator[None]:
-    send_queue: asyncio.Queue[Message] = asyncio.Queue()
-    receive_queue: asyncio.Queue[Message] = asyncio.Queue()
-
-    async def receive() -> Message:
-        return await receive_queue.get()
-
-    async def send(message: Message) -> None:
-        await send_queue.put(message)
-
-    async def run_lifespan() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    task = asyncio.create_task(run_lifespan())
-
-    await receive_queue.put({"type": "lifespan.startup"})
-    msg = await send_queue.get()
-    assert msg["type"] == "lifespan.startup.complete", msg
-    try:
-        yield
-    finally:
-        await receive_queue.put({"type": "lifespan.shutdown"})
-        msg = await send_queue.get()
-        assert msg["type"] == "lifespan.shutdown.complete", msg
-        await task
-
-
-def _parse_jsonrpc_response(resp: httpx.Response) -> dict[str, object]:
-    content_type = resp.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
-        for line in resp.text.splitlines():
-            if line.startswith("data: "):
-                return json.loads(line[6:])  # type: ignore[return-value]
-        raise AssertionError(f"No data line in SSE response: {resp.text!r}")
-    return resp.json()  # type: ignore[return-value]
-
-
-@contextlib.asynccontextmanager
 async def _open_session(
     app: ASGIApp, *, token: str
 ) -> AsyncIterator[Callable[[str, dict[str, object] | None], Awaitable[dict[str, object]]]]:
     """Initialize one real MCP session and yield a caller for repeated
     JSON-RPC calls against it — the handshake runs once, not per query."""
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = dict(INIT_HEADERS)
+    headers["Authorization"] = f"Bearer {token}"
     transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
-                },
-            },
-            headers=headers,
-        )
+    async with (
+        asgi_lifespan(app),
+        httpx.AsyncClient(transport=transport, base_url="http://t") as c,
+    ):
+        init_resp = await c.post("/mcp", json=INIT_BODY, headers=headers)
         assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
         session_id = init_resp.headers.get("mcp-session-id")
         if session_id:
@@ -207,7 +152,7 @@ async def _open_session(
             body = {"jsonrpc": "2.0", "id": next(counter), "method": method, "params": params or {}}
             resp = await c.post("/mcp", json=body, headers=headers)
             assert resp.status_code == 200, f"{method} failed ({resp.status_code}): {resp.text}"
-            return _parse_jsonrpc_response(resp)
+            return parse_jsonrpc_response(resp)
 
         yield _call
 

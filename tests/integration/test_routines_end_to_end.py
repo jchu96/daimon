@@ -26,9 +26,6 @@ from unittest.mock import AsyncMock
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import (
-    BetaManagedAgentsModelConfig,
-)
 from anthropic.types.beta.sessions import BetaManagedAgentsSessionEvent
 from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
     BetaManagedAgentsAgentMessageEvent,
@@ -57,11 +54,10 @@ from daimon.adapters.scheduler.main import (
 from daimon.adapters.scheduler.main import run as scheduler_run
 from daimon.core.config import Settings
 from daimon.core.db import build_engine
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores import tenant_ledger
 from daimon.core.stores.routines import create_routine, get_routine
+from daimon.testing import ma_agent, ma_environment, ma_model_config
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import EMPTY_CLOUD_CONFIG
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -139,39 +135,14 @@ def _build_fake_anthropic_factory(
     """
     now_dt = dt.datetime.now(dt.UTC)
     now_iso = now_dt.isoformat()
-    live_agent = BetaManagedAgentsAgent(
+    live_agent = ma_agent(
         id=agent_id,
-        type="agent",
         name=agent_name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: agent_name,
-        },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model=ma_model_config(speed="standard"),
+        tenant_id=tenant_id,
         created_at=now_dt,
-        updated_at=now_dt,
-        archived_at=None,
     )
-    live_env = BetaEnvironment(
-        id=env_id,
-        type="environment",
-        name="default",
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: "default",
-        },
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
+    live_env = ma_environment(id=env_id, name="default", tenant_id=tenant_id, created_at=now_iso)
 
     class _EnvList:
         """Async-iterable wrapper for `client.beta.environments.list(...)`."""
@@ -489,58 +460,22 @@ def _build_archived_agent_factory(
     """
     now_dt = dt.datetime.now(dt.UTC)
     now_iso = now_dt.isoformat()
-    archived_agent = BetaManagedAgentsAgent(
+    archived_agent = ma_agent(
         id=stale_agent_id,
-        type="agent",
         name=agent_name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: agent_name,
-        },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model=ma_model_config(speed="standard"),
+        tenant_id=tenant_id,
         created_at=now_dt,
-        updated_at=now_dt,
         archived_at=now_dt,  # archived_at populated -> resolver treats as not-live
     )
-    fresh_agent = BetaManagedAgentsAgent(
+    fresh_agent = ma_agent(
         id=fresh_agent_id,
-        type="agent",
         name=agent_name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: agent_name,
-        },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model=ma_model_config(speed="standard"),
+        tenant_id=tenant_id,
         created_at=now_dt,
-        updated_at=now_dt,
-        archived_at=None,
     )
-    live_env = BetaEnvironment(
-        id=env_id,
-        type="environment",
-        name="default",
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: "default",
-        },
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
+    live_env = ma_environment(id=env_id, name="default", tenant_id=tenant_id, created_at=now_iso)
 
     class _AgentList:
         def __init__(self, agents: list[BetaManagedAgentsAgent]) -> None:
@@ -754,72 +689,22 @@ def _build_two_tenant_fake_anthropic_factory(
     now_dt = dt.datetime.now(dt.UTC)
     now_iso = now_dt.isoformat()
 
-    agent_a = BetaManagedAgentsAgent(
+    agent_a = ma_agent(
         id=agent_id_a,
-        type="agent",
         name="daimon",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id_a),
-            MA_METADATA_KEY_NAME: "daimon",
-        },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model=ma_model_config(speed="standard"),
+        tenant_id=tenant_id_a,
         created_at=now_dt,
-        updated_at=now_dt,
-        archived_at=None,
     )
-    agent_b = BetaManagedAgentsAgent(
+    agent_b = ma_agent(
         id=agent_id_b,
-        type="agent",
         name="daimon",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id_b),
-            MA_METADATA_KEY_NAME: "daimon",
-        },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model=ma_model_config(speed="standard"),
+        tenant_id=tenant_id_b,
         created_at=now_dt,
-        updated_at=now_dt,
-        archived_at=None,
     )
-    env_a = BetaEnvironment(
-        id=env_id_a,
-        type="environment",
-        name="default",
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id_a),
-            MA_METADATA_KEY_NAME: "default",
-        },
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
-    env_b = BetaEnvironment(
-        id=env_id_b,
-        type="environment",
-        name="default",
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id_b),
-            MA_METADATA_KEY_NAME: "default",
-        },
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
+    env_a = ma_environment(id=env_id_a, name="default", tenant_id=tenant_id_a, created_at=now_iso)
+    env_b = ma_environment(id=env_id_b, name="default", tenant_id=tenant_id_b, created_at=now_iso)
 
     _agents_by_id = {agent_id_a: agent_a, agent_id_b: agent_b}
     _envs_by_id = {env_id_a: env_a, env_id_b: env_b}
