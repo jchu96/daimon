@@ -1,6 +1,14 @@
 # Re-export the most commonly used symbols.
 # For module-specific imports, use daimon.testing.ma / .db / .factories directly.
 from daimon.testing.archives import make_tarball
+from daimon.testing.asgi import (
+    INIT_BODY,
+    INIT_HEADERS,
+    asgi_lifespan,
+    call_mcp_tool,
+    mcp_session,
+    parse_jsonrpc_response,
+)
 from daimon.testing.crypto import make_fernet
 from daimon.testing.factories import (
     link_principals,
@@ -70,8 +78,18 @@ from daimon.testing.ma_sessions import (
     make_fake_sessions_handler,
     session_turn_sse,
 )
+from daimon.testing.turn_router import (
+    AGENT_ID,
+    AGENT_TEXT,
+    ENV_ID,
+    MODEL_ID,
+    build_turn_router,
+    turn_events,
+)
 
 __all__ = [
+    "AGENT_ID",
+    "AGENT_TEXT",
     "DEFAULT_AGENT_ID",
     "DEFAULT_AGENT_NAME",
     "DEFAULT_ENV_ID",
@@ -81,16 +99,23 @@ __all__ = [
     "EMPTY_CLOUD_CONFIG",
     "EMPTY_SESSION_STATS",
     "EMPTY_SESSION_USAGE",
+    "ENV_ID",
     "FIXED_TS",
     "FIXED_TS_STR",
+    "INIT_BODY",
+    "INIT_HEADERS",
+    "MODEL_ID",
     "FakeMAState",
     "FakeMemoryStoreState",
     "FakeSessionsState",
     "MARouter",
     "NotHandled",
+    "asgi_lifespan",
     "build_fake_anthropic",
     "build_no_retry_anthropic",
     "build_stub_anthropic",
+    "build_turn_router",
+    "call_mcp_tool",
     "combine_handlers",
     "json_body",
     "link_principals",
@@ -125,7 +150,9 @@ __all__ = [
     "make_thread_session",
     "make_usage_event",
     "make_wizard_session",
+    "mcp_session",
     "not_found_response",
+    "parse_jsonrpc_response",
     "require_api_key",
     "resolved_agent_env_router",
     "send_events_response",
@@ -134,4 +161,5 @@ __all__ = [
     "sse_response",
     "stub_anthropic",
     "tenant_metadata",
+    "turn_events",
 ]
