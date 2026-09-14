@@ -1534,6 +1534,63 @@ async def test_pending_task_is_sanitized_and_bounded(
     ), "the stored work must be exactly the bound, not longer"
 
 
+async def test_pending_task_drops_the_key_request_itself_and_keeps_a_real_task(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A save-only ask must not buy a billed continuation; a real task still does."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_work", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+
+    ask_posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9310", posted=ask_posted)
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_work",
+        agent_name="daimon",
+        key="HIGGSFIELD_API_KEY",
+        purpose="trying Higgsfield",
+        channel_id="222",
+        pending_task="give Daimon a HIGGSFIELD_API_KEY so people can try it here",
+    )
+    ask_row = await peek_credential_request(db_session, token=_token_from_posted(ask_posted))
+    assert ask_row is not None, "the minted token must resolve to the created row"
+    assert ask_row.requested_work is None, (
+        "a pending task that only restates the key request describes no work after the save"
+    )
+
+    task = "once TOGGL_API_TOKEN is saved, run /root/work/toggl_report.py"
+    task_posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9311", posted=task_posted)
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_work",
+        agent_name="daimon",
+        key="TOGGL_API_TOKEN",
+        purpose="tracking time",
+        channel_id="222",
+        pending_task=task,
+    )
+    task_row = await peek_credential_request(db_session, token=_token_from_posted(task_posted))
+    assert task_row is not None, "the minted token must resolve to the created row"
+    assert task_row.requested_work == task, (
+        "a task naming work beyond the save is kept even when it repeats the key name"
+    )
+
+
 async def test_request_repo_binding_packs_branch_into_target(
     committing_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,

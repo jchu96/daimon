@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Final
 from urllib.parse import urlparse
 
 from anthropic.types.beta import BetaManagedAgentsAgent
@@ -82,8 +82,33 @@ _POSIX_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 _PENDING_TASK_DESCRIPTION = (
-    "The task that is waiting on this input, in the person's words, or omit "
-    "when they only asked to save it."
+    "The work that should run once the value is saved, in the person's words "
+    "— a script, a file, a question. Omit it when they only asked to save "
+    "or replace the key; the request itself is never a task."
+)
+
+#: Words that mark work beyond the save itself. A `pending_task` that names the
+#: key, server or repo but carries none of these is the request restated, not a
+#: task waiting on it.
+_WORK_WORDS: Final[tuple[str, ...]] = (
+    "run",
+    "finish",
+    "append",
+    "write",
+    "fetch",
+    "pull",
+    "analy",
+    "plot",
+    "report",
+    "build",
+    "test",
+    "deploy",
+    "continue",
+    "update",
+    "generate",
+    "compute",
+    "query",
+    "summar",
 )
 
 #: What the model should say once the card is up. The card already carries the
@@ -146,9 +171,23 @@ def _bounded_pending_task(pending_task: str | None, *, echoes: tuple[str, ...]) 
     string; the slice is the caller's half of that contract (the sanitizer
     deliberately does not truncate). The echoes are the agent name and the
     target, the two strings a model restates instead of describing work.
+
+    On top of that sits a heuristic backstop for a save-only request: text that
+    names one of those and carries no word signalling work beyond the save
+    ("give daimon a HIGGSFIELD_API_KEY so people can try it here") is the ask
+    itself, and persisting it would buy a billed continuation for a request
+    that ended at the card. The guidance in `defaults/` is the rule; this only
+    catches the case where the model passed the ask back anyway. Text that does
+    name work is kept even when it repeats the key name ("once
+    TOGGL_API_TOKEN is saved, run /root/work/toggl_report.py").
     """
     work = sanitize_requested_work(pending_task, echoes=echoes)
     if work is None:
+        return None
+    normalized = work.lower()
+    names_a_target = any(echo.strip().lower() in normalized for echo in echoes if echo.strip())
+    describes_work = any(word in normalized for word in _WORK_WORDS)
+    if names_a_target and not describes_work:
         return None
     return work[:MAX_REQUESTED_WORK]
 
