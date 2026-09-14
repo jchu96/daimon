@@ -60,6 +60,7 @@ from daimon.adapters.slack.credential_requests import (
     evaluate_credential_submission,
     handle_credential_request_click,
     run_env_credential_submission,
+    run_env_file_credential_submission,
     run_mcp_credential_submission,
     run_repo_bind_credential_submission,
     run_skill_repo_credential_submission,
@@ -116,6 +117,7 @@ from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.slack_oauth import build_slack_connect_url
+from daimon.core.stores.credential_requests import peek_credential_request
 from daimon.core.stores.domain import Role, TaskContinuationRow
 from daimon.core.stores.slack_bot_tokens import get_slack_bot_token
 from daimon.core.stores.slack_connect_prompts import mark_connect_prompted, was_connect_prompted
@@ -637,23 +639,57 @@ class SlackApp:
                         _team: str = str(cred_team.get("id") or ""),
                         _user: str = str(cred_user.get("id") or ""),
                     ) -> None:
+                        async def _dispatch_continuations() -> None:
+                            """Run whatever the just-saved value unblocked.
+
+                            Addressed from the request row, never from the
+                            form: the modal carries routing handles only, and
+                            the thread that is waiting is the one the request
+                            was minted in, which may not be where the form
+                            was submitted from.
+                            """
+                            async with self.runtime.sessionmaker() as _session:
+                                _row = await peek_credential_request(_session, token=_d.token)
+                            if _row is None or _row.origin_thread_id is None:
+                                return
+                            _client = await resolve_web_client(self.runtime, team_id=_team)
+                            if _client is None:
+                                return
+                            await self.dispatch_continuations_in_thread(
+                                web_client=_client,
+                                tenant_id=_row.tenant_id,
+                                channel=_row.parent_channel_id or _row.channel_id,
+                                thread_id=_row.origin_thread_id,
+                                account_id=_row.account_id,
+                            )
+
                         common: dict[str, Any] = {
                             "team_id": _team,
                             "user_id": _user,
                             "channel_id": _d.channel_id,
                             "message_ts": _d.message_ts,
                             "token": _d.token,
-                            "value": _d.value,
+                            "dispatch_continuations": _dispatch_continuations,
                         }
                         if _d.kind == "env":
-                            await run_env_credential_submission(self.runtime, **common)
+                            await run_env_credential_submission(
+                                self.runtime, value=_d.value, **common
+                            )
+                        elif _d.kind == "env_file":
+                            await run_env_file_credential_submission(
+                                self.runtime, file_id=_d.file_id or "", **common
+                            )
                         elif _d.kind == "mcp":
-                            await run_mcp_credential_submission(self.runtime, **common)
+                            await run_mcp_credential_submission(
+                                self.runtime, value=_d.value, **common
+                            )
                         elif _d.kind == "skill_repo":
-                            await run_skill_repo_credential_submission(self.runtime, **common)
+                            await run_skill_repo_credential_submission(
+                                self.runtime, value=_d.value, **common
+                            )
                         elif _d.kind == "repo":
                             await run_repo_bind_credential_submission(
-                                self.runtime, branch=_d.branch, **common
+                                self.runtime, value=_d.value, **common
                             )
                         else:
                             log.info("slack.on_request.unknown_credential_kind", kind=_d.kind)

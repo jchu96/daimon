@@ -110,6 +110,7 @@ from daimon.adapters.slack.setup_conversations import (
     setup_link,
     setup_reply_button,
 )
+from daimon.core.constants import DEFAULT_AGENT_MODEL
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import (
     find_agent_by_daimon_tag,
@@ -119,6 +120,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED, MA_METADATA_K
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.mcp_auth import mint_agent_mcp_token
+from daimon.core.models_catalog import list_model_choices
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.scope import (
     ChannelScopeRef,
@@ -152,6 +154,31 @@ _BUILTIN_AGENT_DELETE_MESSAGE = (
 def _new_request_id() -> str:
     """Generate a short opaque request ID for error cross-referencing."""
     return str(uuid.uuid4())[:8]
+
+
+def _build_model_select_options() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Block Kit ``static_select`` options for the New agent form's Model field.
+
+    views.py stays free of ``daimon.core`` imports (module docstring), so the
+    catalog lookup happens here and is handed down as plain option dicts —
+    Task 4E's real model select, not a handwritten model ID.
+    """
+    options: list[dict[str, Any]] = []
+    initial_option: dict[str, Any] | None = None
+    for choice in list_model_choices(default=DEFAULT_AGENT_MODEL):
+        option: dict[str, Any] = {
+            "text": {"type": "plain_text", "text": choice.label},
+            "value": choice.id,
+        }
+        if choice.description:
+            option["description"] = {"type": "plain_text", "text": choice.description}
+        options.append(option)
+        if choice.is_default:
+            initial_option = option
+    assert initial_option is not None, (
+        "list_model_choices always flags exactly one entry as the default"
+    )
+    return options, initial_option
 
 
 # ---------------------------------------------------------------------------
@@ -1417,12 +1444,15 @@ async def handle_agent_setup_action(runtime: SlackRuntime, payload: dict[str, An
         # creating an unscoped agent is not tenant-wide blast radius.
         # -----------------------------------------------------------------------
         elif action_id == "agent_setup__new":
+            model_options, initial_model_option = _build_model_select_options()
             await client.views_push(  # pyright: ignore[reportUnknownMemberType]
                 trigger_id=payload.get("trigger_id") or "",
                 view=build_l3_new_agent_form(
                     team_id=team_id,
                     channel_id=channel_id,
                     parent_section=None,
+                    model_options=model_options,
+                    initial_model_option=initial_model_option,
                 ),
             )
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -169,4 +170,97 @@ class NotAModal(discord.ui.View):
 """
     assert _rules(source) == [], (
         "a class that does not subclass Modal must produce no findings whatever it contains"
+    )
+
+
+def test_label_wrapped_text_input_without_its_own_label_passes() -> None:
+    source = """
+class Private(discord.ui.Modal, title="Private"):
+    def __init__(self) -> None:
+        self.add_item(
+            discord.ui.Label(
+                text="Value",
+                component=discord.ui.TextInput(required=True, max_length=4000),
+            )
+        )
+"""
+    assert _rules(source) == [], (
+        "a Label is how an input is labelled from discord.py 2.6 on, so the TextInput "
+        "inside one must not be reported as missing a (deprecated) label kwarg"
+    )
+
+
+def test_bare_text_input_without_a_label_is_still_flagged_beside_a_labelled_one() -> None:
+    source = """
+class Mixed(discord.ui.Modal, title="Mixed"):
+    def __init__(self) -> None:
+        self.add_item(discord.ui.Label(text="Value", component=discord.ui.TextInput()))
+        self.add_item(discord.ui.TextInput())
+"""
+    assert _rules(source) == ["discord/missing-label"], (
+        "only the input actually written inside a Label is labelled; a second, bare one "
+        "must still be flagged"
+    )
+
+
+def test_long_label_text_flagged() -> None:
+    long_text = "x" * 46
+    source = f"""
+class LongLabelText(discord.ui.Modal, title="Long"):
+    def __init__(self) -> None:
+        self.add_item(discord.ui.Label(text="{long_text}", component=discord.ui.TextInput()))
+"""
+    assert _rules(source) == ["discord/label-text-too-long"], (
+        "46 codepoints exceeds Discord's 45-character cap on Label text"
+    )
+
+
+def test_label_text_at_the_cap_passes() -> None:
+    at_cap = "x" * 45
+    source = f"""
+class LabelTextAtCap(discord.ui.Modal, title="At cap"):
+    def __init__(self) -> None:
+        self.add_item(discord.ui.Label(text="{at_cap}", component=discord.ui.TextInput()))
+"""
+    assert _rules(source) == [], (
+        "45 codepoints is Discord's exact cap; the boundary pair guards the off-by-one"
+    )
+
+
+def test_long_label_description_flagged() -> None:
+    long_description = "d" * 101
+    source = f"""
+class LongDescription(discord.ui.Modal, title="Long"):
+    def __init__(self) -> None:
+        self.add_item(
+            discord.ui.Label(
+                text="Token",
+                description="{long_description}",
+                component=discord.ui.TextInput(),
+            )
+        )
+"""
+    assert _rules(source) == ["discord/label-description-too-long"], (
+        "101 codepoints exceeds Discord's 100-character cap on a Label description"
+    )
+
+
+def test_non_literal_label_text_is_reported_informationally() -> None:
+    source = """
+class DynamicLabel(discord.ui.Modal, title="Dynamic"):
+    def __init__(self, name: str) -> None:
+        self.add_item(discord.ui.Label(text=name, component=discord.ui.TextInput()))
+"""
+    assert _rules(source) == ["discord/non-literal-label-text"], (
+        "a computed Label text cannot be measured here, so it is reported but not failed"
+    )
+
+
+def test_non_literal_label_text_is_not_a_failing_rule() -> None:
+    informational = "discord/non-literal-label-text"
+    failing_source = inspect.getsource(lint_discord_modals.main)
+
+    assert f'"{informational}"' not in failing_source, (
+        "an unmeasurable Label text is information, not a build failure -- the failing set "
+        "must not list it"
     )

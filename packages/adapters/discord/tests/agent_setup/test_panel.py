@@ -189,12 +189,12 @@ def test_build_panel_container_without_thumbnail_uses_text_display(account_id: u
 
 
 def test_build_panel_container_vitals_contains_model(account_id: uuid.UUID) -> None:
-    """The header subtext (vitals line) must contain the agent's model."""
+    """The header subtext (vitals line) must contain the agent's model display name."""
     selected = _entry("bot", model="claude-opus-4-8")
     state = PanelState(roster=[selected], selected=selected, account_id=account_id)
     container = build_panel_container(state, thumbnail_url=None)
     text = _container_text(container)
-    assert "claude-opus-4-8" in text, "vitals subtext must include the agent model"
+    assert "Opus 4.8" in text, "vitals subtext must show the model's familiar display name"
 
 
 # ---------------------------------------------------------------------------
@@ -1732,3 +1732,181 @@ async def test_panel_member_row_is_still_usable_by_a_non_admin(account_id: uuid.
         "a non-admin must still reach the New agent modal"
     )
     interaction.response.send_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# NewAgentModal: real model select (task 4E)
+# ---------------------------------------------------------------------------
+
+
+def _new_agent_modal(account_id: uuid.UUID, *, runtime: Any = None) -> Any:
+    from daimon.adapters.discord.agent_setup.panel import NewAgentModal
+
+    state = PanelState(roster=[], selected=None, account_id=account_id)
+    return NewAgentModal(state, runtime=runtime or _make_runtime(), allowed_user_id=42)
+
+
+def test_new_agent_modal_has_three_children(account_id: uuid.UUID) -> None:
+    """Name, purpose and model are the modal's only three top-level components."""
+    modal = _new_agent_modal(account_id)
+    assert len(modal.children) == 3, "NewAgentModal must have exactly 3 top-level components"
+
+
+def test_new_agent_modal_model_select_options_match_catalog(account_id: uuid.UUID) -> None:
+    from daimon.core.constants import DEFAULT_AGENT_MODEL
+    from daimon.core.models_catalog import list_model_choices
+
+    modal = _new_agent_modal(account_id)
+    model_field = modal.model_label.component
+    assert isinstance(model_field, discord.ui.Select), "Model field must be a Select"
+
+    expected = list_model_choices(default=DEFAULT_AGENT_MODEL)
+    assert len(model_field.options) == len(expected), (
+        "the Select must offer exactly the catalog's choices"
+    )
+    for option, choice in zip(model_field.options, expected, strict=True):
+        assert option.value == choice.id, "option value must be the model id"
+        assert option.label == choice.label, "option label must be the catalog display name"
+        assert option.description == choice.description, (
+            "option description must match the catalog entry"
+        )
+        assert option.default == choice.is_default, (
+            "option default flag must match the catalog's is_default"
+        )
+
+
+def test_new_agent_modal_default_option_preselected(account_id: uuid.UUID) -> None:
+    from daimon.core.constants import DEFAULT_AGENT_MODEL
+
+    modal = _new_agent_modal(account_id)
+    model_field = modal.model_label.component
+    assert isinstance(model_field, discord.ui.Select), "Model field must be a Select"
+
+    default_options = [o for o in model_field.options if o.default]
+    assert len(default_options) == 1, "exactly one option must be preselected"
+    assert default_options[0].value == DEFAULT_AGENT_MODEL, (
+        "the preselected option must be the configured default model"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_agent_modal_submit_rejects_retired_model_id(
+    monkeypatch: pytest.MonkeyPatch, account_id: uuid.UUID
+) -> None:
+    """A stale client can still submit a retired model id; validate_model_id must refuse it."""
+    from daimon.adapters.discord.agent_setup import panel as panel_mod
+
+    create_called = False
+
+    async def fake_create_blank_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal create_called
+        create_called = True
+        return MagicMock()
+
+    monkeypatch.setattr(panel_mod, "create_blank_agent", fake_create_blank_agent)
+
+    modal = _new_agent_modal(account_id)
+    name_field = modal.name_label.component
+    assert isinstance(name_field, discord.ui.TextInput)
+    name_field._value = "churn-explorer"  # pyright: ignore[reportPrivateUsage]
+    model_field = modal.model_label.component
+    assert isinstance(model_field, discord.ui.Select)
+    model_field._values = ["claude-retired-99"]  # pyright: ignore[reportPrivateUsage]
+
+    interaction = MagicMock()
+    interaction.user.id = 42
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+
+    await modal.on_submit(interaction)
+
+    interaction.response.send_message.assert_called_once()
+    interaction.response.defer.assert_not_called()
+    assert not create_called, "a retired model id must never reach create_blank_agent"
+
+
+def test_vitals_subtext_shows_display_name_when_reachable(account_id: uuid.UUID) -> None:
+    from daimon.core.scope import DeploymentDefault
+
+    selected = _entry("bot", model="claude-opus-4-8")
+    state = PanelState(
+        roster=[selected],
+        selected=selected,
+        account_id=account_id,
+        deployment_default=DeploymentDefault(agent_name="bot"),
+    )
+    container = build_panel_container(state, thumbnail_url=None)
+    text = _container_text(container)
+    assert "Opus 4.8" in text, "vitals subtext must show the model's display name"
+    assert "Not answering" not in text, "a reachable agent must not show the not-answering line"
+
+
+def test_vitals_subtext_shows_not_answering_when_unreachable(account_id: uuid.UUID) -> None:
+    selected = _entry("bot", model="claude-opus-4-8")
+    state = PanelState(roster=[selected], selected=selected, account_id=account_id)
+    container = build_panel_container(state, thumbnail_url=None)
+    text = _container_text(container)
+    assert "Opus 4.8" in text, "vitals subtext must still show the model's display name"
+    assert "Not answering in any channel yet" in text, (
+        "an agent no channel/tenant/deployment default resolves to must say so"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_button_targets_newly_created_agent(
+    monkeypatch: pytest.MonkeyPatch, account_id: uuid.UUID
+) -> None:
+    """The 💬 Set up with Daimon button must carry the just-created agent as its target."""
+    from daimon.adapters.discord.agent_setup import panel as panel_mod
+
+    captured: dict[str, Any] = {}
+
+    async def fake_create_blank_agent(*args: Any, **kwargs: Any) -> Any:
+        return MagicMock(anthropic_id="ag_new")
+
+    async def fake_load_tenant_roster(*args: Any, **kwargs: Any) -> list[RosterEntry]:
+        return [
+            RosterEntry(
+                name="churn-explorer",
+                model="claude-sonnet-5",
+                spec=AgentSpec(name="churn-explorer", model="claude-sonnet-5", system=None),
+                ma_agent_id="ag_new",
+            )
+        ]
+
+    async def fake_open_setup_conversation(
+        interaction: Any, *, runtime: Any, state: PanelState
+    ) -> None:
+        captured["selected_name"] = state.selected.name if state.selected else None
+
+    monkeypatch.setattr(panel_mod, "create_blank_agent", fake_create_blank_agent)
+    monkeypatch.setattr(panel_mod, "load_tenant_roster", fake_load_tenant_roster)
+    monkeypatch.setattr(panel_mod, "_resolve_tenant", AsyncMock(return_value=uuid.UUID(int=0)))
+    monkeypatch.setattr(panel_mod, "open_setup_conversation", fake_open_setup_conversation)
+
+    modal = _new_agent_modal(account_id, runtime=MagicMock())
+    name_field = modal.name_label.component
+    assert isinstance(name_field, discord.ui.TextInput)
+    name_field._value = "churn-explorer"  # pyright: ignore[reportPrivateUsage]
+    model_field = modal.model_label.component
+    assert isinstance(model_field, discord.ui.Select)
+    model_field._values = ["claude-sonnet-5"]  # pyright: ignore[reportPrivateUsage]
+
+    interaction = MagicMock()
+    interaction.user.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await modal.on_submit(interaction)
+
+    assert modal.state.selected is not None, "creation must select the new agent"
+    assert modal.state.selected.name == "churn-explorer"
+
+    setup_interaction = MagicMock()
+    setup_interaction.response.defer = AsyncMock()
+    view = panel_mod.AgentSetupView(modal.state, runtime=modal.runtime, allowed_user_id=42)
+    await view._on_setup_conversation(setup_interaction)  # pyright: ignore[reportPrivateUsage]
+
+    assert captured["selected_name"] == "churn-explorer", (
+        "Set up with Daimon must carry the newly created agent as its target"
+    )

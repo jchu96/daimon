@@ -144,10 +144,16 @@ async def test_new_agent_calls_reconcile_with_blank_spec_and_account_id(
     )
 
     modal = NewAgentModal(state, runtime=runtime, allowed_user_id=42)
-    # Simulate the user typing into the TextInput components
-    modal.name_in._value = "research-bot"  # pyright: ignore[reportPrivateUsage]  # TextInput private value
-    modal.prompt_in._value = "be helpful"  # pyright: ignore[reportPrivateUsage]
-    modal.model_in._value = "claude-sonnet-4-6"  # pyright: ignore[reportPrivateUsage]
+    # Simulate the user typing into / selecting the Label-wrapped components.
+    name_field = modal.name_label.component
+    assert isinstance(name_field, discord.ui.TextInput)
+    name_field._value = "research-bot"  # pyright: ignore[reportPrivateUsage]  # TextInput private value
+    prompt_field = modal.prompt_label.component
+    assert isinstance(prompt_field, discord.ui.TextInput)
+    prompt_field._value = "be helpful"  # pyright: ignore[reportPrivateUsage]
+    model_field = modal.model_label.component
+    assert isinstance(model_field, discord.ui.Select)
+    model_field._values = ["claude-sonnet-4-6"]  # pyright: ignore[reportPrivateUsage]  # Select private value
 
     interaction = MagicMock()
     interaction.user.id = 42

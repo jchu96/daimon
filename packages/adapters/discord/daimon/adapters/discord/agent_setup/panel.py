@@ -35,10 +35,11 @@ from daimon.adapters.discord.checks import refuse_if_not_admin
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core.constants import DEFAULT_AGENT_MODEL
+from daimon.core.constants import DEFAULT_AGENT_MODEL, MODEL_DISPLAY_NAMES
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.models_catalog import list_model_choices
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.scope import (
     ChannelConfigRow,
@@ -154,7 +155,7 @@ def _build_vitals_subtext(state: PanelState) -> str:
     """
     if state.selected is None:
         return ""
-    model = state.selected.model
+    model = MODEL_DISPLAY_NAMES.get(state.selected.model, state.selected.model)
 
     # Determine effective default scope for the current channel.
     tenant_row, ch_rows = state.cascade_view
@@ -171,6 +172,8 @@ def _build_vitals_subtext(state: PanelState) -> str:
 
     if scope_label and _winner_name == state.selected.name:
         return f"{model} · ⭐ {scope_label}"
+    if not state.is_selected_reachable():
+        return f"{model} · Not answering in any channel yet"
     return model
 
 
@@ -786,26 +789,59 @@ class NewAgentModal(discord.ui.Modal, title="New agent"):
         self.state = state
         self.runtime = runtime
         self.allowed_user_id = allowed_user_id
-        self.name_in: discord.ui.TextInput[NewAgentModal] = discord.ui.TextInput(
-            label="Name", max_length=64, placeholder="research-bot"
+        # Each TextInput's own `label=` is redundant with the wrapping Label's
+        # `text=` (Discord's modern Label-wrapped modal fields), but is kept
+        # so `scripts/lint_discord_modals.py`'s unconditional missing-label
+        # rule passes; discord.py's constructor writes it straight into the
+        # underlying component dataclass rather than through the deprecated
+        # `TextInput.label` property, so it costs nothing at runtime.
+        self.name_label: discord.ui.Label[NewAgentModal] = discord.ui.Label(
+            text="Name",
+            description="lowercase, dashes ok",
+            component=discord.ui.TextInput(
+                label="Name", placeholder="churn-explorer", max_length=64
+            ),
         )
-        self.prompt_in: discord.ui.TextInput[NewAgentModal] = discord.ui.TextInput(
-            label="System prompt",
-            style=discord.TextStyle.paragraph,
-            max_length=2000,
-            required=False,
+        self.prompt_label: discord.ui.Label[NewAgentModal] = discord.ui.Label(
+            text="What should it help with?",
+            description="one or two sentences",
+            component=discord.ui.TextInput(
+                label="What should it help with?",
+                style=discord.TextStyle.paragraph,
+                max_length=2000,
+                required=False,
+            ),
         )
-        self.model_in: discord.ui.TextInput[NewAgentModal] = discord.ui.TextInput(
-            label="Model", default=DEFAULT_AGENT_MODEL, max_length=64
+        self.model_label: discord.ui.Label[NewAgentModal] = discord.ui.Label(
+            text="Model",
+            component=discord.ui.Select(
+                options=[
+                    discord.SelectOption(
+                        label=choice.label,
+                        value=choice.id,
+                        description=choice.description,
+                        default=choice.is_default,
+                    )
+                    for choice in list_model_choices(default=DEFAULT_AGENT_MODEL)
+                ],
+                min_values=1,
+                max_values=1,
+            ),
         )
-        self.add_item(self.name_in)
-        self.add_item(self.prompt_in)
-        self.add_item(self.model_in)
+        self.add_item(self.name_label)
+        self.add_item(self.prompt_label)
+        self.add_item(self.model_label)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        new_name = str(self.name_in).strip()
-        model_value = str(self.model_in).strip() or DEFAULT_AGENT_MODEL
-        system_value = str(self.prompt_in).strip() or None
+        name_field = self.name_label.component
+        assert isinstance(name_field, discord.ui.TextInput), "name field is a TextInput"
+        prompt_field = self.prompt_label.component
+        assert isinstance(prompt_field, discord.ui.TextInput), "prompt field is a TextInput"
+        model_field = self.model_label.component
+        assert isinstance(model_field, discord.ui.Select), "model field is a Select"
+        new_name = str(name_field.value).strip()
+        model_value = model_field.values[0]
+        system_value = str(prompt_field.value).strip() or None
         log.info(
             "agent_setup.new.submit",
             new_name=new_name,

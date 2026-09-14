@@ -48,6 +48,7 @@ import anthropic
 import structlog
 from daimon.adapters.slack.agent_setup import gate
 from daimon.adapters.slack.agent_setup.state import decode_private_metadata
+from daimon.adapters.slack.agent_setup.views import build_new_agent_created_blocks
 from daimon.adapters.slack.agent_setup.write import (
     call_reconcile_for_panel,
     create_blank_agent,
@@ -59,8 +60,7 @@ from daimon.adapters.slack.agent_setup.write import (
     store_inline_pat,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.adapters.slack.setup_conversations import setup_button
-from daimon.core.constants import DEFAULT_AGENT_MODEL
+from daimon.core.constants import DEFAULT_AGENT_MODEL, MODEL_DISPLAY_NAMES
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
@@ -158,6 +158,14 @@ def _get_value(values: dict[str, Any], block_id: str, action_id: str) -> str:
     return str(element.get("value") or "").strip()
 
 
+def _get_selected_option_value(values: dict[str, Any], block_id: str, action_id: str) -> str:
+    """Extract a static_select's selected option value from state.values."""
+    block: dict[str, Any] = values.get(block_id) or {}
+    element: dict[str, Any] = block.get(action_id) or {}
+    selected: dict[str, Any] = element.get("selected_option") or {}
+    return str(selected.get("value") or "").strip()
+
+
 def _get_user_id(payload: dict[str, Any]) -> str:
     user: dict[str, Any] = payload.get("user") or {}
     return str(user.get("id") or "")
@@ -223,7 +231,12 @@ def evaluate_new_agent_submission(payload: dict[str, Any]) -> SubmitDecision:
     values = _get_values(payload)
 
     name = _get_value(values, "new_agent__name", "new_agent__name")
-    model = _get_value(values, "new_agent__model", "new_agent__model")
+    # Task 4E: a real static_select over the model catalog, not free text —
+    # read the selected option's value rather than a plain_text_input value.
+    # A stale client (an already-open form re-submitted after a catalog
+    # change) can still send an id outside the allow-list, so this stays
+    # validated exactly like the old free-text field was.
+    model = _get_selected_option_value(values, "new_agent__model", "new_agent__model")
     system = _get_value(values, "new_agent__prompt", "new_agent__prompt")
 
     if not _AGENT_NAME_RE.match(name):
@@ -234,10 +247,10 @@ def evaluate_new_agent_submission(payload: dict[str, Any]) -> SubmitDecision:
             payload=payload,
         )
 
-    if model and model not in _allowed_model_ids():
+    if not model or model not in _allowed_model_ids():
         return _error_decision(
             "new_agent__model",
-            f'Unknown model "{model}". Leave blank to use the default.',
+            f'Unknown model "{model}". Choose one from the list.',
             meta=meta,
             payload=payload,
         )
@@ -247,7 +260,7 @@ def evaluate_new_agent_submission(payload: dict[str, Any]) -> SubmitDecision:
         payload=payload,
         extra={
             "name": name,
-            "model": model or DEFAULT_AGENT_MODEL,
+            "model": model,
             "system": system or None,
         },
     )
@@ -616,17 +629,17 @@ async def run_new_agent_submission(
             team_id=team_id,
             agent_name=extra.get("name"),
         )
+        created_model = str(extra.get("model") or DEFAULT_AGENT_MODEL)
+        agent_name = str(extra.get("name") or "")
         await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id,
             user=user_id,
-            text=f":white_check_mark: Created agent `{extra.get('name')}`.",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"Created agent `{extra.get('name')}`."},
-                },
-                setup_button(outcome.anthropic_id),
-            ],
+            text=f":white_check_mark: Created agent `{agent_name}`.",
+            blocks=build_new_agent_created_blocks(
+                agent_name=agent_name,
+                model_display_name=MODEL_DISPLAY_NAMES.get(created_model, created_model),
+                target_ma_agent_id=outcome.anthropic_id,
+            ),
         )
     except (DaimonError, anthropic.APIError, SlackApiError, SQLAlchemyError) as exc:
         log.error("slack.agent_setup.new_agent_failed", team_id=team_id, exc_info=exc)

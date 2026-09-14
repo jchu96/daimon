@@ -37,6 +37,7 @@ __all__ = [
     "build_skills_section",
     "build_mcps_section",
     "build_secrets_section",
+    "build_new_agent_created_blocks",
     "build_l3_new_agent_form",
     "build_l3_fork_agent_form",
     "build_l3_edit_agent_form",
@@ -882,20 +883,73 @@ def build_secrets_section(
 # ---------------------------------------------------------------------------
 
 
+def build_new_agent_created_blocks(
+    *,
+    agent_name: str,
+    model_display_name: str,
+    target_ma_agent_id: str | None,
+) -> list[dict[str, Any]]:
+    """Build the post-create confirmation blocks (New agent → Details, Task 4E).
+
+    Shown as a channel ephemeral once ``create_blank_agent`` succeeds: the
+    agent's name and model, the same "not answering anywhere yet" fact the
+    design's Details view states for an unrouted agent, and the same
+    ``setup_button`` shown on every agent's Details — carrying the newly
+    created agent, not whatever was previously selected.
+
+    Args:
+        agent_name:          Name of the just-created agent.
+        model_display_name:  Familiar display name for the agent's model
+                              (caller resolves via ``MODEL_DISPLAY_NAMES`` —
+                              this module stays ``daimon.core``-free).
+        target_ma_agent_id:  The new agent's MA id, for the setup button's target.
+
+    Returns:
+        Block Kit blocks safe to pass to ``chat.postEphemeral``.
+    """
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":white_check_mark: Created agent `{escape_mrkdwn(agent_name)}`.\n"
+                    f"*Model:* {escape_mrkdwn(model_display_name)}\n"
+                    "Not answering in any channel yet."
+                ),
+            },
+        },
+        setup_button(target_ma_agent_id),
+    ]
+
+
 def build_l3_new_agent_form(
     *,
     team_id: str,
     channel_id: str,
+    model_options: list[dict[str, Any]],
+    initial_model_option: dict[str, Any],
     agent_name: str = "",
     parent_section: str | None = None,
 ) -> dict[str, Any]:
     """Build the New Agent input form (L3 push).
 
+    The model field is a real ``static_select`` over the supported catalog
+    (Task 4E) rather than a handwritten model ID — this module stays
+    ``daimon.core``-free (module docstring), so the caller builds
+    ``model_options``/``initial_model_option`` from
+    ``daimon.core.models_catalog.list_model_choices`` and passes them in as
+    plain Block Kit option dicts.
+
     Args:
-        team_id:        Slack workspace ID.
-        channel_id:     Invoking channel.
-        agent_name:     Unused; reserved for consistency. Pass empty string.
-        parent_section: Which L2 section to update after pop (typically None -> L1).
+        team_id:               Slack workspace ID.
+        channel_id:            Invoking channel.
+        model_options:         Block Kit ``static_select`` options, one per
+                                catalog model choice.
+        initial_model_option:  The option (from ``model_options``) matching
+                                the configured default model.
+        agent_name:            Unused; reserved for consistency. Pass empty string.
+        parent_section:        Which L2 section to update after pop (typically None -> L1).
 
     Returns:
         A modal view dict for ``views.push``.
@@ -928,7 +982,7 @@ def build_l3_new_agent_form(
             {
                 "type": "input",
                 "block_id": "new_agent__prompt",
-                "label": {"type": "plain_text", "text": "System prompt"},
+                "label": {"type": "plain_text", "text": "What should it help with?"},
                 "optional": True,
                 "element": {
                     "type": "plain_text_input",
@@ -936,22 +990,19 @@ def build_l3_new_agent_form(
                     "multiline": True,
                     "placeholder": {
                         "type": "plain_text",
-                        "text": "You are a helpful assistant…",
+                        "text": "One or two sentences…",
                     },
                 },
             },
             {
                 "type": "input",
                 "block_id": "new_agent__model",
-                "label": {"type": "plain_text", "text": "Model ID"},
-                "optional": True,
+                "label": {"type": "plain_text", "text": "Model"},
                 "element": {
-                    "type": "plain_text_input",
+                    "type": "static_select",
                     "action_id": "new_agent__model",
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "Leave blank for default",
-                    },
+                    "options": model_options,
+                    "initial_option": initial_model_option,
                 },
             },
         ],

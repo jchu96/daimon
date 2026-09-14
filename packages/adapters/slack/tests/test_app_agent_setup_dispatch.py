@@ -138,7 +138,12 @@ def _make_new_agent_view_submission_payload(*, name: str) -> dict[str, Any]:
                         "new_agent__name": {"value": name},
                     },
                     "new_agent__model": {
-                        "new_agent__model": {"value": ""},
+                        "new_agent__model": {
+                            "selected_option": {
+                                "text": {"type": "plain_text", "text": "claude-sonnet-5"},
+                                "value": "claude-sonnet-5",
+                            },
+                        },
                     },
                     "new_agent__prompt": {
                         "new_agent__prompt": {"value": ""},
