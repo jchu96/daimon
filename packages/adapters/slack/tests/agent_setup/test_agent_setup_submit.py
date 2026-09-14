@@ -207,6 +207,18 @@ def _input_value(block_id: str, action_id: str, value: str) -> dict[str, Any]:
     return {block_id: {action_id: {"type": "plain_text_input", "value": value}}}
 
 
+def _select_value(block_id: str, action_id: str, value: str) -> dict[str, Any]:
+    """Build a minimal state.values entry for a static_select's selected_option."""
+    return {
+        block_id: {
+            action_id: {
+                "type": "static_select",
+                "selected_option": {"text": {"type": "plain_text", "text": value}, "value": value},
+            }
+        }
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pure evaluator tests — evaluate_new_agent_submission
 # ---------------------------------------------------------------------------
@@ -232,7 +244,10 @@ def test_evaluate_new_agent_submission_when_name_invalid_returns_errors_keyed_ne
 
 
 def test_evaluate_new_agent_submission_when_name_valid_returns_clear_and_proceed() -> None:
-    values = _input_value("new_agent__name", "new_agent__name", "my-agent")
+    values = {
+        **_input_value("new_agent__name", "new_agent__name", "my-agent"),
+        **_select_value("new_agent__model", "new_agent__model", "claude-sonnet-5"),
+    }
     payload = _payload(callback_id="agent_setup__new_agent", values=values)
 
     decision = evaluate_new_agent_submission(payload)
@@ -242,14 +257,18 @@ def test_evaluate_new_agent_submission_when_name_valid_returns_clear_and_proceed
         "successful new-agent submit should clear (pop to L1)"
     )
     assert decision.extra.get("name") == "my-agent", "name should be carried to extra"
+    assert decision.extra.get("model") == "claude-sonnet-5", (
+        "the selected option's value must be carried to extra"
+    )
 
 
 def test_evaluate_new_agent_submission_when_model_invalid_returns_errors_keyed_new_agent_model() -> (
     None
 ):
+    """A stale client can still submit a retired/unknown model id via the select."""
     values = {
         **_input_value("new_agent__name", "new_agent__name", "valid-name"),
-        **_input_value("new_agent__model", "new_agent__model", "gpt-4-turbo"),
+        **_select_value("new_agent__model", "new_agent__model", "gpt-4-turbo"),
     }
     payload = _payload(callback_id="agent_setup__new_agent", values=values)
 
@@ -260,6 +279,21 @@ def test_evaluate_new_agent_submission_when_model_invalid_returns_errors_keyed_n
     assert "new_agent__model" in errors, (
         "error must be keyed to new_agent__model (the input block_id)"
     )
+
+
+def test_evaluate_new_agent_submission_when_model_missing_returns_errors_keyed_new_agent_model() -> (
+    None
+):
+    """The model select always carries an initial_option in production, but the
+    evaluator must not silently fall back to a default if a value is somehow absent."""
+    values = _input_value("new_agent__name", "new_agent__name", "valid-name")
+    payload = _payload(callback_id="agent_setup__new_agent", values=values)
+
+    decision = evaluate_new_agent_submission(payload)
+
+    assert decision.proceed is False, "a missing model selection must not proceed"
+    errors = decision.response_payload.get("errors", {})
+    assert "new_agent__model" in errors
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +623,14 @@ def _ephemeral_texts(client_fake: Any) -> list[str]:
     ]
 
 
+def _ephemeral_blocks(client_fake: Any) -> list[Any]:
+    ephemeral_key = ("POST", yarl.URL("https://slack.com/api/chat.postEphemeral"))
+    return [
+        call.kwargs["json"].get("blocks", [])
+        for call in client_fake.mock.requests.get(ephemeral_key, [])
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Creation paths, open to every member; and the two per-agent attachment
 # paths, refused for a non-admin on a shared agent — each with an
@@ -621,6 +663,38 @@ async def test_run_new_agent_submission_when_non_admin_creates_agent_with_no_ref
     )
     assert not any("permission" in t for t in texts), (
         "creation must not post a permission-refusal ephemeral"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_new_agent_submission_success_view_shows_detail_and_setup_button(
+    fake_slack_web_client: Any,
+) -> None:
+    """The post-create confirmation must read as the new agent's Details: model
+    display name, the not-answering fact, and Set up with Daimon targeting it."""
+    client_fake: Any = fake_slack_web_client
+    runtime = _build_runtime_no_db()
+
+    await run_new_agent_submission(
+        runtime,
+        client_fake.client,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        view_id="V_SUBMIT_TEST",
+        extra={"name": "churn-explorer", "model": "claude-sonnet-4-6", "system": None},
+    )
+
+    blocks = _ephemeral_blocks(client_fake)
+    assert blocks, "run_new_agent_submission must post an ephemeral with blocks"
+    serialized = json.dumps(blocks[-1])
+    assert "Sonnet" in serialized, "the model's familiar display name must be shown"
+    assert "Not answering in any channel yet" in serialized, (
+        "a just-created agent has no routing yet and must say so, like Details does"
+    )
+    setup_actions = next(b for b in blocks[-1] if b.get("type") == "actions")
+    assert setup_actions["elements"][0]["value"], (
+        "the setup button must carry the newly created agent's MA id as its target"
     )
 
 

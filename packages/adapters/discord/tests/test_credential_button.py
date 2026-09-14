@@ -17,13 +17,26 @@ from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.discord.credential_button import CredentialRequestButton
 from daimon.adapters.discord.credential_modals import (
     EnvCredentialModal,
+    EnvFileModal,
     McpCredentialModal,
     RepoBindModal,
 )
 from daimon.adapters.discord.credential_repo_bind import _SHARED_AGENT_MESSAGE
-from daimon.core.credential_requests import build_button_label, build_custom_id, mint_request_token
+from daimon.core.credential_requests import (
+    ENV_FILE_TARGET,
+    build_button_label,
+    build_custom_id,
+    mint_request_token,
+)
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.posted_controls import (
+    ALREADY_USED_MESSAGE,
+    EXPIRED_HEADLINE,
+    NO_LONGER_VALID_MESSAGE,
+    WRONG_REQUESTER_MESSAGE,
+    expired_message,
+)
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import get_binding
 from daimon.core.stores.credential_requests import (
@@ -106,6 +119,36 @@ def _repo_member_interaction(*, client: Any, guild_id: int = _GUILD_ID) -> Magic
     return interaction
 
 
+def _card_click(*, user_id: str) -> MagicMock:
+    """A click on the card of a `with_card=True` row.
+
+    `is_credential_interaction_valid` compares the thread, the parent channel
+    and the card's own message id against the row, so a click that is meant
+    to reach the expiry branch has to agree with all three.
+    """
+    interaction = _interaction(user_id=user_id, client=MagicMock())
+    interaction.channel_id = 333
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.parent_id = 222
+    interaction.message = MagicMock()
+    interaction.message.id = 444
+    _partial_card(interaction).edit = AsyncMock()
+    return interaction
+
+
+def _partial_card(interaction: MagicMock) -> MagicMock:
+    """The partial message `edit_posted_card` re-renders, off the mock chain."""
+    channel = interaction.client.get_partial_messageable.return_value
+    return channel.get_partial_message.return_value  # pyright: ignore[reportAny]
+
+
+def _card_text(view: discord.ui.LayoutView) -> str:
+    """All text the rendered card shows, newline-joined."""
+    return "\n".join(
+        item.content for item in view.walk_children() if isinstance(item, discord.ui.TextDisplay)
+    )
+
+
 def _match(token: str) -> Any:
     custom_id = build_custom_id(token)
     matched = CredentialRequestButton.__discord_ui_compiled_template__.fullmatch(custom_id)
@@ -116,17 +159,25 @@ def _match(token: str) -> Any:
 def _row(
     *,
     token: str,
-    kind: Literal["env", "mcp", "repo"] = "env",
+    kind: Literal["env", "env_file", "mcp", "repo"] = "env",
     target: str = "OPENAI_API_KEY",
     mcp_server_url: str | None = None,
     requester_platform_user_id: str = _REQUESTER_ID,
+    target_name: str | None = None,
+    responder_name: str | None = None,
     tenant_id: uuid.UUID | None = None,
     agent_id: uuid.UUID | None = None,
     account_id: uuid.UUID | None = None,
     expires_at: datetime | None = None,
     used_at: datetime | None = None,
+    with_card: bool = False,
 ) -> CredentialRequestRow:
-    """Build a CredentialRequestRow in memory -- no DB needed for interaction_check/callback tests."""
+    """Build a CredentialRequestRow in memory -- no DB needed for interaction_check/callback tests.
+
+    `with_card` gives the row the posted card the expiry flip below edits;
+    without those ids there is no message to re-render and the edit is a
+    no-op by design.
+    """
     now = datetime.now(UTC)
     return CredentialRequestRow(
         idempotency_key=uuid.uuid4(),
@@ -138,7 +189,13 @@ def _row(
         target=target,
         mcp_server_url=mcp_server_url,
         requester_platform_user_id=requester_platform_user_id,
-        channel_id="chan-1",
+        channel_id="333" if with_card else "chan-1",
+        platform="discord" if with_card else None,
+        parent_channel_id="222" if with_card else None,
+        origin_thread_id="333" if with_card else None,
+        posted_message_id="444" if with_card else None,
+        target_name=target_name,
+        responder_name=responder_name,
         created_at=now,
         expires_at=expires_at or (now + timedelta(minutes=30)),
         used_at=used_at,
@@ -314,7 +371,9 @@ async def test_interaction_check_unknown_row_sends_ephemeral_and_rejects() -> No
     assert allowed is False, "no row means the click must be rejected"
     interaction.response.send_message.assert_awaited_once()
     message = interaction.response.send_message.call_args.args[0]
-    assert "no longer valid" in message, "unknown-row rejection must tell the user to ask again"
+    assert message == NO_LONGER_VALID_MESSAGE, (
+        "the refusal must be the shared card copy, so Discord and Slack cannot drift"
+    )
 
 
 async def test_interaction_check_wrong_requester_sends_ephemeral_and_rejects() -> None:
@@ -326,13 +385,17 @@ async def test_interaction_check_wrong_requester_sends_ephemeral_and_rejects() -
 
     assert allowed is False, "a non-requester click must be rejected"
     message = interaction.response.send_message.call_args.args[0]
-    assert "someone else" in message, "rejection must indicate the request targeted another user"
+    assert message == WRONG_REQUESTER_MESSAGE, (
+        "the refusal must be the shared card copy, so Discord and Slack cannot drift"
+    )
 
 
 async def test_interaction_check_expired_sends_ephemeral_and_rejects() -> None:
     row = _row(
         token="expiredrow123456789012",
         expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        target_name="research-bot",
+        responder_name="Daimon",
     )
     item = CredentialRequestButton(token=row.token, label="Add credential", request_row=row)
     interaction = _interaction(user_id=_REQUESTER_ID, client=None)
@@ -341,7 +404,13 @@ async def test_interaction_check_expired_sends_ephemeral_and_rejects() -> None:
 
     assert allowed is False, "an expired row must be rejected"
     message = interaction.response.send_message.call_args.args[0]
-    assert "expired" in message, "rejection must say the request expired"
+    assert message == expired_message(
+        kind="env",
+        agent_name="research-bot",
+        responder_name="Daimon",
+        target="OPENAI_API_KEY",
+    ), "a late clicker must be told exactly what the card beside them now says"
+    assert "research-bot" in message, "the way back must name the agent that was being set up"
 
 
 async def test_interaction_check_already_used_sends_ephemeral_and_rejects() -> None:
@@ -353,7 +422,9 @@ async def test_interaction_check_already_used_sends_ephemeral_and_rejects() -> N
 
     assert allowed is False, "an already-used row must be rejected"
     message = interaction.response.send_message.call_args.args[0]
-    assert "already used" in message, "rejection must say the request was already used"
+    assert message == ALREADY_USED_MESSAGE, (
+        "the refusal must be the shared card copy, so Discord and Slack cannot drift"
+    )
 
 
 async def test_interaction_check_allows_requester_with_valid_row_and_sends_nothing() -> None:
@@ -381,6 +452,21 @@ async def test_callback_dispatches_env_modal_for_env_kind() -> None:
     interaction.response.send_modal.assert_awaited_once()
     sent_modal = interaction.response.send_modal.call_args.args[0]
     assert isinstance(sent_modal, EnvCredentialModal), "env-kind rows must open EnvCredentialModal"
+
+
+async def test_callback_dispatches_env_file_modal_for_env_file_kind() -> None:
+    row = _row(token="envfilecallback12345678", kind="env_file", target=ENV_FILE_TARGET)
+    item = CredentialRequestButton(token=row.token, label="Add keys from .env", request_row=row)
+    bot = _fake_bot(MagicMock())
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot)
+
+    await item.callback(interaction)
+
+    interaction.response.send_modal.assert_awaited_once()
+    sent_modal = interaction.response.send_modal.call_args.args[0]
+    assert isinstance(sent_modal, EnvFileModal), (
+        "env_file-kind rows must open the upload form, not the single-value one"
+    )
 
 
 async def test_callback_dispatches_mcp_modal_for_mcp_kind() -> None:
@@ -547,4 +633,60 @@ def test_custom_id_that_does_not_fullmatch_template_never_dispatches() -> None:
     )
     assert pattern.fullmatch(build_custom_id("a" * 20)) is not None, (
         "a well-formed minted custom_id must match the dispatch template"
+    )
+
+
+async def test_expired_click_flips_the_card() -> None:
+    """The one person who could have used this card is the one who can retire it.
+
+    Nothing sweeps expiries, so a card goes stale in the channel with its
+    button still showing. The late click is the event that can still correct
+    it, and the clicker's own refusal must not wait on that edit.
+    """
+    row = _row(
+        token="expiredcard1234567890",
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        target_name="research-bot",
+        responder_name="Daimon",
+        with_card=True,
+    )
+    item = CredentialRequestButton(token=row.token, label="Add credential", request_row=row)
+    interaction = _card_click(user_id=_REQUESTER_ID)
+
+    allowed = await item.interaction_check(interaction)
+
+    assert allowed is False, "an expired row must still be rejected"
+    interaction.client.get_partial_messageable.assert_called_once_with(333)
+    interaction.client.get_partial_messageable.return_value.get_partial_message.assert_called_once_with(
+        444
+    )
+    edit = _partial_card(interaction).edit
+    edit.assert_awaited_once()
+    card = _card_text(edit.call_args.kwargs["view"])
+    assert EXPIRED_HEADLINE in card, "the card must now say the form expired"
+    assert "research-bot" in card, "and name the agent, so the way back is on the card too"
+    refusal = interaction.response.send_message.call_args.args[0]
+    assert all(line in card for line in refusal.split("\n")), (
+        "the card and the late clicker's refusal must say the same thing, line for line "
+        f"(refusal={refusal!r}, card={card!r})"
+    )
+
+
+async def test_wrong_requester_click_does_not_edit() -> None:
+    """Anyone in the channel can click; nobody else may retire the card."""
+    row = _row(
+        token="wrongrequestercard1234",
+        requester_platform_user_id=_REQUESTER_ID,
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        with_card=True,
+    )
+    item = CredentialRequestButton(token=row.token, label="Add credential", request_row=row)
+    interaction = _card_click(user_id=_OTHER_USER_ID)
+
+    allowed = await item.interaction_check(interaction)
+
+    assert allowed is False, "a non-requester click must be rejected"
+    interaction.client.get_partial_messageable.assert_not_called()
+    assert interaction.response.send_message.call_args.args[0] == WRONG_REQUESTER_MESSAGE, (
+        "the wrong clicker is told whose request this is, and changes nothing"
     )

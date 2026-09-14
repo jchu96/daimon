@@ -25,6 +25,7 @@ from daimon.adapters.slack.agent_setup.views import (
     build_l3_paste_secrets_form,
     build_loading_view,
     build_mcps_section,
+    build_new_agent_created_blocks,
     build_repo_auth_section,
     build_secrets_section,
     build_skills_section,
@@ -675,14 +676,91 @@ def _assert_l3_form(
     )
 
 
+def _model_options() -> tuple[list[dict], dict]:  # type: ignore[type-arg]
+    """Block Kit static_select options shaped like actions.py's real catalog lookup."""
+    options = [
+        {"text": {"type": "plain_text", "text": "Sonnet"}, "value": "claude-sonnet-5"},
+        {
+            "text": {"type": "plain_text", "text": "Opus"},
+            "value": "claude-opus-5",
+            "description": {"type": "plain_text", "text": "the default"},
+        },
+    ]
+    return options, options[1]
+
+
 def test_build_l3_new_agent_form_has_correct_structure() -> None:
-    view = build_l3_new_agent_form(team_id="T123", channel_id="C456")
+    model_options, initial_model_option = _model_options()
+    view = build_l3_new_agent_form(
+        team_id="T123",
+        channel_id="C456",
+        model_options=model_options,
+        initial_model_option=initial_model_option,
+    )
     _assert_l3_form(
         view,
         expected_callback_id="agent_setup__new_agent",
         expected_block_ids=["new_agent__name", "new_agent__prompt", "new_agent__model"],
     )
     assert view["submit"]["text"] == "Create", "new agent form submit label must be 'Create'"
+
+
+def test_build_l3_new_agent_form_prompt_label_is_purpose_question() -> None:
+    model_options, initial_model_option = _model_options()
+    view = build_l3_new_agent_form(
+        team_id="T123",
+        channel_id="C456",
+        model_options=model_options,
+        initial_model_option=initial_model_option,
+    )
+    prompt_block = next(b for b in view["blocks"] if b["block_id"] == "new_agent__prompt")
+    assert prompt_block["label"]["text"] == "What should it help with?", (
+        "the prompt field's label must ask what the agent should help with, per the design"
+    )
+
+
+def test_build_l3_new_agent_form_model_field_is_static_select_with_catalog_options() -> None:
+    model_options, initial_model_option = _model_options()
+    view = build_l3_new_agent_form(
+        team_id="T123",
+        channel_id="C456",
+        model_options=model_options,
+        initial_model_option=initial_model_option,
+    )
+    model_block = next(b for b in view["blocks"] if b["block_id"] == "new_agent__model")
+    assert model_block["label"]["text"] == "Model", "the model field's label must be 'Model'"
+    assert "optional" not in model_block or model_block["optional"] is False, (
+        "the model field is a real select with a preselected default, not an optional field"
+    )
+    element = model_block["element"]
+    assert element["type"] == "static_select", (
+        "the model field must be a static_select over the catalog, not free text"
+    )
+    assert element["options"] == model_options, (
+        "the select's options must be exactly what the caller passed in"
+    )
+    assert element["initial_option"] == initial_model_option, (
+        "the configured default model must be preselected"
+    )
+
+
+def test_build_new_agent_created_blocks_shows_not_answering_and_setup_button() -> None:
+    blocks = build_new_agent_created_blocks(
+        agent_name="churn-explorer",
+        model_display_name="Sonnet 5",
+        target_ma_agent_id="ag_new123",
+    )
+    serialized = json.dumps(blocks)
+    assert "churn-explorer" in serialized, "the created agent's name must appear"
+    assert "Sonnet 5" in serialized, "the model's display name must appear"
+    assert "Not answering in any channel yet" in serialized, (
+        "a just-created agent has no routing yet and must say so"
+    )
+    setup_actions = next(b for b in blocks if b.get("type") == "actions")
+    assert setup_actions["elements"][0]["value"] == "ag_new123", (
+        "the setup button must carry the newly created agent as its target"
+    )
+    assert setup_actions["elements"][0]["text"]["text"] == "💬 Set up with Daimon"
 
 
 def test_build_l3_fork_agent_form_has_correct_structure() -> None:

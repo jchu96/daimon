@@ -13,6 +13,12 @@ skill_removed, repo) are covered the same way as unit tests colocated with
 each adapter module (`packages/adapters/discord/tests/...`); this file is the
 cross-adapter parity anchor, not the exhaustive sweep.
 
+A posted control has no ack of its own: its receipt is the card the request
+was posted as, re-rendered in place. So the key-add case below reads the
+card the form edited rather than an ephemeral, and compares it to the same
+renderer call -- the card adds a state marker to the first line and nothing
+else.
+
 Each test function name carries `discord` so the Slack half of this suite
 (added separately, to the same file) never collides with these.
 """
@@ -33,6 +39,7 @@ from daimon.core.credential_requests import mint_request_token
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
+from daimon.core.posted_controls import classify_card_state
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_files import list_agent_files
@@ -99,6 +106,31 @@ def _interaction(*, user_id: int = 100000000000000001, guild_id: int | None = No
     return interaction
 
 
+def _card_interaction(*, user_id: int, guild_id: int) -> MagicMock:
+    """An interaction on the posted card of a request minted with one."""
+    interaction = _interaction(user_id=user_id, guild_id=guild_id)
+    interaction.type = discord.InteractionType.modal_submit
+    interaction.message = None
+    interaction.channel_id = 333
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.parent_id = 222
+    _card_message(interaction).edit = AsyncMock()
+    return interaction
+
+
+def _card_message(interaction: MagicMock) -> MagicMock:
+    channel = interaction.client.get_partial_messageable.return_value
+    return channel.get_partial_message.return_value  # pyright: ignore[reportAny]
+
+
+def _rendered_card(interaction: MagicMock) -> str:
+    """The text of the last card the modal re-rendered."""
+    view = _card_message(interaction).edit.call_args.kwargs["view"]
+    return "\n".join(
+        item.content for item in view.walk_children() if isinstance(item, discord.ui.TextDisplay)
+    )
+
+
 async def test_discord_env_key_add_ack_matches_core_renderer(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -118,12 +150,16 @@ async def test_discord_env_key_add_ack_matches_core_renderer(
             target="STRIPE_KEY",
             mcp_server_url=None,
             requester_platform_user_id=str(requester_user_id),
-            channel_id="chan-1",
+            channel_id="333",
+            platform="discord",
+            parent_channel_id="222",
+            origin_thread_id="333",
+            posted_message_id="444",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
             idempotency_key=uuid.uuid4(),
-            target_ma_agent_id="ag_test",
-            target_name="tester",
-            requested_work=None,
+            target_ma_agent_id=ma_agent_id,
+            target_name="stripe-bot",
+            requested_work="finish the payout reconciliation",
         )
 
     agent = ma_agent(id=ma_agent_id, name="stripe-bot", tenant_id=tenant.id)
@@ -131,16 +167,27 @@ async def test_discord_env_key_add_ack_matches_core_renderer(
     modal = EnvCredentialModal(runtime=runtime, request_row=row)
     modal.value_input._value = "sk_live_do_not_leak"  # pyright: ignore[reportPrivateUsage]
 
-    interaction = _interaction(user_id=requester_user_id, guild_id=int(workspace_id))
+    interaction = _card_interaction(user_id=requester_user_id, guild_id=int(workspace_id))
     await modal.on_submit(interaction)
 
-    posted = interaction.followup.send.call_args.args[0]
+    posted = _rendered_card(interaction)
     expected = render_change_confirmation(
         ConfigurationChange(
             target_name="stripe-bot", kind="key", availability="next_message", detail="STRIPE_KEY"
         )
     )
-    assert posted == expected, f"expected the renderer's own copy, got {posted!r}"
+    headline, *facts = expected.split("\n")
+    posted_headline, *posted_facts = posted.split("\n")
+    assert classify_card_state(posted_headline.strip("*")) == "applied", (
+        f"the card must mark the state on its first line, got {posted_headline!r}"
+    )
+    assert headline in posted_headline, (
+        f"the headline must be the renderer's own first line, got {posted_headline!r}"
+    )
+    assert [fact.removeprefix("-# ") for fact in posted_facts] == facts, (
+        f"the rest must be the renderer's own copy, got {posted!r}"
+    )
+    interaction.followup.send.assert_not_awaited()
 
     async with db_session_factory() as session:
         stored = await list_agent_files(session, tenant_id=row.tenant_id, agent_id=row.agent_id)
