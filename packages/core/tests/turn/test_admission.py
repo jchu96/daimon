@@ -10,20 +10,23 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-import httpx
 import pytest
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
+from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.core.billing import BillingConfig
 from daimon.core.config import McpSettings
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_resolver import MAResolverMissError, ResolverCache, new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.stores.scoped_config_read import get_scope
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.turn.admission import Admission, AdmissionDenied, MissingTurnConfigError, admit
 from daimon.core.turn.deps import TurnDeps
-from daimon.testing.ma import EMPTY_CLOUD_CONFIG, MARouter, build_fake_anthropic, list_response
+from daimon.testing.ma import (
+    MARouter,
+    build_fake_anthropic,
+    list_response,
+    resolved_agent_env_router,
+)
+from daimon.testing.ma_models import ma_agent, ma_environment
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -37,102 +40,19 @@ from daimon.testing.factories import (  # isort: skip
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
 
-def _agent(
-    *,
-    agent_id: str,
-    name: str,
-    tenant_id: uuid.UUID,
-    archived_at: datetime | None = None,
-) -> BetaManagedAgentsAgent:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
-        id=agent_id,
-        type="agent",
-        name=name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: name,
-        },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=now,
-        updated_at=now,
-        archived_at=archived_at,
-    )
-
-
-def _env(*, env_id: str, name: str, tenant_id: uuid.UUID) -> BetaEnvironment:
-    now_iso = datetime.now(UTC).isoformat()
-    return BetaEnvironment(
-        id=env_id,
-        type="environment",
-        name=name,
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: name,
-        },
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
-
-
-def _agent_payload(agent: BetaManagedAgentsAgent) -> dict[str, object]:
-    return agent.model_dump(mode="json")
-
-
-def _env_payload(env: BetaEnvironment) -> dict[str, object]:
-    return env.model_dump(mode="json")
-
-
-def _resolved_router(*, tenant_id: uuid.UUID) -> MARouter:
-    """Router whose LIST routes resolve a live agent/environment for tenant_id."""
-    agent = _agent(agent_id="ag_1", name="daimon", tenant_id=tenant_id)
-    env = _env(env_id="env_1", name="default", tenant_id=tenant_id)
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([_agent_payload(agent)]))
-    router.add(
-        "GET", r"/v1/agents/ag_1", lambda req, _m: httpx.Response(200, json=_agent_payload(agent))
-    )
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([_env_payload(env)]))
-    router.add(
-        "GET",
-        r"/v1/environments/env_1",
-        lambda req, _m: httpx.Response(200, json=_env_payload(env)),
-    )
-    return router
-
-
-def _archived_agent_router(
-    *, tenant_id: uuid.UUID, dead_agent_id: str, dead_agent: BetaManagedAgentsAgent
-) -> MARouter:
+def _archived_agent_router(*, tenant_id: uuid.UUID, dead_agent: BetaManagedAgentsAgent) -> MARouter:
     """Router with a live environment plus a retrieve-only archived agent.
 
     Deliberately has no agent LIST route: the resolver's TTL-cache hit
-    returns `dead_agent_id` without ever calling the tag lookup, mirroring
-    the real staleness -- an id cached while the agent was live, archived
-    since.
+    returns the dead agent's id without ever calling the tag lookup,
+    mirroring the real staleness -- an id cached while the agent was live,
+    archived since.
     """
-    env = _env(env_id="env_1", name="default", tenant_id=tenant_id)
+    env = ma_environment(id="env_1", name="default", tenant_id=tenant_id)
     router = MARouter()
-    router.add(
-        "GET",
-        rf"/v1/agents/{dead_agent_id}",
-        lambda req, _m: httpx.Response(200, json=_agent_payload(dead_agent)),
-    )
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([_env_payload(env)]))
-    router.add(
-        "GET",
-        r"/v1/environments/env_1",
-        lambda req, _m: httpx.Response(200, json=_env_payload(env)),
-    )
+    router.add_agent(dead_agent)
+    router.add_environment_list(env)
+    router.add_environment(env)
     return router
 
 
@@ -183,7 +103,10 @@ async def test_admit_over_balance_tenant_raises_admission_denied_balance_deplete
     await db_session.commit()
     # No ledger entry seeded -> balance is 0 -> over-balance.
 
-    router = _resolved_router(tenant_id=tenant.id)
+    router = resolved_agent_env_router(
+        ma_agent(id="ag_1", name="daimon", tenant_id=tenant.id),
+        ma_environment(id="env_1", name="default", tenant_id=tenant.id),
+    )
     deps = _deps(
         sessionmaker=db_session_factory,
         defaults_root=tmp_path,
@@ -218,7 +141,10 @@ async def test_admit_over_cap_user_raises_admission_denied_cap_exceeded(
     await make_tenant_user_cap(db_session, tenant=tenant, amount=Decimal("0"))
     await db_session.commit()
 
-    router = _resolved_router(tenant_id=tenant.id)
+    router = resolved_agent_env_router(
+        ma_agent(id="ag_1", name="daimon", tenant_id=tenant.id),
+        ma_environment(id="env_1", name="default", tenant_id=tenant.id),
+    )
     deps = _deps(
         sessionmaker=db_session_factory,
         defaults_root=tmp_path,
@@ -350,7 +276,10 @@ async def test_admit_happy_path_returns_admission_with_retrieved_agent_and_accou
     await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
     await db_session.commit()
 
-    router = _resolved_router(tenant_id=tenant.id)
+    router = resolved_agent_env_router(
+        ma_agent(id="ag_1", name="daimon", tenant_id=tenant.id),
+        ma_environment(id="env_1", name="default", tenant_id=tenant.id),
+    )
     deps = _deps(
         sessionmaker=db_session_factory,
         defaults_root=tmp_path,
@@ -430,15 +359,13 @@ async def test_admit_raises_resolver_miss_when_the_resolved_agent_is_archived(
     )
     await db_session.commit()
 
-    dead_agent = _agent(
-        agent_id="ag_dead",
+    dead_agent = ma_agent(
+        id="ag_dead",
         name="doomed-agent",
         tenant_id=tenant.id,
         archived_at=datetime(2026, 7, 30, tzinfo=UTC),
     )
-    router = _archived_agent_router(
-        tenant_id=tenant.id, dead_agent_id="ag_dead", dead_agent=dead_agent
-    )
+    router = _archived_agent_router(tenant_id=tenant.id, dead_agent=dead_agent)
     cache = new_resolver_cache()
     cache[(tenant.id, "agent", "doomed-agent")] = "ag_dead"
 
@@ -501,15 +428,13 @@ async def test_admit_clears_the_scope_row_that_named_an_archived_agent(
     )
     await db_session.commit()
 
-    dead_agent = _agent(
-        agent_id="ag_dead",
+    dead_agent = ma_agent(
+        id="ag_dead",
         name="doomed-agent",
         tenant_id=tenant.id,
         archived_at=datetime(2026, 7, 30, tzinfo=UTC),
     )
-    router = _archived_agent_router(
-        tenant_id=tenant.id, dead_agent_id="ag_dead", dead_agent=dead_agent
-    )
+    router = _archived_agent_router(tenant_id=tenant.id, dead_agent=dead_agent)
     cache = new_resolver_cache()
     cache[(tenant.id, "agent", "doomed-agent")] = "ag_dead"
 
@@ -607,49 +532,20 @@ async def test_setup_admission_uses_bound_identity_and_leaves_missing_target_unc
     )
     await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
     await db_session.commit()
-    responder = BetaManagedAgentsAgent(
+    responder = ma_agent(
         id="ag_exact",
         name="daimon",
-        type="agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        mcp_servers=[],
-        skills=[],
-        tools=[],
+        tenant_id=tenant.id,
+        metadata={"daimon_managed": "true"},
         created_at=_NOW,
-        updated_at=_NOW,
-        metadata={
-            "daimon_tenant": str(tenant.id),
-            "daimon_name": "daimon",
-            "daimon_managed": "true",
-        },
     )
-    environment = BetaEnvironment(
-        id="env_science",
-        type="environment",
-        name="default",
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "default"},
-        created_at=_NOW.isoformat(),
-        updated_at=_NOW.isoformat(),
+    environment = ma_environment(
+        id="env_science", name="default", tenant_id=tenant.id, created_at=_NOW.isoformat()
     )
     router = MARouter()
-    router.add(
-        "GET",
-        r"/v1/agents/ag_exact",
-        lambda req, match: httpx.Response(200, json=responder.model_dump(mode="json")),
-    )
-    router.add(
-        "GET",
-        r"/v1/environments",
-        lambda req, match: list_response([environment.model_dump(mode="json")]),
-    )
-    router.add(
-        "GET",
-        r"/v1/environments/env_science",
-        lambda req, match: httpx.Response(200, json=environment.model_dump(mode="json")),
-    )
+    router.add_agent(responder)
+    router.add_environment_list(environment)
+    router.add_environment(environment)
     admission = await admit(
         _deps(sessionmaker=db_session_factory, router=router, defaults_root=tmp_path),
         tenant_id=tenant.id,
@@ -693,18 +589,12 @@ async def test_handoff_thread_admits_the_agent_the_task_was_handed_to(
     )
     await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
     await db_session.commit()
-    stats = _agent(agent_id="ag_stats", name="stats-bot", tenant_id=tenant.id)
-    env = _env(env_id="env_1", name="default", tenant_id=tenant.id)
+    stats = ma_agent(id="ag_stats", name="stats-bot", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", name="default", tenant_id=tenant.id)
     router = MARouter()
-    router.add(
-        "GET",
-        r"/v1/agents/ag_stats",
-        lambda _r, _m: httpx.Response(200, json=_agent_payload(stats)),
-    )
-    router.add("GET", r"/v1/environments", lambda _r, _m: list_response([_env_payload(env)]))
-    router.add(
-        "GET", r"/v1/environments/env_1", lambda _r, _m: httpx.Response(200, json=_env_payload(env))
-    )
+    router.add_agent(stats)
+    router.add_environment_list(env)
+    router.add_environment(env)
 
     admission = await admit(
         _deps(sessionmaker=db_session_factory, router=router, defaults_root=tmp_path),
@@ -749,18 +639,12 @@ async def test_handoff_thread_refuses_an_agent_from_another_workspace(
     )
     await make_ledger_entry(db_session, tenant=tenant, delta_usd=Decimal("10"))
     await db_session.commit()
-    foreign = _agent(agent_id="ag_foreign", name="stats-bot", tenant_id=uuid.uuid4())
-    env = _env(env_id="env_1", name="default", tenant_id=tenant.id)
+    foreign = ma_agent(id="ag_foreign", name="stats-bot", tenant_id=uuid.uuid4())
+    env = ma_environment(id="env_1", name="default", tenant_id=tenant.id)
     router = MARouter()
-    router.add(
-        "GET",
-        r"/v1/agents/ag_foreign",
-        lambda _r, _m: httpx.Response(200, json=_agent_payload(foreign)),
-    )
-    router.add("GET", r"/v1/environments", lambda _r, _m: list_response([_env_payload(env)]))
-    router.add(
-        "GET", r"/v1/environments/env_1", lambda _r, _m: httpx.Response(200, json=_env_payload(env))
-    )
+    router.add_agent(foreign)
+    router.add_environment_list(env)
+    router.add_environment(env)
 
     with pytest.raises(DaimonError, match="no longer available in this workspace"):
         await admit(
