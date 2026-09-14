@@ -29,7 +29,7 @@ from starlette.routing import Route
 
 def _make_app(*, lifecycle: list[str], sse: bool = False) -> Starlette:
     @contextlib.asynccontextmanager
-    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+    async def recording_lifespan(_app: Starlette) -> AsyncIterator[None]:
         lifecycle.append("startup")
         yield
         lifecycle.append("shutdown")
@@ -50,7 +50,7 @@ def _make_app(*, lifecycle: list[str], sse: bool = False) -> Starlette:
             )
         return JSONResponse(result)
 
-    return Starlette(routes=[Route("/mcp", mcp, methods=["POST"])], lifespan=lifespan)
+    return Starlette(routes=[Route("/mcp", mcp, methods=["POST"])], lifespan=recording_lifespan)
 
 
 async def test_asgi_lifespan_runs_startup_on_enter_and_shutdown_on_exit() -> None:
