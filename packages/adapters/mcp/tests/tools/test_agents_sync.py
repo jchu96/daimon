@@ -38,7 +38,7 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
-# Helpers (minimal, no factory wrappers)
+# Helpers
 # ---------------------------------------------------------------------------
 
 

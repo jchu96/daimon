@@ -221,10 +221,9 @@ def session_turn_sse(*events: BaseModel) -> httpx.Response:
     """Frame already-constructed SDK session-event models as one SSE
     response, for queuing into `FakeSessionsState.stream_scripts`.
 
-    Only serializes and frames; tests construct the real SDK event models
-    (e.g. `BetaManagedAgentsSessionStatusIdleEvent(...)`) inline -- this is
-    not a response factory (per `guideline:testing`'s no-response-factory
-    rule).
+    Only serializes and frames; the caller constructs the real SDK event
+    models (e.g. `BetaManagedAgentsSessionStatusIdleEvent(...)`), so this
+    helper never invents payload content of its own.
     """
     return sse_response([e.model_dump(mode="json") for e in events])
 

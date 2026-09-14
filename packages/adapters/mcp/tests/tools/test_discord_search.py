@@ -44,7 +44,7 @@ _search_messages_impl = _search_mod._search_messages_impl  # pyright: ignore[rep
 
 
 # ---------------------------------------------------------------------------
-# Helpers (per-file copies — inline at every call site per guideline:testing)
+# Helpers
 # ---------------------------------------------------------------------------
 
 _VIEW_CHANNEL = 1 << 10  # 1024

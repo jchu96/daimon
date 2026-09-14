@@ -6,8 +6,8 @@ This is the canonical proof that the routines integration coverage closes:
 2. ``last_error`` is populated on failure (``session.error`` event).
 3. The advisory lock blocks a second concurrent scheduler.
 
-The tests build a real ``AsyncEngine`` bound to the test Postgres, scoped
-to a per-test schema via SQLAlchemy ``schema_translate_map``. The
+The tests take a real ``AsyncEngine`` bound to the test Postgres from the
+``schema_engine`` fixture, an own pooled engine on the worker's test schema. The
 scheduler's ``run`` is invoked through its ``_engine_override`` and
 ``_anthropic_factory`` test seams so production wiring is exercised
 end-to-end without touching real network or the live Anthropic API.
