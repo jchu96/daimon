@@ -289,6 +289,11 @@ class TestNewThreadCreation:
         # Trigger content appears in <user_query>, not the raw message
         assert "<user_query" in user_message, "channel context must include a <user_query> element"
         assert "hello" in user_message, "trigger content must appear somewhere in the user message"
+        assert '"handle": "@' in user_message, (
+            "the turn controls must carry the handle people mention beside the agent name, so a "
+            "renamed bot account is never read as a second agent "
+            "(the exact name comes from settings; see test_branding.TestResponderHandle)"
+        )
         assert call_kwargs["session_id"] == "sess-abc", "should use ma_session.id"
 
     @patch("daimon.core.turn.admission.resolve_agent", new_callable=AsyncMock)

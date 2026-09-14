@@ -14,7 +14,10 @@ leading emoji and is deliberately lossy in two places (a `received` card
 repeats the `requested` headline; `superseded` shares ⚠️ with `partial`).
 Both are recoverable from the rest of the card, so this module refines them:
 `RECEIVED_FOOTER` separates received from requested, and the one line only
-`_superseded_content` writes separates superseded from partial.
+`_superseded_content` writes separates superseded from partial. The third
+collision, `replaced` against `expired` on ⌛, needs no refinement here:
+`replaced` writes one fixed headline, so core matches it exactly and this
+reader gets the right state back already.
 """
 
 from __future__ import annotations

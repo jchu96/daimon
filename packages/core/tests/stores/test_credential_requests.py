@@ -33,13 +33,15 @@ async def _seed_request(
     token: str | None = None,
     requester_platform_user_id: str = "requester-1",
     expires_at: datetime | None = None,
+    agent_id: uuid.UUID | None = None,
+    origin_thread_id: str | None = None,
 ) -> CredentialRequestRow:
     return await store.create_credential_request(
         session,
         token=token or mint_request_token(),
         kind="env",
         tenant_id=tenant_id,
-        agent_id=uuid.uuid4(),
+        agent_id=agent_id or uuid.uuid4(),
         account_id=account_id,
         target="OPENAI_API_KEY",
         mcp_server_url=None,
@@ -50,6 +52,7 @@ async def _seed_request(
         target_ma_agent_id="ag_test",
         target_name="tester",
         requested_work=None,
+        origin_thread_id=origin_thread_id,
     )
 
 
@@ -488,3 +491,82 @@ async def test_set_credential_request_outcome_does_not_raise_for_unknown_token(
 ) -> None:
     """No raise if absent — the outcome is a trace, never a gate."""
     await store.set_credential_request_outcome(db_session, token="no-such-token", outcome="applied")
+
+
+async def test_list_live_credential_requests_excludes_used_and_expired(
+    db_session: AsyncSession,
+) -> None:
+    """Live means what the consume gate accepts, inside one supersede scope."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+    now = datetime.now(tz=UTC)
+
+    async def seed(**overrides: object) -> CredentialRequestRow:
+        kwargs: dict[str, object] = {
+            "tenant_id": tenant.id,
+            "account_id": account.id,
+            "agent_id": agent_id,
+            "origin_thread_id": "thread-1",
+        }
+        kwargs.update(overrides)
+        return await _seed_request(db_session, **kwargs)  # type: ignore[arg-type]
+
+    live = await seed()
+    used = await seed()
+    await store.consume_credential_request(db_session, token=used.token, now=now)
+    expired = await seed(expires_at=now - timedelta(minutes=1))
+    other_thread = await seed(origin_thread_id="thread-2")
+    other_agent = await seed(agent_id=uuid.uuid4())
+    other_requester = await seed(requester_platform_user_id="requester-2")
+
+    found = await store.list_live_credential_requests(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        requester_platform_user_id="requester-1",
+        origin_thread_id="thread-1",
+        now=now,
+    )
+
+    assert [row.token for row in found] == [live.token], (
+        "only the unused, unexpired request for this requester, thread and agent is live"
+    )
+    for row, why in (
+        (used, "a consumed request"),
+        (expired, "an expired request"),
+        (other_thread, "a request in another thread"),
+        (other_agent, "a request for another agent"),
+        (other_requester, "another person's request"),
+    ):
+        assert row.token not in {found_row.token for found_row in found}, (
+            f"{why} must never be listed as live here"
+        )
+
+
+async def test_supersede_marks_used_with_replaced_outcome_once(
+    db_session: AsyncSession,
+) -> None:
+    """The retirement spends the row exactly like a click would, and only once."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await _seed_request(db_session, tenant_id=tenant.id, account_id=account.id)
+    now = datetime.now(tz=UTC)
+
+    first = await store.supersede_credential_request(db_session, token=row.token, now=now)
+    second = await store.supersede_credential_request(
+        db_session, token=row.token, now=now + timedelta(seconds=1)
+    )
+
+    assert first is not None, "an unused request must be retirable"
+    assert first.used_at == now, "retiring spends the row at the supplied time"
+    assert first.outcome == "replaced_by_newer", "the row records why it was never clicked"
+    assert second is None, "a row already spent must not be retired a second time"
+    after = await store.peek_credential_request(db_session, token=row.token)
+    assert after is not None and after.used_at == now, "the second call must change nothing"
+    assert (
+        await store.consume_credential_request(
+            db_session, token=row.token, now=now + timedelta(seconds=2)
+        )
+        is None
+    ), "a retired request can no longer be consumed by a late click"

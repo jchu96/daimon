@@ -118,6 +118,17 @@ def _resolve_bot_display_name(settings: Settings) -> str:
     return settings.discord.bot_display_name if settings.discord is not None else "daimon"
 
 
+def _responder_handle(settings: Settings) -> str:
+    """The handle the turn's own history shows people mentioning.
+
+    `context.py` rewrites `<@bot_id>` to `@{bot_display_name}`, so this is the
+    exact string the model reads in the message that summoned it. The turn
+    controls carry it beside the MA agent name so a deployment whose bot is
+    named `daimon-staging` is not read as a second agent.
+    """
+    return f"@{_resolve_bot_display_name(settings)}"
+
+
 def _setting_up_message(bot_display_name: str) -> str:
     """Distinct from the MAResolverMissError "no longer exists" message so a
     still-provisioning state is never confused with a genuine misconfiguration."""
@@ -1484,7 +1495,10 @@ class DaimonBot(commands.Bot):
                 )
             return (
                 render_turn_origin(
-                    recovery_origin, session_state=session_state, handoff=handoff_notice
+                    recovery_origin,
+                    responder_handle=_responder_handle(self.runtime.settings),
+                    session_state=session_state,
+                    handoff=handoff_notice,
                 )
                 + "\n"
                 + seed_message
@@ -1531,7 +1545,10 @@ class DaimonBot(commands.Bot):
                     external_user_id=row.requester_external_user_id,
                     user_message=(
                         render_turn_origin(
-                            origin, session_state=session_state, handoff=handoff_notice
+                            origin,
+                            responder_handle=_responder_handle(self.runtime.settings),
+                            session_state=session_state,
+                            handoff=handoff_notice,
                         )
                         + "\n"
                         + seed_message
@@ -2117,7 +2134,11 @@ class DaimonBot(commands.Bot):
                     "This turn's setup context expired. Mention me again to continue."
                 )
             return (
-                render_turn_origin(recovery_origin, session_state=session_state)
+                render_turn_origin(
+                    recovery_origin,
+                    responder_handle=_responder_handle(self.runtime.settings),
+                    session_state=session_state,
+                )
                 + "\n"
                 + full_message
             )
@@ -2174,7 +2195,11 @@ class DaimonBot(commands.Bot):
                     thread_id=str(thread.id),
                     external_user_id=str(message.author.id),
                     user_message=(
-                        render_turn_origin(origin, session_state=session_state)
+                        render_turn_origin(
+                            origin,
+                            responder_handle=_responder_handle(self.runtime.settings),
+                            session_state=session_state,
+                        )
                         + "\n"
                         + user_message
                     ),

@@ -26,9 +26,15 @@ from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivat
 from daimon.adapters.mcp.tools.discord import (
     _post_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.adapters.mcp.tools.discord._credential_button import (
+    edit_card_replaced as edit_discord_card_replaced,
+)
 from daimon.adapters.mcp.tools.setup_target import require_turn_origin, resolve_setup_agent
 from daimon.adapters.mcp.tools.slack._credential_button import (
     _post_slack_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
+)
+from daimon.adapters.mcp.tools.slack._credential_button import (
+    edit_card_replaced as edit_slack_card_replaced,
 )
 from daimon.core.continuity.continuation import MAX_REQUESTED_WORK, sanitize_requested_work
 from daimon.core.credential_requests import (
@@ -49,14 +55,17 @@ from daimon.core.operation_policy import (
 from daimon.core.stores.agent_files import get_agent_file
 from daimon.core.stores.credential_requests import (
     create_credential_request,
+    list_live_credential_requests,
+    supersede_credential_request,
     update_credential_request_message,
 )
-from daimon.core.stores.domain import TurnOriginRow
+from daimon.core.stores.domain import CredentialRequestRow, TurnOriginRow
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from daimon.core.stores.turn_origins import get_active_origin
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Mirrors packages/adapters/discord/daimon/adapters/discord/agent_setup/credentials.py's
 # _POSIX_KEY_RE. Duplicated rather than imported: the Discord adapter and the
@@ -77,6 +86,16 @@ _PENDING_TASK_DESCRIPTION = (
     "when they only asked to save it."
 )
 
+#: What the model should say once the card is up. The card already carries the
+#: expiry as a live timestamp, the requester restriction and who can use the
+#: value; a model paraphrasing any of those writes a sentence that stops being
+#: true as it ages, and repeats what the reader can already see.
+_REPLY_POINTS_AT_THE_FORM = (
+    "Reply with at most one short sentence pointing to the form below, or "
+    "nothing more if a form was all they asked for. Do not mention when it "
+    "expires, who can open it, or who can use the key — the card says that."
+)
+
 
 class RequestCredentialResult(BaseModel):
     """Result of minting and posting a credential-request button."""
@@ -85,8 +104,24 @@ class RequestCredentialResult(BaseModel):
 
     kind: CredentialRequestKind
     target: str
-    expires_at: datetime
     message_id: str
+    instruction: str
+    """What to say about the posted card."""
+
+
+def _named_single_key(text: str) -> str | None:
+    """Return the one key name `text` spells out, or None when it names none.
+
+    A file form is for several keys; a sentence carrying an UPPER_SNAKE word
+    (`TOGGL_API_TOKEN`) names exactly one, and handing that person a whole
+    `.env` upload is the mismatch this catches. A service name on its own
+    ("the Higgsfield key") carries no underscore and names nothing here — the
+    file form is still the right answer when the key argument is omitted.
+    """
+    for word in re.split(r"[^A-Za-z0-9_]+", text):
+        if "_" in word and word.isupper() and _POSIX_KEY_RE.fullmatch(word):
+            return word
+    return None
 
 
 def _require_requestable_platform(auth: AuthIdentity) -> str:
@@ -187,6 +222,42 @@ async def _require_key_replacement_allowed(
         )
 
 
+async def _supersede_live_siblings(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    requester_platform_user_id: str,
+    origin_thread_id: str,
+    now: datetime,
+) -> list[CredentialRequestRow]:
+    """Retire every form this person already has open here, and return them.
+
+    A corrected request used to leave its predecessor live, so one thread held
+    two buttons for one intent and the stale one asked for the wrong thing.
+    Scope is deliberately narrow — same requester, same thread, same agent —
+    so a second person's form and another agent's form are untouched.
+
+    Runs in the mint's own transaction, so the retirement and the new row
+    commit together: there is never a moment with no live form at all. A row
+    someone is submitting right this second wins its own UPDATE and is left
+    out of the returned list, so no card is edited out from under them.
+    """
+    live = await list_live_credential_requests(
+        session,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        requester_platform_user_id=requester_platform_user_id,
+        origin_thread_id=origin_thread_id,
+        now=now,
+    )
+    retired: list[CredentialRequestRow] = []
+    for row in live:
+        if await supersede_credential_request(session, token=row.token, now=now) is not None:
+            retired.append(row)
+    return retired
+
+
 async def _mint_and_post(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -208,7 +279,8 @@ async def _mint_and_post(
     # A tool-supplied channel cannot redirect a private-input request.
     channel_id = origin.parent_channel_id if auth.platform == "slack" else origin.thread_id
     token = mint_request_token()
-    expires_at = datetime.now(UTC) + DEFAULT_TTL
+    now = datetime.now(UTC)
+    expires_at = now + DEFAULT_TTL
     # The card says who will pick the work back up; an origin with no
     # responder name is the headless case, where the built-in agent's name is
     # the only honest thing to print.
@@ -220,14 +292,22 @@ async def _mint_and_post(
             tenant_id=auth.tenant_id,
             account_id=auth.account_id,
             platform=origin.platform,
-            now=datetime.now(UTC),
+            now=now,
             for_update=True,
         )
         if active_origin is None:
             raise ToolError(
                 "This turn origin expired before the request; retry in that conversation."
             )
-        row = await create_credential_request(
+        retired = await _supersede_live_siblings(
+            session,
+            tenant_id=auth.tenant_id,
+            agent_id=agent_id,
+            requester_platform_user_id=requester_platform_user_id,
+            origin_thread_id=origin.thread_id,
+            now=now,
+        )
+        await create_credential_request(
             session,
             token=token,
             kind=kind,
@@ -290,8 +370,18 @@ async def _mint_and_post(
         ) from exc
     async with runtime.session_factory.begin() as session:
         await update_credential_request_message(session, token=token, posted_message_id=message_id)
+    # Only now that the replacement is visible: an edit that lands first would
+    # point the reader at a "newer form below" that does not exist yet.
+    for old in retired:
+        if auth.platform == "slack":
+            await edit_slack_card_replaced(runtime, auth, row=old)
+        else:
+            await edit_discord_card_replaced(runtime, row=old)
     return RequestCredentialResult(
-        kind=kind, target=target, expires_at=row.expires_at, message_id=message_id
+        kind=kind,
+        target=target,
+        message_id=message_id,
+        instruction=_REPLY_POINTS_AT_THE_FORM,
     )
 
 
@@ -313,6 +403,12 @@ async def _request_agent_key_impl(
             "key must match [A-Za-z_][A-Za-z0-9_]* "
             "(letters, digits, underscores; must not start with a digit)"
         )
+    if key is None:
+        named = _named_single_key(purpose)
+        if named is not None:
+            raise ToolError(
+                f"You named one key ({named}); pass it as `key` instead of requesting a file."
+            )
     origin = await require_turn_origin(runtime, auth, origin_context_id)
     agent_id, ma_agent = await _resolve_agent_uuid(
         runtime, auth, agent_name, expected_ma_agent_id, origin
@@ -506,9 +602,9 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             str | None,
             Field(
                 description=(
-                    "Stored environment variable name, UPPER_SNAKE, e.g. TOGGL_TOKEN "
-                    "or OPENAI_API_KEY; never the secret value. Omit it to ask for a "
-                    "whole .env file of keys instead."
+                    "The exact key name (e.g. TOGGL_API_TOKEN). Pass it whenever the "
+                    "person named or implied ONE key. Omit ONLY when they want to "
+                    "upload a .env file holding several keys."
                 )
             ),
         ] = None,
@@ -517,9 +613,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         """Give an agent an API key or token for any service: Toggl, OpenAI,
         Higgsfield, or a platform that just launched. Unknown services work too.
 
-        Never accept secret values in chat; ask for rotation if pasted. Omit `key` to
-        load, upload or import a whole `.env` file at once. For MCP credentials use
-        ``request_mcp_token``; GitHub access uses ``request_repo_binding``.
+        Never accept secret values in chat; ask for rotation if pasted. One named key
+        → pass `key`. To load, upload or import a whole `.env` file of several keys at
+        once, omit it. For MCP credentials use ``request_mcp_token``; GitHub access
+        uses ``request_repo_binding``.
 
         Posts a card naming the agent and the key. Only the requester can open its
         private form; it expires in 30 minutes. Values never appear in chat. Anyone

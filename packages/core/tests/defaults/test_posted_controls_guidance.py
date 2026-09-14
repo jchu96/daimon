@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from daimon.core.defaults.loader import load_agent_specs, load_skill_paths, load_skill_spec
@@ -98,3 +99,63 @@ def test_after_confirmed_save_notes_next_message_availability_and_card_result() 
     assert "paraphrase" in save_section, (
         "guidance must say not to paraphrase the card's result line"
     )
+
+
+def _reply_shape_sections() -> list[tuple[str, str]]:
+    """The two places that tell the model what to say after posting a card."""
+    return [
+        (
+            "daimon.yaml key-only reply shape",
+            _section(_daimon_system(), "Key-only request:", "\n\n"),
+        ),
+        (
+            "workspace-setup Keys section",
+            _section(_workspace_setup_body(), "2. **Keys.**", "3. **Skills.**"),
+        ),
+    ]
+
+
+def test_reply_shape_points_below_the_reply_and_never_above() -> None:
+    """The card is always posted after the reply, so the pointer must say below."""
+    for label, section in _reply_shape_sections():
+        assert "form below" in section, (
+            f"{label} must point the person to the form below; the card lands after the reply"
+        )
+        unquoted = [
+            match for match in re.finditer("above", section) if section[match.start() - 1] != '"'
+        ]
+        assert not unquoted, (
+            f"{label} says 'above' outside the prohibition; the card is never above the reply"
+        )
+
+
+def test_reply_shape_never_asks_the_model_to_state_the_expiry() -> None:
+    """D24-QA-04/S24-01: the card carries a live timestamp, the prose goes stale."""
+    for label, section in _reply_shape_sections():
+        assert "expires" not in section, (
+            f"{label} uses the word 'expires'; the reply must never restate when the card expires"
+        )
+
+
+def test_reply_shape_covers_the_waiting_task_path() -> None:
+    """The `pending_task` branch is where the reply ran long, so it is named explicitly."""
+    for label, section in _reply_shape_sections():
+        assert "pending_task" in section, (
+            f"{label} must cover the waiting-task path: the continuation resumes on its own, "
+            "so the reply does not describe what happens after the save"
+        )
+
+
+def test_guidance_states_the_mention_handle_is_the_answering_agent() -> None:
+    """D24-QA-01: a bot display name differing from the agent name is not ambiguity."""
+    for label, text in (
+        ("daimon.yaml", _daimon_system()),
+        ("workspace-setup", _workspace_setup_body()),
+    ):
+        assert "responder.handle" in text, (
+            f"{label} must name responder.handle, the platform handle in <turn_controls>"
+        )
+        assert "Never ask whether they are the same agent" in text, (
+            f"{label} must forbid asking whether the mention handle and the responder name "
+            "are the same agent"
+        )

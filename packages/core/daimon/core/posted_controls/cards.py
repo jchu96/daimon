@@ -48,6 +48,7 @@ __all__ = [
     "NO_LONGER_VALID_MESSAGE",
     "PostedCard",
     "RECEIVED_FOOTER",
+    "REPLACED_HEADLINE",
     "RefusalReason",
     "WRONG_REQUESTER_MESSAGE",
     "build_posted_card",
@@ -64,6 +65,7 @@ CardState = Literal[
     "refused",
     "expired",
     "superseded",
+    "replaced",
 ]
 #: `env_file` is a bulk upload of one .env file; the other four match the
 #: single-value request kinds in `daimon.core.credential_requests`.
@@ -84,6 +86,12 @@ RefusalReason = Literal[
 FOOTER_TEMPLATE: Final[str] = "Only {requester} can open this form. Expires {expires}."
 RECEIVED_FOOTER: Final[str] = "Received. Saving…"
 EXPIRED_HEADLINE: Final[str] = "⌛ This form expired."
+#: `replaced` is the one state nobody asked for: the requester asked again in
+#: the same thread, so this form was retired unclicked. Its copy names no
+#: agent and no target — the newer card below it already does, and two cards
+#: naming one key is what made the pair confusing in the first place.
+REPLACED_HEADLINE: Final[str] = "⌛ This form was replaced."
+_REPLACED_FACT: Final[str] = "Use the newer form below."
 
 # Refusals for a click that cannot be honoured at all. These are the ephemeral
 # replies both adapters were spelling out separately; they live here so the two
@@ -106,9 +114,11 @@ _BUTTON_LABEL: Final[dict[CardKind, str]] = {
 # Leading emoji → state, for a reader (parity driver, QA script) holding only
 # the rendered headline. The mapping is deliberately lossy in two places: a
 # `received` card repeats its `requested` headline verbatim (only the footer
-# changes), and `superseded` shares ⚠️ with `partial`. A caller that needs the
-# exact state reads `PostedCard.state`; this is for after the round trip
-# through a platform, where only text survives.
+# changes), and `superseded` shares ⚠️ with `partial`. `replaced` shares ⌛
+# with `expired` but is recoverable, because its headline is one fixed string
+# no other state writes. A caller that needs the exact state reads
+# `PostedCard.state`; this is for after the round trip through a platform,
+# where only text survives.
 _STATE_BY_EMOJI: Final[dict[str, CardState]] = {
     "🔑": "requested",
     "🔌": "requested",
@@ -188,8 +198,12 @@ def classify_card_state(headline: str) -> CardState | None:
 
     `None` when the line starts with no state emoji. The mapping is lossy: a
     `received` headline reads as `requested` and a `superseded` one as
-    `partial`, because those pairs share their emoji by design.
+    `partial`, because those pairs share their emoji by design. `replaced` is
+    the one ⌛ collision that is not lossy — it writes one fixed headline, so
+    matching that string exactly is checked before the emoji table.
     """
+    if headline == REPLACED_HEADLINE:
+        return "replaced"
     for emoji, state in _STATE_BY_EMOJI.items():
         if headline.startswith(f"{emoji} "):
             return state
@@ -434,6 +448,8 @@ def build_posted_card(
                 repo_display=repo_display,
             ),
         )
+    elif state == "replaced":
+        lines = (REPLACED_HEADLINE, _REPLACED_FACT)
     elif state == "refused":
         if refusal is None:
             raise ValueError("state='refused' requires refusal")

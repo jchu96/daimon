@@ -3017,9 +3017,10 @@
         Give an agent an API key or token for any service: Toggl, OpenAI,
         Higgsfield, or a platform that just launched. Unknown services work too.
         
-        Never accept secret values in chat; ask for rotation if pasted. Omit `key` to
-        load, upload or import a whole `.env` file at once. For MCP credentials use
-        ``request_mcp_token``; GitHub access uses ``request_repo_binding``.
+        Never accept secret values in chat; ask for rotation if pasted. One named key
+        → pass `key`. To load, upload or import a whole `.env` file of several keys at
+        once, omit it. For MCP credentials use ``request_mcp_token``; GitHub access
+        uses ``request_repo_binding``.
         
         Posts a card naming the agent and the key. Only the requester can open its
         private form; it expires in 30 minutes. Values never appear in chat. Anyone
@@ -3051,7 +3052,7 @@
               }),
             ]),
             'default': None,
-            'description': 'Stored environment variable name, UPPER_SNAKE, e.g. TOGGL_TOKEN or OPENAI_API_KEY; never the secret value. Omit it to ask for a whole .env file of keys instead.',
+            'description': 'The exact key name (e.g. TOGGL_API_TOKEN). Pass it whenever the person named or implied ONE key. Omit ONLY when they want to upload a .env file holding several keys.',
           }),
           'origin_context_id': dict({
             'type': 'string',

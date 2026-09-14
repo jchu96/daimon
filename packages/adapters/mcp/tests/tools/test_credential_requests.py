@@ -42,6 +42,7 @@ from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_TENANT,
 )
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.posted_controls import REPLACED_HEADLINE
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.credential_requests import peek_credential_request
@@ -273,6 +274,49 @@ def _patch_successful_post(
             if posted is not None:
                 posted.update(kwargs)
             return _message_payload(message_id=message_id)
+        if route.method == "PATCH" and route.path == "/channels/{channel_id}/messages/{message_id}":
+            # A second mint in the same thread retires the first card by
+            # editing it; a test that is not about that edit just lets it
+            # through. Use `_patch_post_and_edit` to assert on one.
+            return _message_payload(message_id=message_id)
+        raise AssertionError(f"unexpected route {route.method} {route.path}")
+
+    patch_discord_http(monkeypatch, handler)
+
+
+def _patch_post_and_edit(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    message_ids: list[str],
+    posted: list[dict[str, Any]],
+    edited: dict[str, dict[str, Any]],
+) -> None:
+    """Patch a transport that can post several cards and edit an earlier one.
+
+    `_patch_successful_post` serves exactly one POST and refuses every other
+    route; a supersede posts the new card and then PATCHes the one it retired,
+    so both are served here. POSTs take their ids from ``message_ids`` in
+    order and land in ``posted``; each PATCH lands in ``edited`` under the
+    message id it targeted.
+    """
+    ids = iter(message_ids)
+
+    async def handler(route: discord.http.Route, kwargs: dict[str, Any]) -> Any:
+        if route.path == "/guilds/{guild_id}":
+            return _guild_payload()
+        if route.path == "/guilds/{guild_id}/roles":
+            return [_everyone_role("111", _VIEW_CHANNEL | _SEND_MESSAGES)]
+        if route.path == "/guilds/{guild_id}/members/{member_id}":
+            return _member_payload()
+        if route.path == "/channels/{channel_id}":
+            return _text_channel_payload()
+        if route.method == "POST" and route.path == "/channels/{channel_id}/messages":
+            posted.append(kwargs)
+            return _message_payload(message_id=next(ids))
+        if route.method == "PATCH" and route.path == "/channels/{channel_id}/messages/{message_id}":
+            message_id = route.url.rsplit("/", 1)[-1]
+            edited[message_id] = kwargs
+            return _message_payload(message_id=message_id)
         raise AssertionError(f"unexpected route {route.method} {route.path}")
 
     patch_discord_http(monkeypatch, handler)
@@ -375,11 +419,11 @@ async def test_request_agent_key_creates_row_and_posts_button(
     assert result.kind == "env", "result must report the env kind"
     assert result.target == "OPENAI_API_KEY", "result must report the exact key"
     assert result.message_id == "9201", "result must report the posted message id"
-    assert before + DEFAULT_TTL <= result.expires_at, "expires_at must be at least now + TTL"
     assert await _row_count(db_session) == 1, "exactly one credential_requests row must be created"
 
     row = await peek_credential_request(db_session, token=_token_from_posted(posted))
     assert row is not None, "the minted token must resolve to the created row"
+    assert before + DEFAULT_TTL <= row.expires_at, "the row must expire no sooner than now + TTL"
     assert row.kind == "env"
     assert row.mcp_server_url is None, "env rows must not carry an mcp_server_url"
     assert row.account_id == auth.account_id, "row must stamp the caller's account_id"
@@ -736,11 +780,11 @@ async def test_request_repo_binding_creates_row_and_posts_button(
         "result must report the repo url packed with the default branch"
     )
     assert result.message_id == "9204", "result must report the posted message id"
-    assert before + DEFAULT_TTL <= result.expires_at, "expires_at must be at least now + TTL"
     assert await _row_count(db_session) == 1, "exactly one credential_requests row must be created"
 
     row = await peek_credential_request(db_session, token=_token_from_posted(posted))
     assert row is not None, "the minted token must resolve to the created row"
+    assert before + DEFAULT_TTL <= row.expires_at, "the row must expire no sooner than now + TTL"
     assert row.kind == "repo"
     assert row.target == "https://github.com/clsandoval/daimon-qa-scratch@main", (
         "the row stores the branch packed into the target"
@@ -1097,7 +1141,7 @@ async def test_request_agent_key_posts_slack_button_carrying_the_token(
         responder_name="Daimon",
         target="OPENAI_API_KEY",
         requester_platform_user_id=_SLACK_USER_ID,
-        expires_at=result.expires_at,
+        expires_at=row.expires_at,
         token=button["value"],
     )
     assert body["text"] == card_notification_text(expected_card), (
@@ -1547,3 +1591,341 @@ async def test_request_repo_binding_rejects_a_branch_carrying_a_delimiter(
             branch="feat@weird",
         )
     assert await _row_count(db_session) == 0, "a branch that would mangle the target creates no row"
+
+
+# ---------------------------------------------------------------------------
+# The parameter contract: one named key is never a whole-file upload
+# ---------------------------------------------------------------------------
+
+
+async def test_request_agent_key_refuses_a_file_form_when_one_key_is_named_in_purpose(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming TOGGL_API_TOKEN and omitting `key` asked for the wrong form."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_named", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    _patch_successful_post(monkeypatch, message_id="9501")
+
+    with pytest.raises(ToolError, match="TOGGL_API_TOKEN") as err:
+        await _request_agent_key_impl(
+            runtime,
+            auth,
+            origin_context_id=str(origin_id),
+            expected_ma_agent_id="ag_named",
+            agent_name="daimon",
+            key=None,
+            purpose="saving the TOGGL_API_TOKEN so the hours report can run",
+            channel_id="222",
+        )
+
+    assert "`key`" in str(err.value), "the refusal must name the parameter to pass instead"
+    assert await _row_count(db_session) == 0, "a refused request mints no row and posts no card"
+
+
+async def test_request_agent_key_omitted_key_with_no_named_token_mints_env_file(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A service name alone ("the Higgsfield key") still gets the file form."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_unnamed", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    _patch_successful_post(monkeypatch, message_id="9502")
+
+    result = await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_unnamed",
+        agent_name="daimon",
+        key=None,
+        purpose="the Higgsfield key and a few others they want to paste in",
+        channel_id="222",
+    )
+
+    assert result.kind == "env_file", "no UPPER_SNAKE token means no single key was named"
+    assert result.target == ENV_FILE_TARGET, "the file form names the .env sentinel"
+
+
+async def test_result_carries_instruction_and_no_expiry(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The card owns the expiry; the result tells the model not to restate it."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_instr", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    _patch_successful_post(monkeypatch, message_id="9503")
+
+    result = await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_instr",
+        agent_name="daimon",
+        key="TOGGL_API_TOKEN",
+        purpose="pulling last week's hours",
+        channel_id="222",
+    )
+
+    assert "expires_at" not in result.model_dump(), (
+        "the model paraphrased the expiry; the result must not hand it one to paraphrase"
+    )
+    assert set(result.model_dump()) == {"kind", "target", "message_id", "instruction"}, (
+        "the result is the four fields the model needs and nothing else"
+    )
+    assert "expires" in result.instruction, "the instruction must forbid restating the expiry"
+    assert "one short sentence" in result.instruction, "the instruction must bound the reply"
+
+
+# ---------------------------------------------------------------------------
+# A second request retires the live one instead of leaving two buttons up
+# ---------------------------------------------------------------------------
+
+
+async def test_second_request_in_same_thread_supersedes_the_live_one_and_edits_its_card(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_super", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: list[dict[str, Any]] = []
+    edited: dict[str, dict[str, Any]] = {}
+    _patch_post_and_edit(monkeypatch, message_ids=["9601", "9602"], posted=posted, edited=edited)
+
+    first = await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_super",
+        agent_name="daimon",
+        key=None,
+        purpose="taking several keys at once",
+        channel_id="222",
+    )
+    second = await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_super",
+        agent_name="daimon",
+        key="TOGGL_API_TOKEN",
+        purpose="pulling last week's hours",
+        channel_id="222",
+    )
+
+    assert (first.message_id, second.message_id) == ("9601", "9602"), "both cards were posted"
+    old_row = await peek_credential_request(db_session, token=_token_from_posted(posted[0]))
+    new_row = await peek_credential_request(db_session, token=_token_from_posted(posted[1]))
+    assert old_row is not None and new_row is not None, "both requests must have rows"
+    assert old_row.used_at is not None, "the corrected request must no longer be clickable"
+    assert old_row.outcome == "replaced_by_newer", "the row says why it was never clicked"
+    assert new_row.used_at is None, "the newest request is the one that stays live"
+
+    assert set(edited) == {"9601"}, "only the retired card is edited, and exactly once"
+    replaced_card = edited["9601"]["json"]["components"]
+    texts = [str(c["content"]) for c in _walk_components(replaced_card) if "content" in c]
+    assert texts[0] == f"**{REPLACED_HEADLINE}**", "the retired card announces it was replaced"
+    assert "Use the newer form below." in "\n".join(texts), (
+        "the retired card points at the live one"
+    )
+    assert not [
+        c
+        for c in _walk_components(replaced_card)
+        if str(c.get("custom_id", "")).startswith(CUSTOM_ID_PREFIX)
+    ], "a replaced card must offer no button"
+    assert edited["9601"]["json"]["allowed_mentions"] == {"parse": []}, (
+        "re-rendering a card must not ping the requester again"
+    )
+
+
+async def test_requests_for_another_agent_or_requester_are_not_superseded(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Supersede scope is one requester, one thread, one agent — nothing wider."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [
+            _ma_agent(agent_id="ag_one", name="daimon", tenant_id=tenant.id),
+            _ma_agent(agent_id="ag_two", name="research-bot", tenant_id=tenant.id),
+        ]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    other_auth = _auth_identity(
+        tenant_id=tenant.id, platform_user_id="43", external_id=auth.external_id
+    )
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await make_account(db_session, tenant=tenant, id=other_auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    other_origin_id = await _seed_origin(
+        committing_sessionmaker, tenant_id=tenant.id, auth=other_auth
+    )
+    posted: list[dict[str, Any]] = []
+    edited: dict[str, dict[str, Any]] = {}
+    _patch_post_and_edit(
+        monkeypatch, message_ids=["9701", "9702", "9703"], posted=posted, edited=edited
+    )
+
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_two",
+        agent_name="research-bot",
+        key="TOGGL_API_TOKEN",
+        purpose="pulling hours",
+        channel_id="222",
+    )
+    await _request_agent_key_impl(
+        runtime,
+        other_auth,
+        origin_context_id=str(other_origin_id),
+        expected_ma_agent_id="ag_one",
+        agent_name="daimon",
+        key="TOGGL_API_TOKEN",
+        purpose="pulling hours",
+        channel_id="222",
+    )
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_one",
+        agent_name="daimon",
+        key="OPENAI_API_KEY",
+        purpose="calling the OpenAI API",
+        channel_id="222",
+    )
+
+    assert edited == {}, "a different agent and a different requester retire nothing"
+    for index, whose in enumerate(("another agent's", "another person's", "its own")):
+        row = await peek_credential_request(db_session, token=_token_from_posted(posted[index]))
+        assert row is not None and row.used_at is None, f"{whose} request must stay live"
+
+
+async def test_second_slack_request_in_same_thread_supersedes_the_live_one_and_edits_its_card(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    import yarl
+    from aioresponses import aioresponses
+
+    tenant = await make_tenant(db_session, platform="slack", workspace_id=_SLACK_TEAM_ID)
+    await db_session.commit()
+    fernet = await _seed_slack_bot_token(committing_sessionmaker)
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_slack_super", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _slack_runtime(committing_sessionmaker, client=client, fernet=fernet)
+    auth = _auth_identity(
+        platform="slack",
+        external_id=_SLACK_TEAM_ID,
+        platform_user_id=_SLACK_USER_ID,
+        tenant_id=tenant.id,
+    )
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform="slack",
+            parent_channel_id="C_CRED",
+            thread_id="1700000000.000001",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
+
+    with aioresponses() as m:
+        _register_slack_post_defaults(m)
+        m.post(
+            "https://slack.com/api/chat.update",
+            payload={"ok": True, "ts": "1700000009.000900", "channel": "C_CRED"},
+            repeat=True,
+        )
+        await _request_agent_key_impl(
+            runtime,
+            auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_slack_super",
+            agent_name="daimon",
+            key=None,
+            purpose="taking several keys at once",
+            channel_id="C_CRED",
+        )
+        await _request_agent_key_impl(
+            runtime,
+            auth,
+            origin_context_id=str(origin.id),
+            expected_ma_agent_id="ag_slack_super",
+            agent_name="daimon",
+            key="TOGGL_API_TOKEN",
+            purpose="pulling last week's hours",
+            channel_id="C_CRED",
+        )
+        posts = m.requests[("POST", yarl.URL("https://slack.com/api/chat.postMessage"))]
+        updates = m.requests[("POST", yarl.URL("https://slack.com/api/chat.update"))]
+
+    assert len(posts) == 2, "each request posts its own card"
+    assert len(updates) == 1, "exactly the one retired card is updated"
+    update_body = updates[0].kwargs["json"]
+    assert update_body["ts"] == "1700000009.000900", "the update targets the first card"
+    assert update_body["channel"] == "C_CRED", "the update goes to the channel the card is in"
+    assert REPLACED_HEADLINE in str(update_body["blocks"]), (
+        "the retired card announces it was replaced"
+    )
+    assert not [b for b in update_body["blocks"] if b["type"] == "actions"], (
+        "a replaced card must offer no button"
+    )
+
+    old_token = posts[0].kwargs["json"]["blocks"][2]["elements"][0]["value"]
+    old_row = await peek_credential_request(db_session, token=old_token)
+    assert old_row is not None and old_row.outcome == "replaced_by_newer", (
+        "the retired Slack request records why it was never clicked"
+    )

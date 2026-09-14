@@ -95,7 +95,11 @@ from daimon.adapters.slack.routines_panel.submit import (
     run_routines_create_submission,
     run_routines_delete_submission,
 )
-from daimon.adapters.slack.runtime import SlackRuntime, resolve_bot_display_name
+from daimon.adapters.slack.runtime import (
+    SlackRuntime,
+    resolve_bot_display_name,
+    responder_handle,
+)
 from daimon.adapters.slack.setup_conversations import handle_setup_lifecycle
 from daimon.adapters.slack.vision import (
     SlackFile,
@@ -1821,7 +1825,11 @@ class SlackApp:
                         "This turn's setup context expired. Please retry your message."
                     )
                 return (
-                    render_turn_origin(recovery_origin, session_state=session_state)
+                    render_turn_origin(
+                        recovery_origin,
+                        responder_handle=responder_handle(self.runtime.settings),
+                        session_state=session_state,
+                    )
                     + "\n"
                     + full_message
                 )
@@ -1891,7 +1899,11 @@ class SlackApp:
                         thread_id=thread_id,
                         external_user_id=str(event.get("user") or ""),
                         user_message=(
-                            render_turn_origin(origin, session_state=session_state)
+                            render_turn_origin(
+                                origin,
+                                responder_handle=responder_handle(self.runtime.settings),
+                                session_state=session_state,
+                            )
                             + "\n"
                             + user_message
                         ),
@@ -2169,7 +2181,11 @@ class SlackApp:
             if recovery_origin is None:
                 raise DaimonError("This turn's setup context expired. Please retry your message.")
             return (
-                render_turn_origin(recovery_origin, handoff=handoff_notice)
+                render_turn_origin(
+                    recovery_origin,
+                    responder_handle=responder_handle(self.runtime.settings),
+                    handoff=handoff_notice,
+                )
                 + "\n"
                 + seed_user_message
             )
@@ -2218,7 +2234,11 @@ class SlackApp:
                     thread_id=thread_id,
                     external_user_id=row.requester_external_user_id,
                     user_message=(
-                        render_turn_origin(follow_origin, handoff=handoff_notice)
+                        render_turn_origin(
+                            follow_origin,
+                            responder_handle=responder_handle(self.runtime.settings),
+                            handoff=handoff_notice,
+                        )
                         + "\n"
                         + seed_user_message
                     ),
