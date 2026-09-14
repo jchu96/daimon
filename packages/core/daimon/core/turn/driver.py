@@ -739,6 +739,12 @@ async def _consume_with_reconnect(
     # the losing side of that race never reaches this assignment, and its own
     # `on_cancel_win_result=lambda s: s.close()` already covers it.
     opened_stream: _anthropic.AsyncStream[BetaManagedAgentsStreamSessionEvents] | None = None
+    # The in-flight next-event fetch, if any. `asyncio.wait` below does not
+    # cancel the tasks it waits on when the waiting task itself is cancelled
+    # (a ceiling `wait_for` breach, an adapter tearing the turn down), so the
+    # `finally` drains it explicitly; otherwise the abandoned `__anext__`
+    # lingers as a pending task after the turn has returned.
+    next_task: asyncio.Task[Any] | None = None
     try:
         if is_retry:
             log.info(
@@ -802,7 +808,7 @@ async def _consume_with_reconnect(
             if cancel.is_set():
                 raise _InterruptInConsume()
             next_coro = cast(Any, stream_iter).__anext__()
-            next_task: asyncio.Task[Any] = asyncio.create_task(
+            next_task = asyncio.create_task(
                 next_coro,
                 name="turn.stream_next",
             )
@@ -885,6 +891,10 @@ async def _consume_with_reconnect(
             cancel_task.cancel()
             with _suppress_task_exc():
                 await cancel_task
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+            with _suppress_task_exc():
+                await next_task
         if opened_stream is not None:
             # Unconditional close of any stream this attempt opened, on
             # every exit path -- clean close, read timeout, mid-consume
