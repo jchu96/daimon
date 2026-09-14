@@ -51,7 +51,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME
 from daimon.core.defaults.provisioning import provision_tenant, reconcile_tenant_defaults
 from daimon.core.defaults.report import compose_failure_reason
 from daimon.core.errors import DaimonError
-from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
 from daimon.core.stores.domain import Role, TaskContinuationRow, TenantRow
 from daimon.core.stores.tenants import (
@@ -81,6 +81,7 @@ from daimon.core.turn.gating import should_admit_turn
 from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import bind_session
 from daimon.core.turn.run import RunOutcome, run_prepared_turn
+from daimon.core.turn_keys import list_mounted_key_names
 from daimon.core.turn_origin import HandoffNotice, SessionState, render_turn_origin, turn_origin
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -1286,6 +1287,47 @@ class DaimonBot(commands.Bot):
         else:
             await target.send(error_text)
 
+    async def _dispatch_continuations(
+        self, *, tenant_id: uuid.UUID, thread: discord.Thread, guild_id: str
+    ) -> None:
+        """Claim and run any pending continuations for `thread`, guard already held.
+
+        Callers must already own this thread's `_processing` slot. The
+        turn-completion path does (`on_message` holds it for the whole turn);
+        anything outside a turn goes through
+        `dispatch_continuations_in_thread`, which takes the guard first.
+        """
+        await dispatch_pending_continuations(
+            self.runtime.sessionmaker,
+            self.runtime.anthropic,
+            tenant_id=tenant_id,
+            thread=thread,
+            run_follow_up=lambda row, decision: self._run_continuation_turn(
+                row, decision, thread=thread, tenant_id=tenant_id, guild_id=guild_id
+            ),
+        )
+
+    async def dispatch_continuations_in_thread(
+        self, *, tenant_id: uuid.UUID, thread: discord.Thread, guild_id: str
+    ) -> None:
+        """Claim and run any pending continuations for `thread`, from outside a turn.
+
+        Takes the same per-thread guard a mention turn takes, so a form
+        submission and a mention can never dispatch the same thread at once. A
+        thread already processing is skipped outright rather than queued: the
+        turn running there reaches `_dispatch_continuations` at its own tail
+        anyway, and will pick up whatever this call would have.
+        """
+        if thread.id in self._processing:
+            return
+        self._processing.add(thread.id)
+        try:
+            await self._dispatch_continuations(
+                tenant_id=tenant_id, thread=thread, guild_id=guild_id
+            )
+        finally:
+            self._processing.discard(thread.id)
+
     async def _run_continuation_turn(
         self,
         row: TaskContinuationRow,
@@ -1400,12 +1442,20 @@ class DaimonBot(commands.Bot):
             if transfer_kind == "transcript"
             else "history_only"
         )
-        handoff_notice = HandoffNotice(
-            from_name=from_name or "the previous agent",
-            from_ma_agent_id=from_ma_agent_id or "",
-            requested_by=f"<@{row.requester_external_user_id}>",
-            requested_work=decision.seed_user_message,
-            workspace=workspace,
+        # Only a handoff hands the task to a different agent, so only a handoff
+        # gets the one-time notice. `private_input_applied` re-runs the SAME
+        # agent that just asked for the value, so framing it as "X handed you
+        # this" would describe a transfer that never happened.
+        handoff_notice = (
+            HandoffNotice(
+                from_name=from_name or "the previous agent",
+                from_ma_agent_id=from_ma_agent_id or "",
+                requested_by=f"<@{row.requester_external_user_id}>",
+                requested_work=decision.seed_user_message,
+                workspace=workspace,
+            )
+            if row.reason == "task_handoff"
+            else None
         )
         session_state = (
             None
@@ -1892,6 +1942,28 @@ class DaimonBot(commands.Bot):
                 )
                 await _at_session.commit()
 
+        # Names-only <keys> context: stored key names for THIS agent, named
+        # only while the mounted `.env` is still exactly today's agent_files
+        # rows (see `list_mounted_key_names`). One extra read per turn.
+        async with self.runtime.sessionmaker() as _keys_session:
+            _live_row_for_keys = await get_live_thread_session(
+                _keys_session,
+                tenant_id=tenant_id,
+                platform="discord",
+                thread_id=str(thread.id),
+                account_id=session_account_id,
+            )
+            _live_config = (
+                None if _live_row_for_keys is None else _live_row_for_keys.effective_config
+            )
+            _env_sha256 = None if _live_config is None else _live_config.env_sha256
+            key_names = await list_mounted_key_names(
+                _keys_session,
+                tenant_id=tenant_id,
+                agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
+                env_sha256=_env_sha256,
+            )
+
         # Split trigger-message attachments: API-consumable images → vision
         # blocks; everything else (data files, unsupported/oversized images)
         # → signed CDN URL surfaced to the agent (it has bash + network egress
@@ -1934,6 +2006,7 @@ class DaimonBot(commands.Bot):
                     bot_display_name=discord_settings.bot_display_name,
                     is_admin=is_admin,
                     unprompted=unprompted,
+                    key_names=key_names,
                 )
             else:
                 user_message, _ = await build_context_xml(
@@ -1944,6 +2017,7 @@ class DaimonBot(commands.Bot):
                     bot_display_name=discord_settings.bot_display_name,
                     is_admin=is_admin,
                     unprompted=unprompted,
+                    key_names=key_names,
                 )
         else:
             if content_override is not None:
@@ -1956,6 +2030,7 @@ class DaimonBot(commands.Bot):
                     bot_user_id=self.user.id if self.user else None,
                     bot_display_name=discord_settings.bot_display_name,
                     is_admin=is_admin,
+                    key_names=key_names,
                 )
             else:
                 # Forum/voice channels: fall back to raw message content
@@ -2024,6 +2099,7 @@ class DaimonBot(commands.Bot):
                 omit_oversized_image_urls=True,
                 is_admin=is_admin,
                 unprompted=unprompted,
+                key_names=key_names,
             )
             if synthetic_prefix:
                 full_message = synthetic_prefix + "\n" + full_message
@@ -2194,12 +2270,6 @@ class DaimonBot(commands.Bot):
             # continue, gets its first turn dispatched now -- still inside this
             # turn's concurrency guard, so nothing else can land in the thread
             # first.
-            await dispatch_pending_continuations(
-                self.runtime.sessionmaker,
-                self.runtime.anthropic,
-                tenant_id=tenant_id,
-                thread=thread,
-                run_follow_up=lambda row, decision: self._run_continuation_turn(
-                    row, decision, thread=thread, tenant_id=tenant_id, guild_id=guild_id
-                ),
+            await self._dispatch_continuations(
+                tenant_id=tenant_id, thread=thread, guild_id=guild_id
             )

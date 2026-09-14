@@ -42,6 +42,9 @@ from daimon.core.ma import delete_skill_and_versions, update_agent_with_version_
 from daimon.core.skills.fetch import GitHubFetchError
 from daimon.core.skills.pipeline import run_skill_sync
 from daimon.core.stores.agent_repo_binding import get_bindings_for_repo
+from daimon.core.stores.agent_skill_repo_credentials import (
+    list_skill_repo_credentials_for_repo,
+)
 from daimon.core.stores.domain import RepoProofKind
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -118,14 +121,33 @@ async def _resolve_sync_token(
     """Resolve a GitHub token for syncing ``url``, or None (anonymous fetch).
 
     The session JWT carries no agent_id claim (SC-4), so the credential is
-    resolved from the URL instead: the caller-tenant's ``agent_repo_binding``
-    rows for this repo → that agent's PAT overlay, and (independently) any
-    recorded proof of access this tenant established for the same repo.
-    Other tenants' bindings for the same repo never resolve a per-agent PAT
-    and never count as this tenant's proof — no cross-tenant credential
-    bleed. Because the loop returns on the first non-``None`` overlay PAT,
-    an agent whose overlay resolves short-circuits the loop — correct, since
-    only one per-agent credential is needed.
+    resolved from the URL instead, over two storage tiers read in order:
+
+    1. ``agent_skill_repo_credentials`` — the caller-tenant's skill-repo
+       enrollments of this exact repo (one per agent, any number of repos
+       per agent) → that agent's PAT overlay, plus the first recorded proof
+       of access among them. This is where enrolling a skill repo writes
+       today, so it is consulted first.
+    2. ``agent_repo_binding`` — the legacy home, where skill enrollment used
+       to record its PAT because there was nowhere else to put it. Read when
+       tier 1 left the PAT or the proof unresolved, and it supplies only the
+       one(s) still missing — the two are resolved independently, so a
+       skill-repo credential carrying a proof but no usable PAT overlay
+       still picks up a legacy binding's PAT (and vice versa) instead of
+       suppressing it. The fallback is load-bearing, not transitional
+       politeness: every tenant enrolled through the old path keeps syncing
+       with zero data migration, and a binding row is still the only record
+       such a tenant has. Removing it silently drops those tenants to
+       anonymous fetches on private repos.
+
+    Either tier resolves the PAT the same way — ``get_pat`` on the row's
+    agent — and reads the proof independently of it. Other tenants' rows for
+    the same repo never resolve a per-agent PAT and never count as this
+    tenant's proof — no cross-tenant credential bleed (tier 1's store query
+    is tenant-scoped; tier 2 filters the install-agnostic result itself).
+    Because each loop stops on the first non-``None`` overlay PAT, an agent
+    whose overlay resolves short-circuits it — correct, since only one
+    per-agent credential is needed.
 
     The full precedence decision (per-agent token -> GitHub App installation
     -> operator fallback -> anonymous) is delegated to
@@ -152,17 +174,18 @@ async def _resolve_sync_token(
         else None
     )
     async with runtime.session_factory() as session:
-        bindings = await get_bindings_for_repo(session, repo_url=url)
-    tenant_bindings = [binding for binding in bindings if binding.tenant_id == auth.tenant_id]
+        credentials = await list_skill_repo_credentials_for_repo(
+            session, tenant_id=auth.tenant_id, repo_url=url
+        )
     proof_kind: RepoProofKind | None = next(
-        (binding.proof_kind for binding in tenant_bindings if binding.proof_kind is not None),
+        (credential.proof_kind for credential in credentials if credential.proof_kind is not None),
         None,
     )
     per_agent_pat: str | None = None
-    for binding in tenant_bindings:
+    for credential in credentials:
         token = await get_pat(
-            principal_id=binding.agent_id,
-            agent_id=binding.agent_id,
+            principal_id=credential.agent_id,
+            agent_id=credential.agent_id,
             sessionmaker=runtime.session_factory,
             fernet=runtime.fernet,
             allow_service_default=False,
@@ -171,6 +194,38 @@ async def _resolve_sync_token(
         if token is not None:
             per_agent_pat = token
             break
+
+    if per_agent_pat is None or proof_kind is None:
+        # Tier 2 — the legacy binding home, filling in only what tier 1 left
+        # unresolved. A tenant that enrolled before the credential table
+        # existed has its PAT and its proof here; one mid-migration may have
+        # each in a different tier, so neither is allowed to suppress the
+        # other.
+        async with runtime.session_factory() as session:
+            bindings = await get_bindings_for_repo(session, repo_url=url)
+        tenant_bindings = [binding for binding in bindings if binding.tenant_id == auth.tenant_id]
+        if proof_kind is None:
+            proof_kind = next(
+                (
+                    binding.proof_kind
+                    for binding in tenant_bindings
+                    if binding.proof_kind is not None
+                ),
+                None,
+            )
+        if per_agent_pat is None:
+            for binding in tenant_bindings:
+                token = await get_pat(
+                    principal_id=binding.agent_id,
+                    agent_id=binding.agent_id,
+                    sessionmaker=runtime.session_factory,
+                    fernet=runtime.fernet,
+                    allow_service_default=False,
+                    fallback_pat=None,
+                )
+                if token is not None:
+                    per_agent_pat = token
+                    break
 
     github_app_id = runtime.settings.github.app_id
     github_app_private_key = runtime.settings.github.app_private_key

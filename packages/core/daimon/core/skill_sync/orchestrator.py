@@ -80,6 +80,9 @@ from daimon.core.skill_sync.fetcher import (
 from daimon.core.skill_zip import canonical_zip_bytes
 from daimon.core.specs import SkillRepo, merge_default_agent_toolset
 from daimon.core.stores.agent_repo_binding import get_tenant_repo_proof_kind
+from daimon.core.stores.agent_skill_repo_credentials import (
+    get_tenant_skill_repo_proof_kind,
+)
 from daimon.core.stores.domain import RepoProofKind
 from daimon.core.stores.user_skills import (
     delete_user_skill,
@@ -445,13 +448,18 @@ async def sync_agent_skills(
         fallback, then an unauthenticated fetch. Resolution happens per repo
         (not once for the whole call) because App installation coverage AND
         the tenant's recorded proof are both repo-specific: before each
-        ``resolve_skill_sync_token`` call this function reads
-        ``daimon.core.stores.agent_repo_binding.get_tenant_repo_proof_kind``
-        for ``tenant_id``/``repo.url`` — ANY of this tenant's own bindings
-        recording proof for that exact repo is sufficient; a repo this
-        tenant has never bound (with proof) is never eligible for the App
-        tier, even when the deployment's App happens to cover it because
-        some unrelated tenant installed it for their own use.
+        ``resolve_skill_sync_token`` call this function reads the proof this
+        tenant recorded for ``tenant_id``/``repo.url``, preferring its
+        skill-repo credential
+        (``agent_skill_repo_credentials.get_tenant_skill_repo_proof_kind``)
+        and falling back to the legacy binding
+        (``agent_repo_binding.get_tenant_repo_proof_kind``) so tenants
+        enrolled before the credential table keep their proof. ANY of this
+        tenant's own rows recording proof for that exact repo is
+        sufficient; a repo this tenant has never enrolled or bound (with
+        proof) is never eligible for the App tier, even when the
+        deployment's App happens to cover it because some unrelated tenant
+        installed it for their own use.
 
         ``app_id``, ``app_private_key``, and ``installation_lookup`` feed the
         App tier of that per-repo resolution. ``installation_lookup`` is
@@ -553,8 +561,14 @@ async def sync_agent_skills(
                 # extra-I/O on the resolution path, not just the App tier.
                 proof_kind: RepoProofKind | None = None
                 if per_agent_credential is None:
+                    # The skill-repo credential is where enrolling a skill
+                    # repo records its proof today; the binding is the
+                    # legacy home, still authoritative for tenants that
+                    # enrolled before the credential table existed.
                     async with sessionmaker() as session:
-                        proof_kind = await get_tenant_repo_proof_kind(
+                        proof_kind = await get_tenant_skill_repo_proof_kind(
+                            session, tenant_id=tenant_id, repo_url=repo.url
+                        ) or await get_tenant_repo_proof_kind(
                             session, tenant_id=tenant_id, repo_url=repo.url
                         )
                 try:
