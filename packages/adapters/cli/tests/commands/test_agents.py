@@ -54,6 +54,8 @@ from rich.console import Console
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from typer.testing import CliRunner
 
+from ..harness import build_cli_runtime
+
 # These tests create their tenant explicitly as cli:local (the tenant
 # discover_tenant derives for the CLI) and tag MA resources against it, so they
 # opt out of the conftest db_session_factory autoseed to avoid a duplicate.
@@ -71,22 +73,6 @@ class _FakeMcp:
 class _FakeSettings:
     cli = _FakeCli()
     mcp = _FakeMcp()
-
-
-def _build_rt(
-    db_session_factory: async_sessionmaker[AsyncSession],
-    router: MARouter,
-) -> CliRuntime:
-    transport = httpx.MockTransport(router.dispatch)
-    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
-    client = AsyncAnthropic(api_key="test", http_client=http_client)
-    return CliRuntime(
-        settings=cast(Settings, _FakeSettings()),
-        anthropic=client,
-        sessionmaker=db_session_factory,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
-    )
 
 
 def _agent_json(
@@ -135,7 +121,7 @@ async def test_agents_list_returns_ma_columns(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent1, agent2]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_list(rt=rt, console=console, as_json=False)
 
@@ -160,7 +146,7 @@ async def test_agents_get_resolves_via_tag(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     # Should not raise — agent found via tag
     await agents_get(rt=rt, console=console, name="my-agent", as_json=False)
@@ -189,7 +175,7 @@ async def test_agents_get_with_include_archived_passes_flag_to_sdk(
     router.add("GET", r"/v1/agents", list_with_flag_capture)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_get(
         rt=rt,
@@ -216,7 +202,7 @@ async def test_agents_get_not_found_raises(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     with pytest.raises(StoreError, match="no agent named"):
         await agents_get(rt=rt, console=console, name="ghost-agent", as_json=False)
@@ -240,7 +226,7 @@ async def test_agents_bind_google_writes_binding_readable_through_store(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_bind_google(
         rt=rt,
@@ -278,7 +264,7 @@ async def test_agents_bind_google_twice_leaves_second_scope_set(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_bind_google(
         rt=rt,
@@ -318,7 +304,7 @@ async def test_agents_bind_google_unknown_agent_raises_and_writes_nothing(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     with pytest.raises(StoreError, match="no agent named"):
         await agents_bind_google(
@@ -351,7 +337,7 @@ async def test_agents_bind_google_missing_scopes_raises_and_writes_nothing(
     router.add("GET", r"/v1/agents", lambda req, m: list_response([agent_data]))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     with pytest.raises(StoreError, match="scopes"):
         await agents_bind_google(
@@ -395,7 +381,7 @@ async def test_agents_create_calls_sdk_create(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: new-agent\nmodel: claude-sonnet-4-6\n")
@@ -441,7 +427,7 @@ async def test_agents_update_passes_version(
     router.add("POST", r"/v1/agents/ag_01", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: my-agent\nmodel: claude-sonnet-4-6\nsystem: hello\n")
@@ -493,7 +479,7 @@ async def test_agents_update_keeps_guild_account_stamp(
     router.add("POST", r"/v1/agents/ag_guild", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: guild-agent\nmodel: claude-sonnet-4-6\nsystem: hello\n")
@@ -572,7 +558,7 @@ async def test_agents_update_preserves_inherited_mcp_toolset_when_yaml_omits_it(
     router.add("POST", r"/v1/agents/ag_mcp", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: my-fork\nmodel: claude-sonnet-4-6\nsystem: hello\n")
@@ -599,7 +585,7 @@ async def test_agents_update_rename_raises_spec_error(
     """Names are identity; a YAML name != the target name must raise, not rename."""
     router = MARouter()
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=80)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: renamed\nmodel: claude-sonnet-4-6\nsystem: hello\n")
@@ -639,7 +625,7 @@ async def test_agents_fork_strips_server_fields_and_creates(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_fork(rt=rt, console=console, src="base-agent", dst="forked-agent")
 
@@ -691,7 +677,7 @@ async def test_agents_fork_adds_base_toolset_when_source_lacks_it(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_fork(rt=rt, console=console, src="base-agent", dst="forked-agent")
 
@@ -711,7 +697,7 @@ async def test_agents_fork_missing_dst_raises(
     """fork raises BadParameter before any MA call when dst is None."""
     router = MARouter()
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     with pytest.raises(typer.BadParameter, match="destination name is required"):
         await agents_fork(rt=rt, console=console, src="agent-x", dst=None)
@@ -724,7 +710,7 @@ async def test_agents_fork_same_name_raises(
     """fork raises StoreError when dst equals src."""
     router = MARouter()
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     with pytest.raises(StoreError, match="conflicts with source"):
         await agents_fork(rt=rt, console=console, src="agent-x", dst="agent-x")
@@ -752,7 +738,7 @@ async def test_agents_archive_calls_sdk_archive(
     router.add("POST", r"/v1/agents/ag_doomed/archive", on_archive)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_archive(rt=rt, console=console, name="doomed", yes=True)
 
@@ -798,7 +784,7 @@ async def test_agents_archive_clears_scope_rows_naming_the_archived_agent(
     )
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_archive(rt=rt, console=console, name="doomed", yes=True)
 
@@ -877,7 +863,7 @@ async def test_agents_create_rejects_when_name_exists_in_tenant(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: new-agent\nmodel: claude-sonnet-4-6\n")
@@ -963,7 +949,7 @@ async def test_agents_create_stamps_spec_hash_guidance_and_guild_account(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     spec_path = tmp_path / "agent.yaml"
     spec_path.write_text("name: stamped-agent\nmodel: claude-sonnet-4-6\nsystem: hello\n")
@@ -1075,8 +1061,8 @@ async def test_agents_fork_skips_mcp_merge_when_public_url_none(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    # public_url=None via the default _build_rt fixture
-    rt = _build_rt(db_session_factory, router)
+    # public_url=None via the module-level _FakeSettings
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_fork(rt=rt, console=console, src="base-agent", dst="forked-agent")
 
@@ -1128,7 +1114,7 @@ async def test_agents_fork_rejects_when_destination_name_exists_in_tenant(
     router.add("POST", r"/v1/agents", on_create)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     with pytest.raises(StoreError, match="already exists in this server"):
         await agents_fork(rt=rt, console=console, src="base-agent", dst="forked-agent")

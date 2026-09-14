@@ -8,18 +8,17 @@ import pytest
 import typer
 from anthropic import AsyncAnthropic
 from daimon.adapters.cli.commands.tenants import tenants_delete, tenants_list
-from daimon.adapters.cli.runtime import CliRuntime
-from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.errors import StoreError
 from daimon.core.ma_identity import derive_tenant_uuid
-from daimon.core.ma_resolver import new_resolver_cache
-from daimon.core.scope import DeploymentDefault, TenantScopeRef
+from daimon.core.scope import TenantScopeRef
 from daimon.core.stores import scoped_config_write
 from daimon.core.stores.tenants import get_tenant
 from daimon.testing.factories import make_tenant
 from rich.console import Console
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ..harness import build_cli_runtime
 
 pytestmark = pytest.mark.no_cli_local_seed
 
@@ -32,19 +31,6 @@ class _FakeSettings:
     cli = _FakeCli()
 
 
-def _build_rt(
-    db_session_factory: async_sessionmaker[AsyncSession],
-    stub_anthropic: AsyncAnthropic,
-) -> CliRuntime:
-    return CliRuntime(
-        settings=cast(Settings, _FakeSettings()),
-        anthropic=stub_anthropic,
-        sessionmaker=db_session_factory,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
-    )
-
-
 def _make_console() -> Console:
     """Console that writes to a StringIO for test output capture."""
     return Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
@@ -55,7 +41,7 @@ async def test_tenants_delete_removes_tenant_when_no_dependents(
     db_session_factory: async_sessionmaker[AsyncSession],
     stub_anthropic: AsyncAnthropic,
 ) -> None:
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     await provision_tenant(db_session_factory, platform="discord", workspace_id="guild-123")
@@ -80,7 +66,7 @@ async def test_tenants_delete_refuses_when_dependents_exist_without_cascade(
     db_session_factory: async_sessionmaker[AsyncSession],
     stub_anthropic: AsyncAnthropic,
 ) -> None:
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     result = await provision_tenant(
@@ -116,7 +102,7 @@ async def test_tenants_delete_cascade_deletes_tenant_when_dependents_exist(
     db_session_factory: async_sessionmaker[AsyncSession],
     stub_anthropic: AsyncAnthropic,
 ) -> None:
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     result = await provision_tenant(
@@ -151,7 +137,7 @@ async def test_tenants_delete_raises_when_tenant_not_found(
     db_session_factory: async_sessionmaker[AsyncSession],
     stub_anthropic: AsyncAnthropic,
 ) -> None:
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     with pytest.raises(StoreError, match="not found"):
@@ -170,7 +156,7 @@ async def test_tenants_list_returns_all_tenants(
     db_session_factory: async_sessionmaker[AsyncSession],
     stub_anthropic: AsyncAnthropic,
 ) -> None:
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     async with db_session_factory() as s, s.begin():
@@ -199,7 +185,7 @@ async def test_tenants_list_filters_by_platform(
     db_session_factory: async_sessionmaker[AsyncSession],
     stub_anthropic: AsyncAnthropic,
 ) -> None:
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     async with db_session_factory() as s, s.begin():
@@ -226,7 +212,7 @@ async def test_tenants_list_filters_by_slack_platform(
     The validator previously allowed only discord and cli, so every Slack
     install was unreachable from `daimon tenants list` and `tenants delete`.
     """
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     async with db_session_factory() as s, s.begin():
@@ -251,7 +237,7 @@ async def test_tenants_list_rejects_unknown_platform(
     stub_anthropic: AsyncAnthropic,
 ) -> None:
     """An unrecognized platform still fails loudly rather than deriving a wrong UUID."""
-    rt = _build_rt(db_session_factory, stub_anthropic)
+    rt = build_cli_runtime(db_session_factory, anthropic=stub_anthropic, settings=_FakeSettings())
     console = _make_console()
 
     with pytest.raises(typer.BadParameter, match="discord, cli, slack"):
