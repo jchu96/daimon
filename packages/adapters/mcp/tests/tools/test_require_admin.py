@@ -30,9 +30,11 @@ from daimon.adapters.mcp.tools.skills import _list_impl, _sync_impl
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec, EnvironmentSpec
 from daimon.core.stores.domain import Role
+from daimon.testing import ma_agent
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
-from factories import make_ma_agent
 from fastmcp.exceptions import ToolError
+
+from ..harness import seed_tenant
 
 pytestmark = pytest.mark.asyncio
 
@@ -94,16 +96,12 @@ async def test_create_agent_impl_does_not_raise_admin_gate_for_non_admin() -> No
     router.add(
         "POST",
         r"/v1/agents",
-        lambda _req, _m: httpx.Response(
-            200, json=make_ma_agent(name="demo").model_dump(mode="json")
-        ),
+        lambda _req, _m: httpx.Response(200, json=ma_agent(name="demo").model_dump(mode="json")),
     )
     router.add(
         "GET",
         r"/v1/agents/([^/]+)",
-        lambda _req, _m: httpx.Response(
-            200, json=make_ma_agent(name="demo").model_dump(mode="json")
-        ),
+        lambda _req, _m: httpx.Response(200, json=ma_agent(name="demo").model_dump(mode="json")),
     )
     client = build_fake_anthropic(router.dispatch)
 
@@ -129,7 +127,7 @@ async def test_list_agents_impl_does_not_raise_for_non_admin() -> None:
         r"/v1/agents",
         lambda _req, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
                 ).model_dump(mode="json")
@@ -158,7 +156,6 @@ async def test_self_write_file_impl_does_not_raise_admin_gate_for_non_admin(
 ) -> None:
     """self_write_file is no longer admin-gated — a non-admin agent session can
     write its own per-agent file (a per-agent attachment, not a spec field)."""
-    from factories import seed_tenant  # type: ignore[import-untyped]
 
     async with committing_sessionmaker.begin() as session:
         tenant_id = await seed_tenant(session)
@@ -184,7 +181,6 @@ async def test_self_read_file_impl_does_not_raise_admin_gate_for_non_admin(
     committing_sessionmaker: Any,
 ) -> None:
     """Read tool is ungated — non-admin agent can read its own files."""
-    from factories import seed_tenant  # type: ignore[import-untyped]
 
     async with committing_sessionmaker.begin() as session:
         tenant_id = await seed_tenant(session)

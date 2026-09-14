@@ -36,14 +36,14 @@ from daimon.core.reports.publish import (
     PublishResult,
 )
 from daimon.core.scope import DeploymentDefault
+from daimon.testing.asgi import mcp_session
 from daimon.testing.factories import make_account, make_tenant
-from factories import make_jwt
 from fastmcp.exceptions import ToolError
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
-from ..factories import mcp_session
+from ..harness import make_jwt
 
 pytestmark = pytest.mark.asyncio
 

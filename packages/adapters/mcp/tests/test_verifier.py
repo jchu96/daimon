@@ -22,7 +22,7 @@ from daimon.core.mcp_auth import mint_agent_mcp_token
 from daimon.core.stores.mcp_tokens import revoke_mcp_token
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .factories import seed_tenant_and_account
+from .harness import seed_tenant_and_account
 
 pytestmark = pytest.mark.asyncio
 

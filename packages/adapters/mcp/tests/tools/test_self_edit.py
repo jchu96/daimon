@@ -36,10 +36,11 @@ from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.domain import Role
 from daimon.testing.factories import make_account, make_tenant
-from factories import seed_tenant
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ..harness import seed_tenant
 
 pytestmark = pytest.mark.asyncio
 

@@ -23,9 +23,9 @@ from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault, TenantScopeRef
 from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.scoped_config_write import set_fields
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
-from factories import make_ma_agent
 from fastmcp.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -99,7 +99,7 @@ def _spec_agent_router(
         metadata["daimon_account"] = str(account_id)
 
     def _agent_payload() -> dict[str, Any]:
-        return make_ma_agent(
+        return ma_agent(
             id=agent_id,
             name=agent_name,
             mcp_servers=mcp_servers or [],
@@ -120,7 +120,7 @@ def _spec_agent_router(
         request_log.append("POST /v1/agents/{id}")
         captured.update(json_body(req))
         return httpx.Response(
-            200, json=make_ma_agent(id=agent_id, name=agent_name).model_dump(mode="json")
+            200, json=ma_agent(id=agent_id, name=agent_name).model_dump(mode="json")
         )
 
     router = MARouter()
@@ -300,7 +300,7 @@ async def test_detach_mcp_server_impl_retries_once_on_version_conflict() -> None
     def on_list(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         return list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_conflict",
                     name="demo",
                     mcp_servers=[
@@ -314,7 +314,7 @@ async def test_detach_mcp_server_impl_retries_once_on_version_conflict() -> None
     def on_retrieve(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         return httpx.Response(
             200,
-            json=make_ma_agent(
+            json=ma_agent(
                 id="ag_conflict",
                 name="demo",
                 mcp_servers=[{"name": "ctx7", "type": "url", "url": "https://ctx7.example/mcp"}],
@@ -329,7 +329,7 @@ async def test_detach_mcp_server_impl_retries_once_on_version_conflict() -> None
             return _conflict_response()
         return httpx.Response(
             200,
-            json=make_ma_agent(id="ag_conflict", name="demo", version=2).model_dump(mode="json"),
+            json=ma_agent(id="ag_conflict", name="demo", version=2).model_dump(mode="json"),
         )
 
     router = MARouter()
@@ -387,7 +387,7 @@ async def test_remove_skill_impl_detaches_by_resolved_display_name() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_removal",
                     name="demo",
                     skills=[{"type": "custom", "skill_id": "skill_build", "version": "1"}],
@@ -418,7 +418,7 @@ async def test_remove_skill_impl_detaches_by_resolved_display_name() -> None:
     def on_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         captured.update(json_body(req))
         return httpx.Response(
-            200, json=make_ma_agent(id="ag_removal", name="demo").model_dump(mode="json")
+            200, json=ma_agent(id="ag_removal", name="demo").model_dump(mode="json")
         )
 
     router.add(
@@ -426,7 +426,7 @@ async def test_remove_skill_impl_detaches_by_resolved_display_name() -> None:
         r"/v1/agents/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=make_ma_agent(
+            json=ma_agent(
                 id="ag_removal",
                 name="demo",
                 skills=[{"type": "custom", "skill_id": "skill_build", "version": "1"}],
@@ -542,7 +542,7 @@ def _agent_only_router(
         "GET",
         r"/v1/agents",
         lambda _r, _m: list_response(
-            [make_ma_agent(id=agent_id, name=agent_name, metadata=metadata).model_dump(mode="json")]
+            [ma_agent(id=agent_id, name=agent_name, metadata=metadata).model_dump(mode="json")]
         ),
     )
     return build_fake_anthropic(router.dispatch)
@@ -558,7 +558,7 @@ def _multi_agent_router(
         if account_id is not None:
             metadata["daimon_account"] = str(account_id)
         payloads.append(
-            make_ma_agent(id=agent_id, name=agent_name, metadata=metadata).model_dump(mode="json")
+            ma_agent(id=agent_id, name=agent_name, metadata=metadata).model_dump(mode="json")
         )
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda _r, _m: list_response(payloads))

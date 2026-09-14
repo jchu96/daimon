@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import json
 import uuid
-from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -35,17 +31,18 @@ from daimon.adapters.mcp.tools.sessions import (
     register_sessions_tools,
 )
 from daimon.core.scope import DeploymentDefault
+from daimon.testing import ma_agent
+from daimon.testing.asgi import call_mcp_tool
 from daimon.testing.ma import (
     MARouter,
     build_fake_anthropic,
     list_response,
 )
-from factories import make_ma_agent
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.types import ASGIApp, Message
+from starlette.types import ASGIApp
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,95 +57,10 @@ def _runtime(client: AsyncAnthropic) -> McpRuntime:
 
 
 # ---------------------------------------------------------------------------
-# Full-HTTP-pipeline harness (copied from test_agent_chat.py:964-1086) — FastMCP
+# Full-HTTP-pipeline app — FastMCP
 # output-schema validation only runs through mcp.http_app() + a real JSON-RPC
 # tools/call; unit-calling the _impl functions bypasses it entirely.
 # ---------------------------------------------------------------------------
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(app: ASGIApp) -> AsyncIterator[None]:
-    send_q: asyncio.Queue[Message] = asyncio.Queue()
-    recv_q: asyncio.Queue[Message] = asyncio.Queue()
-
-    async def receive() -> Message:
-        return await recv_q.get()
-
-    async def send(message: Message) -> None:
-        await send_q.put(message)
-
-    async def run() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    task = asyncio.create_task(run())
-    await recv_q.put({"type": "lifespan.startup"})
-    msg = await send_q.get()
-    assert msg["type"] == "lifespan.startup.complete", msg
-    try:
-        yield
-    finally:
-        await recv_q.put({"type": "lifespan.shutdown"})
-        msg = await send_q.get()
-        assert msg["type"] == "lifespan.shutdown.complete", msg
-        await task
-
-
-def _parse_jsonrpc(resp: httpx.Response) -> dict[str, object]:
-    ct = resp.headers.get("content-type", "")
-    if "text/event-stream" in ct:
-        for line in resp.text.splitlines():
-            if line.startswith("data: "):
-                return json.loads(line[6:])  # type: ignore[return-value]
-        raise AssertionError(f"No data line in SSE: {resp.text!r}")
-    return resp.json()  # type: ignore[return-value]
-
-
-async def _call_tool_via_http(
-    app: ASGIApp, token: str, name: str, arguments: dict[str, object]
-) -> dict[str, object]:
-    """Initialize an MCP HTTP session and call tools/call; return the JSON-RPC result.
-
-    Goes through the full server pipeline (auth -> IdentityMiddleware -> tool ->
-    FastMCP OUTPUT VALIDATION) so it exercises the same output-schema check that
-    rejects overly-strict schemas in prod — unlike _impl-level tests, which bypass it.
-    """
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
-                },
-            },
-            headers=headers,
-        )
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        call_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            },
-            headers=headers,
-        )
-        assert call_resp.status_code == 200, f"tools/call failed: {call_resp.text}"
-        return _parse_jsonrpc(call_resp)
 
 
 def _sessions_mcp_app(client: AsyncAnthropic, token: str, claims: dict[str, str]) -> ASGIApp:
@@ -266,7 +178,7 @@ async def test_get_session_admits_novel_status_string_through_fastmcp() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
@@ -287,7 +199,9 @@ async def test_get_session_admits_novel_status_string_through_fastmcp() -> None:
     client = build_fake_anthropic(router.dispatch)
     app = _sessions_mcp_app(client, token, claims)
 
-    result = await _call_tool_via_http(app, token, "get_session", {"session_id": "ses_1"})
+    result = await call_mcp_tool(
+        app, token=token, name="get_session", arguments={"session_id": "ses_1"}
+    )
 
     payload = result.get("result", result)
     assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
@@ -325,7 +239,7 @@ async def test_list_session_events_admits_thread_status_events_through_fastmcp()
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
@@ -354,7 +268,9 @@ async def test_list_session_events_admits_thread_status_events_through_fastmcp()
     client = build_fake_anthropic(router.dispatch)
     app = _sessions_mcp_app(client, token, claims)
 
-    result = await _call_tool_via_http(app, token, "list_session_events", {"session_id": "ses_1"})
+    result = await call_mcp_tool(
+        app, token=token, name="list_session_events", arguments={"session_id": "ses_1"}
+    )
 
     payload = result.get("result", result)
     assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
@@ -379,7 +295,7 @@ async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
@@ -459,7 +375,7 @@ async def test_get_session_raises_when_session_belongs_to_other_tenant() -> None
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
@@ -519,7 +435,7 @@ async def test_get_session_returns_session_info_when_owned() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
@@ -590,7 +506,7 @@ async def test_list_session_events_returns_page_envelope() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},
@@ -665,7 +581,7 @@ def _agents_router(tenant_id: uuid.UUID) -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id="ag_a",
                     name="demo",
                     metadata={"daimon_tenant": str(tenant_id), "daimon_name": "demo"},

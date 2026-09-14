@@ -40,7 +40,7 @@ from google.genai import types
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .factories import seed_tenant_and_account
+from .harness import seed_tenant_and_account
 from .services.conftest import make_stub_gemini
 
 

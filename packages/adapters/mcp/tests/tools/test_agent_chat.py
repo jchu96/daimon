@@ -14,13 +14,9 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import datetime as dt
-import json
 import re
 import uuid
-from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -71,6 +67,8 @@ from daimon.core.pricing import MODEL_PRICING, cost_of
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.core.tenant_balance import debit_amount
+from daimon.testing import ma_agent
+from daimon.testing.asgi import call_mcp_tool, mcp_session
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
@@ -80,7 +78,6 @@ from daimon.testing.ma import (
     list_response,
     send_events_response,
 )
-from factories import make_ma_agent
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -90,7 +87,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import ImageContent
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.types import ASGIApp, Message
+from starlette.types import ASGIApp
 
 pytestmark = pytest.mark.asyncio
 
@@ -224,77 +221,9 @@ def _make_thread_idle_event(*, stop_reason_type: str = "end_turn") -> dict[str, 
 # ---------------------------------------------------------------------------
 
 
-@contextlib.asynccontextmanager
-async def _lifespan(app: ASGIApp) -> AsyncIterator[None]:
-    send_q: asyncio.Queue[Message] = asyncio.Queue()
-    recv_q: asyncio.Queue[Message] = asyncio.Queue()
-
-    async def receive() -> Message:
-        return await recv_q.get()
-
-    async def send(message: Message) -> None:
-        await send_q.put(message)
-
-    async def run() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    task = asyncio.create_task(run())
-    await recv_q.put({"type": "lifespan.startup"})
-    msg = await send_q.get()
-    assert msg["type"] == "lifespan.startup.complete", msg
-    try:
-        yield
-    finally:
-        await recv_q.put({"type": "lifespan.shutdown"})
-        msg = await send_q.get()
-        assert msg["type"] == "lifespan.shutdown.complete", msg
-        await task
-
-
-def _parse_jsonrpc(resp: httpx.Response) -> dict[str, object]:
-    ct = resp.headers.get("content-type", "")
-    if "text/event-stream" in ct:
-        for line in resp.text.splitlines():
-            if line.startswith("data: "):
-                return json.loads(line[6:])  # type: ignore[return-value]
-        raise AssertionError(f"No data line in SSE: {resp.text!r}")
-    return resp.json()  # type: ignore[return-value]
-
-
 async def _tools_list_via_http(app: ASGIApp, token: str) -> list[str]:
     """Initialize an MCP HTTP session and call tools/list; return tool names."""
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
-                },
-            },
-            headers=headers,
-        )
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        list_resp = await c.post(
-            "/mcp",
-            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            headers=headers,
-        )
-        assert list_resp.status_code == 200, f"tools/list failed: {list_resp.text}"
-        result = _parse_jsonrpc(list_resp)
+    result = await mcp_session(app, token=token, method="tools/list")
     tools_payload = result.get("result", result)
     return [t["name"] for t in tools_payload.get("tools", [])]  # type: ignore[union-attr]
 
@@ -538,7 +467,7 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1177,7 +1106,7 @@ async def test_start_turn_resolves_env_from_deployment_default_when_no_tenant_ro
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1246,7 +1175,7 @@ async def test_get_session_raises_session_not_found_for_cross_tenant_handle() ->
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1296,7 +1225,7 @@ def _sibling_tenant_agents_router() -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1304,7 +1233,7 @@ def _sibling_tenant_agents_router() -> MARouter:
                         "daimon_name": "test-agent",
                     },
                 ).model_dump(mode="json"),
-                make_ma_agent(
+                ma_agent(
                     id="ag_sibling",
                     name="sibling-agent",
                     metadata={
@@ -1452,7 +1381,7 @@ async def test_list_sessions_lists_only_the_callers_agent_sessions() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1490,7 +1419,7 @@ def _describe_agent_router() -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1549,54 +1478,6 @@ async def test_describe_agent_returns_none_repo_url_for_unbound_agent(
 # ---------------------------------------------------------------------------
 # Test 3: list_events output schema admits session.thread_status_* events
 # ---------------------------------------------------------------------------
-
-
-async def _call_tool_via_http(
-    app: ASGIApp, token: str, name: str, arguments: dict[str, object]
-) -> dict[str, object]:
-    """Initialize an MCP HTTP session and call tools/call; return the JSON-RPC result.
-
-    Goes through the full server pipeline (auth -> IdentityMiddleware -> tool ->
-    FastMCP OUTPUT VALIDATION) so it exercises the same output-schema check that
-    rejected the transcript in prod — unlike the _impl-level tests which bypass it.
-    """
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
-                },
-            },
-            headers=headers,
-        )
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        call_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            },
-            headers=headers,
-        )
-        assert call_resp.status_code == 200, f"tools/call failed: {call_resp.text}"
-        return _parse_jsonrpc(call_resp)
 
 
 async def test_list_events_admits_thread_status_events_through_fastmcp() -> None:
@@ -1658,8 +1539,8 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
     runtime = _runtime(build_fake_anthropic(router.dispatch), session_factory=mock_sessionmaker)
     register_agent_chat_tools(mcp, runtime, billing_config=None)
 
-    result = await _call_tool_via_http(
-        mcp.http_app(), token, "list_events", {"handle": "ses_test001"}
+    result = await call_mcp_tool(
+        mcp.http_app(), token=token, name="list_events", arguments={"handle": "ses_test001"}
     )
 
     payload = result.get("result", result)
@@ -1734,7 +1615,9 @@ async def test_turn_tools_refuse_over_balance_tenant_before_creating_session(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
         new=AsyncMock(),
     ) as mock_create_session:
-        result = await _call_tool_via_http(mcp.http_app(), token, tool_name, {"message": "hello"})
+        result = await call_mcp_tool(
+            mcp.http_app(), token=token, name=tool_name, arguments={"message": "hello"}
+        )
 
     payload = result.get("result", result)
     assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
@@ -1774,7 +1657,7 @@ def _agent_and_env_router() -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1810,7 +1693,7 @@ def _isolated_agent_and_env_router(*, ma_agent_id: str = _MA_AGENT_ID) -> MARout
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=ma_agent_id,
                     name="reader-agent",
                     metadata={
@@ -2881,7 +2764,7 @@ async def test_ask_with_handle_continues_instead_of_starting(
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={

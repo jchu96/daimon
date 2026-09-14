@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import datetime as dt
-import json
 import uuid
-from collections.abc import AsyncIterator
 from unittest.mock import MagicMock
 
-import httpx
 import pytest
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.server import create_mcp_app
@@ -27,121 +22,28 @@ from daimon.core.config import (
 )
 from daimon.core.mcp_auth import mint_jwt
 from daimon.core.scope import DeploymentDefault
+from daimon.testing.asgi import call_mcp_tool, mcp_session
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.types import ASGIApp, Message
+from starlette.types import ASGIApp
 
 _SECRET = b"a" * 32
-
-_INIT_BODY: dict[str, object] = {
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "initialize",
-    "params": {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "test", "version": "0"},
-    },
-}
-_INIT_HEADERS = {
-    "Accept": "application/json, text/event-stream",
-    "Content-Type": "application/json",
-}
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(app: ASGIApp) -> AsyncIterator[None]:
-    """Drive the ASGI lifespan protocol around a raw ASGITransport call.
-
-    Mirrors ``test_rbac.py``'s helper of the same name — duplicated locally
-    per the testing guideline (inline data/helpers, no cross-test-file
-    sharing of private setup).
-    """
-    send_queue: asyncio.Queue[Message] = asyncio.Queue()
-    receive_queue: asyncio.Queue[Message] = asyncio.Queue()
-
-    async def receive() -> Message:
-        return await receive_queue.get()
-
-    async def send(message: Message) -> None:
-        await send_queue.put(message)
-
-    async def run_lifespan() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    task = asyncio.create_task(run_lifespan())
-
-    await receive_queue.put({"type": "lifespan.startup"})
-    msg = await send_queue.get()
-    assert msg["type"] == "lifespan.startup.complete", msg
-    try:
-        yield
-    finally:
-        await receive_queue.put({"type": "lifespan.shutdown"})
-        msg = await send_queue.get()
-        assert msg["type"] == "lifespan.shutdown.complete", msg
-        await task
-
-
-def _parse_jsonrpc_response(resp: httpx.Response) -> dict[str, object]:
-    content_type = resp.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
-        for line in resp.text.splitlines():
-            if line.startswith("data: "):
-                return json.loads(line[6:])  # type: ignore[return-value]
-        raise AssertionError(f"No data line in SSE response: {resp.text!r}")
-    return resp.json()  # type: ignore[return-value]
 
 
 async def _call_tool(
     app: ASGIApp, *, token: str, tool_name: str, arguments: dict[str, object]
 ) -> dict[str, object]:
     """Initialize an MCP HTTP session and call a tool; return the JSON-RPC result."""
-    headers = dict(_INIT_HEADERS)
-    headers["Authorization"] = f"Bearer {token}"
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post("/mcp", json=_INIT_BODY, headers=headers)
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-
-        body = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        }
-        resp = await c.post("/mcp", json=body, headers=headers)
-        assert resp.status_code == 200, f"tools/call failed ({resp.status_code}): {resp.text}"
-        result = _parse_jsonrpc_response(resp)
+    result = await call_mcp_tool(app, token=token, name=tool_name, arguments=arguments)
     return result.get("result", result)  # type: ignore[return-value]
 
 
 async def _list_tool_names(app: ASGIApp, *, token: str) -> list[str]:
     """Initialize an MCP HTTP session and call tools/list; return tool names."""
-    headers = dict(_INIT_HEADERS)
-    headers["Authorization"] = f"Bearer {token}"
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post("/mcp", json=_INIT_BODY, headers=headers)
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        body: dict[str, object] = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {},
-        }
-        resp = await c.post("/mcp", json=body, headers=headers)
-        assert resp.status_code == 200, f"tools/list failed: {resp.text}"
-        result = _parse_jsonrpc_response(resp)
+    result = await mcp_session(app, token=token, method="tools/list")
     tools_payload = result.get("result", result)
     return [t["name"] for t in tools_payload.get("tools", [])]  # type: ignore[union-attr]
 

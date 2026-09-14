@@ -27,11 +27,10 @@ from daimon.core.config import (
 )
 from daimon.core.stores import accounts
 from daimon.core.stores.domain import Role
+from daimon.testing.asgi import mcp_session
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-from .factories import mcp_session
 
 pytestmark = pytest.mark.asyncio
 
