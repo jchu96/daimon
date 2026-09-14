@@ -262,6 +262,7 @@ async def _seed_request(
     expires_in: timedelta = timedelta(minutes=30),
     mcp_server_url: str | None = None,
     agent_id: uuid.UUID | None = None,
+    posted_message_id: str | None = _MESSAGE_TS,
 ) -> str:
     token = mint_request_token()
     await create_credential_request(
@@ -275,6 +276,7 @@ async def _seed_request(
         mcp_server_url=mcp_server_url,
         requester_platform_user_id=requester,
         channel_id=_CHANNEL_ID,
+        posted_message_id=posted_message_id,
         expires_at=datetime.now(UTC) + expires_in,
         idempotency_key=uuid.uuid4(),
         target_ma_agent_id="ag_test",
@@ -531,8 +533,12 @@ async def test_env_submission_consumes_row_and_writes_the_secret(
     assert rows and rows[0]["key"] == "OPENAI_API_KEY"
     assert rows[0]["content"] == "s3cr3t-value"
     assert row is not None and row.used_at is not None, "the consume must have committed"
-    assert ("POST", _CHAT_UPDATE_URL) in fake_slack_web_client.mock.requests, (
-        "the button message must be swapped for a consumed marker"
+    edit = fake_slack_web_client.mock.requests[("POST", _CHAT_UPDATE_URL)][0].kwargs["json"]
+    assert edit["text"] == "🔑 Add OPENAI_API_KEY to tester", (
+        "the consumed card keeps its headline instead of collapsing to a marker"
+    )
+    assert not [b for b in edit["blocks"] if b["type"] == "actions"], (
+        "the consumed card must not keep a live button"
     )
     assert ("POST", _EPHEMERAL_URL) in fake_slack_web_client.mock.requests
 

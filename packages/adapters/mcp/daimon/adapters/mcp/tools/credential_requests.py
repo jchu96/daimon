@@ -4,6 +4,11 @@ These tools create single-use, expiring request rows and post a target-naming
 card through the caller's platform. Secret values never enter tool arguments.
 Submission checks requester identity; these enrollment paths deliberately do
 not inherit the admin gate for direct agent-spec mutations.
+
+Replacing a key that already exists is the one exception: it destroys shared
+state, so `daimon.core.operation_policy` decides it here, *before* the mint,
+and a refusal posts no card at all — nobody is asked for a secret they were
+never going to be allowed to save.
 """
 
 from __future__ import annotations
@@ -25,19 +30,29 @@ from daimon.adapters.mcp.tools.setup_target import require_turn_origin, resolve_
 from daimon.adapters.mcp.tools.slack._credential_button import (
     _post_slack_credential_button_impl,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.core.continuity.continuation import MAX_REQUESTED_WORK, sanitize_requested_work
 from daimon.core.credential_requests import (
     DEFAULT_TTL,
+    ENV_FILE_TARGET,
     CredentialRequestKind,
     build_skill_repo_target,
     mint_request_token,
 )
+from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.operation_policy import (
+    TargetFacts,
+    decide_operation,
+    needs_reachability_read,
+)
+from daimon.core.stores.agent_files import get_agent_file
 from daimon.core.stores.credential_requests import (
     create_credential_request,
     update_credential_request_message,
 )
 from daimon.core.stores.domain import TurnOriginRow
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from daimon.core.stores.turn_origins import get_active_origin
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -56,6 +71,11 @@ _POSIX_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # segments" before the row is minted, guaranteeing the modal's later
 # normalization sees the same shape this tool validated.
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+_PENDING_TASK_DESCRIPTION = (
+    "The task that is waiting on this input, in the person's words, or omit "
+    "when they only asked to save it."
+)
 
 
 class RequestCredentialResult(BaseModel):
@@ -84,6 +104,20 @@ def _require_requestable_platform(auth: AuthIdentity) -> str:
     return auth.platform_user_id
 
 
+def _bounded_pending_task(pending_task: str | None, *, echoes: tuple[str, ...]) -> str | None:
+    """Return the waiting task to persist, or None when it says nothing.
+
+    `sanitize_requested_work` nulls out an empty, too-short, or name-echoing
+    string; the slice is the caller's half of that contract (the sanitizer
+    deliberately does not truncate). The echoes are the agent name and the
+    target, the two strings a model restates instead of describing work.
+    """
+    work = sanitize_requested_work(pending_task, echoes=echoes)
+    if work is None:
+        return None
+    return work[:MAX_REQUESTED_WORK]
+
+
 async def _resolve_agent_uuid(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -110,6 +144,49 @@ async def _resolve_agent_uuid(
     return agent_uuid, ma_agent
 
 
+async def _require_key_replacement_allowed(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    ma_agent: BetaManagedAgentsAgent,
+    key: str,
+) -> None:
+    """Raise before the mint when this caller may not replace an existing key.
+
+    `key_replace` is an attachment operation: an admin is allowed on any
+    target (that is the first-run onboarding step), a non-admin is refused on
+    a defaults-managed agent and on one that currently answers somewhere in
+    the tenant. The reachability read is paid for only when the policy says
+    the answer actually depends on it.
+    """
+    is_daimon_managed = ma_agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
+    reachable = False
+    if needs_reachability_read(
+        "key_replace", is_admin=auth.is_admin, is_daimon_managed=is_daimon_managed
+    ):
+        async with runtime.session_factory() as session:
+            reachable = await is_agent_reachable_in_tenant(
+                session,
+                tenant_id=auth.tenant_id,
+                agent_name=ma_agent.name,
+                default=runtime.deployment_default,
+            )
+    outcome = decide_operation(
+        "key_replace",
+        is_admin=auth.is_admin,
+        target=TargetFacts(is_daimon_managed=is_daimon_managed, is_reachable_in_tenant=reachable),
+    )
+    if outcome in ("managed_agent", "needs_admin"):
+        raise ToolError(
+            f"'{ma_agent.name}' is shared with everyone here, so replacing the key "
+            f"'{key}' it already has needs a server or workspace admin, and the caller "
+            f"is not one. Nothing changed: the existing '{key}' is still in use and no "
+            "card was posted. Tell them an admin can ask Daimon to replace the "
+            f"'{key}' key on '{ma_agent.name}'. Do not ask anyone for the value here "
+            "and do not retry."
+        )
+
+
 async def _mint_and_post(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -124,11 +201,18 @@ async def _mint_and_post(
     purpose: str,
     channel_id: str,
     origin: TurnOriginRow,
+    requested_work: str | None,
+    replaces_updated_at: datetime | None = None,
+    branch: str | None = None,
 ) -> RequestCredentialResult:
     # A tool-supplied channel cannot redirect a private-input request.
     channel_id = origin.parent_channel_id if auth.platform == "slack" else origin.thread_id
     token = mint_request_token()
     expires_at = datetime.now(UTC) + DEFAULT_TTL
+    # The card says who will pick the work back up; an origin with no
+    # responder name is the headless case, where the built-in agent's name is
+    # the only honest thing to print.
+    responder_name = origin.responder_name or "Daimon"
     async with runtime.session_factory.begin() as session:
         active_origin = await get_active_origin(
             session,
@@ -158,10 +242,9 @@ async def _mint_and_post(
             idempotency_key=uuid.uuid4(),
             target_ma_agent_id=str(ma_agent.id),
             target_name=ma_agent.name,
-            # Nothing is queued behind a credential request minted here: the
-            # tool returns to the agent mid-turn and the click resumes nothing.
-            requested_work=None,
-            responder_name=origin.responder_name,
+            requested_work=requested_work,
+            responder_name=responder_name,
+            replaces_updated_at=replaces_updated_at,
             platform=origin.platform,
             parent_channel_id=origin.parent_channel_id,
             origin_thread_id=origin.thread_id,
@@ -178,6 +261,10 @@ async def _mint_and_post(
                 token=token,
                 agent_name=agent_name,
                 purpose=purpose,
+                expires_at=expires_at,
+                responder_name=responder_name,
+                mcp_server_url=mcp_server_url,
+                branch=branch,
             )
         else:
             message_id = await _post_credential_button_impl(
@@ -189,6 +276,10 @@ async def _mint_and_post(
                 token=token,
                 agent_name=agent_name,
                 purpose=purpose,
+                expires_at=expires_at,
+                responder_name=responder_name,
+                mcp_server_url=mcp_server_url,
+                branch=branch,
             )
     except ToolError as exc:
         # The row already exists (single-use + TTL bound it regardless), but
@@ -209,14 +300,15 @@ async def _request_agent_key_impl(
     auth: AuthIdentity,
     *,
     agent_name: str,
-    key: str,
+    key: str | None,
     purpose: str,
     channel_id: str,
+    pending_task: str | None = None,
     origin_context_id: str | None = None,
     expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
     requester = _require_requestable_platform(auth)
-    if not _POSIX_KEY_RE.match(key):
+    if key is not None and not _POSIX_KEY_RE.match(key):
         raise ToolError(
             "key must match [A-Za-z_][A-Za-z0-9_]* "
             "(letters, digits, underscores; must not start with a digit)"
@@ -225,11 +317,27 @@ async def _request_agent_key_impl(
     agent_id, ma_agent = await _resolve_agent_uuid(
         runtime, auth, agent_name, expected_ma_agent_id, origin
     )
+    # No key name means a whole-file import, which names no single key and
+    # replaces nothing by compare-and-set: the file form merges.
+    kind: CredentialRequestKind = "env_file" if key is None else "env"
+    target = ENV_FILE_TARGET if key is None else key
+    replaces_updated_at: datetime | None = None
+    if key is not None:
+        async with runtime.session_factory() as session:
+            existing = await get_agent_file(
+                session, tenant_id=auth.tenant_id, agent_id=agent_id, key=key
+            )
+        if existing is not None:
+            await _require_key_replacement_allowed(runtime, auth, ma_agent=ma_agent, key=key)
+            # The card promises "the value as it stands right now"; the
+            # submit path compares against this timestamp and refuses a
+            # write that would clobber someone else's later change.
+            replaces_updated_at = existing.updated_at
     return await _mint_and_post(
         runtime,
         auth,
-        kind="env",
-        target=key,
+        kind=kind,
+        target=target,
         mcp_server_url=None,
         agent_id=agent_id,
         ma_agent=ma_agent,
@@ -238,6 +346,8 @@ async def _request_agent_key_impl(
         purpose=purpose,
         channel_id=channel_id,
         origin=origin,
+        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, target)),
+        replaces_updated_at=replaces_updated_at,
     )
 
 
@@ -249,6 +359,7 @@ async def _request_mcp_token_impl(
     server_name: str,
     url: str,
     channel_id: str,
+    pending_task: str | None = None,
     origin_context_id: str | None = None,
     expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
@@ -279,14 +390,10 @@ async def _request_mcp_token_impl(
         purpose=f"connecting the MCP server '{server_name}'",
         channel_id=channel_id,
         origin=origin,
+        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, server_name)),
     )
 
 
-# No `default_branch` parameter here: the credential_requests row has no
-# column to hold one, and none is being added, so an argument accepted here
-# would be silently discarded — the exact class of surface-that-lies this
-# tool exists not to become. The modal collects the branch instead,
-# defaulting to `main`.
 async def _request_skill_repo_token_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -297,6 +404,7 @@ async def _request_skill_repo_token_impl(
     path: str,
     purpose: str,
     channel_id: str,
+    pending_task: str | None = None,
     origin_context_id: str | None = None,
     expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
@@ -330,6 +438,8 @@ async def _request_skill_repo_token_impl(
         purpose=purpose,
         channel_id=channel_id,
         origin=origin,
+        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, repo_url)),
+        branch=branch,
     )
 
 
@@ -341,6 +451,8 @@ async def _request_repo_binding_impl(
     repo_url: str,
     purpose: str,
     channel_id: str,
+    branch: str = "main",
+    pending_task: str | None = None,
     origin_context_id: str | None = None,
     expected_ma_agent_id: str | None = None,
 ) -> RequestCredentialResult:
@@ -351,6 +463,11 @@ async def _request_repo_binding_impl(
         raise ToolError(
             "repo url must name exactly one owner/repo, e.g. https://github.com/owner/repo"
         )
+    # Same delimiter rule `request_skill_repo_token` applies: the branch rides
+    # in the packed `target`, so a branch carrying one would round-trip as a
+    # different repo.
+    if "@" in branch or "#" in branch:
+        raise ToolError("branch must not contain '@' or '#'")
     origin = await require_turn_origin(runtime, auth, origin_context_id)
     agent_id, ma_agent = await _resolve_agent_uuid(
         runtime, auth, agent_name, expected_ma_agent_id, origin
@@ -359,7 +476,7 @@ async def _request_repo_binding_impl(
         runtime,
         auth,
         kind="repo",
-        target=repo_url,
+        target=build_skill_repo_target(repo_url, branch, ""),
         mcp_server_url=None,
         agent_id=agent_id,
         ma_agent=ma_agent,
@@ -368,6 +485,8 @@ async def _request_repo_binding_impl(
         purpose=purpose,
         channel_id=channel_id,
         origin=origin,
+        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, repo_url)),
+        branch=branch,
     )
 
 
@@ -376,15 +495,6 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
     async def request_agent_key(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         agent_name: str,
-        key: Annotated[
-            str,
-            Field(
-                description=(
-                    "Stored environment variable name, UPPER_SNAKE, e.g. TOGGL_TOKEN "
-                    "or OPENAI_API_KEY; never the secret value."
-                )
-            ),
-        ],
         purpose: str,
         channel_id: Annotated[
             str,
@@ -392,18 +502,31 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         ],
         origin_context_id: str,
         expected_ma_agent_id: str,
+        key: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Stored environment variable name, UPPER_SNAKE, e.g. TOGGL_TOKEN "
+                    "or OPENAI_API_KEY; never the secret value. Omit it to ask for a "
+                    "whole .env file of keys instead."
+                )
+            ),
+        ] = None,
+        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
     ) -> RequestCredentialResult:
         """Give an agent an API key or token for any service: Toggl, OpenAI,
         Higgsfield, or a platform that just launched. Unknown services work too.
 
-        Never accept secret values in chat; ask for rotation if pasted. For MCP
-        credentials use ``request_mcp_token``; GitHub access uses ``request_repo_binding``.
-        To load .env keys, request each key separately; whole-file import is unavailable.
+        Never accept secret values in chat; ask for rotation if pasted. Omit `key` to
+        load, upload or import a whole `.env` file at once. For MCP credentials use
+        ``request_mcp_token``; GitHub access uses ``request_repo_binding``.
 
-        Posts a card in this channel. Only the requester can open its private form;
-        it expires in 30 minutes. Values never appear in chat. Anyone who talks to
-        the agent can use added keys. Members can add keys to the selected agent,
-        including built-in Daimon."""
+        Posts a card naming the agent and the key. Only the requester can open its
+        private form; it expires in 30 minutes. Values never appear in chat. Anyone
+        who talks to the agent can use added keys. Members can add new keys, including
+        to built-in Daimon; replacing one a shared agent already has needs an admin.
+        Pass the waiting task as `pending_task` so it resumes after the value is
+        saved."""
         return await _request_agent_key_impl(
             runtime,
             await _auth(ctx),
@@ -411,6 +534,7 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             key=key,
             purpose=purpose,
             channel_id=channel_id,
+            pending_task=pending_task,
             origin_context_id=origin_context_id,
             expected_ma_agent_id=expected_ma_agent_id,
         )
@@ -434,6 +558,7 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         ],
         origin_context_id: str,
         expected_ma_agent_id: str,
+        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
     ) -> RequestCredentialResult:
         """Connect an agent such as research-bot to Linear, Notion or GitHub through
         an MCP endpoint with a bearer token, not browser OAuth.
@@ -443,10 +568,12 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         credentials in chat. Members can use this form on shared agents and built-in
         Daimon; the admin and fork gates for direct spec edits do not apply.
 
-        Posts a requester-only card opening a private form, expiring in 30 minutes.
-        Submission attaches the server to the agent, not this session's toolset.
-        Check tool availability before promising use here. Values never appear in
-        chat; everyone talking to the agent can use the connection."""
+        Posts a requester-only card naming the agent and the server, opening a private
+        form, expiring in 30 minutes. Submission attaches the server to the agent, not
+        this session's toolset. Check tool availability before promising use here.
+        Values never appear in chat; everyone talking to the agent can use the
+        connection. Pass the waiting task as `pending_task` so it resumes after the
+        value is saved."""
         return await _request_mcp_token_impl(
             runtime,
             await _auth(ctx),
@@ -454,6 +581,7 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             server_name=server_name,
             url=url,
             channel_id=channel_id,
+            pending_task=pending_task,
             origin_context_id=origin_context_id,
             expected_ma_agent_id=expected_ma_agent_id,
         )
@@ -473,18 +601,23 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         ],
         origin_context_id: str,
         expected_ma_agent_id: str,
-        branch: str = "main",
+        branch: Annotated[
+            str, Field(description="Branch the skills are read from, e.g. main.")
+        ] = "main",
         path: str = "",
+        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
     ) -> RequestCredentialResult:
         """The skills repo is private: collect a GitHub token to import its skills.
 
         After ``sync_skills`` cannot read a private skill repository, use this form.
-        For a working repo use ``request_repo_binding``. Currently this enrollment
-        also changes the working-repo binding and therefore what the agent clones.
+        The skill repo is separate from the working repo; for that one use
+        ``request_repo_binding``.
 
-        Posts a requester-only card, expiring in 30 minutes. Its private form retries
-        import and attachment; tokens never appear in chat. Anyone talking to the
-        agent can use the imported skills. Pass the same repo URL, branch and path."""
+        Posts a requester-only card naming the agent and the repo, expiring in 30
+        minutes. Its private form retries import and attachment; tokens never appear
+        in chat. Anyone talking to the agent can use the imported skills. Pass the
+        same repo URL, branch and path, and the waiting task as `pending_task` so it
+        resumes after the value is saved."""
         return await _request_skill_repo_token_impl(
             runtime,
             await _auth(ctx),
@@ -494,6 +627,7 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             path=path,
             purpose=purpose,
             channel_id=channel_id,
+            pending_task=pending_task,
             origin_context_id=origin_context_id,
             expected_ma_agent_id=expected_ma_agent_id,
         )
@@ -513,6 +647,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         ],
         origin_context_id: str,
         expected_ma_agent_id: str,
+        branch: Annotated[
+            str, Field(description="Branch the agent checks out, e.g. main.")
+        ] = "main",
+        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
     ) -> RequestCredentialResult:
         """Let an agent read a GitHub working repo or repository, public or private.
 
@@ -520,10 +658,12 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         no working token, ``post_github_app_install_link`` offers a GitHub App install;
         installing alone does not bind the repo or verify this tenant's access.
 
-        Posts a requester-only card in this channel, expiring in 30 minutes. The
-        private form confirms the branch and collects a GitHub token only when needed;
-        values never appear in chat. Saving binds the working repository for future
-        sessions. Existing working tokens remain in use."""
+        Posts a requester-only card naming the agent and the repo, expiring in 30
+        minutes. Only the requester can open its private form, which collects a GitHub
+        token only when needed; values never appear in chat. Saving binds the working
+        repository on `branch` for future sessions. Existing working tokens remain in
+        use. Pass the waiting task as `pending_task` so it resumes after the value is
+        saved."""
         return await _request_repo_binding_impl(
             runtime,
             await _auth(ctx),
@@ -531,6 +671,8 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
             repo_url=repo_url,
             purpose=purpose,
             channel_id=channel_id,
+            branch=branch,
+            pending_task=pending_task,
             origin_context_id=origin_context_id,
             expected_ma_agent_id=expected_ma_agent_id,
         )

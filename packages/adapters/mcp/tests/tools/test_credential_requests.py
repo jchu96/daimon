@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,9 +30,20 @@ from daimon.core.config import (
     DiscordSettings,
     Settings,
 )
-from daimon.core.credential_requests import CUSTOM_ID_PREFIX, DEFAULT_TTL
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
+from daimon.core.continuity.continuation import MAX_REQUESTED_WORK
+from daimon.core.credential_requests import (
+    CUSTOM_ID_PREFIX,
+    DEFAULT_TTL,
+    ENV_FILE_TARGET,
+)
+from daimon.core.defaults.metadata import (
+    MA_METADATA_KEY_MANAGED,
+    MA_METADATA_KEY_NAME,
+    MA_METADATA_KEY_TENANT,
+)
+from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.scope import DeploymentDefault
+from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.credential_requests import peek_credential_request
 from daimon.core.stores.domain import Role
 from daimon.core.stores.turn_origins import create_origin
@@ -80,6 +92,7 @@ def _runtime(
     *,
     client: AsyncAnthropic | None = None,
     with_discord: bool = True,
+    deployment_default: DeploymentDefault | None = None,
 ) -> McpRuntime:
     settings = Settings(
         database=DatabaseSettings(url="postgresql+asyncpg://x/y"),  # pyright: ignore[reportArgumentType]
@@ -90,7 +103,9 @@ def _runtime(
         session_factory=sessionmaker,
         client=client if client is not None else MagicMock(),  # type: ignore[arg-type]
         settings=settings,
-        deployment_default=DeploymentDefault(),
+        deployment_default=(
+            deployment_default if deployment_default is not None else DeploymentDefault()
+        ),
     )
 
 
@@ -113,15 +128,20 @@ def _auth_identity(
     )
 
 
-def _ma_agent(*, agent_id: str, name: str, tenant_id: uuid.UUID) -> dict[str, object]:
+def _ma_agent(
+    *, agent_id: str, name: str, tenant_id: uuid.UUID, managed: bool = False
+) -> dict[str, object]:
+    metadata = {
+        MA_METADATA_KEY_TENANT: str(tenant_id),
+        MA_METADATA_KEY_NAME: name,
+    }
+    if managed:
+        metadata[MA_METADATA_KEY_MANAGED] = "true"
     agent = ma_agent(
         id=agent_id,
         name=name,
         model=ma_model_config("claude-sonnet-4-6", speed="standard"),
-        metadata={
-            MA_METADATA_KEY_TENANT: str(tenant_id),
-            MA_METADATA_KEY_NAME: name,
-        },
+        metadata=metadata,
     )
     return agent.model_dump(mode="json")
 
@@ -258,9 +278,42 @@ def _patch_successful_post(
     patch_discord_http(monkeypatch, handler)
 
 
+def _walk_components(components: Any) -> Iterator[dict[str, Any]]:
+    """Yield every component dict in a components-v2 payload, depth first.
+
+    The card is a nested container (`type: 17`) holding text displays and an
+    action row, so the button no longer sits at a fixed index — walking the
+    tree keeps these tests reading the payload rather than its shape.
+    """
+    if isinstance(components, dict):
+        yield components  # pyright: ignore[reportUnknownArgumentType]
+        for value in components.values():  # pyright: ignore[reportUnknownVariableType]
+            if isinstance(value, (dict, list)):
+                yield from _walk_components(value)
+    elif isinstance(components, list):
+        for item in components:  # pyright: ignore[reportUnknownVariableType]
+            yield from _walk_components(item)
+
+
+def _button_from_posted(posted: dict[str, Any]) -> dict[str, Any]:
+    buttons = [
+        c
+        for c in _walk_components(posted["json"]["components"])
+        if str(c.get("custom_id", "")).startswith(CUSTOM_ID_PREFIX)
+    ]
+    assert len(buttons) == 1, f"expected exactly one credential button, got {len(buttons)}"
+    return buttons[0]
+
+
+def _card_text(posted: dict[str, Any]) -> str:
+    """Every rendered text run in the posted card, joined."""
+    return "\n".join(
+        str(c["content"]) for c in _walk_components(posted["json"]["components"]) if "content" in c
+    )
+
+
 def _token_from_posted(posted: dict[str, Any]) -> str:
-    custom_id: str = posted["json"]["components"][0]["components"][0]["custom_id"]
-    assert custom_id.startswith(CUSTOM_ID_PREFIX), f"unexpected custom_id shape: {custom_id!r}"
+    custom_id: str = _button_from_posted(posted)["custom_id"]
     return custom_id[len(CUSTOM_ID_PREFIX) :]
 
 
@@ -679,8 +732,8 @@ async def test_request_repo_binding_creates_row_and_posts_button(
     )
 
     assert result.kind == "repo", "result must report the repo kind"
-    assert result.target == "https://github.com/clsandoval/daimon-qa-scratch", (
-        "result must report the exact submitted repo url"
+    assert result.target == "https://github.com/clsandoval/daimon-qa-scratch@main", (
+        "result must report the repo url packed with the default branch"
     )
     assert result.message_id == "9204", "result must report the posted message id"
     assert before + DEFAULT_TTL <= result.expires_at, "expires_at must be at least now + TTL"
@@ -689,7 +742,9 @@ async def test_request_repo_binding_creates_row_and_posts_button(
     row = await peek_credential_request(db_session, token=_token_from_posted(posted))
     assert row is not None, "the minted token must resolve to the created row"
     assert row.kind == "repo"
-    assert row.target == "https://github.com/clsandoval/daimon-qa-scratch"
+    assert row.target == "https://github.com/clsandoval/daimon-qa-scratch@main", (
+        "the row stores the branch packed into the target"
+    )
     assert row.mcp_server_url is None, "repo rows must not carry an mcp_server_url"
     assert row.account_id == auth.account_id, "row must stamp the caller's account_id"
     assert row.requester_platform_user_id == auth.platform_user_id, (
@@ -817,17 +872,12 @@ async def test_request_repo_binding_posts_message_naming_agent_and_repo(
         channel_id="222",
     )
 
-    content = posted["json"]["content"]
-    assert "daimon" in content, "message body must name the agent"
-    assert "https://github.com/clsandoval/daimon-qa-scratch" in content, (
-        "message body must name the exact repo"
-    )
-    button = posted["json"]["components"][0]["components"][0]
+    card_text = _card_text(posted)
+    assert "daimon" in card_text, "the card must name the agent"
+    assert "clsandoval/daimon-qa-scratch" in card_text, "the card must name the exact repo"
+    button = _button_from_posted(posted)
     assert button["custom_id"].startswith(CUSTOM_ID_PREFIX), (
         "the button's custom_id must carry the credential-request prefix"
-    )
-    assert button["label"].startswith("Set working repo: "), (
-        "the button's label must use the repo-kind prefix"
     )
 
 
@@ -963,6 +1013,11 @@ async def test_request_agent_key_posts_slack_button_carrying_the_token(
 ) -> None:
     from aioresponses import aioresponses
     from daimon.core.credential_requests import SLACK_ACTION_ID
+    from daimon.core.posted_controls import (
+        build_card_blocks,
+        build_posted_card,
+        card_notification_text,
+    )
 
     tenant = await make_tenant(db_session, platform="slack", workspace_id=_SLACK_TEAM_ID)
     await db_session.commit()
@@ -1025,7 +1080,7 @@ async def test_request_agent_key_posts_slack_button_carrying_the_token(
         "the button's value must be the minted single-use token"
     )
     assert row.requester_platform_user_id == _SLACK_USER_ID
-    assert "OPENAI_API_KEY" in button["text"]["text"]
+    assert "OPENAI_API_KEY" in str(body["blocks"]), "the posted card must name the exact key"
     assert len(button["text"]["text"]) <= 75, "Slack caps button text at 75 characters"
 
     assert body["channel"] == "C_CRED", "tool arguments cannot redirect a card"
@@ -1034,6 +1089,23 @@ async def test_request_agent_key_posts_slack_button_carrying_the_token(
         "submission retains the thread after origin expiry"
     )
     assert row.posted_message_id == result.message_id, "outcomes retain the posted card identity"
+
+    expected_card = build_posted_card(
+        kind="env",
+        state="requested",
+        agent_name="daimon",
+        responder_name="Daimon",
+        target="OPENAI_API_KEY",
+        requester_platform_user_id=_SLACK_USER_ID,
+        expires_at=result.expires_at,
+        token=button["value"],
+    )
+    assert body["text"] == card_notification_text(expected_card), (
+        "the notification text is the card's headline, not a second copy of the copy"
+    )
+    assert body["blocks"] == build_card_blocks(expected_card, token=button["value"]), (
+        "the posted message is exactly the core-rendered requested card"
+    )
 
 
 async def test_request_repo_binding_posts_slack_button(
@@ -1089,3 +1161,389 @@ async def test_request_repo_binding_posts_slack_button(
 
     assert result.kind == "repo"
     assert await _row_count(db_session) == 1
+
+
+# ---------------------------------------------------------------------------
+# Provenance, whole-file import, replacement policy and the waiting task
+# ---------------------------------------------------------------------------
+
+
+async def _seed_origin(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    tenant_id: uuid.UUID,
+    auth: AuthIdentity,
+    responder_name: str = "Daimon",
+) -> uuid.UUID:
+    """Create a live Discord turn origin and return its id."""
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant_id,
+            account_id=auth.account_id,
+            platform="discord",
+            parent_channel_id="1111",
+            thread_id="222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name=responder_name,
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
+    return origin.id
+
+
+async def test_request_agent_key_persists_idempotency_key_and_frozen_target(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_idem", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9301", posted=posted)
+
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_idem",
+        agent_name="daimon",
+        key="TOGGL_TOKEN",
+        purpose="tracking time",
+        channel_id="222",
+    )
+
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None, "the minted token must resolve to the created row"
+    assert isinstance(row.idempotency_key, uuid.UUID), (
+        "every minted row carries its own idempotency key"
+    )
+    assert row.target_ma_agent_id == "ag_idem", (
+        "the row freezes the MA agent id the control targets"
+    )
+    assert row.target_name == "daimon", "the row freezes the target's name at mint time"
+    assert row.responder_name == "Daimon", "the row records who picks the work back up"
+    assert row.replaces_updated_at is None, "a key that does not exist yet replaces nothing"
+    assert row.requested_work is None, "no waiting task was passed"
+
+
+async def test_request_agent_key_with_none_key_persists_env_file_kind(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_envfile", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9302", posted=posted)
+
+    result = await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_envfile",
+        agent_name="daimon",
+        key=None,
+        purpose="importing a whole .env",
+        channel_id="222",
+    )
+
+    assert result.kind == "env_file", "an omitted key name requests a whole-file import"
+    assert result.target == ENV_FILE_TARGET, (
+        "a whole-file request names the fixed .env sentinel, not a key"
+    )
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None, "the minted token must resolve to the created row"
+    assert row.kind == "env_file", "the row records the whole-file kind"
+    assert row.target == ENV_FILE_TARGET, "the row records the .env sentinel"
+    assert row.replaces_updated_at is None, "a whole-file import replaces no single key"
+
+
+async def test_request_agent_key_records_replaces_updated_at_for_an_existing_key(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_replace", name="private-bot", tenant_id=tenant.id)]
+    )
+    # No deployment default and no config rows: "private-bot" answers nowhere,
+    # so a member may replace its own key without an admin.
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="ag_replace")
+    async with committing_sessionmaker.begin() as session:
+        existing = await put_agent_file(
+            session,
+            tenant_id=tenant.id,
+            agent_id=agent_uuid,
+            key="TOGGL_TOKEN",
+            content="old-value",
+            set_by_account_id=auth.account_id,
+        )
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9303", posted=posted)
+
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_replace",
+        agent_name="private-bot",
+        key="TOGGL_TOKEN",
+        purpose="rotating the Toggl key",
+        channel_id="222",
+    )
+
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None, "the minted token must resolve to the created row"
+    assert row.replaces_updated_at == existing.updated_at, (
+        "a replacement pins the value it saw, so a later write cannot be clobbered"
+    )
+
+
+async def test_request_agent_key_refuses_replacement_on_shared_agent_before_minting(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_shared", name="daimon", tenant_id=tenant.id)]
+    )
+    # The deployment default makes "daimon" reachable for everyone in the
+    # tenant, so replacing a key it already has is an admin operation.
+    runtime = _runtime(
+        committing_sessionmaker,
+        client=client,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    auth = _auth_identity(tenant_id=tenant.id, is_admin=False)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="ag_shared")
+    async with committing_sessionmaker.begin() as session:
+        await put_agent_file(
+            session,
+            tenant_id=tenant.id,
+            agent_id=agent_uuid,
+            key="TOGGL_TOKEN",
+            content="old-value",
+            set_by_account_id=None,
+        )
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9304", posted=posted)
+
+    with pytest.raises(ToolError, match="admin"):
+        await _request_agent_key_impl(
+            runtime,
+            auth,
+            origin_context_id=str(origin_id),
+            expected_ma_agent_id="ag_shared",
+            agent_name="daimon",
+            key="TOGGL_TOKEN",
+            purpose="rotating the Toggl key",
+            channel_id="222",
+        )
+
+    assert await _row_count(db_session) == 0, (
+        "a refused replacement must mint no credential request row"
+    )
+    assert posted == {}, "a refused replacement must post no card — nobody is asked for a secret"
+
+
+async def test_request_agent_key_allows_replacement_for_admin_on_shared_agent(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_shared_admin", name="daimon", tenant_id=tenant.id, managed=True)]
+    )
+    runtime = _runtime(
+        committing_sessionmaker,
+        client=client,
+        deployment_default=DeploymentDefault(agent_name="daimon"),
+    )
+    auth = _auth_identity(tenant_id=tenant.id, is_admin=True)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="ag_shared_admin")
+    async with committing_sessionmaker.begin() as session:
+        existing = await put_agent_file(
+            session,
+            tenant_id=tenant.id,
+            agent_id=agent_uuid,
+            key="TOGGL_TOKEN",
+            content="old-value",
+            set_by_account_id=None,
+        )
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9305", posted=posted)
+
+    result = await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_shared_admin",
+        agent_name="daimon",
+        key="TOGGL_TOKEN",
+        purpose="rotating the Toggl key",
+        channel_id="222",
+    )
+
+    assert result.target == "TOGGL_TOKEN", (
+        "an admin may replace a key on the shared, defaults-managed agent"
+    )
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None, "the minted token must resolve to the created row"
+    assert row.replaces_updated_at == existing.updated_at, (
+        "the admin's replacement still pins the value the card described"
+    )
+
+
+async def test_pending_task_is_sanitized_and_bounded(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_work", name="research-bot", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+
+    echo_posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9306", posted=echo_posted)
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_work",
+        agent_name="research-bot",
+        key="TOGGL_TOKEN",
+        purpose="tracking time",
+        channel_id="222",
+        pending_task="research-bot",
+    )
+    echo_row = await peek_credential_request(db_session, token=_token_from_posted(echo_posted))
+    assert echo_row is not None, "the minted token must resolve to the created row"
+    assert echo_row.requested_work is None, (
+        "a pending task that only restates the agent's name describes no work"
+    )
+
+    long_posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9307", posted=long_posted)
+    long_task = "pull the timesheet for " + ("x" * 600)
+    await _request_agent_key_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_work",
+        agent_name="research-bot",
+        key="OPENAI_API_KEY",
+        purpose="calling the OpenAI API",
+        channel_id="222",
+        pending_task=long_task,
+    )
+    long_row = await peek_credential_request(db_session, token=_token_from_posted(long_posted))
+    assert long_row is not None, "the minted token must resolve to the created row"
+    assert long_row.requested_work == long_task[:MAX_REQUESTED_WORK], (
+        "a real pending task is kept verbatim, bounded to MAX_REQUESTED_WORK"
+    )
+    assert long_row.requested_work is not None and len(long_row.requested_work) == (
+        MAX_REQUESTED_WORK
+    ), "the stored work must be exactly the bound, not longer"
+
+
+async def test_request_repo_binding_packs_branch_into_target(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_branch", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    origin_id = await _seed_origin(committing_sessionmaker, tenant_id=tenant.id, auth=auth)
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9308", posted=posted)
+
+    result = await _request_repo_binding_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin_id),
+        expected_ma_agent_id="ag_branch",
+        agent_name="daimon",
+        repo_url="https://github.com/owner/repo",
+        purpose="cloning the project",
+        channel_id="222",
+        branch="develop",
+    )
+
+    assert result.target == "https://github.com/owner/repo@develop", (
+        "the branch rides in the packed target so the click can recover it"
+    )
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None, "the minted token must resolve to the created row"
+    assert row.target == "https://github.com/owner/repo@develop", (
+        "the row stores the packed repo@branch target"
+    )
+
+
+async def test_request_repo_binding_rejects_a_branch_carrying_a_delimiter(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    runtime = _runtime(committing_sessionmaker)
+    auth = _auth_identity()
+    with pytest.raises(ToolError, match="branch must not contain"):
+        await _request_repo_binding_impl(
+            runtime,
+            auth,
+            agent_name="daimon",
+            repo_url="https://github.com/owner/repo",
+            purpose="x",
+            channel_id="222",
+            branch="feat@weird",
+        )
+    assert await _row_count(db_session) == 0, "a branch that would mangle the target creates no row"

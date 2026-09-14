@@ -9,3 +9,4 @@ COLOR_GREYPLE = 0x99AAB5  # Discord greyple — neutral-empty / no-data
 COLOR_THINKING = 0x95A5A6  # Turn — thinking phase (turn only)
 COLOR_TOOL_RUNNING = 0x3498DB  # Turn — tool executing (turn only)
 COLOR_PAUSED = 0xFEE75C  # Routine — paused (routines only)
+COLOR_AMBER = 0xFEE75C  # Posted control cards — the one accent every card state wears
