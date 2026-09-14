@@ -19,6 +19,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # Silences pyright-python's "newer version available" nag in the log.
+      PYRIGHT_PYTHON_IGNORE_WARNINGS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
