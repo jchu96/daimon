@@ -35,10 +35,14 @@ export DAIMON_DATABASE__TEST_URL=postgresql+asyncpg://daimon:daimon@localhost:54
 uv run pytest
 ```
 
-Tests run against a real Postgres, not an in-memory fake — each test gets its
-own schema (`CREATE SCHEMA test_<uuid>` + `DROP SCHEMA ... CASCADE`) for
-isolation, so `uv run pytest` is safe to run repeatedly and concurrently
-against the same `daimon_test` database.
+Tests run against a real Postgres, not an in-memory fake. Each pytest worker
+owns one schema (`test_w<pid>_<nonce>`), created once per run and dropped at
+the end; every ORM table in it is wiped before each test. Because the schema
+name carries the worker's pid, concurrent runs and several worktrees can all
+point at the same `daimon_test` database safely. Mark a test that runs its own
+DDL with `@pytest.mark.fresh_schema` to give it a private throwaway schema
+instead, and run `scripts/db/sweep_test_schemas.py` to reclaim schemas left
+behind by a killed run.
 
 Install pre-commit hooks once so the gates below run automatically on every
 commit:
