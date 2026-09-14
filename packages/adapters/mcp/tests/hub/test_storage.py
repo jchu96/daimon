@@ -17,11 +17,11 @@ def test_asyncpg_dsn_strips_sqlalchemy_driver() -> None:
 
 
 async def test_platforms_share_the_table_but_not_keys(
-    db_engine: AsyncEngine, db_session: AsyncSession, test_schema: str
+    db_engine: AsyncEngine, db_session: AsyncSession, db_schema: str
 ) -> None:
     fernet = MultiFernet([Fernet(Fernet.generate_key())])
     dsn = asyncpg_dsn(str(db_engine.url.render_as_string(hide_password=False)))
-    dsn = f"{dsn}?options=-csearch_path%3D{test_schema}"
+    dsn = f"{dsn}?options=-csearch_path%3D{db_schema}"
     store, base = build_hub_kv_base(database_url=dsn, fernet=fernet)
     slack = hub_kv_for(base, platform="slack")
     discord = hub_kv_for(base, platform="discord")
