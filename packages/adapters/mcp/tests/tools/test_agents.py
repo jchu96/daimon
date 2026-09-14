@@ -4792,7 +4792,7 @@ async def test_fork_agent_impl_allows_non_admin_source_with_no_daimon_account(
 
 
 def _anthropic_skill(skill_id: str) -> dict[str, Any]:
-    # "version" is required by the SDK response model (make_ma_agent below
+    # "version" is required by the SDK response model (ma_agent below
     # builds a real BetaManagedAgentsAgent) but not by the update-patch
     # BetaManagedAgentsSkillParams shape the extra key is simply ignored there.
     return {"type": "anthropic", "skill_id": skill_id, "version": "1"}
