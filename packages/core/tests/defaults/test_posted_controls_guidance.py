@@ -159,3 +159,30 @@ def test_guidance_states_the_mention_handle_is_the_answering_agent() -> None:
             f"{label} must forbid asking whether the mention handle and the responder name "
             "are the same agent"
         )
+
+
+def test_reply_shape_posts_the_card_before_any_clarifying_question() -> None:
+    """D24-QA-06: a key named inside a larger task must still post the card first."""
+    for label, section in _reply_shape_sections():
+        assert "before any clarifying question" in section, (
+            f"{label} must say the request tool is called before any clarifying question; "
+            "an underspecified surrounding task is not a reason to withhold the card"
+        )
+        assert "underspecified" in section, (
+            f"{label} must say the form is posted even when the waiting task is underspecified"
+        )
+        assert "never replaces the card" in section, (
+            f"{label} must say a clarifying question comes after the card and never replaces it"
+        )
+
+
+def test_reply_shape_forbids_describing_a_form_that_was_not_posted() -> None:
+    """D24-QA-06: the agent told the person about a key-request form it never posted."""
+    for label, section in _reply_shape_sections():
+        assert "a form you did not post" in section, (
+            f"{label} must forbid describing, promising or referring to a form you did "
+            "not post in this turn"
+        )
+        assert "if posting failed, say" in section, (
+            f"{label} must tell the model to say what failed when posting fails"
+        )
