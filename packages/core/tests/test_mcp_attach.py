@@ -27,8 +27,8 @@ from anthropic.types.beta.beta_managed_agents_mcp_toolset import BetaManagedAgen
 from anthropic.types.beta.beta_managed_agents_mcp_toolset_default_config import (
     BetaManagedAgentsMCPToolsetDefaultConfig,
 )
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.core.mcp_attach import build_attached_spec
+from daimon.testing.ma_models import ma_agent
 
 
 def _agent_toolset() -> BetaManagedAgentsAgentToolset20260401:
@@ -60,21 +60,13 @@ def _agent(
     tools: list[object],
 ) -> BetaManagedAgentsAgent:
     now = datetime(2026, 8, 7, tzinfo=UTC)
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id="agent_01Test",
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[{"name": s["name"], "type": "url", "url": s["url"]} for s in mcp_servers],  # pyright: ignore[reportArgumentType]
-        metadata={},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5"),
         name="test-agent",
-        skills=[],
-        system=None,
-        tools=tools,  # pyright: ignore[reportArgumentType]
-        type="agent",
-        updated_at=now,
-        version=1,
+        model="claude-sonnet-5",
+        tools=tools,
+        mcp_servers=[{"name": s["name"], "type": "url", "url": s["url"]} for s in mcp_servers],
+        created_at=now,
     )
 
 

@@ -20,7 +20,6 @@ import httpx
 import pytest
 from anthropic.types import RawMessageStreamEvent
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
     BetaManagedAgentsAgentMessageEvent,
 )
@@ -29,7 +28,6 @@ from anthropic.types.beta.sessions.beta_managed_agents_user_message_event import
     BetaManagedAgentsUserMessageEvent,
 )
 from daimon.core.config import McpSettings
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.errors import TurnError
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
@@ -46,7 +44,6 @@ from daimon.core.turn.prepare import ContinuityOutcome, PreparedTurn, bind_recor
 from daimon.core.turn.run import RunOutcome, _is_dead_session, run_prepared_turn
 from daimon.core.turn.state import TurnState
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     MARouter,
     build_fake_anthropic,
     list_response,
@@ -55,6 +52,7 @@ from daimon.testing.ma import (
     send_events_response,
     sse_response,
 )
+from daimon.testing.ma_models import ma_agent, ma_environment, ma_model_usage
 from daimon.testing.turn_fakes import RecordingLifecycle
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -67,41 +65,6 @@ from daimon.testing.factories import (  # isort: skip
 )
 
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
-
-
-def _agent(*, agent_id: str, tenant_id: uuid.UUID, name: str = "daimon") -> BetaManagedAgentsAgent:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
-        id=agent_id,
-        type="agent",
-        name=name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=now,
-        updated_at=now,
-        archived_at=None,
-    )
-
-
-def _env(*, env_id: str, tenant_id: uuid.UUID, name: str = "default") -> BetaEnvironment:
-    now_iso = datetime.now(UTC).isoformat()
-    return BetaEnvironment(
-        id=env_id,
-        type="environment",
-        name=name,
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
 
 
 def _admission(
@@ -341,8 +304,8 @@ async def test_happy_path_runs_once_and_returns_recovered_false(
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids=set())
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -395,8 +358,8 @@ async def test_dead_session_recovers_once_and_rebinds_recorder(
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids={"sess_old"})
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -479,8 +442,8 @@ async def test_render_failure_during_recovery_does_not_prevent_recovery(
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids={"sess_old"})
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -531,9 +494,6 @@ async def test_dead_session_recorder_rebind_targets_new_session_id(
     event through the recovered run and reading the row back."""
     from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
         BetaManagedAgentsSpanModelRequestEndEvent,
-    )
-    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-        BetaManagedAgentsSpanModelUsage,
     )
 
     tenant = await make_tenant(db_session)
@@ -606,12 +566,7 @@ async def test_dead_session_recorder_rebind_targets_new_session_id(
                 id="evt_span",
                 is_error=False,
                 model_request_start_id="start_1",
-                model_usage=BetaManagedAgentsSpanModelUsage(
-                    input_tokens=10,
-                    output_tokens=20,
-                    cache_creation_input_tokens=0,
-                    cache_read_input_tokens=0,
-                ),
+                model_usage=ma_model_usage(input_tokens=10, output_tokens=20),
                 processed_at=datetime.now(UTC),
                 type="span.model_request_end",
             )
@@ -623,8 +578,8 @@ async def test_dead_session_recorder_rebind_targets_new_session_id(
 
     router = _router_with_usage_event({"sess_old"})
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -672,9 +627,6 @@ async def test_recovery_rebinds_the_recorder_to_the_recreated_sessions_model(
     `sessions.create` returned, not what the admission asked for."""
     from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
         BetaManagedAgentsSpanModelRequestEndEvent,
-    )
-    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-        BetaManagedAgentsSpanModelUsage,
     )
     from daimon.core.stores import tenant_ledger
 
@@ -746,12 +698,7 @@ async def test_recovery_rebinds_the_recorder_to_the_recreated_sessions_model(
             id="evt_span",
             is_error=False,
             model_request_start_id="start_1",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                input_tokens=1_000_000,
-                output_tokens=0,
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-            ),
+            model_usage=ma_model_usage(input_tokens=1_000_000, output_tokens=0),
             processed_at=datetime.now(UTC),
             type="span.model_request_end",
         )
@@ -761,8 +708,8 @@ async def test_recovery_rebinds_the_recorder_to_the_recreated_sessions_model(
     router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _stream)
 
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     assert admission.agent.model.id == "claude-sonnet-4-6", (
         "the admission must differ from the recreated session's model for this test to bite"
@@ -829,8 +776,8 @@ async def test_dead_session_without_mapping_id_does_not_recover(
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids={"sess_old"})
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -896,8 +843,8 @@ async def test_non_404_upstream_error_does_not_recover(
     router.add("POST", r"/v1/sessions", _explode)
 
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1008,8 +955,8 @@ async def test_second_consecutive_dead_session_does_not_loop(
     router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _stream)
 
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1115,8 +1062,8 @@ async def test_recovered_turn_never_shows_the_user_a_failure(
 
     router = _router(session_bodies=[], dead_session_ids={"sess_old"})
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1179,8 +1126,8 @@ async def test_unrecovered_failure_is_still_delivered_to_the_caller(
     router.add("GET", r"/v1/sessions/(?P<sid>[^/]+)/events/stream", _400)
 
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1233,8 +1180,8 @@ async def test_ceiling_breach_on_first_attempt_returns_ceiling_error_and_marks_m
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids=set())
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1327,8 +1274,8 @@ async def test_ceiling_breach_during_recovery_marks_the_new_mapping_dead_not_the
         _deps(sessionmaker=db_session_factory, router=router),
         anthropic=anthropic.AsyncAnthropic(api_key="test", http_client=http_client),
     )
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1401,8 +1348,8 @@ async def test_ceiling_breach_never_triggers_dead_session_recovery(
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids=set())
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1455,8 +1402,8 @@ async def test_run_prepared_turn_default_deadline_none_still_succeeds_on_the_hap
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids=set())
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1535,8 +1482,8 @@ async def test_cancel_set_before_recovery_starts_aborts_recovery_and_flushes_hel
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids=set())
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1633,8 +1580,8 @@ async def test_cancel_during_recovery_mirrors_into_the_recovery_turn_and_interru
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids=set())
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1732,8 +1679,8 @@ async def test_recovery_happy_path_unaffected_by_the_cancel_mirror_and_leaks_no_
     session_bodies: list[dict[str, object]] = []
     router = _router(session_bodies=session_bodies, dead_session_ids={"sess_old"})
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
     prepared = _prepared_turn(
         deps=deps,
@@ -1811,8 +1758,8 @@ async def test_a_replacement_sends_its_framing_with_the_first_user_message(
     deps = _deps(sessionmaker=db_session_factory, router=router)
     admission = _admission(
         account_id=account.id,
-        agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
-        env=_env(env_id="env_1", tenant_id=tenant.id),
+        agent=ma_agent(id="ag_1", tenant_id=tenant.id),
+        env=ma_environment(id="env_1", tenant_id=tenant.id),
     )
     continuity = _replacement_continuity()
     prepared = dataclasses.replace(
@@ -1889,8 +1836,8 @@ async def test_an_ordinary_turn_sends_exactly_the_user_message(
         deps=deps,
         admission=_admission(
             account_id=account.id,
-            agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
-            env=_env(env_id="env_1", tenant_id=tenant.id),
+            agent=ma_agent(id="ag_1", tenant_id=tenant.id),
+            env=ma_environment(id="env_1", tenant_id=tenant.id),
         ),
         tenant_id=tenant.id,
         external_user_id="user-1",
@@ -1956,8 +1903,8 @@ async def test_recovery_reports_a_replacement_after_loss_and_keeps_the_framing_p
             deps=deps,
             admission=_admission(
                 account_id=account.id,
-                agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
-                env=_env(env_id="env_1", tenant_id=tenant.id),
+                agent=ma_agent(id="ag_1", tenant_id=tenant.id),
+                env=ma_environment(id="env_1", tenant_id=tenant.id),
             ),
             tenant_id=tenant.id,
             external_user_id="user-1",
@@ -2067,8 +2014,8 @@ async def _recover_from_archived_session(
         deps=deps,
         admission=_admission(
             account_id=account.id,
-            agent=_agent(agent_id="ag_1", tenant_id=tenant.id),
-            env=_env(env_id="env_1", tenant_id=tenant.id),
+            agent=ma_agent(id="ag_1", tenant_id=tenant.id),
+            env=ma_environment(id="env_1", tenant_id=tenant.id),
         ),
         tenant_id=tenant.id,
         external_user_id="user-1",

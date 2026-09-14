@@ -24,7 +24,6 @@ from anthropic.types.beta.beta_managed_agents_custom_tool_input_schema import (
 from anthropic.types.beta.beta_managed_agents_mcp_server_url_definition import (
     BetaManagedAgentsMCPServerURLDefinition,
 )
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.sessions.beta_managed_agents_file_resource import (
     BetaManagedAgentsFileResource,
 )
@@ -60,6 +59,7 @@ from daimon.testing.ma import (
     combine_handlers,
     make_fake_ma_handler,
 )
+from daimon.testing.ma_models import ma_agent
 from daimon.testing.ma_sessions import FakeSessionsState, make_fake_sessions_handler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -73,21 +73,13 @@ def _agent(
     tools: list[BetaManagedAgentsCustomTool] | None = None,
     mcp_servers: list[BetaManagedAgentsMCPServerURLDefinition] | None = None,
 ) -> BetaManagedAgentsAgent:
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=_AGENT_ID,
-        type="agent",
         name="daimon",
-        version=2,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        system=None,
-        description=None,
-        metadata={},
-        mcp_servers=mcp_servers or [],
         tools=tools or [],
-        skills=[],
+        mcp_servers=mcp_servers or [],
+        version=2,
         created_at=_NOW,
-        updated_at=_NOW,
-        archived_at=None,
     )
 
 

@@ -22,14 +22,12 @@ import pytest
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.core import usage_recording
 from daimon.core._models import UsageEvent
 from daimon.core.pricing import MODEL_PRICING
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.testing.factories import make_tenant
+from daimon.testing.ma_models import ma_model_usage
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -45,12 +43,7 @@ async def test_record_turn_usage_writes_row_from_real_sdk_event(
         id="evt_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=100, output_tokens=50),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -81,12 +74,7 @@ async def test_record_turn_usage_idempotent_under_replay(
         id="evt_replay",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=100, output_tokens=50),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -130,12 +118,7 @@ async def test_record_turn_usage_propagates_db_errors_no_swallow(
         id="evt_boom",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1,
-            output_tokens=1,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1, output_tokens=1),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -175,12 +158,7 @@ async def test_record_turn_usage_debit_writes_ledger_row_for_guild_turn(
         id="evt_debit_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1_000_000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1_000_000, output_tokens=0),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -212,12 +190,7 @@ async def test_record_turn_usage_debit_dm_exemption_no_ledger_row(
         id="evt_dm_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=100, output_tokens=50),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -259,12 +232,7 @@ async def test_record_turn_usage_debit_idempotent_replay_no_double_debit(
         id="evt_idem",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1_000,
-            output_tokens=500,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1_000, output_tokens=500),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )

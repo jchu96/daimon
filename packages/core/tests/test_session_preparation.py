@@ -18,18 +18,14 @@ from typing import Any
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
+from anthropic.types.beta import BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_custom_tool import BetaManagedAgentsCustomTool
 from anthropic.types.beta.beta_managed_agents_custom_tool_input_schema import (
     BetaManagedAgentsCustomToolInputSchema,
 )
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.session_create_params import Resource
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
 )
 from daimon.core.config import McpSettings
 from daimon.core.credential_env import assemble_env_bytes
@@ -69,7 +65,6 @@ from daimon.core.turn.prepare import (
 )
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     FakeMAState,
     NotHandled,
     build_fake_anthropic,
@@ -77,6 +72,7 @@ from daimon.testing.ma import (
     make_fake_ma_handler,
     make_fake_memory_store_handler,
 )
+from daimon.testing.ma_models import ma_agent, ma_environment, ma_model_usage
 from daimon.testing.ma_sessions import FakeSessionsState, make_fake_sessions_handler
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -93,35 +89,12 @@ def _agent(
     model_id: str = _MODEL,
     tools: list[BetaManagedAgentsCustomTool] | None = None,
 ) -> BetaManagedAgentsAgent:
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=agent_id,
-        type="agent",
         name="daimon",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id=model_id),
-        system=None,
-        description=None,
-        metadata={},
-        mcp_servers=[],
+        model=model_id,
         tools=list(tools) if tools else [],
-        skills=[],
         created_at=_NOW,
-        updated_at=_NOW,
-        archived_at=None,
-    )
-
-
-def _env() -> BetaEnvironment:
-    return BetaEnvironment(
-        id=_ENV_ID,
-        type="environment",
-        name="default",
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={},
-        created_at=_NOW.isoformat(),
-        updated_at=_NOW.isoformat(),
-        archived_at=None,
     )
 
 
@@ -134,7 +107,7 @@ def _admission(
     return Admission(
         account_id=account.id,
         agent=agent if agent is not None else _agent(),
-        environment=_env(),
+        environment=ma_environment(id=_ENV_ID, name="default", created_at=_NOW.isoformat()),
         config=ResolvedConfig(
             agent_name="daimon", environment_name="default", thread_binding_id=thread_binding_id
         ),
@@ -515,12 +488,7 @@ async def test_a_model_change_replaces_the_session_and_bills_the_new_model(
         id="evt_replaced",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1000, output_tokens=0),
         processed_at=_NOW,
         type="span.model_request_end",
     )

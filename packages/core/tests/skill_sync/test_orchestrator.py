@@ -3,9 +3,9 @@
 Patterns enforced:
 - Real `AsyncAnthropic` backed by `httpx.MockTransport` via `MARouter` — no
   AsyncMock on `client.beta.*`.
-- SDK response objects constructed inline at every call site via real
-  constructors (`SkillListResponse`, `VersionCreateResponse`) — no
-  `model_construct`, no factory wrappers.
+- SDK response objects built via real constructors (`SkillListResponse`,
+  `VersionCreateResponse`) or the `daimon.testing` builders — no
+  `model_construct`.
 - Real Postgres via `db_session_factory`.
 """
 
@@ -22,7 +22,6 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
-    BetaManagedAgentsAgent,
     BetaManagedAgentsCustomSkill,
     SkillListResponse,
 )
@@ -52,11 +51,12 @@ from daimon.testing.archives import make_tarball
 from daimon.testing.crypto import make_fernet
 from daimon.testing.factories import make_cli_principal
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
+from daimon.testing.ma_models import ma_agent
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
-# Helpers (intentionally minimal — no SDK constructor wrappers)
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1029,7 +1029,7 @@ async def test_per_skill_timeout_isolates_failure(
 
 
 # ---------------------------------------------------------------------------
-# Local helpers — no SDK constructor wrapping; transport assembly only
+# Local helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1860,23 +1860,13 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
         ),
     )
 
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_transient",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=3,
-        mcp_servers=[],
-        skills=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         tools=[_base_toolset],
-        system=None,
+        version=3,
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -1885,24 +1875,17 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_transient",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=4,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(
                         skill_id="sk_transient", type="custom", version="1"
                     )
                 ],
-                tools=[],
-                system=None,
+                version=4,
             ).model_dump(mode="json"),
         )
 
@@ -2060,23 +2043,12 @@ async def test_sync_agent_skills_attaches_uploaded_skills_to_ma_agent(
     def on_list_agents(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         return list_response(
             [
-                BetaManagedAgentsAgent(
+                ma_agent(
                     id="ag_target",
-                    type="agent",
                     name="agent",
-                    model={"id": "claude-opus-4-7"},
-                    metadata={
-                        "daimon_tenant": str(cli.tenant_id),
-                        "daimon_name": "agent",
-                    },
-                    description=None,
-                    created_at="2026-04-21T00:00:00Z",
-                    updated_at="2026-04-21T00:00:00Z",
+                    model="claude-opus-4-7",
+                    tenant_id=cli.tenant_id,
                     version=7,
-                    mcp_servers=[],
-                    skills=[],
-                    tools=[],
-                    system=None,
                 ).model_dump(mode="json")
             ]
         )
@@ -2087,46 +2059,21 @@ async def test_sync_agent_skills_attaches_uploaded_skills_to_ma_agent(
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_target",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={
-                    "daimon_tenant": str(cli.tenant_id),
-                    "daimon_name": "agent",
-                },
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=8,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(skill_id="sk_new", type="custom", version="1")
                 ],
-                tools=[],
-                system=None,
+                version=8,
             ).model_dump(mode="json"),
         )
 
     # update_agent_with_version_retry calls agents.retrieve before the update.
-    agent_payload = BetaManagedAgentsAgent(
-        id="ag_target",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=7,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+    agent_payload = ma_agent(
+        id="ag_target", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=7
     ).model_dump(mode="json")
 
     def on_retrieve_agent(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
@@ -2228,27 +2175,17 @@ async def test_sync_agent_skills_attach_is_noop_when_skill_already_attached(
     def on_list_agents(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         return list_response(
             [
-                BetaManagedAgentsAgent(
+                ma_agent(
                     id="ag_target",
-                    type="agent",
                     name="agent",
-                    model={"id": "claude-opus-4-7"},
-                    metadata={
-                        "daimon_tenant": str(cli.tenant_id),
-                        "daimon_name": "agent",
-                    },
-                    description=None,
-                    created_at="2026-04-21T00:00:00Z",
-                    updated_at="2026-04-21T00:00:00Z",
-                    version=7,
-                    mcp_servers=[],
+                    model="claude-opus-4-7",
+                    tenant_id=cli.tenant_id,
                     skills=[
                         BetaManagedAgentsCustomSkill(
                             skill_id="sk_existing", type="custom", version="1"
                         )
                     ],
-                    tools=[],
-                    system=None,
+                    version=7,
                 ).model_dump(mode="json")
             ]
         )
@@ -2818,23 +2755,8 @@ async def test_attach_adds_base_toolset_when_agent_lacks_it(
         )
 
     # Toolless agent — no tools at all.
-    agent_payload = BetaManagedAgentsAgent(
-        id="ag_toolless",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=3,
-        mcp_servers=[],
-        skills=[],
-        tools=[],  # no agent_toolset_20260401
-        system=None,
+    agent_payload = ma_agent(
+        id="ag_toolless", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=3
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -2843,22 +2765,15 @@ async def test_attach_adds_base_toolset_when_agent_lacks_it(
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_toolless",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=4,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(skill_id="sk_new", type="custom", version="1")
                 ],
-                tools=[],
-                system=None,
+                version=4,
             ).model_dump(mode="json"),
         )
 
@@ -2947,23 +2862,13 @@ async def test_attach_sends_skills_only_when_agent_has_base_toolset(
     )
 
     # Agent already has the base toolset.
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_with_toolset",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=5,
-        mcp_servers=[],
-        skills=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         tools=[_base_toolset],
-        system=None,
+        version=5,
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -2972,22 +2877,15 @@ async def test_attach_sends_skills_only_when_agent_has_base_toolset(
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_with_toolset",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=6,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(skill_id="sk_new", type="custom", version="1")
                 ],
-                tools=[],
-                system=None,
+                version=6,
             ).model_dump(mode="json"),
         )
 
@@ -3059,37 +2957,18 @@ async def test_attach_retries_once_on_version_conflict(
         )
 
     # Initial list response: agent has no skills yet.
-    initial_agent = BetaManagedAgentsAgent(
-        id="ag_conflict",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=10,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+    initial_agent = ma_agent(
+        id="ag_conflict", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=10
     ).model_dump(mode="json")
 
     # Fresh retrieve (after conflict): agent now has sk_concurrent added concurrently.
-    fresh_agent = BetaManagedAgentsAgent(
+    fresh_agent = ma_agent(
         id="ag_conflict",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=11,
-        mcp_servers=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         skills=[BetaManagedAgentsCustomSkill(skill_id="sk_concurrent", type="custom", version="1")],
-        tools=[],
-        system=None,
+        version=11,
     ).model_dump(mode="json")
 
     retrieve_count = 0
@@ -3120,25 +2999,18 @@ async def test_attach_retries_once_on_version_conflict(
         # Second attempt: success
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_conflict",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=12,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(
                         skill_id="sk_concurrent", type="custom", version="1"
                     ),
                     BetaManagedAgentsCustomSkill(skill_id="sk_target", type="custom", version="1"),
                 ],
-                tools=[],
-                system=None,
+                version=12,
             ).model_dump(mode="json"),
         )
 
@@ -3216,20 +3088,8 @@ async def test_attach_over_cap_records_failure_instead_of_raising(
             anthropic_latest_version="1",
         )
 
-    agent_payload = BetaManagedAgentsAgent(
-        id="ag_cap",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=10,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+    agent_payload = ma_agent(
+        id="ag_cap", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=10
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -3381,20 +3241,13 @@ async def test_attach_refuses_union_when_legacy_registry_skill_shares_mount_name
             anthropic_latest_version="1",
         )
 
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_coll",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=10,
-        mcp_servers=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         skills=[{"type": "custom", "skill_id": "sk_registry", "version": "1"}],
-        tools=[],
-        system=None,
+        version=10,
     ).model_dump(mode="json")
 
     registry_skill = SkillListResponse(

@@ -11,9 +11,6 @@ from anthropic.types.beta.sessions.beta_managed_agents_image_block import (
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
     BetaManagedAgentsTextBlock,
 )
@@ -26,6 +23,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_url_image_source import (
 from daimon.core.errors import TurnError
 from daimon.core.turn.reducers import apply
 from daimon.core.turn.state import TextBlock, ToolUseBlock, TurnState, UsageTotals
+from daimon.testing.ma_models import ma_model_usage
 
 from .conftest import (
     make_agent_message,
@@ -406,11 +404,11 @@ def test_apply_folds_span_model_request_end_into_usage_totals() -> None:
         id="sevt_usage_1",
         type="span.model_request_end",
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
+        model_usage=ma_model_usage(
             input_tokens=10,
+            output_tokens=5,
             cache_creation_input_tokens=3,
             cache_read_input_tokens=2,
-            output_tokens=5,
             speed="standard",
         ),
         processed_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -430,11 +428,11 @@ def test_apply_accumulates_usage_totals_across_two_span_events() -> None:
         id="sevt_usage_1",
         type="span.model_request_end",
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
+        model_usage=ma_model_usage(
             input_tokens=10,
+            output_tokens=5,
             cache_creation_input_tokens=3,
             cache_read_input_tokens=2,
-            output_tokens=5,
             speed="standard",
         ),
         processed_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -443,11 +441,11 @@ def test_apply_accumulates_usage_totals_across_two_span_events() -> None:
         id="sevt_usage_2",
         type="span.model_request_end",
         model_request_start_id="start_2",
-        model_usage=BetaManagedAgentsSpanModelUsage(
+        model_usage=ma_model_usage(
             input_tokens=100,
+            output_tokens=20,
             cache_creation_input_tokens=7,
             cache_read_input_tokens=8,
-            output_tokens=20,
             speed="standard",
         ),
         processed_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -468,11 +466,11 @@ def test_apply_dedupes_span_model_request_end_leaving_usage_totals_unchanged() -
         id="sevt_usage_1",
         type="span.model_request_end",
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
+        model_usage=ma_model_usage(
             input_tokens=10,
+            output_tokens=5,
             cache_creation_input_tokens=3,
             cache_read_input_tokens=2,
-            output_tokens=5,
             speed="standard",
         ),
         processed_at=datetime(2026, 1, 1, tzinfo=UTC),

@@ -2,7 +2,7 @@
 
 Patterns (same as test_orchestrator):
 - Real AsyncAnthropic over httpx.MockTransport via MARouter — no AsyncMock.
-- SDK response objects constructed inline via real constructors.
+- SDK response objects built via real constructors or the `daimon.testing` builders.
 - Real Postgres via db_session / db_session_factory.
 """
 
@@ -14,7 +14,6 @@ import uuid
 
 import httpx
 from anthropic.types.beta import (
-    BetaManagedAgentsAgent,
     BetaManagedAgentsCustomSkill,
 )
 from daimon.core.skill_sync.remove import (
@@ -27,6 +26,7 @@ from daimon.core.stores.user_skills import (
 )
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
+from daimon.testing.ma_models import ma_agent
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -70,23 +70,16 @@ def test_compute_skills_after_removal_returns_empty_list_when_clearing_last_skil
 def _agent_payload(
     *, tenant_id: uuid.UUID, version: int, skill_ids: list[str]
 ) -> dict[str, object]:
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id="ag1",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=version,
-        mcp_servers=[],
+        model="claude-opus-4-7",
+        tenant_id=tenant_id,
         skills=[
             BetaManagedAgentsCustomSkill(skill_id=sid, type="custom", version="1")
             for sid in skill_ids
         ],
-        tools=[],
-        system=None,
+        version=version,
     ).model_dump(mode="json")
 
 

@@ -28,7 +28,6 @@ from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.domain import RepoAccessProof
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     FakeMemoryStoreState,
     NotHandled,
     combine_handlers,
@@ -36,6 +35,7 @@ from daimon.testing.ma import (
     make_fake_memory_store_handler,
 )
 from daimon.testing.ma import build_fake_anthropic as build_fake_anthropic_http
+from daimon.testing.ma_models import ma_agent, ma_environment, ma_session, ma_session_agent
 from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -49,31 +49,10 @@ def _session_body(
     model_id: str = "claude-opus-4-7",
 ) -> dict[str, Any]:
     """Build a BetaManagedAgentsSession JSON body via validated SDK models."""
-    return BetaManagedAgentsSession.model_validate(
-        {
-            "id": session_id,
-            "agent": {
-                "id": agent_id,
-                "mcp_servers": [],
-                "model": {"id": model_id},
-                "name": agent_name,
-                "skills": [],
-                "tools": [],
-                "type": "agent",
-                "version": 1,
-            },
-            "created_at": "2026-04-21T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": environment_id,
-            "metadata": {},
-            "resources": [],
-            "stats": {},
-            "status": "idle",
-            "type": "session",
-            "updated_at": "2026-04-21T00:00:00Z",
-            "usage": {},
-            "vault_ids": [],
-        }
+    return ma_session(
+        id=session_id,
+        agent=ma_session_agent(id=agent_id, name=agent_name, model=model_id),
+        environment_id=environment_id,
     ).model_dump(mode="json")
 
 
@@ -105,25 +84,8 @@ def _make_agent(
     anthropic_id: str = "ag_1",
     name: str = "a",
 ) -> BetaManagedAgentsAgent:
-    """Inline BetaManagedAgentsAgent construction — no DB needed."""
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": anthropic_id,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {},
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-04-21T00:00:00Z",
-            "updated_at": "2026-04-21T00:00:00Z",
-            "version": 1,
-            "mcp_servers": [],
-            "skills": [],
-            "tools": [],
-            "system": None,
-        }
-    )
+    """An agent with this file's defaults — no DB needed."""
+    return ma_agent(id=anthropic_id, name=name, model="claude-opus-4-7")
 
 
 def _make_env(
@@ -131,17 +93,8 @@ def _make_env(
     anthropic_id: str = "env_1",
     name: str = "e",
 ) -> BetaEnvironment:
-    """Inline BetaEnvironment construction — no DB needed."""
-    return BetaEnvironment(
-        id=anthropic_id,
-        type="environment",
-        name=name,
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={},
-        description="",
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-    )
+    """An environment with this file's defaults — no DB needed."""
+    return ma_environment(id=anthropic_id, name=name)
 
 
 async def test_create_session_calls_ma_api_and_returns_sdk_type() -> None:

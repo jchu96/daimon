@@ -13,12 +13,8 @@ import pytest
 from anthropic import APIStatusError, AsyncAnthropic
 from anthropic.types.beta import (
     BetaManagedAgentsAgent,
-    BetaManagedAgentsModelConfig,
     BetaManagedAgentsSession,
 )
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from anthropic.types.beta.sessions import (
     BetaManagedAgentsAgentMessageEvent,
     BetaManagedAgentsSessionEndTurn,
@@ -53,6 +49,7 @@ from daimon.testing.ma import (
     list_response,
     sse_response,
 )
+from daimon.testing.ma_models import ma_agent, ma_session
 
 
 def _user_message(event_id: str, text: str) -> BetaManagedAgentsUserMessageEvent:
@@ -303,61 +300,23 @@ def _make_session(
     extra_meta: dict[str, str] | None = None,
 ) -> BetaManagedAgentsSession:
     """Build a minimal BetaManagedAgentsSession for transport-level fakes."""
-    now = datetime.now(UTC).isoformat()
     meta: dict[str, str] = {}
     if account_id is not None:
         meta["daimon_account"] = str(account_id)
     if extra_meta:
         meta.update(extra_meta)
-    return BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    return ma_session(
         id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            id=agent_id,
-            description=None,
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-            name="test-agent",
-            skills=[],
-            system=None,
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        archived_at=None,
-        created_at=now,
+        agent_id=agent_id,
         environment_id="env_test123",
         metadata=meta,
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        title=None,
-        type="session",
-        updated_at=now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
+        created_at=datetime.now(UTC),
     )
 
 
 def _make_agent(agent_id: str, tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
     """Build a minimal BetaManagedAgentsAgent for transport-level fakes."""
-    now = datetime.now(UTC).isoformat()
-    return BetaManagedAgentsAgent(
-        id=agent_id,
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id)},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="test-agent",
-        skills=[],
-        system=None,
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
-    )
+    return ma_agent(id=agent_id, name="test-agent", metadata={"daimon_tenant": str(tenant_id)})
 
 
 def _build_delete_sessions_client(
@@ -548,21 +507,8 @@ async def test_update_agent_with_version_retry_refetches_once_when_first_update_
     """
     now = datetime.now(UTC)
     agent_id = "agent_test123"
-    agent_payload = BetaManagedAgentsAgent(
-        id=agent_id,
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="test-agent",
-        skills=[],
-        system="original",
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+    agent_payload = ma_agent(
+        id=agent_id, name="test-agent", system="original", created_at=now
     ).model_dump(mode="json")
     updated_payload = {**agent_payload, "system": "updated", "version": 2}
 
@@ -603,21 +549,8 @@ async def test_update_agent_with_version_retry_reraises_when_error_is_not_confli
     """
     now = datetime.now(UTC)
     agent_id = "agent_test456"
-    agent_payload = BetaManagedAgentsAgent(
-        id=agent_id,
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="test-agent",
-        skills=[],
-        system="original",
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+    agent_payload = ma_agent(
+        id=agent_id, name="test-agent", system="original", created_at=now
     ).model_dump(mode="json")
 
     update_count = 0
@@ -661,21 +594,8 @@ async def test_update_agent_with_version_retry_propagates_second_conflict() -> N
     """
     now = datetime.now(UTC)
     agent_id = "agent_test789"
-    agent_payload = BetaManagedAgentsAgent(
-        id=agent_id,
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="test-agent",
-        skills=[],
-        system="original",
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+    agent_payload = ma_agent(
+        id=agent_id, name="test-agent", system="original", created_at=now
     ).model_dump(mode="json")
 
     update_count = 0
@@ -747,22 +667,8 @@ def _build_workspace_nuke_client(
 
 
 async def test_delete_entire_workspace_raises_and_touches_nothing_when_sentinel_is_absent() -> None:
-    now = datetime.now(UTC).isoformat()
-    tenant_agent = BetaManagedAgentsAgent(
-        id="agent_tenant",
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(uuid.uuid4())},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="someone-elses-agent",
-        skills=[],
-        system=None,
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+    tenant_agent = ma_agent(
+        id="agent_tenant", name="someone-elses-agent", metadata={"daimon_tenant": str(uuid.uuid4())}
     )
     seen: list[tuple[str, str]] = []
     client = _build_workspace_nuke_client([tenant_agent], seen)
@@ -782,38 +688,13 @@ async def test_delete_entire_workspace_raises_and_touches_nothing_when_sentinel_
 
 
 async def test_delete_entire_workspace_archives_other_agents_but_spares_sentinel() -> None:
-    now = datetime.now(UTC).isoformat()
-    sentinel = BetaManagedAgentsAgent(
+    sentinel = ma_agent(
         id="agent_sentinel",
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={MA_METADATA_KEY_WORKSPACE: MA_METADATA_VALUE_WORKSPACE_DISPOSABLE},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
         name=WORKSPACE_SENTINEL_AGENT_NAME,
-        skills=[],
-        system=None,
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+        metadata={MA_METADATA_KEY_WORKSPACE: MA_METADATA_VALUE_WORKSPACE_DISPOSABLE},
     )
-    disposable_agent = BetaManagedAgentsAgent(
-        id="agent_disposable",
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(uuid.uuid4())},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="scratch-agent",
-        skills=[],
-        system=None,
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+    disposable_agent = ma_agent(
+        id="agent_disposable", name="scratch-agent", metadata={"daimon_tenant": str(uuid.uuid4())}
     )
     seen: list[tuple[str, str]] = []
     client = _build_workspace_nuke_client([sentinel, disposable_agent], seen)
@@ -829,22 +710,8 @@ async def test_delete_entire_workspace_archives_other_agents_but_spares_sentinel
 async def test_find_workspace_disposable_sentinel_returns_none_when_no_agent_carries_the_marker() -> (
     None
 ):
-    now = datetime.now(UTC).isoformat()
-    plain_agent = BetaManagedAgentsAgent(
-        id="agent_plain",
-        archived_at=None,
-        created_at=now,
-        description=None,
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(uuid.uuid4())},
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        name="plain-agent",
-        skills=[],
-        system=None,
-        tools=[],
-        type="agent",
-        updated_at=now,
-        version=1,
+    plain_agent = ma_agent(
+        id="agent_plain", name="plain-agent", metadata={"daimon_tenant": str(uuid.uuid4())}
     )
     seen: list[tuple[str, str]] = []
     client = _build_workspace_nuke_client([plain_agent], seen)
