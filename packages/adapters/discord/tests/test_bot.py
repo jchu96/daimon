@@ -20,7 +20,7 @@ from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.testing import ma_agent, ma_environment, ma_session
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .harness import make_bot
 
@@ -757,6 +757,7 @@ class TestOnReadySweepWidenedReconcile:
         mock_reconcile: AsyncMock,
         db_session: AsyncSession,
         db_session_factory: async_sessionmaker[AsyncSession],
+        db_engine: AsyncEngine,
     ) -> None:
         """A tenant already in status='ready' still gets `_seed_tenant_defaults`
         invoked on boot -- the whole point of widening the sweep."""
@@ -775,7 +776,10 @@ class TestOnReadySweepWidenedReconcile:
         tenant_id = derive_tenant_uuid(platform="discord", workspace_id=str(guild_id))
         mock_reconcile.return_value = ApplyReport()
 
-        runtime = _make_runtime(db_session_factory)
+        # The sweep spawns one background task per guild, and each opens its own
+        # session: give them a sessionmaker on the engine, not `db_session_factory`
+        # (bound to one connection), so the concurrent tasks don't share a transaction.
+        runtime = _make_runtime(async_sessionmaker(bind=db_engine, expire_on_commit=False))
         bot = make_bot(runtime)
         bot._connection._guilds = {guild_id: _make_sweep_guild(guild_id)}  # pyright: ignore[reportPrivateUsage]
         bot.tree.clear_commands = MagicMock()  # type: ignore[method-assign]
@@ -800,6 +804,7 @@ class TestOnReadySweepWidenedReconcile:
         mock_reconcile: AsyncMock,
         db_session: AsyncSession,
         db_session_factory: async_sessionmaker[AsyncSession],
+        db_engine: AsyncEngine,
     ) -> None:
         """Pre-existing behavior is not lost: tenants stuck in pending or failed
         are still reconciled on boot."""
@@ -828,7 +833,10 @@ class TestOnReadySweepWidenedReconcile:
         await set_provision_status(db_session_factory, tenant_id=tenant_failed, status="failed")
         mock_reconcile.return_value = ApplyReport()
 
-        runtime = _make_runtime(db_session_factory)
+        # The sweep spawns one background task per guild, and each opens its own
+        # session: give them a sessionmaker on the engine, not `db_session_factory`
+        # (bound to one connection), so the concurrent tasks don't share a transaction.
+        runtime = _make_runtime(async_sessionmaker(bind=db_engine, expire_on_commit=False))
         bot = make_bot(runtime)
         bot._connection._guilds = {  # pyright: ignore[reportPrivateUsage]
             guild_pending: _make_sweep_guild(guild_pending),
