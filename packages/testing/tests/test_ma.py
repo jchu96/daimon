@@ -367,11 +367,10 @@ async def test_build_no_retry_anthropic_does_not_retry_a_conflict() -> None:
 
 
 def test_require_api_key_skips_without_the_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    from daimon.testing.ma import _require_api_key, require_api_key
+    from daimon.testing.ma import require_api_key
 
     monkeypatch.delenv("DAIMON_TEST_ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(pytest.skip.Exception):
         require_api_key()
     monkeypatch.setenv("DAIMON_TEST_ANTHROPIC_API_KEY", "sk-live")
     assert require_api_key() == "sk-live", "the key must be returned when set"
-    assert _require_api_key is require_api_key, "the former private name must stay an alias"

@@ -324,10 +324,6 @@ def require_api_key() -> str:
     return key
 
 
-_require_api_key = require_api_key
-"""Former private spelling; kept until every importer uses `require_api_key`."""
-
-
 # ---------------------------------------------------------------------------
 # Stateful agent CRUD handler
 # ---------------------------------------------------------------------------

@@ -10,7 +10,6 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 
-from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.core.mcp_auth import mint_jwt
 from daimon.core.stores.domain import Role
@@ -21,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 __all__ = [
     "make_identity",
     "make_jwt",
-    "make_ma_agent",
     "mcp_session",
     "seed_tenant",
     "seed_tenant_and_account",
@@ -71,24 +69,3 @@ async def seed_tenant_and_account(
     tenant = await make_tenant(session, platform="discord")
     account = await make_account(session, tenant=tenant)
     return tenant.id, account.id
-
-
-def make_ma_agent(**overrides: object) -> BetaManagedAgentsAgent:
-    """Transitional shim for other trees still importing it; use `daimon.testing.ma_agent`."""
-    base: dict[str, object] = {
-        "id": "ag_new",
-        "type": "agent",
-        "version": 1,
-        "name": "demo",
-        "model": {"id": "claude-opus-4-5"},
-        "description": None,
-        "system": None,
-        "tools": [],
-        "mcp_servers": [],
-        "skills": [],
-        "created_at": "2026-04-24T00:00:00Z",
-        "updated_at": "2026-04-24T00:00:00Z",
-        "metadata": {},
-    }
-    base.update(overrides)
-    return BetaManagedAgentsAgent.model_validate(base)
