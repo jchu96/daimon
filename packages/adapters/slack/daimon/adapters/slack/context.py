@@ -20,11 +20,13 @@ No try/except — exceptions propagate to the listener boundary.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 from xml.sax.saxutils import escape, quoteattr
 
 from daimon.adapters.slack.attachments import ProxyUrlContext, build_proxy_url
 from daimon.adapters.slack.vision import SlackFile
+from daimon.core.turn_keys import render_keys_element
 from slack_sdk.web.async_client import AsyncWebClient
 
 # Slack's ceiling for non-Marketplace apps on conversations.replies (both the
@@ -103,6 +105,7 @@ async def build_context_xml(
     author_id: str = "",
     is_admin: bool = False,
     proxy: ProxyUrlContext | None = None,
+    key_names: Sequence[str] = (),
 ) -> str:
     """Build XML context from thread history for the first turn.
 
@@ -117,6 +120,9 @@ async def build_context_xml(
     replays the root and the first replies, and the block carries
     ``truncated="true"`` so the model knows the recent tail is missing.
     Discord's equivalent replays 100 messages; the gap is Slack's rate policy.
+
+    ``key_names`` names this agent's stored keys, names only (see
+    `daimon.core.turn_keys`); empty renders no ``<keys>`` element at all.
     """
     resp = await client.conversations_replies(  # pyright: ignore[reportUnknownMemberType]
         channel=channel, ts=thread_ts, limit=THREAD_PAGE_LIMIT
@@ -127,8 +133,10 @@ async def build_context_xml(
     lines: list[str] = [
         "<context>",
         f"<channel platform={quoteattr('slack')} id={quoteattr(channel)}/>",
+        render_keys_element(key_names),
         _open_tag("thread_history", truncated=truncated),
     ]
+    lines = [line for line in lines if line]
     for msg in messages:
         lines.extend(_render_message(msg, proxy=proxy))
     lines.append("</thread_history>")
@@ -149,6 +157,7 @@ async def build_delta_xml(
     author_id: str = "",
     is_admin: bool = False,
     proxy: ProxyUrlContext | None = None,
+    key_names: Sequence[str] = (),
 ) -> str:
     """Build XML context for a continuation turn (delta since watermark).
 
@@ -159,6 +168,9 @@ async def build_delta_xml(
 
     One page of ``THREAD_PAGE_LIMIT`` messages, oldest-first from the
     watermark; a delta longer than that is marked ``truncated="true"``.
+
+    ``key_names`` names this agent's stored keys, names only (see
+    `daimon.core.turn_keys`); empty renders no ``<keys>`` element at all.
     """
     resp = await client.conversations_replies(  # pyright: ignore[reportUnknownMemberType]
         channel=channel,
@@ -173,8 +185,10 @@ async def build_delta_xml(
     lines: list[str] = [
         "<context>",
         f"<channel platform={quoteattr('slack')} id={quoteattr(channel)}/>",
+        render_keys_element(key_names),
         _open_tag("thread_delta", truncated=truncated),
     ]
+    lines = [line for line in lines if line]
     for msg in messages:
         lines.extend(_render_message(msg, proxy=proxy))
     lines.append("</thread_delta>")

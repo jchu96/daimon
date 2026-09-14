@@ -112,7 +112,7 @@ from daimon.core.credential_requests import SLACK_ACTION_ID as SLACK_CREDENTIAL_
 from daimon.core.defaults.provisioning import teardown_slack_install
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, decrypt_token
-from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.ma_resolver import MAResolverMissError
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.slack_oauth import build_slack_connect_url
@@ -145,6 +145,7 @@ from daimon.core.turn.lifecycle import TurnLifecycle
 from daimon.core.turn.prepare import ContinuityOutcome, bind_session
 from daimon.core.turn.run import run_prepared_turn
 from daimon.core.turn.state import ToolUseBlock
+from daimon.core.turn_keys import list_mounted_key_names
 from daimon.core.turn_origin import HandoffNotice, SessionState, render_turn_origin, turn_origin
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.async_client import AsyncBaseSocketModeClient
@@ -1636,6 +1637,28 @@ class SlackApp:
                 watermark=watermark,
             )
 
+            # Names-only <keys> context: stored key names for THIS agent, named
+            # only while the mounted `.env` is still exactly today's agent_files
+            # rows (see `list_mounted_key_names`). One extra read per turn.
+            async with self.runtime.sessionmaker() as _keys_session:
+                _live_row_for_keys = await get_live_thread_session(
+                    _keys_session,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    thread_id=thread_id,
+                    account_id=admission.account_id,
+                )
+                _live_config = (
+                    None if _live_row_for_keys is None else _live_row_for_keys.effective_config
+                )
+                _env_sha256 = None if _live_config is None else _live_config.env_sha256
+                key_names = await list_mounted_key_names(
+                    _keys_session,
+                    tenant_id=tenant_id,
+                    agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(agent.id)),
+                    env_sha256=_env_sha256,
+                )
+
             # --- Build user message ---
             proxy_base = self.runtime.settings.mcp.app_root_url
             proxy_secret = (
@@ -1666,6 +1689,7 @@ class SlackApp:
                     author_id=author_id,
                     is_admin=is_admin,
                     proxy=proxy_ctx,
+                    key_names=key_names,
                 )
             elif watermark is not None:
                 # Continuation: replay only messages since the last watermark.
@@ -1678,6 +1702,7 @@ class SlackApp:
                     author_id=author_id,
                     is_admin=is_admin,
                     proxy=proxy_ctx,
+                    key_names=key_names,
                 )
             else:
                 # Reused session with no watermark (prior turn's final_ts was None).
@@ -1742,6 +1767,7 @@ class SlackApp:
                     author_id=author_id,
                     is_admin=is_admin,
                     proxy=proxy_ctx,
+                    key_names=key_names,
                 )
                 if synthetic_prefix:
                     full_message = synthetic_prefix + "\n" + full_message
@@ -1915,190 +1941,6 @@ class SlackApp:
                     text=render_current_work_must_finish(admission.agent.name, handoff=False),
                 )
 
-            # Flush any task-continuation queued for this thread (e.g. by a
-            # handoff tool call earlier in THIS turn). The common case is an
-            # empty list; a claimed row runs its own admit -> bind_session ->
-            # run_prepared_turn cycle, so it is deliberately kept out of the
-            # try/finally above -- its own marker bookkeeping lives inside
-            # `_run_continuation_follow_up`.
-            async def _run_continuation_follow_up(
-                row: TaskContinuationRow, seed_user_message: str
-            ) -> None:
-                """Run the receiving agent's first turn for a dispatched continuation.
-
-                Same path as an ordinary mention (admit -> bind_session ->
-                run_prepared_turn), as the requester who asked for the
-                handoff, seeded with their own words and framed by a
-                one-time `HandoffNotice` so the receiving agent's first reply
-                shows it has the task.
-
-                KNOWN GAP: `TaskContinuationRow` does not carry the outgoing
-                agent's identity, so `from_name`/`from_ma_agent_id` are taken
-                from THIS turn's own `admission` -- correct when the
-                continuation is dispatched immediately after the turn that
-                requested the handoff (the common case), not guaranteed for
-                one dispatched later on an unrelated mention in the same
-                thread.
-                """
-                follow_admission = await admit(
-                    self.runtime.turn_deps,
-                    tenant_id=tenant_id,
-                    platform="slack",
-                    external_user_id=row.requester_external_user_id,
-                    channel_id=channel,
-                    thread_id=thread_id,
-                    role=Role.USER,
-                    now=datetime.now(UTC),
-                )
-                follow_deadline = turn_deadline(now=datetime.now(UTC))
-                follow_prepared = await bind_session(
-                    self.runtime.turn_deps,
-                    follow_admission,
-                    tenant_id=tenant_id,
-                    platform="slack",
-                    external_user_id=row.requester_external_user_id,
-                    thread_id=thread_id,
-                    session_account_id=follow_admission.account_id,
-                    reuse_existing=True,
-                    deadline=follow_deadline,
-                )
-                follow_cancel = asyncio.Event()
-                follow_lifecycle = SlackTurnLifecycle(
-                    client=web_client,
-                    channel=channel,
-                    thread_ts=thread_id,
-                    cancel=follow_cancel,
-                    author_id=row.requester_external_user_id,
-                    agent_name=follow_admission.agent.name,
-                    model_id=follow_admission.agent.model.id,
-                    register=self._register_cancel,
-                    deregister=self._deregister_cancel,
-                )
-                await follow_lifecycle.post_initial()
-                if (
-                    follow_prepared.mapping_id is not None
-                    and follow_lifecycle.status_ts is not None
-                ):
-                    async with self.runtime.sessionmaker() as _at_session:
-                        await mark_turn_active(
-                            _at_session,
-                            id=follow_prepared.mapping_id,
-                            active_turn_message_id=follow_lifecycle.status_ts,
-                            active_turn_channel_id=channel,
-                            now=datetime.now(UTC),
-                        )
-                        await _at_session.commit()
-
-                transfer_kind = follow_prepared.continuity.transfer_kind
-                workspace: Literal["transferred", "transcript_only", "history_only"]
-                not_carried: tuple[str, ...]
-                if transfer_kind == "full":
-                    workspace, not_carried = "transferred", ()
-                elif transfer_kind == "transcript":
-                    workspace, not_carried = "transcript_only", ("working files",)
-                else:
-                    workspace, not_carried = (
-                        "history_only",
-                        ("working files", "earlier conversation"),
-                    )
-                handoff_notice = HandoffNotice(
-                    from_name=admission.agent.name,
-                    from_ma_agent_id=str(admission.agent.id),
-                    requested_by=f"<@{row.requester_external_user_id}>",
-                    requested_work=seed_user_message,
-                    workspace=workspace,
-                    not_carried=not_carried,
-                )
-
-                async def _follow_up_reseed_user_message() -> str:
-                    async with self.runtime.sessionmaker() as session:
-                        recovery_origin = await get_active_origin(
-                            session,
-                            origin_id=follow_origin.id,
-                            tenant_id=tenant_id,
-                            account_id=follow_admission.account_id,
-                            platform="slack",
-                            now=datetime.now(UTC),
-                        )
-                    if recovery_origin is None:
-                        raise DaimonError(
-                            "This turn's setup context expired. Please retry your message."
-                        )
-                    return (
-                        render_turn_origin(recovery_origin, handoff=handoff_notice)
-                        + "\n"
-                        + seed_user_message
-                    )
-
-                def _follow_up_recovery_lifecycle(cancel: asyncio.Event) -> TurnLifecycle:
-                    new_lifecycle = SlackTurnLifecycle(
-                        client=web_client,
-                        channel=channel,
-                        thread_ts=thread_id,
-                        cancel=cancel,
-                        author_id=row.requester_external_user_id,
-                        agent_name=follow_admission.agent.name,
-                        model_id=follow_admission.agent.model.id,
-                        register=self._register_cancel,
-                        deregister=self._deregister_cancel,
-                        adopt_status_ts=follow_lifecycle.status_ts,
-                    )
-                    if follow_lifecycle.status_ts is not None:
-                        self._register_cancel(
-                            follow_lifecycle.status_ts, cancel, row.requester_external_user_id
-                        )
-                    return new_lifecycle
-
-                try:
-                    async with turn_origin(
-                        self.runtime.sessionmaker,
-                        tenant_id=tenant_id,
-                        account_id=follow_admission.account_id,
-                        platform="slack",
-                        parent_channel_id=channel,
-                        thread_id=thread_id,
-                        responder_ma_agent_id=str(follow_admission.agent.id),
-                        responder_name=follow_admission.config.agent_name
-                        or follow_admission.agent.name,
-                        configuration_target_ma_agent_id=(
-                            follow_admission.config.configuration_target_ma_agent_id
-                        ),
-                        configuration_target_name=(
-                            follow_admission.config.configuration_target_name
-                        ),
-                        role=Role.USER,
-                        is_setup=follow_admission.config.thread_binding_kind == "setup",
-                    ) as follow_origin:
-                        await run_prepared_turn(
-                            self.runtime.turn_deps,
-                            follow_prepared,
-                            tenant_id=tenant_id,
-                            platform="slack",
-                            thread_id=thread_id,
-                            external_user_id=row.requester_external_user_id,
-                            user_message=(
-                                render_turn_origin(follow_origin, handoff=handoff_notice)
-                                + "\n"
-                                + seed_user_message
-                            ),
-                            lifecycle=follow_lifecycle,
-                            cancel=follow_cancel,
-                            reseed_user_message=_follow_up_reseed_user_message,
-                            recovery_lifecycle=_follow_up_recovery_lifecycle,
-                            render_interval_s=2.0,
-                            deadline=follow_deadline,
-                        )
-                finally:
-                    if follow_lifecycle.status_ts is not None:
-                        self._deregister_cancel(follow_lifecycle.status_ts)
-                    if follow_prepared.mapping_id is not None:
-                        with contextlib.suppress(SQLAlchemyError):
-                            async with self.runtime.sessionmaker() as _clear_session:
-                                await clear_active_turn(
-                                    _clear_session, id=follow_prepared.mapping_id
-                                )
-                                await _clear_session.commit()
-
             # This turn's own marker is cleared BEFORE anything is dispatched.
             # A continuation's `bind_session` treats a marker on the thread's
             # live row as "a turn is still running", and a responder change
@@ -2114,29 +1956,18 @@ class SlackApp:
                         await clear_active_turn(_clear_session, id=_marker_id)
                         await _clear_session.commit()
 
-            # Read the marker state back rather than passing a constant. The
-            # clears above should have settled it, so this is False in
-            # practice -- but `decide_continuation`'s turn-running gate has to
-            # reflect the row, not this caller's expectation of it (a
-            # suppressed clear, or a turn that landed on a mapping row this
-            # caller never tracked, both leave the marker standing).
-            async with self.runtime.sessionmaker() as _live_session:
-                _live_row = await get_live_thread_session(
-                    _live_session,
-                    tenant_id=tenant_id,
-                    platform="slack",
-                    thread_id=thread_id,
-                    account_id=admission.account_id,
-                )
-            await dispatch_pending_continuations(
-                self.runtime.sessionmaker,
-                self.runtime.anthropic,
-                web_client,
+            # Flush any task-continuation queued for this thread (e.g. by a
+            # handoff tool call earlier in THIS turn). The common case is an
+            # empty list. This thread's `_processing` slot is already held by
+            # `_orchestrate` for the whole turn, so the unguarded entry is the
+            # right one here -- `dispatch_continuations_in_thread` takes the
+            # guard and is for callers outside a turn.
+            await self._dispatch_continuations(
+                web_client=web_client,
                 tenant_id=tenant_id,
                 channel=channel,
                 thread_id=thread_id,
-                active_turn=_live_row is not None and _live_row.active_turn_message_id is not None,
-                run_follow_up=_run_continuation_follow_up,
+                account_id=admission.account_id,
             )
 
             # Detached output sweep. `outcome.ma_session_id` is the post-recovery
@@ -2176,6 +2007,279 @@ class SlackApp:
                     async with self.runtime.sessionmaker() as _clear_session:
                         await clear_active_turn(_clear_session, id=_marker_id)
                         await _clear_session.commit()
+
+    async def _run_continuation_turn(
+        self,
+        row: TaskContinuationRow,
+        seed_user_message: str,
+        *,
+        web_client: AsyncWebClient,
+        tenant_id: uuid.UUID,
+        channel: str,
+        thread_id: str,
+    ) -> None:
+        """Run the receiving agent's first turn for one dispatched continuation.
+
+        Same path as an ordinary mention (admit -> bind_session ->
+        run_prepared_turn), as the requester who asked for it and seeded with
+        their own words. A `task_handoff` row is framed by a one-time
+        `HandoffNotice` so the receiving agent's first reply shows it has the
+        task; a `private_input_applied` row is the SAME agent resuming with a
+        value it just asked for, so it gets no notice -- there is no transfer
+        to announce and naming a "previous agent" would invent one.
+
+        The outgoing agent's identity is read off the thread's live session
+        row BEFORE `bind_session` runs, since that bind is what supersedes it.
+        """
+        # Read the predecessor BEFORE bind_session decides the replacement --
+        # once it runs, the old row is superseded and this is the only chance
+        # to read what it was running.
+        async with self.runtime.sessionmaker() as _predecessor_session:
+            predecessor = await get_live_thread_session(
+                _predecessor_session,
+                tenant_id=tenant_id,
+                platform="slack",
+                thread_id=thread_id,
+                account_id=row.requester_account_id,
+            )
+        from_ma_agent_id = predecessor.ma_agent_id if predecessor is not None else None
+        from_name = (
+            predecessor.effective_config.agent_name
+            if predecessor is not None and predecessor.effective_config is not None
+            else None
+        )
+
+        follow_admission = await admit(
+            self.runtime.turn_deps,
+            tenant_id=tenant_id,
+            platform="slack",
+            external_user_id=row.requester_external_user_id,
+            channel_id=channel,
+            thread_id=thread_id,
+            role=Role.USER,
+            now=datetime.now(UTC),
+        )
+        follow_deadline = turn_deadline(now=datetime.now(UTC))
+        follow_prepared = await bind_session(
+            self.runtime.turn_deps,
+            follow_admission,
+            tenant_id=tenant_id,
+            platform="slack",
+            external_user_id=row.requester_external_user_id,
+            thread_id=thread_id,
+            session_account_id=follow_admission.account_id,
+            reuse_existing=True,
+            deadline=follow_deadline,
+        )
+        follow_cancel = asyncio.Event()
+        follow_lifecycle = SlackTurnLifecycle(
+            client=web_client,
+            channel=channel,
+            thread_ts=thread_id,
+            cancel=follow_cancel,
+            author_id=row.requester_external_user_id,
+            agent_name=follow_admission.agent.name,
+            model_id=follow_admission.agent.model.id,
+            register=self._register_cancel,
+            deregister=self._deregister_cancel,
+        )
+        await follow_lifecycle.post_initial()
+        if follow_prepared.mapping_id is not None and follow_lifecycle.status_ts is not None:
+            async with self.runtime.sessionmaker() as _at_session:
+                await mark_turn_active(
+                    _at_session,
+                    id=follow_prepared.mapping_id,
+                    active_turn_message_id=follow_lifecycle.status_ts,
+                    active_turn_channel_id=channel,
+                    now=datetime.now(UTC),
+                )
+                await _at_session.commit()
+
+        transfer_kind = follow_prepared.continuity.transfer_kind
+        workspace: Literal["transferred", "transcript_only", "history_only"]
+        not_carried: tuple[str, ...]
+        if transfer_kind == "full":
+            workspace, not_carried = "transferred", ()
+        elif transfer_kind == "transcript":
+            workspace, not_carried = "transcript_only", ("working files",)
+        else:
+            workspace, not_carried = (
+                "history_only",
+                ("working files", "earlier conversation"),
+            )
+        handoff_notice = (
+            HandoffNotice(
+                from_name=from_name or "the previous agent",
+                from_ma_agent_id=from_ma_agent_id or "",
+                requested_by=f"<@{row.requester_external_user_id}>",
+                requested_work=seed_user_message,
+                workspace=workspace,
+                not_carried=not_carried,
+            )
+            if row.reason == "task_handoff"
+            else None
+        )
+
+        async def _follow_up_reseed_user_message() -> str:
+            async with self.runtime.sessionmaker() as session:
+                recovery_origin = await get_active_origin(
+                    session,
+                    origin_id=follow_origin.id,
+                    tenant_id=tenant_id,
+                    account_id=follow_admission.account_id,
+                    platform="slack",
+                    now=datetime.now(UTC),
+                )
+            if recovery_origin is None:
+                raise DaimonError("This turn's setup context expired. Please retry your message.")
+            return (
+                render_turn_origin(recovery_origin, handoff=handoff_notice)
+                + "\n"
+                + seed_user_message
+            )
+
+        def _follow_up_recovery_lifecycle(cancel: asyncio.Event) -> TurnLifecycle:
+            new_lifecycle = SlackTurnLifecycle(
+                client=web_client,
+                channel=channel,
+                thread_ts=thread_id,
+                cancel=cancel,
+                author_id=row.requester_external_user_id,
+                agent_name=follow_admission.agent.name,
+                model_id=follow_admission.agent.model.id,
+                register=self._register_cancel,
+                deregister=self._deregister_cancel,
+                adopt_status_ts=follow_lifecycle.status_ts,
+            )
+            if follow_lifecycle.status_ts is not None:
+                self._register_cancel(
+                    follow_lifecycle.status_ts, cancel, row.requester_external_user_id
+                )
+            return new_lifecycle
+
+        try:
+            async with turn_origin(
+                self.runtime.sessionmaker,
+                tenant_id=tenant_id,
+                account_id=follow_admission.account_id,
+                platform="slack",
+                parent_channel_id=channel,
+                thread_id=thread_id,
+                responder_ma_agent_id=str(follow_admission.agent.id),
+                responder_name=follow_admission.config.agent_name or follow_admission.agent.name,
+                configuration_target_ma_agent_id=(
+                    follow_admission.config.configuration_target_ma_agent_id
+                ),
+                configuration_target_name=(follow_admission.config.configuration_target_name),
+                role=Role.USER,
+                is_setup=follow_admission.config.thread_binding_kind == "setup",
+            ) as follow_origin:
+                await run_prepared_turn(
+                    self.runtime.turn_deps,
+                    follow_prepared,
+                    tenant_id=tenant_id,
+                    platform="slack",
+                    thread_id=thread_id,
+                    external_user_id=row.requester_external_user_id,
+                    user_message=(
+                        render_turn_origin(follow_origin, handoff=handoff_notice)
+                        + "\n"
+                        + seed_user_message
+                    ),
+                    lifecycle=follow_lifecycle,
+                    cancel=follow_cancel,
+                    reseed_user_message=_follow_up_reseed_user_message,
+                    recovery_lifecycle=_follow_up_recovery_lifecycle,
+                    render_interval_s=2.0,
+                    deadline=follow_deadline,
+                )
+        finally:
+            if follow_lifecycle.status_ts is not None:
+                self._deregister_cancel(follow_lifecycle.status_ts)
+            if follow_prepared.mapping_id is not None:
+                with contextlib.suppress(SQLAlchemyError):
+                    async with self.runtime.sessionmaker() as _clear_session:
+                        await clear_active_turn(_clear_session, id=follow_prepared.mapping_id)
+                        await _clear_session.commit()
+
+    async def _dispatch_continuations(
+        self,
+        *,
+        web_client: AsyncWebClient,
+        tenant_id: uuid.UUID,
+        channel: str,
+        thread_id: str,
+        account_id: uuid.UUID,
+    ) -> None:
+        """Claim and settle every pending continuation for this thread, guard held.
+
+        Callers must already own this thread's `_processing` slot; the
+        turn-completion path does (`_orchestrate` holds it for the whole turn).
+        Anything outside a turn goes through `dispatch_continuations_in_thread`,
+        which takes the guard first.
+
+        The marker state is read back off the live row rather than passed as a
+        constant: `decide_continuation`'s turn-running gate has to reflect the
+        row, not the caller's expectation of it (a suppressed clear, or a turn
+        that landed on a mapping row the caller never tracked, both leave the
+        marker standing).
+        """
+        async with self.runtime.sessionmaker() as _live_session:
+            live_row = await get_live_thread_session(
+                _live_session,
+                tenant_id=tenant_id,
+                platform="slack",
+                thread_id=thread_id,
+                account_id=account_id,
+            )
+        await dispatch_pending_continuations(
+            self.runtime.sessionmaker,
+            self.runtime.anthropic,
+            web_client,
+            tenant_id=tenant_id,
+            channel=channel,
+            thread_id=thread_id,
+            active_turn=live_row is not None and live_row.active_turn_message_id is not None,
+            run_follow_up=lambda row, seed: self._run_continuation_turn(
+                row,
+                seed,
+                web_client=web_client,
+                tenant_id=tenant_id,
+                channel=channel,
+                thread_id=thread_id,
+            ),
+        )
+
+    async def dispatch_continuations_in_thread(
+        self,
+        *,
+        web_client: AsyncWebClient,
+        tenant_id: uuid.UUID,
+        channel: str,
+        thread_id: str,
+        account_id: uuid.UUID,
+    ) -> None:
+        """Claim and run any pending continuations for this thread, from outside a turn.
+
+        Takes the same per-thread guard a mention takes, so a form submission
+        and a mention can never dispatch the same thread at once. A thread
+        already processing is skipped outright rather than queued: the turn
+        running there reaches `_dispatch_continuations` at its own tail anyway,
+        and will pick up whatever this call would have.
+        """
+        if thread_id in self._processing:
+            return
+        self._processing.add(thread_id)
+        try:
+            await self._dispatch_continuations(
+                web_client=web_client,
+                tenant_id=tenant_id,
+                channel=channel,
+                thread_id=thread_id,
+                account_id=account_id,
+            )
+        finally:
+            self._processing.discard(thread_id)
 
     async def drain_and_close(self, client: AsyncBaseSocketModeClient) -> None:
         """Graceful shutdown drain.

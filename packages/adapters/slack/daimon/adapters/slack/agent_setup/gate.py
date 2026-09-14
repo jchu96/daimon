@@ -46,6 +46,7 @@ from daimon.adapters.slack.admin import resolve_is_admin
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
+from daimon.core.operation_policy import TargetFacts, decide_operation
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -99,6 +100,10 @@ async def refuse_if_reachable_and_not_admin(
     Returns:
         ``True`` if the caller must refuse and return early, ``False`` to
         proceed.
+
+    The decision itself is `daimon.core.operation_policy.decide_operation`'s
+    (`"agent_spec_edit"`); this function only gathers the facts, in the
+    order above, and renders the outcome.
     """
     # Defaults-managed agents are off-limits to everyone, admins included, and
     # this check therefore runs BEFORE the admin short-circuit. A panel edit
@@ -108,7 +113,10 @@ async def refuse_if_reachable_and_not_admin(
     # Read fresh from the roster rather than from anything the rendered view or
     # private_metadata carried, matching this module's re-resolve discipline.
     seeded = await find_agent_by_daimon_tag(runtime.anthropic, tenant_id=tenant_id, name=agent_name)
-    if seeded is not None and seeded.metadata.get(MA_METADATA_KEY_MANAGED) == "true":
+    is_daimon_managed = (
+        seeded is not None and seeded.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
+    )
+    if is_daimon_managed:
         await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id or user_id,
             user=user_id,
@@ -127,7 +135,13 @@ async def refuse_if_reachable_and_not_admin(
             agent_name=agent_name,
             default=runtime.deployment_default,
         )
-    if not reachable:
+
+    outcome = decide_operation(
+        "agent_spec_edit",
+        is_admin=is_admin,
+        target=TargetFacts(is_daimon_managed=is_daimon_managed, is_reachable_in_tenant=reachable),
+    )
+    if outcome != "needs_admin":
         return False
 
     await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
@@ -189,13 +203,20 @@ async def refuse_if_shared_and_not_admin(
     Returns:
         ``True`` if the caller must refuse and return early, ``False`` to
         proceed.
+
+    The decision itself is `daimon.core.operation_policy.decide_operation`'s
+    (`"key_replace"`); this function only gathers the facts, in the order
+    above, and renders the outcome.
     """
     is_admin = await resolve_is_admin(web_client, user_id=user_id)
     if is_admin:
         return False
 
     seeded = await find_agent_by_daimon_tag(runtime.anthropic, tenant_id=tenant_id, name=agent_name)
-    if seeded is not None and seeded.metadata.get(MA_METADATA_KEY_MANAGED) == "true":
+    is_daimon_managed = (
+        seeded is not None and seeded.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
+    )
+    if is_daimon_managed:
         await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id or user_id,
             user=user_id,
@@ -210,7 +231,13 @@ async def refuse_if_shared_and_not_admin(
             agent_name=agent_name,
             default=runtime.deployment_default,
         )
-    if not reachable:
+
+    outcome = decide_operation(
+        "key_replace",
+        is_admin=is_admin,
+        target=TargetFacts(is_daimon_managed=is_daimon_managed, is_reachable_in_tenant=reachable),
+    )
+    if outcome != "needs_admin":
         return False
 
     await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]

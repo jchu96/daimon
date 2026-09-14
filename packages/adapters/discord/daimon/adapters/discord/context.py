@@ -7,6 +7,7 @@ prepending to a user's message when responding in an existing thread.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from xml.sax.saxutils import escape, quoteattr
 
 from daimon.adapters.discord.vision import (
@@ -14,6 +15,7 @@ from daimon.adapters.discord.vision import (
     is_oversized_image,
     is_vision_image_attachment,
 )
+from daimon.core.turn_keys import render_keys_element
 
 import discord
 
@@ -170,6 +172,7 @@ async def build_context_xml(
     omit_oversized_image_urls: bool = False,
     is_admin: bool = False,
     unprompted: bool = False,
+    key_names: Sequence[str] = (),
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context from thread history for the turn driver.
 
@@ -185,6 +188,9 @@ async def build_context_xml(
 
     ``unprompted=True`` marks the trigger as one nobody @mentioned (organic
     thread participation), so the agent knows it chose to speak.
+
+    ``key_names`` names this agent's stored keys, names only (see
+    `daimon.core.turn_keys`); empty renders no ``<keys>`` element at all.
     """
     messages = [m async for m in thread.history(limit=limit)]
     messages.sort(key=lambda m: m.created_at)
@@ -217,8 +223,10 @@ async def build_context_xml(
     lines: list[str] = [
         "<context>",
         *_render_location(thread),
+        render_keys_element(key_names),
         "<thread_history>",
     ]
+    lines = [line for line in lines if line]
     for msg in messages:
         lines.extend(
             _render_message(
@@ -256,6 +264,7 @@ async def build_delta_xml(
     omit_oversized_image_urls: bool = False,
     is_admin: bool = False,
     unprompted: bool = False,
+    key_names: Sequence[str] = (),
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context for a continuation turn (delta since watermark).
 
@@ -280,6 +289,9 @@ async def build_delta_xml(
     When ``after_message_id`` is ``None`` (no watermark — first turn or
     recreate re-seed), falls back to ``build_context_xml`` for a full
     snapshot.
+
+    ``key_names`` names this agent's stored keys, names only (see
+    `daimon.core.turn_keys`); empty renders no ``<keys>`` element at all.
     """
     if after_message_id is None:
         return await build_context_xml(
@@ -289,6 +301,7 @@ async def build_delta_xml(
             bot_display_name=bot_display_name,
             is_admin=is_admin,
             unprompted=unprompted,
+            key_names=key_names,
         )
 
     after_obj = discord.Object(id=after_message_id)
@@ -308,8 +321,10 @@ async def build_delta_xml(
     lines: list[str] = [
         "<context>",
         *_render_location(thread),
+        render_keys_element(key_names),
         "<thread_delta>",
     ]
+    lines = [line for line in lines if line]
     for msg in messages:
         lines.extend(
             _render_message(
@@ -346,6 +361,7 @@ async def build_channel_context_xml(
     bot_display_name: str = "daimon",
     omit_oversized_image_urls: bool = False,
     is_admin: bool = False,
+    key_names: Sequence[str] = (),
 ) -> tuple[str, list[discord.Attachment]]:
     """Build XML context from parent channel history for a channel-mention turn.
 
@@ -363,6 +379,9 @@ async def build_channel_context_xml(
 
     Unlike ``build_delta_xml``, bot replies are not filtered — the channel context
     shows the agent's own prior responses so the agent understands the conversation.
+
+    ``key_names`` names this agent's stored keys, names only (see
+    `daimon.core.turn_keys`); empty renders no ``<keys>`` element at all.
     """
     messages = [m async for m in channel.history(limit=limit)]
     messages.sort(key=lambda m: m.created_at)
@@ -372,7 +391,12 @@ async def build_channel_context_xml(
         att for msg in messages for att in msg.attachments if is_vision_image_attachment(att)
     ]
 
-    lines: list[str] = [*_render_location(thread), f'<channel_context count="{len(messages)}">']
+    lines: list[str] = [
+        *_render_location(thread),
+        render_keys_element(key_names),
+        f'<channel_context count="{len(messages)}">',
+    ]
+    lines = [line for line in lines if line]
     for msg in messages:
         lines.extend(
             _render_message(

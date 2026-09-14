@@ -40,6 +40,7 @@ from daimon.core.skill_sync.orchestrator import sync_agent_skills
 from daimon.core.skill_zip import canonical_zip_bytes
 from daimon.core.specs import SkillRepo
 from daimon.core.stores.agent_repo_binding import set_binding
+from daimon.core.stores.agent_skill_repo_credentials import set_skill_repo_credential
 from daimon.core.stores.domain import RepoAccessProof
 from daimon.core.stores.github_credentials import upsert_credential
 from daimon.core.stores.user_skills import (
@@ -333,6 +334,80 @@ async def test_no_per_agent_token_with_recorded_proof_reaches_app_tier(
     )
     assert report.skipped_repos == [("https://github.com/o/r", "GitHubUnreachable")], (
         "the tarball 404 must still be recorded normally; only the credential is under test"
+    )
+
+
+async def test_skill_repo_credential_proof_is_preferred_over_the_binding_proof(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The proof gate reads the skill-repo credential first: a credential
+    recording proof of access opens the App tier even though the tenant's
+    binding for the same repo records none. The binding is the legacy home
+    for this proof, so reading only it would deny the App tier to every
+    tenant enrolled through the credential table."""
+    cli = await make_cli_principal(db_session, os_user="alice")
+    await db_session.commit()
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=cli.tenant_id,
+            agent_id=uuid.uuid4(),
+            repo_url="o/r",
+            default_branch="main",
+            ma_secret_ref="anon:",
+            proof=None,
+        )
+        await set_skill_repo_credential(
+            s,
+            tenant_id=cli.tenant_id,
+            agent_id=uuid.uuid4(),
+            repo_url="o/r",
+            default_branch="main",
+            path="skills",
+            ma_secret_ref="anon:",
+            proof=RepoAccessProof(kind="pat", at=datetime.now(UTC), account_id=cli.account_id),
+        )
+    fernet = make_fernet()
+    # No PAT seeded — the per-agent tier must not short-circuit the proof read.
+
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
+    anthropic_client = build_fake_anthropic(router.dispatch)
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path == "/app/installations/777/access_tokens":
+            return httpx.Response(201, json={"token": "ghs_installation_token"})
+        return httpx.Response(404)  # tarball fetch — content doesn't matter for this test
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def lookup(owner: str, repo: str) -> int | None:
+        assert (owner, repo) == ("o", "r"), "the lookup must target the repo under sync"
+        return 777
+
+    await sync_agent_skills(
+        principal_id=cli.id,
+        tenant_id=cli.tenant_id,
+        agent_name="agent",
+        repos=[SkillRepo(url="https://github.com/o/r", branch="main", split=False)],
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        http_client=http_client,
+        anthropic_client=anthropic_client,
+        app_id="12345",
+        app_private_key=SecretStr(_generate_rsa_keypair()),
+        installation_lookup=lookup,
+    )
+
+    tarball_requests = [r for r in captured if "tarball" in r.url.path]
+    assert len(tarball_requests) == 1, "the fetcher must have attempted the tarball download"
+    assert tarball_requests[0].headers.get("Authorization") == "token ghs_installation_token", (
+        "the proof recorded on the skill-repo credential must open the App tier, even "
+        "though the binding for the same repo records no proof"
     )
 
 
