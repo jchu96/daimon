@@ -15,7 +15,6 @@ import json
 from typing import Any
 
 import httpx
-import pytest
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import (
     AnthropicSettings,
@@ -30,8 +29,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
-
-pytestmark = pytest.mark.asyncio
 
 _WEBHOOK_SECRET = "test-webhook-secret-abc123"
 # A valid Fernet key (base64-urlsafe 32 bytes). The GitHub App webhook requires

@@ -62,9 +62,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
-pytestmark = pytest.mark.asyncio
-
-
 # Repeated nested config required by the SDK response models. Inlined in every
 # test that needs it (only the permission_policy block is shared — every other
 # field is constructed at the call site per guideline:testing).

@@ -25,8 +25,6 @@ from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime(client: AsyncAnthropic, session_factory: Any) -> McpRuntime:
     settings = MagicMock()

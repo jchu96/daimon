@@ -36,8 +36,6 @@ from fastmcp.exceptions import ToolError
 
 from ..harness import seed_tenant
 
-pytestmark = pytest.mark.asyncio
-
 _ADMIN_REQUIRED = "requires a workspace or server admin"
 
 

@@ -45,8 +45,6 @@ from starlette.types import ASGIApp
 
 from ..harness import make_jwt
 
-pytestmark = pytest.mark.asyncio
-
 SECRET = "a" * 32
 
 

@@ -26,8 +26,6 @@ from daimon.testing.factories import make_account, make_tenant
 from fastmcp.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 _ADMIN_REQUIRED = "requires a workspace or server admin"
 
 

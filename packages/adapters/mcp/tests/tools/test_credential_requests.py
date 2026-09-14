@@ -65,7 +65,6 @@ _request_repo_binding_impl = (
 )
 register_credential_request_tools = _credential_requests_mod.register_credential_request_tools
 
-pytestmark = pytest.mark.asyncio
 
 _VIEW_CHANNEL = 1 << 10
 _SEND_MESSAGES = 1 << 11

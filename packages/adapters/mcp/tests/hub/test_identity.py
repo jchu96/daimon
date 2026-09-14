@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 from daimon.adapters.mcp.hub.app import build_hub_app
 from daimon.adapters.mcp.hub.claims import decode_hub_claims, encode_hub_claims
 from daimon.adapters.mcp.hub.identity import HubIdentity, HubIdentityMiddleware, _hub_auth
@@ -15,8 +14,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .test_app import _runtime
-
-pytestmark = pytest.mark.asyncio
 
 _TENANT = HubTenant(
     tenant_id=uuid.uuid4(), account_id=uuid.uuid4(), workspace_id="g1", workspace_name="PyMC"

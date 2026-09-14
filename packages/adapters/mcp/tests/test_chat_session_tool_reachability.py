@@ -59,8 +59,6 @@ from starlette.types import ASGIApp
 
 from .harness import make_jwt
 
-pytestmark = pytest.mark.asyncio
-
 SECRET = "a" * 32
 _NOW = dt.datetime(2026, 4, 24, tzinfo=dt.UTC)
 

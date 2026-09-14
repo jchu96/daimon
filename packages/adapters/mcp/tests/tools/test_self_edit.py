@@ -42,8 +42,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..harness import seed_tenant
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime(
     sessionmaker: async_sessionmaker[AsyncSession],

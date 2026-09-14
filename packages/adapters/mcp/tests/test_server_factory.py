@@ -21,9 +21,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
-
 _EXPECTED_TOOLS = {
     "list_agents",
     "get_agent",

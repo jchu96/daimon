@@ -32,7 +32,6 @@ _tools_conftest = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tools_conftest)
 patch_discord_http = _tools_conftest.patch_discord_http
 
-pytestmark = pytest.mark.asyncio
 
 _VIEW_CHANNEL = 1 << 10
 GUILD, PARENT, THREAD, CALLER = "111", "222", "999", "42"

@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import httpx
-import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import FileMetadata
 from daimon.adapters.mcp.server import create_mcp_app
@@ -25,8 +24,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
-
-pytestmark = pytest.mark.asyncio
 
 _TENANT_ID: uuid.UUID = uuid.uuid4()
 _AGENT_ID: uuid.UUID = uuid.uuid4()

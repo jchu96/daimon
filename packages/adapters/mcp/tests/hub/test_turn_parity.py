@@ -13,7 +13,6 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
-import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
     BetaManagedAgentsSession,
@@ -49,8 +48,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 
 from .test_app import _lifespan
-
-pytestmark = pytest.mark.asyncio
 
 _TOKEN = "tok"
 

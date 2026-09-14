@@ -90,8 +90,6 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
-pytestmark = pytest.mark.asyncio
-
 _BUNDLE_SECRET = "test-bundle-handle-secret"
 _TENANT_ID = uuid.uuid4()
 _MA_AGENT_ID = "ag_test001"

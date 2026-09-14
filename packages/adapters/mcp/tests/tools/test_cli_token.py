@@ -39,8 +39,6 @@ from mcp.shared.exceptions import McpError
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 async def _fixture_is_admin_resolver_false(_ctx: object) -> str | None:
     return None

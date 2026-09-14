@@ -43,8 +43,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime(client: AsyncAnthropic) -> McpRuntime:
     return McpRuntime(

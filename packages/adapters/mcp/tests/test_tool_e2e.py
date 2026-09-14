@@ -11,7 +11,6 @@ import json
 import uuid
 
 import httpx
-import pytest
 from anthropic.types.beta import SkillListResponse
 from daimon.adapters.mcp.middleware.mcp_identity import ClaimResolver
 from daimon.adapters.mcp.server import create_mcp_app
@@ -31,8 +30,6 @@ from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .harness import seed_tenant_and_account
-
-pytestmark = pytest.mark.asyncio
 
 
 def _fixed_resolvers(

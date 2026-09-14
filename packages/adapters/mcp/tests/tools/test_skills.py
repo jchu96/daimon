@@ -33,8 +33,6 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime(client: AsyncAnthropic) -> McpRuntime:
     return McpRuntime(

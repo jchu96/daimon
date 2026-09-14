@@ -38,8 +38,6 @@ _list_routines_impl = _routines_mod._list_routines_impl  # pyright: ignore[repor
 _update_routine_impl = _routines_mod._update_routine_impl  # pyright: ignore[reportPrivateUsage]
 _require_platform_user_id = _routines_mod._require_platform_user_id  # pyright: ignore[reportPrivateUsage]
 
-pytestmark = pytest.mark.asyncio
-
 
 def _ma_agent(*, agent_id: str, name: str, tenant_id: uuid.UUID) -> dict[str, object]:
     """Construct a real ``BetaManagedAgentsAgent`` payload tagged for ``tenant_id``.

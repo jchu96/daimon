@@ -17,8 +17,6 @@ from daimon.testing.factories import make_tenant
 from fastmcp.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime(session_factory: async_sessionmaker[AsyncSession] | MagicMock) -> McpRuntime:
     return McpRuntime(

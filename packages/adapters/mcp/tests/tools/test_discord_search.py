@@ -42,8 +42,6 @@ patch_discord_http = _tools_conftest.patch_discord_http
 
 _search_messages_impl = _search_mod._search_messages_impl  # pyright: ignore[reportPrivateUsage]
 
-pytestmark = pytest.mark.asyncio
-
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file copies — inline at every call site per guideline:testing)

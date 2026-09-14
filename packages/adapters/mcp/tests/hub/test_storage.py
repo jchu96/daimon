@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
 from cryptography.fernet import Fernet, MultiFernet
 from daimon.adapters.mcp.hub.storage import asyncpg_dsn, build_hub_kv_base, hub_kv_for
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
-
-pytestmark = pytest.mark.asyncio
 
 
 def test_asyncpg_dsn_strips_sqlalchemy_driver() -> None:

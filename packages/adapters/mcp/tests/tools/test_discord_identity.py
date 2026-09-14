@@ -43,7 +43,6 @@ _tools_conftest = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tools_conftest)
 patch_discord_http = _tools_conftest.patch_discord_http
 
-pytestmark = pytest.mark.asyncio
 
 # The fake ``static_login`` in conftest reports the bot as user "1".
 _BOT_USER_ID = "1"

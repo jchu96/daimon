@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.middleware.mcp_identity import (
     IdentityMiddleware,
@@ -27,8 +26,6 @@ from fastmcp.server.context import Context
 from fastmcp.server.transforms import Visibility
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
-
-pytestmark = pytest.mark.asyncio
 
 
 async def _list_tools(app: ASGIApp, *, token: str) -> list[str]:

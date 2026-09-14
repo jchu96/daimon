@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
 from cryptography.fernet import Fernet
 from daimon.adapters.mcp.hub.app import build_hub_app
 from daimon.adapters.mcp.runtime import McpRuntime
@@ -37,8 +36,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from syrupy.assertion import SnapshotAssertion
-
-pytestmark = pytest.mark.asyncio
 
 # Tool names whose absence would mean a whole registration group silently
 # failed to register (e.g. a Settings regression that drops discord/slack or

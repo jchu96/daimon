@@ -19,7 +19,6 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import pytest
 from anthropic.types.beta import SkillListResponse
 from cryptography.fernet import MultiFernet
 from cryptography.hazmat.primitives import serialization
@@ -37,9 +36,6 @@ from daimon.testing.factories import make_cli_principal
 from daimon.testing.ma import MARouter, list_response
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
-
 
 # ---------------------------------------------------------------------------
 # Helpers (minimal, no factory wrappers)

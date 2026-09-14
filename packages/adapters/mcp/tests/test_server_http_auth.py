@@ -11,7 +11,6 @@ import uuid
 
 import httpx
 import jwt as pyjwt
-import pytest
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import (
     AnthropicSettings,
@@ -25,8 +24,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
 from .harness import seed_tenant_and_account
-
-pytestmark = pytest.mark.asyncio
 
 SECRET = "a" * 32
 

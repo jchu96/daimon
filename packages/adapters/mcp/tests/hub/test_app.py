@@ -29,8 +29,6 @@ from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 
-pytestmark = pytest.mark.asyncio
-
 _HUB_TOOLS = {
     "list_daimons",
     "describe_daimon",

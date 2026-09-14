@@ -22,8 +22,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .test_turn_parity import _call_tool, _runtime
 
-pytestmark = pytest.mark.asyncio
-
 _TOKEN = "tok"
 _HANDLE = "ses_wrap_001"
 _THEIR_HANDLE = "ses_theirs"
