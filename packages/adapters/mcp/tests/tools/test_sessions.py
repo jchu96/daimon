@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsSession
 from anthropic.types.beta.sessions.beta_managed_agents_user_message_event import (
     BetaManagedAgentsUserMessageEvent,
 )
@@ -31,7 +30,7 @@ from daimon.adapters.mcp.tools.sessions import (
     register_sessions_tools,
 )
 from daimon.core.scope import DeploymentDefault
-from daimon.testing import ma_agent
+from daimon.testing import ma_agent, ma_session
 from daimon.testing.asgi import call_mcp_tool
 from daimon.testing.ma import (
     MARouter,
@@ -90,43 +89,17 @@ def _make_session_payload(
     status: str = "idle",
     account_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build a BetaManagedAgentsSession payload via the real SDK constructor,
-    then override ``status`` — the SDK's Literal cannot carry a novel value
-    through *validated construction*, even though its response-parsing path
-    tolerates one at the transport boundary (mirrors test_agent_chat.py's
-    ``_make_fake_session(status=...)``)."""
-    payload = BetaManagedAgentsSession.model_validate(
-        {
-            "id": session_id,
-            "type": "session",
-            "agent": {
-                "id": agent_id,
-                "name": "demo",
-                "version": 1,
-                "type": "agent",
-                "model": {"id": "claude-opus-4-5"},
-                "mcp_servers": [],
-                "skills": [],
-                "tools": [],
-            },
-            "archived_at": None,
-            "created_at": "2026-05-08T10:00:00Z",
-            "updated_at": "2026-05-08T10:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": "env_1",
-            "metadata": {"daimon_account": str(account_id)},
-            "resources": [],
-            "stats": {},
-            "status": "idle",
-            "title": None,
-            "usage": {},
-            "vault_ids": [],
-        }
+    """A session payload with ``status`` overridden after validated construction:
+    the SDK's Literal cannot carry a novel value, even though its response-parsing
+    path tolerates one at the transport boundary. Session reads are scoped to the
+    account that opened the session, so a payload with no ``daimon_account`` is
+    unreadable by design."""
+    payload = ma_session(
+        id=session_id,
+        agent_id=agent_id,
+        metadata={"daimon_account": account_id} if account_id else {},
     ).model_dump(mode="json")
     payload["status"] = status
-    # Session reads are scoped to the account that opened the session, so a
-    # payload with no daimon_account is unreadable by design.
-    payload["metadata"] = {"daimon_account": account_id} if account_id else {}
     return payload
 
 
@@ -308,33 +281,8 @@ async def test_list_sessions_returns_only_tenant_scoped_sessions() -> None:
         r"/v1/sessions",
         lambda _r, _m: list_response(
             [
-                BetaManagedAgentsSession.model_validate(
-                    {
-                        "id": "ses_1",
-                        "type": "session",
-                        "agent": {
-                            "id": "ag_a",
-                            "name": "demo",
-                            "version": 1,
-                            "type": "agent",
-                            "model": {"id": "claude-opus-4-5"},
-                            "mcp_servers": [],
-                            "skills": [],
-                            "tools": [],
-                        },
-                        "archived_at": None,
-                        "created_at": "2026-05-08T10:00:00Z",
-                        "updated_at": "2026-05-08T10:00:00Z",
-                        "outcome_evaluations": [],
-                        "environment_id": "env_1",
-                        "metadata": {"daimon_account": str(account_id)},
-                        "resources": [],
-                        "stats": {},
-                        "status": "idle",
-                        "title": None,
-                        "usage": {},
-                        "vault_ids": [],
-                    }
+                ma_session(
+                    id="ses_1", agent_id="ag_a", metadata={"daimon_account": str(account_id)}
                 ).model_dump(mode="json")
             ]
         ),
@@ -388,33 +336,8 @@ async def test_get_session_raises_when_session_belongs_to_other_tenant() -> None
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsSession.model_validate(
-                {
-                    "id": "ses_x",
-                    "type": "session",
-                    "agent": {
-                        "id": "ag_other",
-                        "name": "other",
-                        "version": 1,
-                        "type": "agent",
-                        "model": {"id": "claude-opus-4-5"},
-                        "mcp_servers": [],
-                        "skills": [],
-                        "tools": [],
-                    },
-                    "archived_at": None,
-                    "created_at": "2026-05-08T10:00:00Z",
-                    "updated_at": "2026-05-08T10:00:00Z",
-                    "outcome_evaluations": [],
-                    "environment_id": "env_1",
-                    "metadata": {"daimon_account": str(account_id)},
-                    "resources": [],
-                    "stats": {},
-                    "status": "idle",
-                    "title": None,
-                    "usage": {},
-                    "vault_ids": [],
-                }
+            json=ma_session(
+                id="ses_x", agent_id="ag_other", metadata={"daimon_account": str(account_id)}
             ).model_dump(mode="json"),
         ),
     )
@@ -448,33 +371,8 @@ async def test_get_session_returns_session_info_when_owned() -> None:
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsSession.model_validate(
-                {
-                    "id": "ses_1",
-                    "type": "session",
-                    "agent": {
-                        "id": "ag_a",
-                        "name": "demo",
-                        "version": 1,
-                        "type": "agent",
-                        "model": {"id": "claude-opus-4-5"},
-                        "mcp_servers": [],
-                        "skills": [],
-                        "tools": [],
-                    },
-                    "archived_at": None,
-                    "created_at": "2026-05-08T10:00:00Z",
-                    "updated_at": "2026-05-08T10:00:00Z",
-                    "outcome_evaluations": [],
-                    "environment_id": "env_1",
-                    "metadata": {"daimon_account": str(account_id)},
-                    "resources": [],
-                    "stats": {},
-                    "status": "idle",
-                    "title": None,
-                    "usage": {},
-                    "vault_ids": [],
-                }
+            json=ma_session(
+                id="ses_1", agent_id="ag_a", metadata={"daimon_account": str(account_id)}
             ).model_dump(mode="json"),
         ),
     )
@@ -519,33 +417,8 @@ async def test_list_session_events_returns_page_envelope() -> None:
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsSession.model_validate(
-                {
-                    "id": "ses_1",
-                    "type": "session",
-                    "agent": {
-                        "id": "ag_a",
-                        "name": "demo",
-                        "version": 1,
-                        "type": "agent",
-                        "model": {"id": "claude-opus-4-5"},
-                        "mcp_servers": [],
-                        "skills": [],
-                        "tools": [],
-                    },
-                    "archived_at": None,
-                    "created_at": "2026-05-08T10:00:00Z",
-                    "updated_at": "2026-05-08T10:00:00Z",
-                    "outcome_evaluations": [],
-                    "environment_id": "env_1",
-                    "metadata": {"daimon_account": str(account_id)},
-                    "resources": [],
-                    "stats": {},
-                    "status": "idle",
-                    "title": None,
-                    "usage": {},
-                    "vault_ids": [],
-                }
+            json=ma_session(
+                id="ses_1", agent_id="ag_a", metadata={"daimon_account": str(account_id)}
             ).model_dump(mode="json"),
         ),
     )

@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsSession, FileMetadata
+from anthropic.types.beta import FileMetadata
 from anthropic.types.beta.sessions import (
     BetaManagedAgentsSpanModelRequestEndEvent,
     BetaManagedAgentsSpanModelUsage,
@@ -67,7 +67,7 @@ from daimon.core.pricing import MODEL_PRICING, cost_of
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.core.tenant_balance import debit_amount
-from daimon.testing import ma_agent
+from daimon.testing import ma_agent, ma_model_usage, ma_session
 from daimon.testing.asgi import call_mcp_tool, mcp_session
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
@@ -78,6 +78,7 @@ from daimon.testing.ma import (
     list_response,
     send_events_response,
 )
+from daimon.testing.ma_models import SessionStatus
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -126,40 +127,15 @@ def _auth(agent_id: uuid.UUID | None = _AGENT_UUID) -> AuthIdentity:
     )
 
 
-def _make_fake_session(
+def _session_json(
     *,
     session_id: str = "ses_test001",
     agent_id: str = _MA_AGENT_ID,
-    status: str = "idle",
+    status: SessionStatus = "idle",
 ) -> dict[str, Any]:
-    """Build a BetaManagedAgentsSession payload using the real SDK constructor."""
-    return BetaManagedAgentsSession.model_validate(
-        {
-            "id": session_id,
-            "type": "session",
-            "agent": {
-                "id": agent_id,
-                "name": "test-agent",
-                "version": 1,
-                "type": "agent",
-                "model": {"id": "claude-sonnet-4-6"},
-                "mcp_servers": [],
-                "skills": [],
-                "tools": [],
-            },
-            "archived_at": None,
-            "created_at": "2026-06-23T00:00:00Z",
-            "updated_at": "2026-06-23T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": _ENV_ID,
-            "metadata": {},
-            "resources": [],
-            "stats": {},
-            "status": status,
-            "title": None,
-            "usage": {},
-            "vault_ids": [],
-        }
+    """A session payload under this module's fixed ids, as MA would serve it."""
+    return ma_session(
+        id=session_id, agent_id=agent_id, environment_id=_ENV_ID, status=status
     ).model_dump(mode="json")
 
 
@@ -445,7 +421,7 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
     def on_session_retrieve(req: httpx.Request, m: re.Match[str]) -> httpx.Response:
         call_count["retrieve"] += 1
         status = "running" if call_count["retrieve"] == 1 else "idle"
-        return httpx.Response(200, json=_make_fake_session(status=status))
+        return httpx.Response(200, json=_session_json(status=status))
 
     env_payload = {
         "id": _ENV_ID,
@@ -517,7 +493,9 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
     auth = _auth()
 
     # Build a fake session returned by the patched create_session
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
@@ -1142,7 +1120,9 @@ async def test_start_turn_resolves_env_from_deployment_default_when_no_tenant_ro
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
 
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
         new=AsyncMock(return_value=fake_session),
@@ -1192,7 +1172,7 @@ async def test_get_session_raises_session_not_found_for_cross_tenant_handle() ->
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_cross",
                 agent_id=other_agent_id,
                 status="idle",
@@ -1261,7 +1241,7 @@ async def test_get_session_raises_session_not_found_for_same_tenant_other_agent_
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_sibling",
                 agent_id="ag_sibling",
                 status="running",
@@ -1288,7 +1268,7 @@ async def test_continue_turn_raises_session_not_found_for_same_tenant_other_agen
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_sibling",
                 agent_id="ag_sibling",
                 status="idle",
@@ -1370,8 +1350,8 @@ async def test_list_sessions_lists_only_the_callers_agent_sessions() -> None:
         seen_agent_ids.append(req.url.params.get("agent_id", ""))
         return list_response(
             [
-                _make_fake_session(session_id="ses_a", agent_id=_MA_AGENT_ID, status="idle"),
-                _make_fake_session(session_id="ses_b", agent_id=_MA_AGENT_ID, status="running"),
+                _session_json(session_id="ses_a", agent_id=_MA_AGENT_ID, status="idle"),
+                _session_json(session_id="ses_b", agent_id=_MA_AGENT_ID, status="running"),
             ]
         )
 
@@ -1519,7 +1499,7 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
 
     mock_sessionmaker: async_sessionmaker[AsyncSession] = MagicMock()  # type: ignore[assignment]
@@ -1757,7 +1737,7 @@ async def test_start_turn_with_bundle_mounts_the_single_resource_on_an_isolated_
 
     def on_create(request: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         create_bodies.append(json_body(request))
-        return httpx.Response(200, json=_make_fake_session(status="running"))
+        return httpx.Response(200, json=_session_json(status="running"))
 
     router = _isolated_agent_and_env_router()
     router.add("POST", r"/v1/sessions", on_create)
@@ -1815,9 +1795,7 @@ async def test_start_turn_with_bundle_preserves_the_boundary_return_shape(
         return fixed_at
 
     router = _isolated_agent_and_env_router()
-    router.add(
-        "POST", r"/v1/sessions", lambda _r, _m: httpx.Response(200, json=_make_fake_session())
-    )
+    router.add("POST", r"/v1/sessions", lambda _r, _m: httpx.Response(200, json=_session_json()))
     router.add(
         "GET",
         r"/v1/files/([^/]+)",
@@ -2073,7 +2051,9 @@ async def test_start_turn_returns_the_accepted_events_boundary(
     client = build_fake_anthropic(router.dispatch)
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
@@ -2123,7 +2103,7 @@ async def test_continue_turn_returns_boundary_from_its_own_send() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
 
     def on_send(_r: httpx.Request, _m: re.Match[str]) -> httpx.Response:
@@ -2169,7 +2149,9 @@ async def test_start_turn_raises_when_send_accepts_nothing(
     client = build_fake_anthropic(router.dispatch)
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with (
         patch(
@@ -2212,7 +2194,9 @@ async def test_start_turn_ignores_the_echos_processed_at_even_when_present(
     client = build_fake_anthropic(router.dispatch)
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
@@ -2238,7 +2222,7 @@ async def test_list_events_forwards_created_at_gte_and_types() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", on_events)
     client = build_fake_anthropic(router.dispatch)
@@ -2278,7 +2262,7 @@ async def test_list_events_forwards_neither_when_not_given() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", on_events)
     client = build_fake_anthropic(router.dispatch)
@@ -2306,7 +2290,7 @@ async def test_archive_my_session_rejects_a_sibling_agents_session_and_issues_no
         archive_calls.append(m.group(1))
         return httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_sibling", agent_id="ag_sibling", status="terminated"
             ),
         )
@@ -2317,7 +2301,7 @@ async def test_archive_my_session_rejects_a_sibling_agents_session_and_issues_no
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
+            json=_session_json(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
         ),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/archive", on_archive)
@@ -2337,13 +2321,13 @@ async def test_archive_my_session_archives_an_owned_session_exactly_once() -> No
 
     def on_archive(_req: httpx.Request, m: re.Match[str]) -> httpx.Response:
         archive_calls.append(m.group(1))
-        return httpx.Response(200, json=_make_fake_session(status="terminated"))
+        return httpx.Response(200, json=_session_json(status="terminated"))
 
     router = MARouter()
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/archive", on_archive)
     client = build_fake_anthropic(router.dispatch)
@@ -2376,7 +2360,7 @@ async def test_cancel_turn_sends_exactly_one_user_interrupt_event() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="running")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="running")),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/events", on_send)
     client = build_fake_anthropic(router.dispatch)
@@ -2399,7 +2383,7 @@ async def test_cancel_turn_issues_no_status_precheck_between_ownership_and_send(
 
     def on_retrieve(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         calls.append("retrieve")
-        return httpx.Response(200, json=_make_fake_session(status="running"))
+        return httpx.Response(200, json=_session_json(status="running"))
 
     def on_send(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         calls.append("send")
@@ -2436,9 +2420,7 @@ async def test_cancel_turn_rejects_a_sibling_agents_session_and_issues_zero_send
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
-                session_id="ses_sibling", agent_id="ag_sibling", status="running"
-            ),
+            json=_session_json(session_id="ses_sibling", agent_id="ag_sibling", status="running"),
         ),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/events", on_send)
@@ -2458,7 +2440,7 @@ async def test_cancel_turn_on_already_idle_session_returns_idle_without_raising(
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add(
         "POST",
@@ -2501,13 +2483,8 @@ async def test_get_turn_cost_folds_events_to_the_same_figure_as_debit_amount_at_
     """The fold equals sum(debit_amount(cost_of(usage, rates), markup=1)) over
     the same events — the pre-markup cross-check SPEC 1.4 asks for."""
     rates = MODEL_PRICING["claude-sonnet-4-6"]
-    usage_a = BetaManagedAgentsSpanModelUsage(
-        input_tokens=1000,
-        output_tokens=500,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
-    usage_b = BetaManagedAgentsSpanModelUsage(
+    usage_a = ma_model_usage(input_tokens=1000, output_tokens=500)
+    usage_b = ma_model_usage(
         input_tokens=2000,
         output_tokens=100,
         cache_creation_input_tokens=50,
@@ -2517,7 +2494,7 @@ async def test_get_turn_cost_folds_events_to_the_same_figure_as_debit_amount_at_
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add(
         "GET",
@@ -2558,17 +2535,12 @@ async def test_get_turn_cost_folds_events_to_the_same_figure_as_debit_amount_at_
 async def test_get_turn_cost_excludes_the_boundary_event_itself() -> None:
     """Events at or before ``turn_event_id`` are excluded: of three seeded
     events, one IS the boundary, so ``event_count`` is 2, not 3."""
-    usage = BetaManagedAgentsSpanModelUsage(
-        input_tokens=100,
-        output_tokens=50,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
+    usage = ma_model_usage(input_tokens=100, output_tokens=50)
     router = MARouter()
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add(
         "GET",
@@ -2609,40 +2581,13 @@ async def test_get_turn_cost_excludes_the_boundary_event_itself() -> None:
 async def test_get_turn_cost_returns_none_but_still_counts_events_for_unpriced_model() -> None:
     """No pricing row -> cost_usd is None (never zero — zero would falsely
     claim the turn was free); event_count still counts the events (T-21-06-D)."""
-    session_json = BetaManagedAgentsSession.model_validate(
-        {
-            "id": "ses_test001",
-            "type": "session",
-            "agent": {
-                "id": _MA_AGENT_ID,
-                "name": "test-agent",
-                "version": 1,
-                "type": "agent",
-                "model": {"id": "claude-unpriced-model-x"},
-                "mcp_servers": [],
-                "skills": [],
-                "tools": [],
-            },
-            "archived_at": None,
-            "created_at": "2026-06-23T00:00:00Z",
-            "updated_at": "2026-06-23T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": _ENV_ID,
-            "metadata": {},
-            "resources": [],
-            "stats": {},
-            "status": "idle",
-            "title": None,
-            "usage": {},
-            "vault_ids": [],
-        }
+    session_json = ma_session(
+        id="ses_test001",
+        agent_id=_MA_AGENT_ID,
+        model="claude-unpriced-model-x",
+        environment_id=_ENV_ID,
     ).model_dump(mode="json")
-    usage = BetaManagedAgentsSpanModelUsage(
-        input_tokens=100,
-        output_tokens=50,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
+    usage = ma_model_usage(input_tokens=100, output_tokens=50)
     router = MARouter()
     router.add(
         "GET", r"/v1/sessions/([^/]+)", lambda _r, _m: httpx.Response(200, json=session_json)
@@ -2680,7 +2625,7 @@ async def test_get_turn_cost_returns_a_real_zero_when_priced_model_has_no_events
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", lambda _r, _m: list_response([]))
     client = build_fake_anthropic(router.dispatch)
@@ -2711,7 +2656,7 @@ async def test_get_turn_cost_rejects_a_sibling_agents_session_and_lists_no_event
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
+            json=_session_json(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
         ),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", on_events)
@@ -2778,9 +2723,7 @@ async def test_ask_with_handle_continues_instead_of_starting(
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, m: httpx.Response(
-            200, json=_make_fake_session(session_id=m.group(1), status="idle")
-        ),
+        lambda _r, m: httpx.Response(200, json=_session_json(session_id=m.group(1), status="idle")),
     )
     sent: list[str] = []
 
@@ -2830,9 +2773,7 @@ async def test_ask_with_handle_reads_only_this_turns_reply(
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, m: httpx.Response(
-            200, json=_make_fake_session(session_id=m.group(1), status="idle")
-        ),
+        lambda _r, m: httpx.Response(200, json=_session_json(session_id=m.group(1), status="idle")),
     )
     router.add(
         "POST",

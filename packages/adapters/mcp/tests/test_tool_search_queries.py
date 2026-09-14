@@ -15,7 +15,6 @@ import httpx
 import pytest
 from aioresponses import aioresponses
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
 from cryptography.fernet import Fernet
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.config import (
@@ -37,6 +36,7 @@ from daimon.core.stores.domain import Role
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
 from daimon.core.stores.turn_origins import create_origin
+from daimon.testing import ma_agent
 from daimon.testing.asgi import mcp_session
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, build_stub_anthropic, list_response
@@ -265,17 +265,10 @@ async def test_member_default_agent_edit_refuses_with_admin_handoff(
             agent_name="research-bot",
             mode="agent",
         )
-    agent = BetaManagedAgentsAgent(
+    agent = ma_agent(
         id="ag_research",
         name="research-bot",
-        type="agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5"),
-        created_at=datetime(2026, 1, 1, tzinfo=UTC),
-        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
-        tools=[],
-        skills=[],
-        mcp_servers=[],
+        model="claude-sonnet-5",
         metadata={
             "daimon_tenant": str(tenant.id),
             "daimon_name": "research-bot",
@@ -364,17 +357,10 @@ async def test_member_can_request_new_key_on_managed_agent(
             now=now,
             expires_at=now + timedelta(minutes=10),
         )
-    agent = BetaManagedAgentsAgent(
+    agent = ma_agent(
         id="ag_daimon",
         name="daimon",
-        type="agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5"),
-        created_at=datetime(2026, 1, 1, tzinfo=UTC),
-        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
-        tools=[],
-        skills=[],
-        mcp_servers=[],
+        model="claude-sonnet-5",
         metadata={
             "daimon_tenant": str(tenant.id),
             "daimon_name": "daimon",
@@ -490,17 +476,10 @@ async def test_member_can_request_mcp_token_on_managed_default_agent(
             now=now,
             expires_at=now + timedelta(minutes=10),
         )
-    agent = BetaManagedAgentsAgent(
+    agent = ma_agent(
         id="ag_daimon",
         name="daimon",
-        type="agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5"),
-        created_at=datetime(2026, 1, 1, tzinfo=UTC),
-        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
-        tools=[],
-        skills=[],
-        mcp_servers=[],
+        model="claude-sonnet-5",
         metadata={
             "daimon_tenant": str(tenant.id),
             "daimon_name": "daimon",

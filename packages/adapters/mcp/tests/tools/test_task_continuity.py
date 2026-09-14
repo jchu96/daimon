@@ -13,8 +13,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.task_continuity import (
@@ -32,6 +30,7 @@ from daimon.core.stores.thread_agent_bindings import create_binding, get_binding
 from daimon.core.stores.thread_sessions import create_thread_session, get_live_thread_session
 from daimon.core.stores.turn_origins import create_origin
 from daimon.core.turn_origin import turn_origin
+from daimon.testing import ma_agent, ma_model_config
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp.exceptions import ToolError
@@ -64,21 +63,14 @@ def _runtime(
 
 
 def _destination(tenant_id: uuid.UUID, *, agent_id: str = _DESTINATION_ID) -> dict[str, object]:
-    agent = BetaManagedAgentsAgent(
+    agent = ma_agent(
         id=agent_id,
-        type="agent",
         name=_DESTINATION_NAME,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
+        model=ma_model_config("claude-sonnet-5", speed="standard"),
         metadata={
             MA_METADATA_KEY_TENANT: str(tenant_id),
             MA_METADATA_KEY_NAME: _DESTINATION_NAME,
         },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
     )
     return agent.model_dump(mode="json")
 

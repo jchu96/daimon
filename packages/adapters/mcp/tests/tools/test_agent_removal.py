@@ -25,7 +25,13 @@ from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
+from daimon.testing.ma import (
+    MARouter,
+    build_fake_anthropic,
+    build_no_retry_anthropic,
+    json_body,
+    list_response,
+)
 from fastmcp.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -65,18 +71,6 @@ def _conflict_response() -> httpx.Response:
                 "message": "Concurrent modification detected. Please fetch the latest version and retry.",
             },
         },
-    )
-
-
-def _build_no_retry_anthropic(router: MARouter) -> AsyncAnthropic:
-    """AsyncAnthropic with the SDK's own 409 auto-retry disabled (mirrors test_agents.py)."""
-    return AsyncAnthropic(
-        api_key="test",
-        http_client=httpx.AsyncClient(
-            transport=httpx.MockTransport(router.dispatch),
-            base_url="https://api.anthropic.com",
-        ),
-        max_retries=0,
     )
 
 
@@ -336,7 +330,7 @@ async def test_detach_mcp_server_impl_retries_once_on_version_conflict() -> None
     router.add("GET", r"/v1/agents", on_list)
     router.add("GET", r"/v1/agents/([^/]+)", on_retrieve)
     router.add("POST", r"/v1/agents/([^/]+)", on_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     result = await _detach_mcp_server_impl(

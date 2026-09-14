@@ -6,8 +6,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools.setup_target import (
@@ -22,6 +20,7 @@ from daimon.core.stores.domain import Role
 from daimon.core.stores.thread_agent_bindings import create_binding, get_binding
 from daimon.core.stores.turn_origins import create_origin, get_active_origin
 from daimon.core.turn_origin import turn_origin
+from daimon.testing import ma_agent, ma_model_config
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp.exceptions import ToolError
@@ -61,18 +60,11 @@ async def test_switch_target_updates_shared_binding_and_only_requesting_snapshot
         creator_account_id=caller.id,
     )
     await db_session.commit()
-    target = BetaManagedAgentsAgent(
+    target = ma_agent(
         id="agent_new",
-        type="agent",
         name="new",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
+        model=ma_model_config("claude-sonnet-5", speed="standard"),
         metadata={MA_METADATA_KEY_TENANT: str(tenant.id), MA_METADATA_KEY_NAME: "new"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
     )
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda _r, _m: list_response([target.model_dump(mode="json")]))
@@ -190,18 +182,11 @@ async def test_identity_pin_refuses_deleted_recreated_namesake(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id = uuid.uuid4()
-    recreated = BetaManagedAgentsAgent(
+    recreated = ma_agent(
         id="agent_recreated",
-        type="agent",
         name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
+        model=ma_model_config("claude-sonnet-5", speed="standard"),
         metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: "specialist"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
     )
     router = MARouter()
     router.add(
@@ -280,44 +265,32 @@ async def test_model_change_uses_specialist_identity_and_retains_admin_gate(
         actor_account_id=account.id,
     )
     await db_session.commit()
-    specialist = BetaManagedAgentsAgent(
+    specialist = ma_agent(
         id="agent_specialist",
-        type="agent",
         name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
+        model=ma_model_config("claude-sonnet-5", speed="standard"),
         metadata={
             MA_METADATA_KEY_TENANT: str(tenant.id),
             MA_METADATA_KEY_NAME: "specialist",
             "daimon_account": str(account.id),
         },
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
     )
     updates: list[str] = []
 
     def update_specialist(request: httpx.Request, _match: re.Match[str]) -> httpx.Response:
         updates.append(request.url.path)
         assert json_body(request)["model"] == "claude-opus-5", "the requested model is applied"
-        updated = BetaManagedAgentsAgent(
+        updated = ma_agent(
             id="agent_specialist",
-            type="agent",
             name="specialist",
-            version=2,
-            model=BetaManagedAgentsModelConfig(id="claude-opus-5", speed="standard"),
+            model=ma_model_config("claude-opus-5", speed="standard"),
             metadata={
                 MA_METADATA_KEY_TENANT: str(tenant.id),
                 MA_METADATA_KEY_NAME: "specialist",
                 "daimon_account": str(account.id),
             },
-            mcp_servers=[],
-            tools=[],
-            skills=[],
+            version=2,
             created_at=specialist.created_at,
-            updated_at=datetime.now(UTC),
         )
         return httpx.Response(200, json=updated.model_dump(mode="json"))
 
@@ -390,18 +363,11 @@ async def test_setup_target_refuses_in_a_handoff_thread_and_names_who_answers(
         kind="handoff",
     )
     await db_session.commit()
-    target = BetaManagedAgentsAgent(
+    target = ma_agent(
         id="agent_new",
-        type="agent",
         name="new",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
+        model=ma_model_config("claude-sonnet-5", speed="standard"),
         metadata={MA_METADATA_KEY_TENANT: str(tenant.id), MA_METADATA_KEY_NAME: "new"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
     )
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda _r, _m: list_response([target.model_dump(mode="json")]))

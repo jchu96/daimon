@@ -49,7 +49,13 @@ from daimon.core.stores.scoped_config_write import set_fields
 from daimon.testing import ma_agent
 from daimon.testing.asgi import call_mcp_tool
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
+from daimon.testing.ma import (
+    MARouter,
+    build_fake_anthropic,
+    build_no_retry_anthropic,
+    json_body,
+    list_response,
+)
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -3824,23 +3830,6 @@ async def test_agent_info_skill_names_are_bare_for_own_namespace_pins() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_no_retry_anthropic(router: MARouter) -> AsyncAnthropic:
-    """Build an AsyncAnthropic with max_retries=0 backed by the given MARouter.
-
-    The SDK auto-retries 409 by default (max_retries=2). Tests for
-    update_agent_with_version_retry must disable SDK retries so the helper's
-    own retry logic is exercised in isolation.
-    """
-    return AsyncAnthropic(
-        api_key="test",
-        http_client=httpx.AsyncClient(
-            transport=httpx.MockTransport(router.dispatch),
-            base_url="https://api.anthropic.com",
-        ),
-        max_retries=0,
-    )
-
-
 def _conflict_response() -> httpx.Response:
     """Return an httpx.Response shaped like MA's 409 stale-version conflict."""
     return httpx.Response(
@@ -4250,7 +4239,7 @@ async def test_update_agent_retries_once_on_version_conflict() -> None:
     )
     router.add("GET", r"/v1/agents/([^/]+)", on_retrieve)
     router.add("POST", r"/v1/agents/([^/]+)", on_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     result = await _update_agent_impl(
@@ -4313,7 +4302,7 @@ async def test_update_agent_maps_residual_conflict_to_tool_error() -> None:
     )
     router.add("GET", r"/v1/agents/([^/]+)", on_retrieve)
     router.add("POST", r"/v1/agents/([^/]+)", on_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     with pytest.raises(ToolError, match="modified concurrently"):
@@ -4385,7 +4374,7 @@ async def test_attach_mcp_server_retries_once_on_version_conflict() -> None:
     )
     router.add("GET", r"/v1/agents/([^/]+)", on_retrieve)
     router.add("POST", r"/v1/agents/([^/]+)", on_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     result = await _attach_mcp_server_impl(
@@ -4445,7 +4434,7 @@ async def test_attach_mcp_server_maps_residual_conflict_to_tool_error() -> None:
     )
     router.add("GET", r"/v1/agents/([^/]+)", on_retrieve)
     router.add("POST", r"/v1/agents/([^/]+)", on_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     with pytest.raises(ToolError, match="modified concurrently"):
