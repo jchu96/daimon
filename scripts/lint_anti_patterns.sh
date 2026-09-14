@@ -41,8 +41,8 @@
 #       factories / store helpers, never raw ORM rows. Scoped to its OWN
 #       T9_SEARCH_PATHS (not the shared SEARCH_PATHS above) so packages/core/tests
 #       and packages/testing — which legitimately need ORM access — are never
-#       scanned. Allowlisted: conftest.py files that need Base.metadata.create_all
-#       for schema-per-test setup (a distinct concern from row seeding).
+#       scanned. The only sanctioned importer for schema DDL is
+#       daimon.testing.db (outside T9_SEARCH_PATHS); no conftest is allowlisted.
 #
 # Each rule emits a list of file:line matches. Exits non-zero with the number
 # of failing rules if any pattern is found outside an allow-list.
@@ -133,16 +133,10 @@ ALLOWLIST_T8=(
   "cli/commands/skills.py"
 )
 # T9: daimon.core._models is banned in adapter/integration/parity test trees
-# (SUITE-02). The only tolerated occurrences are conftest.py files that need
-# Base.metadata.create_all for schema-per-test DDL setup — a distinct concern
-# from seeding rows, which must go through daimon.testing factories/store
-# helpers. Each entry below is exactly such a conftest.
-ALLOWLIST_T9=(
-  "packages/adapters/mcp/tests/conftest.py"
-  "packages/adapters/cli/tests/commands/conftest.py"
-  "packages/adapters/cli/tests/contract_flows/conftest.py"
-  "tests/integration/conftest.py"
-)
+# (SUITE-02). Schema DDL lives in daimon.testing.db (outside T9_SEARCH_PATHS);
+# rows are seeded through daimon.testing factories/store helpers. No conftest
+# needs the ORM any more, so the allow-list is empty.
+ALLOWLIST_T9=()
 
 DIVIDER="------------------------------------------------------------------"
 PASS=0
