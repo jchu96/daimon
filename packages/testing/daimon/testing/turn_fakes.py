@@ -147,9 +147,11 @@ class FakeEventsResource:
       opened.
     """
 
-    stream_scripts: list[list[StreamAction]] = field(default_factory=list)
-    replay_events: list[Any] = field(default_factory=list)
-    sent_events: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+    stream_scripts: list[list[StreamAction]] = field(default_factory=list[list[StreamAction]])
+    replay_events: list[Any] = field(default_factory=list[Any])
+    sent_events: list[tuple[str, list[dict[str, Any]]]] = field(
+        default_factory=list[tuple[str, list[dict[str, Any]]]]
+    )
     stream_calls: int = 0
     stream_timeouts: list[Any] = field(default_factory=list[Any])
     streams: list[_FakeEventStream] = field(default_factory=list["_FakeEventStream"])
@@ -337,13 +339,15 @@ class RecordingLifecycle(TurnLifecycle):
     stable across later mutations.
     """
 
-    renders: list[TurnState] = field(default_factory=list)
-    terminal_success: list[TurnState] = field(default_factory=list)
-    terminal_failures: list[tuple[TurnState, Exception]] = field(default_factory=list)
-    sse_events: list[RawMessageStreamEvent] = field(default_factory=list)
-    reconnects: list[ReconnectReason] = field(default_factory=list)
-    rate_limits: list[datetime | None] = field(default_factory=list)
-    interrupts: list[InterruptSource] = field(default_factory=list)
+    renders: list[TurnState] = field(default_factory=list[TurnState])
+    terminal_success: list[TurnState] = field(default_factory=list[TurnState])
+    terminal_failures: list[tuple[TurnState, Exception]] = field(
+        default_factory=list[tuple[TurnState, Exception]]
+    )
+    sse_events: list[RawMessageStreamEvent] = field(default_factory=list[RawMessageStreamEvent])
+    reconnects: list[ReconnectReason] = field(default_factory=list[ReconnectReason])
+    rate_limits: list[datetime | None] = field(default_factory=list[datetime | None])
+    interrupts: list[InterruptSource] = field(default_factory=list[InterruptSource])
 
     async def on_render(self, state: TurnState) -> None:
         self.renders.append(state)
@@ -368,9 +372,10 @@ class RecordingLifecycle(TurnLifecycle):
 
 
 def assert_lifecycle(lc: TurnLifecycle) -> None:
-    """Static-typing guard: RecordingLifecycle satisfies the Protocol."""
+    """Static-typing guard: RecordingLifecycle satisfies the Protocol.
+
+    `RecordingLifecycle` subclasses the Protocol explicitly, so pyright
+    already checks every method against it; this stays as the callable
+    form for tests that want the check spelled out.
+    """
     _ = lc  # runtime no-op; compile-time structural check
-
-
-def _check() -> None:
-    assert_lifecycle(RecordingLifecycle())

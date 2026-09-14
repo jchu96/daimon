@@ -51,7 +51,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 "**/tests/**" = ["E501"]
 
 [tool.pyright]
-include = ["packages/core/daimon", "packages/adapters/cli/daimon", "packages/adapters/mcp/daimon", "packages/adapters/discord/daimon", "packages/adapters/scheduler/daimon", "packages/adapters/slack/daimon", "apps/notebook-host/src/notebook_host", "apps/report-host/src/report_host"]
+include = ["packages/core/daimon", "packages/adapters/cli/daimon", "packages/adapters/mcp/daimon", "packages/adapters/discord/daimon", "packages/adapters/scheduler/daimon", "packages/adapters/slack/daimon", "packages/testing/daimon", "apps/notebook-host/src/notebook_host", "apps/report-host/src/report_host"]
 stubPath = "typings"
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
