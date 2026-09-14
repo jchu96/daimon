@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
 from daimon.core.hub_identity import resolve_hub_tenants
 from daimon.core.stores.identity import find_platform_principal
 from daimon.core.stores.tenants import set_provision_status
 from daimon.testing.factories import make_platform_principal, make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 
 async def test_returns_only_workspaces_with_a_ready_tenant(

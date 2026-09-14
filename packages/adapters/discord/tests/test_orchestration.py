@@ -5,7 +5,6 @@ from __future__ import annotations
 import types
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -14,18 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import anthropic as _anthropic
 import discord
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
-from anthropic.types.beta.beta_cloud_config import BetaCloudConfig
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_model_config import (
-    BetaManagedAgentsModelConfig as _AgentModelConfig,
-)
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
-from anthropic.types.beta.beta_packages import BetaPackages
-from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwork
-from daimon.adapters.discord.bot import DaimonBot
+from anthropic.types.beta import BetaManagedAgentsSession
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings, ThreadNamingSettings
 from daimon.core.ma_resolver import ResolverCache
@@ -39,39 +27,16 @@ from daimon.core.session_snapshot import (
 )
 from daimon.core.stores import tenant_ledger
 from daimon.core.turn.deps import TurnDeps
+from daimon.testing import (
+    DEFAULT_MODEL_ID,
+    ma_agent,
+    ma_environment,
+    ma_session,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import make_tenant
-
-
-def _make_fake_session(session_id: str = "sess_test") -> BetaManagedAgentsSession:
-    """Construct a real BetaManagedAgentsSession with validated fields."""
-    return BetaManagedAgentsSession(
-        id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            # The id the resolver hands the bind: a session's frozen agent id
-            # and the responder's must agree, or a reuse reads as a handoff.
-            id="ag_test",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at="2026-04-28T00:00:00Z",
-        environment_id="env_test",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at="2026-04-28T00:00:00Z",
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
-        outcome_evaluations=[],
-    )
+from .harness import make_bot
 
 
 def _snapshot_of(session: BetaManagedAgentsSession) -> SessionSnapshot:
@@ -107,8 +72,8 @@ def _make_runtime(
     settings.discord = discord_settings
     settings.thread_naming = ThreadNamingSettings(enabled=False)
     anthropic = AsyncMock()
-    anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())
-    anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
+    anthropic.beta.agents.retrieve = AsyncMock(return_value=ma_agent())
+    anthropic.beta.environments.retrieve = AsyncMock(return_value=ma_environment())
     # Dead-session recovery's transcript rescue (`_replay_previous_session`)
     # walks this as an async iterator, not an awaitable -- an unconfigured
     # AsyncMock attribute returns a coroutine instead and blows up with
@@ -159,18 +124,6 @@ def _make_turn_deps(
         resolver_cache=resolver_cache,
         billing_config=None,
     )
-
-
-def _make_bot(runtime: DiscordRuntime) -> DaimonBot:
-    """Build a DaimonBot with minimal intents."""
-    intents = discord.Intents.default()
-    intents.message_content = True
-    bot = DaimonBot(runtime=runtime, intents=intents)
-    # Set bot user so should_process_message passes
-    bot._connection.user = MagicMock(spec=discord.ClientUser)  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.id = 999  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.mentioned_in = MagicMock(return_value=True)  # pyright: ignore[reportPrivateUsage]
-    return bot
 
 
 class _AsyncIter:
@@ -261,41 +214,6 @@ def _stub_resolved_config(
     )
 
 
-def _make_fake_agent(name: str = "test-agent") -> BetaManagedAgentsAgent:
-    """Build a validated BetaManagedAgentsAgent for MA lookup mocks."""
-    return BetaManagedAgentsAgent(
-        id="ag_test",
-        version=1,
-        name=name,
-        type="agent",
-        model=_AgentModelConfig(id="claude-sonnet-4-5"),
-        created_at=datetime(2026, 4, 28, tzinfo=UTC),
-        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
-        mcp_servers=[],
-        metadata={},
-        skills=[],
-        tools=[],
-    )
-
-
-def _make_fake_environment(name: str = "test-env") -> BetaEnvironment:
-    """Build a validated BetaEnvironment for MA lookup mocks."""
-    return BetaEnvironment(
-        id="env_test",
-        name=name,
-        type="environment",
-        config=BetaCloudConfig(
-            type="cloud",
-            networking=BetaUnrestrictedNetwork(type="unrestricted"),
-            packages=BetaPackages(apt=[], cargo=[], gem=[], go=[], npm=[], pip=[]),
-        ),
-        created_at="2026-04-28T00:00:00Z",
-        updated_at="2026-04-28T00:00:00Z",
-        description="",
-        metadata={},
-    )
-
-
 async def _setup_workspace_and_config(
     db_session: AsyncSession,
     tenant_id: uuid.UUID,
@@ -342,12 +260,12 @@ class TestNewThreadCreation:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-abc")
+        mock_create_session.return_value = ma_session(id="sess-abc")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9999
@@ -398,7 +316,7 @@ class TestNewThreadCreation:
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
 
         order: list[str] = []
@@ -425,7 +343,7 @@ class TestNewThreadCreation:
             *args: object, **kwargs: object
         ) -> BetaManagedAgentsSession:
             order.append("session_created")
-            return _make_fake_session("sess-order")
+            return ma_session(id="sess-order")
 
         mock_create_session.side_effect = _record_create_session
 
@@ -461,7 +379,7 @@ class TestNewThreadCreation:
         mock_resolve.return_value = _stub_resolved_config(agent_name=None, environment_name=None)
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
 
         await bot.on_message(message)
@@ -502,7 +420,7 @@ class TestNewThreadCreation:
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9999
@@ -547,7 +465,7 @@ class TestThreadMention:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-thread")
+        mock_create_session.return_value = ma_session(id="sess-thread")
         mock_build_xml.return_value = (
             "<context><thread_history></thread_history></context>\n\n<user_query>hello</user_query>",
             [],
@@ -556,7 +474,7 @@ class TestThreadMention:
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message()
 
         await bot.on_message(message)
@@ -587,7 +505,7 @@ class TestThreadMention:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-xml")
+        mock_create_session.return_value = ma_session(id="sess-xml")
         fake_xml = (
             "<context><thread_history><message>prior</message></thread_history></context>"
             "\n\n<user_query>trigger</user_query>"
@@ -597,7 +515,7 @@ class TestThreadMention:
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message()
 
         await bot.on_message(message)
@@ -629,13 +547,13 @@ class TestThreadMention:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session()
+        mock_create_session.return_value = ma_session()
         mock_build_xml.return_value = ("<context></context>", [])
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message(parent_id=789)
 
         await bot.on_message(message)
@@ -667,13 +585,13 @@ class TestThreadMention:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session()
+        mock_create_session.return_value = ma_session()
         mock_build_xml.return_value = ("<context></context>", [])
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message()
 
         await bot.on_message(message)
@@ -704,13 +622,13 @@ class TestThreadMention:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session()
+        mock_create_session.return_value = ma_session()
         mock_build_xml.return_value = ("<context></context>", [])
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message()
 
         await bot.on_message(message)
@@ -738,7 +656,7 @@ class TestConcurrentTurnProtection:
         tenant = await make_tenant(db_session, platform="discord", workspace_id="123456")
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
 
         # Mark the thread as currently processing a turn (without actually
         # running one). on_message should react ⌛ and append to _pending.
@@ -776,12 +694,12 @@ class TestAutoArchive:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-auto-archive")
+        mock_create_session.return_value = ma_session(id="sess-auto-archive")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9999
@@ -821,13 +739,13 @@ class TestHandleMentionErrorBoundary:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-err")
+        mock_create_session.return_value = ma_session(id="sess-err")
         mock_run_turn.side_effect = _anthropic.APIConnectionError(request=MagicMock())
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9999
@@ -866,13 +784,13 @@ class TestHandleMentionErrorBoundary:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-err2")
+        mock_create_session.return_value = ma_session(id="sess-err2")
         mock_run_turn.side_effect = _anthropic.APIConnectionError(request=MagicMock())
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9998
@@ -903,7 +821,7 @@ class TestSetupHook:
     ) -> None:
         tenant = await make_tenant(db_session, platform="discord", workspace_id="123456")
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
 
         # Stub remaining Cogs via sys.modules to keep the test merge-order-independent.
         mock_help_cog = MagicMock()
@@ -990,7 +908,7 @@ class TestBillingAdmissionGate:
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
 
         await bot.on_message(message)
@@ -1031,12 +949,12 @@ class TestBillingAdmissionGate:
 
         mock_resolve.return_value = _stub_resolved_config()
         mock_is_over_cap.return_value = False
-        mock_create_session.return_value = _make_fake_session("sess-undercap")
+        mock_create_session.return_value = ma_session(id="sess-undercap")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9999
@@ -1061,7 +979,7 @@ class TestBillingAdmissionGate:
         tenant = await make_tenant(db_session, platform="discord", workspace_id="123456")
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         message.guild = None  # DM
 
@@ -1097,12 +1015,12 @@ class TestBillingAdmissionGate:
 
         mock_resolve.return_value = _stub_resolved_config()
         mock_is_over_cap.return_value = False
-        mock_create_session.return_value = _make_fake_session("sess-usage")
+        mock_create_session.return_value = ma_session(id="sess-usage")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 9999
@@ -1125,9 +1043,7 @@ class TestBillingAdmissionGate:
         assert bound["managed_session_id"] == "sess-usage", (
             "managed_session_id should be ma_session.id"
         )
-        assert bound["model_id"] == "claude-sonnet-4-5", (
-            "model_id should be ma_session.agent.model.id"
-        )
+        assert bound["model_id"] == DEFAULT_MODEL_ID, "model_id should be ma_session.agent.model.id"
 
 
 class TestResolverSelfHeal:
@@ -1149,10 +1065,8 @@ class TestResolverSelfHeal:
         resolve_agent / resolve_environment fall through to tag lookup and
         return the live id. Discord replies (no 'no longer exists' error)."""
         import httpx
-        from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
         from daimon.core.ma_resolver import new_resolver_cache
         from daimon.testing.ma import (
-            EMPTY_CLOUD_CONFIG,
             MARouter,
             build_fake_anthropic,
             list_response,
@@ -1163,37 +1077,10 @@ class TestResolverSelfHeal:
         await db_session.commit()
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-heal")
+        mock_create_session.return_value = ma_session(id="sess-heal")
 
-        live_agent = BetaManagedAgentsAgent(
-            id="ag_live",
-            version=1,
-            name="test-agent",
-            type="agent",
-            model=_AgentModelConfig(id="claude-sonnet-4-5"),
-            created_at=datetime(2026, 5, 19, tzinfo=UTC),
-            updated_at=datetime(2026, 5, 19, tzinfo=UTC),
-            mcp_servers=[],
-            metadata={
-                MA_METADATA_KEY_TENANT: str(tenant.id),
-                MA_METADATA_KEY_NAME: "test-agent",
-            },
-            skills=[],
-            tools=[],
-        ).model_dump(mode="json")
-        live_env = BetaEnvironment(
-            id="env_live",
-            name="test-env",
-            type="environment",
-            config=EMPTY_CLOUD_CONFIG,
-            created_at="2026-05-19T00:00:00Z",
-            updated_at="2026-05-19T00:00:00Z",
-            description="",
-            metadata={
-                MA_METADATA_KEY_TENANT: str(tenant.id),
-                MA_METADATA_KEY_NAME: "test-env",
-            },
-        ).model_dump(mode="json")
+        live_agent = ma_agent(id="ag_live", tenant_id=tenant.id).model_dump(mode="json")
+        live_env = ma_environment(id="env_live", tenant_id=tenant.id).model_dump(mode="json")
 
         router = MARouter()
         router.add(
@@ -1237,7 +1124,7 @@ class TestResolverSelfHeal:
             ),
         )
 
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 7777
@@ -1282,11 +1169,9 @@ class TestResolverSelfHeal:
         import re
 
         import httpx
-        from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
         from daimon.core.ma_identity import derive_tenant_uuid
         from daimon.core.ma_resolver import new_resolver_cache
         from daimon.testing.ma import (
-            EMPTY_CLOUD_CONFIG,
             MARouter,
             build_fake_anthropic,
             list_response,
@@ -1300,37 +1185,10 @@ class TestResolverSelfHeal:
         expected_tenant_id = derive_tenant_uuid(platform="discord", workspace_id=workspace_id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-miss-heal")
+        mock_create_session.return_value = ma_session(id="sess-miss-heal")
 
-        live_agent = BetaManagedAgentsAgent(
-            id="ag_miss_live",
-            version=1,
-            name="test-agent",
-            type="agent",
-            model=_AgentModelConfig(id="claude-sonnet-4-5"),
-            created_at=datetime(2026, 5, 19, tzinfo=UTC),
-            updated_at=datetime(2026, 5, 19, tzinfo=UTC),
-            mcp_servers=[],
-            metadata={
-                MA_METADATA_KEY_TENANT: str(tenant.id),
-                MA_METADATA_KEY_NAME: "test-agent",
-            },
-            skills=[],
-            tools=[],
-        ).model_dump(mode="json")
-        live_env = BetaEnvironment(
-            id="env_miss_live",
-            name="test-env",
-            type="environment",
-            config=EMPTY_CLOUD_CONFIG,
-            created_at="2026-05-19T00:00:00Z",
-            updated_at="2026-05-19T00:00:00Z",
-            description="",
-            metadata={
-                MA_METADATA_KEY_TENANT: str(tenant.id),
-                MA_METADATA_KEY_NAME: "test-env",
-            },
-        ).model_dump(mode="json")
+        live_agent = ma_agent(id="ag_miss_live", tenant_id=tenant.id).model_dump(mode="json")
+        live_env = ma_environment(id="env_miss_live", tenant_id=tenant.id).model_dump(mode="json")
 
         # Stateful list handlers: return empty (tag miss) until reconcile fires, then live.
         agent_applied: list[bool] = [False]
@@ -1398,7 +1256,7 @@ class TestResolverSelfHeal:
             ),
         )
 
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         mock_thread = MagicMock(spec=discord.Thread)
         mock_thread.id = 8888
@@ -1440,12 +1298,12 @@ class TestAttachmentOrchestration:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-attach")
+        mock_create_session.return_value = ma_session(id="sess-attach")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         # A non-image attachment routes to the data path → signed CDN URL prefix.
         fake_attachment = MagicMock(spec=discord.Attachment)
@@ -1498,7 +1356,7 @@ class TestAttachmentOrchestration:
         await _setup_workspace_and_config(db_session, tenant.id)
 
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-image-url")
+        mock_create_session.return_value = ma_session(id="sess-image-url")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
 
@@ -1521,7 +1379,7 @@ class TestAttachmentOrchestration:
         )
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_channel_message()
         message.attachments = [cast(discord.Attachment, attachment)]
         mock_thread = MagicMock(spec=discord.Thread)
@@ -1589,7 +1447,7 @@ class TestSessionReuse:
         existing_session_id = "sesn_existing_001"
         watermark_msg_id = "111222333"
         async with db_session_factory() as seed_session:
-            snapshot = _snapshot_of(_make_fake_session(existing_session_id))
+            snapshot = _snapshot_of(ma_session(id=existing_session_id))
             await create_thread_session(
                 seed_session,
                 ma_agent_id="ag_test",
@@ -1614,7 +1472,7 @@ class TestSessionReuse:
         )
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message(thread_id=5555)
 
         await bot.on_message(message)
@@ -1664,7 +1522,7 @@ class TestSessionReuse:
 
         new_session_id = "sesn_new_first_001"
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session(new_session_id)
+        mock_create_session.return_value = ma_session(id=new_session_id)
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
         mock_build_xml.return_value = (
@@ -1677,7 +1535,7 @@ class TestSessionReuse:
         bot_reply_msg.id = 777888999
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message(thread_id=5556)
 
         # Inject the fake reply message so lifecycle.final_message_id is not None.
@@ -1751,7 +1609,7 @@ class TestSessionReuse:
         # Seed a live row for the thread.
         old_session_id = "sesn_old_dead_001"
         async with db_session_factory() as seed_session:
-            snapshot = _snapshot_of(_make_fake_session(old_session_id))
+            snapshot = _snapshot_of(ma_session(id=old_session_id))
             await create_thread_session(
                 seed_session,
                 ma_agent_id="ag_test",
@@ -1769,7 +1627,7 @@ class TestSessionReuse:
 
         new_session_id = "sesn_new_recreated_001"
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session(new_session_id)
+        mock_create_session.return_value = ma_session(id=new_session_id)
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
         mock_build_xml.return_value = (
@@ -1793,7 +1651,7 @@ class TestSessionReuse:
         mock_run_turn.side_effect = [dead_state, success_state]
 
         runtime = _make_runtime(tenant.id, db_session_factory)
-        bot = _make_bot(runtime)
+        bot = make_bot(runtime)
         message = _make_thread_message(thread_id=5557)
 
         await bot.on_message(message)
@@ -1843,7 +1701,7 @@ class TestUnpromptedAdmission:
         tenant = await make_tenant(db_session, platform="discord", workspace_id="123456")
         await _setup_workspace_and_config(db_session, tenant.id)
         mock_resolve.return_value = _stub_resolved_config(agent_name=None, environment_name=None)
-        bot = _make_bot(_make_runtime(tenant.id, db_session_factory))
+        bot = make_bot(_make_runtime(tenant.id, db_session_factory))
         message = _make_thread_message(content="what about the residuals?")
 
         await bot._orchestrate(message, "123456", tenant.id, unprompted=True)  # pyright: ignore[reportPrivateUsage]
@@ -1866,7 +1724,7 @@ class TestUnpromptedAdmission:
         mock_resolve.return_value = _stub_resolved_config()
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
-        bot = _make_bot(_make_runtime(tenant.id, db_session_factory))
+        bot = make_bot(_make_runtime(tenant.id, db_session_factory))
 
         unprompted = _make_thread_message(content="and the priors?")
         await bot._orchestrate(unprompted, "123456", tenant.id, unprompted=True)  # pyright: ignore[reportPrivateUsage]

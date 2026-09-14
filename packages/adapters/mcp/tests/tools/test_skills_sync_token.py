@@ -34,8 +34,6 @@ from daimon.testing.factories import make_tenant
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 FERNET_KEY = "x" * 43 + "="  # length-44 urlsafe base64 — valid Fernet key shape
 
 

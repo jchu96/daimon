@@ -49,15 +49,15 @@ from daimon.core.config import (
     Settings,
 )
 from daimon.core.mcp_auth import mint_jwt
+from daimon.testing import ma_agent
+from daimon.testing.asgi import mcp_session
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
-from .factories import make_jwt, make_ma_agent, mcp_session
-
-pytestmark = pytest.mark.asyncio
+from .harness import make_jwt
 
 SECRET = "a" * 32
 _NOW = dt.datetime(2026, 4, 24, tzinfo=dt.UTC)
@@ -175,14 +175,14 @@ def _build_client() -> AsyncAnthropic:
         "POST",
         r"/v1/agents",
         lambda _r, _m: httpx.Response(
-            200, json=make_ma_agent(name="demo-new-agent").model_dump(mode="json")
+            200, json=ma_agent(name="demo-new-agent").model_dump(mode="json")
         ),
     )
     router.add(
         "GET",
         r"/v1/agents/([^/]+)",
         lambda _r, _m: httpx.Response(
-            200, json=make_ma_agent(name="demo-new-agent").model_dump(mode="json")
+            200, json=ma_agent(name="demo-new-agent").model_dump(mode="json")
         ),
     )
     return build_fake_anthropic(router.dispatch)

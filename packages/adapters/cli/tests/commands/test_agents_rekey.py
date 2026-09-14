@@ -29,19 +29,16 @@ from typing import cast
 
 import httpx
 import pytest
-from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.adapters.cli.commands.agents import agents_rekey
-from daimon.adapters.cli.runtime import CliRuntime
-from daimon.core.config import Settings
 from daimon.core.defaults.provisioning import derive_guild_account_uuid, provision_tenant
 from daimon.core.ma_identity import derive_tenant_uuid
-from daimon.core.ma_resolver import new_resolver_cache
-from daimon.core.scope import DeploymentDefault
 from daimon.testing.ma import MARouter, list_response
 from rich.console import Console
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ..harness import build_cli_runtime
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,22 +98,6 @@ class _FakeSettings:
     mcp = _FakeMcp()
 
 
-def _build_rt(
-    db_session_factory: async_sessionmaker[AsyncSession],
-    router: MARouter,
-) -> CliRuntime:
-    transport = httpx.MockTransport(router.dispatch)
-    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
-    client = AsyncAnthropic(api_key="test", http_client=http_client)
-    return CliRuntime(
-        settings=cast(Settings, _FakeSettings()),
-        anthropic=client,
-        sessionmaker=db_session_factory,
-        deployment_default=DeploymentDefault(),
-        resolver_cache=new_resolver_cache(),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -163,7 +144,7 @@ async def test_rekey_updates_user_owned_guild_agent(
     router.add("POST", rf"/v1/agents/{agent_id}", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 
@@ -223,7 +204,7 @@ async def test_rekey_skips_already_guild_owned(
     router.add("POST", r"/v1/agents/agent_already", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 
@@ -263,7 +244,7 @@ async def test_rekey_skips_system_agent_no_account(
     router.add("POST", r"/v1/agents/agent_system", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 
@@ -305,7 +286,7 @@ async def test_rekey_dry_run_writes_nothing(
 
     out = StringIO()
     console = Console(file=out, force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=True)
 
@@ -387,7 +368,7 @@ async def test_rekey_renames_collision_keeps_canonical(
     router.add("POST", rf"/v1/agents/{older_id}", on_update_older)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 
@@ -473,7 +454,7 @@ async def test_rekey_dry_run_reports_rename_without_writing(
 
     out = StringIO()
     console = Console(file=out, force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=True)
 
@@ -541,7 +522,7 @@ async def test_rekey_renames_when_name_already_guild_owned(
     router.add("POST", r"/v1/agents/agent_personal", on_update_personal)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 
@@ -625,7 +606,7 @@ async def test_rekey_suffix_never_collides_with_later_bare_name(
         router.add("POST", rf"/v1/agents/{agent_id}", _on_update(agent_id, data))
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 
@@ -689,7 +670,7 @@ async def test_rekey_updates_slack_tenant_agent(
     router.add("POST", rf"/v1/agents/{agent_id}", on_update)
 
     console = Console(file=StringIO(), force_terminal=False, highlight=False, width=120)
-    rt = _build_rt(db_session_factory, router)
+    rt = build_cli_runtime(db_session_factory, router=router, settings=_FakeSettings())
 
     await agents_rekey(rt=rt, console=console, yes=True, dry_run=False)
 

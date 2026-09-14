@@ -4,11 +4,8 @@ import datetime as dt
 from typing import Any
 from urllib.parse import urlparse
 
-import pytest
 from daimon.adapters.mcp.artifacts import S3ArtifactStore, build_artifact_store
 from daimon.core.config import ArtifactsSettings
-
-pytestmark = pytest.mark.asyncio
 
 
 class FakeS3Client:

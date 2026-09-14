@@ -20,17 +20,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.core import billing
 from daimon.core._models import UsageEvent
 from daimon.core.stores import tenant_user_caps, usage_events
 from daimon.testing.factories import make_tenant
+from daimon.testing.ma_models import ma_model_usage
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 _TEST_BILLING = billing.BillingConfig(
     secret_key=SecretStr("sk_test"),
@@ -48,22 +44,14 @@ async def _record_1m_opus_tokens(
     tenant_id: uuid.UUID,
     event_id: str,
 ) -> None:
-    """Helper inlined per guideline:testing — explicit construction at call site.
-
-    1M input tokens at claude-opus-4-7 input rate ($15/M) = $15.00.
-    """
+    """1M input tokens at claude-opus-4-7 input rate ($15/M) = $15.00."""
     await usage_events.record(
         session,
         tenant_id=tenant_id,
         platform_user_id=user_id,
         managed_session_id=f"s_{event_id}",
         model="claude-opus-4-7",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1_000_000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1_000_000, output_tokens=0),
         event_id=event_id,
     )
 

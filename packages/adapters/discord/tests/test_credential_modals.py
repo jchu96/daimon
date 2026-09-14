@@ -54,6 +54,7 @@ from daimon.core.stores.credential_requests import (
     peek_credential_request,
 )
 from daimon.core.stores.domain import CredentialRequestRow
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, build_stub_anthropic, list_response
 from pydantic import HttpUrl
@@ -154,20 +155,10 @@ def _make_agent(
     metadata = {"daimon_tenant": str(tenant_id)}
     if managed:
         metadata[MA_METADATA_KEY_MANAGED] = "true"
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=ma_agent_id,
-        type="agent",
         name=name,
-        model={"id": "claude-sonnet-4-6"},
         metadata=metadata,
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     )
 
 
@@ -787,24 +778,14 @@ async def test_mcp_modal_vault_write_failure_keeps_exception_details_private(
 ) -> None:
     def _failing_vault(req: httpx.Request) -> httpx.Response:
         if req.url.path == "/v1/agents":
-            agent = BetaManagedAgentsAgent(
+            agent = ma_agent(
                 id=_MA_AGENT_ID,
-                type="agent",
                 name="test-agent",
-                model={"id": "claude-sonnet-4-6"},
-                description=None,
-                system=None,
                 metadata={
                     "daimon_tenant": str(
                         derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID))
                     )
                 },
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
             )
             return list_response([agent.model_dump(mode="json")])
         raise httpx.ConnectError("upstream reset by peer -- request envelope: secret=abc123")
@@ -840,24 +821,14 @@ async def test_mcp_modal_disables_the_button_even_when_the_write_below_it_fails(
 
     def _failing_vault(req: httpx.Request) -> httpx.Response:
         if req.url.path == "/v1/agents":
-            agent = BetaManagedAgentsAgent(
+            agent = ma_agent(
                 id=_MA_AGENT_ID,
-                type="agent",
                 name="test-agent",
-                model={"id": "claude-sonnet-4-6"},
-                description=None,
-                system=None,
                 metadata={
                     "daimon_tenant": str(
                         derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID))
                     )
                 },
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
             )
             return list_response([agent.model_dump(mode="json")])
         raise httpx.ConnectError("upstream reset by peer")
@@ -1311,20 +1282,10 @@ async def test_skill_repo_failure_reports_only_confirmed_token_saves(
         anthropic=build_fake_anthropic(
             lambda request: list_response(
                 [
-                    BetaManagedAgentsAgent(
+                    ma_agent(
                         id="agent_skill_repo_failure",
-                        type="agent",
                         name="test-agent",
-                        model={"id": "claude-sonnet-4-6"},
-                        description=None,
-                        system=None,
                         metadata={"daimon_tenant": str(row.tenant_id)},
-                        created_at="2026-04-21T00:00:00Z",
-                        updated_at="2026-04-21T00:00:00Z",
-                        version=1,
-                        mcp_servers=[],
-                        skills=[],
-                        tools=[],
                     ).model_dump(mode="json")
                 ]
             )
@@ -1403,20 +1364,10 @@ async def test_env_submit_never_saves_to_a_deleted_target_or_recreated_namesake(
     db_session_factory: async_sessionmaker[AsyncSession], recreated: bool
 ) -> None:
     row = await _seed_env_request(db_session_factory)
-    namesake = BetaManagedAgentsAgent(
+    namesake = ma_agent(
         id="agent_recreated",
-        type="agent",
         name="test-agent",
-        model={"id": "claude-sonnet-4-6"},
-        description=None,
-        system=None,
         metadata={"daimon_tenant": str(row.tenant_id)},
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
     )
     anthropic = build_fake_anthropic(
         lambda request: list_response([namesake.model_dump(mode="json")] if recreated else [])

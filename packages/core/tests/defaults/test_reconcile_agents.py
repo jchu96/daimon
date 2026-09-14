@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from datetime import datetime
 from typing import Any
 
 import httpx
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsAgent, SkillListResponse
+from anthropic.types.beta import SkillListResponse
 from daimon.core.agent_guidance import (
     CREDENTIAL_GUIDANCE_BLOCK,
     apply_credential_guidance,
@@ -23,6 +24,7 @@ from daimon.core.defaults.report import Action
 from daimon.core.specs import AgentSpec, SkillRef
 from daimon.testing.ma import MARouter, list_response
 from daimon.testing.ma import build_fake_anthropic as build_fake_anthropic_http
+from daimon.testing.ma_models import ma_agent
 
 TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 _DEFAULT_MCP_URL = "https://daimon.example/mcp"
@@ -64,23 +66,13 @@ def _tagged_agent(
     }
     if account_id is not None:
         metadata[MA_METADATA_KEY_ACCOUNT] = str(account_id)
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": id_,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": metadata,
-            "description": None,
-            "archived_at": None,
-            "created_at": created_at,
-            "updated_at": created_at,
-            "version": version,
-            "mcp_servers": [],
-            "skills": [],
-            "tools": [],
-            "system": None,
-        }
+    return ma_agent(
+        id=id_,
+        name=name,
+        model="claude-opus-4-7",
+        metadata=metadata,
+        version=version,
+        created_at=datetime.fromisoformat(created_at),
     ).model_dump(mode="json")
 
 
@@ -589,28 +581,12 @@ async def test_reconcile_agent_returns_skipped_when_spec_hash_matches() -> None:
         }
     )
 
-    existing = BetaManagedAgentsAgent.model_validate(
-        {
-            "id": "ag_existing",
-            "type": "agent",
-            "name": spec.name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {
-                MA_METADATA_KEY_TENANT: str(TENANT_ID),
-                MA_METADATA_KEY_NAME: spec.name,
-                "daimon_managed": "true",
-                "daimon_spec_hash": expected_hash,
-            },
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-05-21T00:00:00Z",
-            "updated_at": "2026-05-21T00:00:00Z",
-            "version": 1,
-            "mcp_servers": [],
-            "skills": [],
-            "tools": [],
-            "system": None,
-        }
+    existing = ma_agent(
+        id="ag_existing",
+        name=spec.name,
+        model="claude-opus-4-7",
+        tenant_id=TENANT_ID,
+        metadata={"daimon_managed": "true", "daimon_spec_hash": expected_hash},
     ).model_dump(mode="json")
 
     update_called = False
@@ -643,40 +619,29 @@ async def test_reconcile_agent_preserves_user_attached_mcp_on_update() -> None:
     """
     spec = _agent_spec()  # spec has no mcp_servers, no skills
 
-    existing = BetaManagedAgentsAgent.model_validate(
-        {
-            "id": "ag_existing",
-            "type": "agent",
-            "name": spec.name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {
-                MA_METADATA_KEY_TENANT: str(TENANT_ID),
-                MA_METADATA_KEY_NAME: spec.name,
-            },
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-05-21T00:00:00Z",
-            "updated_at": "2026-05-21T00:00:00Z",
-            "version": 2,
-            "mcp_servers": [
-                {"name": "context7-smoke", "type": "url", "url": "https://ctx7.example/mcp"},
-            ],
-            "skills": [
-                {"skill_id": "sk_external", "type": "custom", "version": "1"},
-            ],
-            "tools": [
-                {
-                    "type": "mcp_toolset",
-                    "mcp_server_name": "context7-smoke",
-                    "configs": [],
-                    "default_config": {
-                        "enabled": True,
-                        "permission_policy": {"type": "always_allow"},
-                    },
+    existing = ma_agent(
+        id="ag_existing",
+        name=spec.name,
+        model="claude-opus-4-7",
+        tenant_id=TENANT_ID,
+        tools=[
+            {
+                "type": "mcp_toolset",
+                "mcp_server_name": "context7-smoke",
+                "configs": [],
+                "default_config": {
+                    "enabled": True,
+                    "permission_policy": {"type": "always_allow"},
                 },
-            ],
-            "system": None,
-        }
+            },
+        ],
+        mcp_servers=[
+            {"name": "context7-smoke", "type": "url", "url": "https://ctx7.example/mcp"},
+        ],
+        skills=[
+            {"skill_id": "sk_external", "type": "custom", "version": "1"},
+        ],
+        version=2,
     ).model_dump(mode="json")
 
     router = _router_with_agents([existing])
@@ -729,39 +694,25 @@ async def test_reconcile_agent_spec_wins_on_mcp_name_collision() -> None:
     """
     drifted_url = "https://stale.example/mcp"
     spec = _agent_spec()  # spec has no explicit mcp_servers; daimon-mcp is merged in via public_url
-    existing = BetaManagedAgentsAgent.model_validate(
-        {
-            "id": "ag_existing",
-            "type": "agent",
-            "name": spec.name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {
-                MA_METADATA_KEY_TENANT: str(TENANT_ID),
-                MA_METADATA_KEY_NAME: spec.name,
-            },
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-05-21T00:00:00Z",
-            "updated_at": "2026-05-21T00:00:00Z",
-            "version": 1,
-            # MA has a daimon-mcp entry but at a stale URL — spec must overwrite.
-            "mcp_servers": [
-                {"name": "daimon-mcp", "type": "url", "url": drifted_url},
-            ],
-            "skills": [],
-            "tools": [
-                {
-                    "type": "mcp_toolset",
-                    "mcp_server_name": "daimon-mcp",
-                    "configs": [],
-                    "default_config": {
-                        "enabled": True,
-                        "permission_policy": {"type": "always_allow"},
-                    },
+    existing = ma_agent(
+        id="ag_existing",
+        name=spec.name,
+        model="claude-opus-4-7",
+        tenant_id=TENANT_ID,
+        tools=[
+            {
+                "type": "mcp_toolset",
+                "mcp_server_name": "daimon-mcp",
+                "configs": [],
+                "default_config": {
+                    "enabled": True,
+                    "permission_policy": {"type": "always_allow"},
                 },
-            ],
-            "system": None,
-        }
+            },
+        ],
+        mcp_servers=[
+            {"name": "daimon-mcp", "type": "url", "url": drifted_url},
+        ],
     ).model_dump(mode="json")
 
     router = _router_with_agents([existing])
@@ -798,28 +749,12 @@ async def test_reconcile_agent_updates_when_spec_hash_mismatch() -> None:
     spec = _agent_spec()
     router = _router_with_agents(
         [
-            BetaManagedAgentsAgent.model_validate(
-                {
-                    "id": "ag_existing",
-                    "type": "agent",
-                    "name": spec.name,
-                    "model": {"id": "claude-opus-4-7"},
-                    "metadata": {
-                        MA_METADATA_KEY_TENANT: str(TENANT_ID),
-                        MA_METADATA_KEY_NAME: spec.name,
-                        "daimon_managed": "true",
-                        "daimon_spec_hash": "stale" + "0" * 11,  # 16 chars, won't match
-                    },
-                    "description": None,
-                    "archived_at": None,
-                    "created_at": "2026-05-21T00:00:00Z",
-                    "updated_at": "2026-05-21T00:00:00Z",
-                    "version": 1,
-                    "mcp_servers": [],
-                    "skills": [],
-                    "tools": [],
-                    "system": None,
-                }
+            ma_agent(
+                id="ag_existing",
+                name=spec.name,
+                model="claude-opus-4-7",
+                tenant_id=TENANT_ID,
+                metadata={"daimon_managed": "true", "daimon_spec_hash": "stale" + "0" * 11},
             ).model_dump(mode="json")
         ]
     )
@@ -1012,28 +947,13 @@ async def test_reconcile_agent_bypasses_skipped_and_repairs_corrupted_daimon_mcp
     )
 
     # Build the MA-side agent: hash matches, but mcp_servers carries a corrupted entry.
-    corrupted_ma_agent = BetaManagedAgentsAgent.model_validate(
-        {
-            "id": "ag_corrupted",
-            "type": "agent",
-            "name": spec.name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {
-                MA_METADATA_KEY_TENANT: str(TENANT_ID),
-                MA_METADATA_KEY_NAME: spec.name,
-                "daimon_managed": "true",
-                "daimon_spec_hash": expected_hash,
-            },
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-05-21T00:00:00Z",
-            "updated_at": "2026-05-21T00:00:00Z",
-            "version": 1,
-            "mcp_servers": [{"name": "daimon-mcp", "type": "url", "url": _OTHER_MCP_URL}],
-            "skills": [],
-            "tools": [],
-            "system": None,
-        }
+    corrupted_ma_agent = ma_agent(
+        id="ag_corrupted",
+        name=spec.name,
+        model="claude-opus-4-7",
+        tenant_id=TENANT_ID,
+        metadata={"daimon_managed": "true", "daimon_spec_hash": expected_hash},
+        mcp_servers=[{"name": "daimon-mcp", "type": "url", "url": _OTHER_MCP_URL}],
     ).model_dump(mode="json")
 
     router = _router_with_agents([corrupted_ma_agent])
@@ -1094,28 +1014,13 @@ async def test_reconcile_agent_stays_skipped_when_hash_matches_and_mcp_healthy()
         }
     )
 
-    healthy_ma_agent = BetaManagedAgentsAgent.model_validate(
-        {
-            "id": "ag_healthy",
-            "type": "agent",
-            "name": spec.name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {
-                MA_METADATA_KEY_TENANT: str(TENANT_ID),
-                MA_METADATA_KEY_NAME: spec.name,
-                "daimon_managed": "true",
-                "daimon_spec_hash": expected_hash,
-            },
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-05-21T00:00:00Z",
-            "updated_at": "2026-05-21T00:00:00Z",
-            "version": 1,
-            "mcp_servers": [{"name": "daimon-mcp", "type": "url", "url": _DEFAULT_MCP_URL}],
-            "skills": [],
-            "tools": [],
-            "system": None,
-        }
+    healthy_ma_agent = ma_agent(
+        id="ag_healthy",
+        name=spec.name,
+        model="claude-opus-4-7",
+        tenant_id=TENANT_ID,
+        metadata={"daimon_managed": "true", "daimon_spec_hash": expected_hash},
+        mcp_servers=[{"name": "daimon-mcp", "type": "url", "url": _DEFAULT_MCP_URL}],
     ).model_dump(mode="json")
 
     update_called = False

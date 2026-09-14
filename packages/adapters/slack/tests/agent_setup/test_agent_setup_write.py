@@ -50,6 +50,7 @@ from daimon.testing.ma import (
     build_fake_anthropic,
     build_stub_anthropic,
     combine_handlers,
+    make_archive_agent_handler,
     make_fake_ma_handler,
     make_fake_memory_store_handler,
 )
@@ -622,43 +623,12 @@ async def test_fork_agent_copies_anon_binding_without_error_or_credential_write(
     assert fork_pat is None, "no credential write must happen for an anon: source"
 
 
-def _make_archive_agent_handler() -> Callable[[httpx.Request], httpx.Response]:
-    """`make_fake_ma_handler` doesn't implement POST .../archive — add it here."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        m = re.fullmatch(r"/v1/agents/(?P<id>[^/]+)/archive", request.url.path)
-        if request.method != "POST" or not m:
-            raise NotHandled
-        now = datetime.now(UTC).isoformat()
-        return httpx.Response(
-            200,
-            json={
-                "id": m.group("id"),
-                "type": "agent",
-                "name": "doomed",
-                "version": 2,
-                "model": {"id": "claude-sonnet-4-6", "speed": "standard"},
-                "system": None,
-                "metadata": {},
-                "mcp_servers": [],
-                "tools": [],
-                "skills": [],
-                "created_at": now,
-                "updated_at": now,
-                "archived_at": now,
-                "description": None,
-            },
-        )
-
-    return handler
-
-
 async def test_delete_agent_archives_memory_store(db_session, db_session_factory) -> None:
     tenant = await make_tenant(db_session, platform="slack", workspace_id="T_DELETE_MEM")
     mem_state = FakeMemoryStoreState()
     client = build_fake_anthropic(
         combine_handlers(
-            _make_archive_agent_handler(),
+            make_archive_agent_handler(),
             make_fake_memory_store_handler(mem_state),
             make_fake_ma_handler(),
         )
@@ -714,7 +684,7 @@ async def test_delete_agent_succeeds_when_store_archive_fails(
     mem_state = FakeMemoryStoreState()
     client = build_fake_anthropic(
         combine_handlers(
-            _make_archive_agent_handler(),
+            make_archive_agent_handler(),
             _make_failing_store_archive_handler(),
             make_fake_memory_store_handler(mem_state),
             make_fake_ma_handler(),
@@ -763,7 +733,7 @@ async def test_delete_agent_clears_tenant_default_naming_the_agent(
 
     client = build_fake_anthropic(
         combine_handlers(
-            _make_archive_agent_handler(),
+            make_archive_agent_handler(),
             make_fake_memory_store_handler(FakeMemoryStoreState()),
             make_fake_ma_handler(),
         )

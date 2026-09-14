@@ -17,30 +17,9 @@ endpoints), so both scenarios share `_build_dead_session_router`.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from decimal import Decimal
 
-import httpx
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
-    BetaManagedAgentsAgentMessageEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_end_turn import (
-    BetaManagedAgentsSessionEndTurn,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event import (
-    BetaManagedAgentsSessionStatusIdleEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
-    BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_text_block import BetaManagedAgentsTextBlock
 from daimon.core.continuity.messages import render_unexpected_loss
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.thread_sessions import (
@@ -49,102 +28,32 @@ from daimon.core.stores.thread_sessions import (
     get_thread_session_by_id,
 )
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
-    MARouter,
-    list_response,
-    not_found_response,
-    send_events_response,
-    sse_response,
-)
+from daimon.testing.ma import MARouter, not_found_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .conftest import AGENT_ID, AGENT_TEXT, ENV_ID, MODEL_ID
+from .conftest import AGENT_ID, build_turn_router
 from .drivers.discord_driver import DiscordDriver
 from .drivers.slack_driver import SlackDriver
 
 # The Discord driver's `create_session` stub always returns this fixed session
-# id for the recreate call (see DiscordDriver._make_fake_session usage in
-# dispatch_turn) -- the recovered-turn's NEW session id in this scenario.
+# id for the recreate call (see the `ma_session(...)` stub in
+# `DiscordDriver.dispatch_turn`) -- the recovered-turn's NEW session id in
+# this scenario.
 _RECOVERED_SESSION_ID = "sess_parity_test"
 _DEAD_SESSION_ID = "sess_dead_before_recovery"
 
 
 def _build_dead_session_router(tenant_id_str: str) -> MARouter:
-    """Agent/environment resolution identical to `build_turn_router`, but with
-    session-id-scoped event routes: the OLD (already-dead) session's SSE
-    stream open 404s (the confirmed dead-session signal -- `run_turn` opens
-    the stream before posting the initial user message, so the 404 surfaces
-    there), the recreated session's stream open + `events.send` succeed.
+    """The shared turn router with its event routes scoped to the recreated
+    session, plus the OLD (already-dead) session: its SSE stream open 404s
+    (the confirmed dead-session signal -- `run_turn` opens the stream before
+    posting the initial user message, so the 404 surfaces there).
     """
-    agent_item = BetaManagedAgentsAgent(
-        id=AGENT_ID,
-        type="agent",
-        name="test-agent",
-        model=BetaManagedAgentsModelConfig(id=MODEL_ID),
-        metadata={
-            MA_METADATA_KEY_TENANT: tenant_id_str,
-            MA_METADATA_KEY_NAME: "test-agent",
-        },
-        description=None,
-        created_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        updated_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    ).model_dump(mode="json")
-
-    env_item = BetaEnvironment(
-        id=ENV_ID,
-        type="environment",
-        name="test-env",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: tenant_id_str,
-            MA_METADATA_KEY_NAME: "test-env",
-        },
-        description="",
-        created_at="2026-06-14T00:00:00Z",
-        updated_at="2026-06-14T00:00:00Z",
-    ).model_dump(mode="json")
-
-    now = datetime.now(UTC)
-    agent_message_event = BetaManagedAgentsAgentMessageEvent(
-        id="evt_parity_recover_msg",
-        type="agent.message",
-        processed_at=now,
-        content=[BetaManagedAgentsTextBlock(type="text", text=AGENT_TEXT)],
-    ).model_dump(mode="json")
-    model_request_end_event = BetaManagedAgentsSpanModelRequestEndEvent(
-        id="evt_parity_recover_usage",
-        is_error=False,
-        model_request_start_id="start_parity_recover",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
-        processed_at=now,
-        type="span.model_request_end",
-    ).model_dump(mode="json")
-    idle_event = BetaManagedAgentsSessionStatusIdleEvent(
-        id="evt_parity_recover_idle",
-        type="session.status_idle",
-        processed_at=now,
-        stop_reason=BetaManagedAgentsSessionEndTurn(type="end_turn"),
-    ).model_dump(mode="json")
-
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent_item]))
-    router.add("GET", r"/v1/agents/[^/]+", lambda req, _m: httpx.Response(200, json=agent_item))
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([env_item]))
-    router.add("GET", r"/v1/environments/[^/]+", lambda req, _m: httpx.Response(200, json=env_item))
-    # OLD session: opening the SSE stream 404s -- the dead-session signal
-    # (`run_turn` opens the stream before `send_initial`, so this is the
-    # first request the driver makes against a gone session).
+    router = build_turn_router(
+        tenant_id_str,
+        session_id=_RECOVERED_SESSION_ID,
+        usage_event_id="evt_parity_recover_usage",
+    )
     router.add(
         "GET",
         rf"/v1/sessions/{_DEAD_SESSION_ID}/events/stream",
@@ -157,17 +66,6 @@ def _build_dead_session_router(tenant_id_str: str) -> MARouter:
         "GET",
         rf"/v1/sessions/{_DEAD_SESSION_ID}",
         lambda req, _m: not_found_response("session gone"),
-    )
-    # Recreated session: events.send + SSE stream succeed.
-    router.add(
-        "POST",
-        rf"/v1/sessions/{_RECOVERED_SESSION_ID}/events",
-        lambda req, _m: send_events_response(),
-    )
-    router.add(
-        "GET",
-        rf"/v1/sessions/{_RECOVERED_SESSION_ID}/events/stream",
-        lambda req, _m: sse_response([agent_message_event, model_request_end_event, idle_event]),
     )
     return router
 

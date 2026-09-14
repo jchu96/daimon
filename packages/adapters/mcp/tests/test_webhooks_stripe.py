@@ -9,7 +9,6 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
-import pytest
 import stripe
 from daimon.adapters.mcp.server import create_mcp_app
 from daimon.core.billing import BillingConfig
@@ -25,8 +24,6 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
-
-pytestmark = pytest.mark.asyncio
 
 _WEBHOOK_SECRET = "whsec_test"
 

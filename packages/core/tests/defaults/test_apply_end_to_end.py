@@ -9,26 +9,22 @@ from typing import Any
 import httpx
 import pytest
 from anthropic.types.beta import (
-    BetaEnvironment,
-    BetaManagedAgentsAgent,
     BetaManagedAgentsModelConfig,
     SkillListResponse,
 )
 from daimon.core.defaults import apply_defaults
 from daimon.core.defaults.metadata import (
-    MA_METADATA_KEY_NAME,
-    MA_METADATA_KEY_TENANT,
     tenant_scoped_display_title,
 )
 from daimon.core.defaults.report import Action
 from daimon.core.errors import DefaultsError
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     MARouter,
     json_body,
     list_response,
 )
 from daimon.testing.ma import build_fake_anthropic as build_fake_anthropic_http
+from daimon.testing.ma_models import ma_agent, ma_environment
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _CREATED_AT = datetime(2026, 4, 21, 0, 0, 0, tzinfo=UTC)
@@ -97,16 +93,7 @@ async def test_apply_creates_all_on_fresh_db(
         r"/v1/environments",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaEnvironment(
-                id="env_1",
-                type="environment",
-                name="default",
-                config=EMPTY_CLOUD_CONFIG,
-                metadata={},
-                description="",
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-            ).model_dump(mode="json"),
+            json=ma_environment(id="env_1", name="default").model_dump(mode="json"),
         ),
     )
 
@@ -114,20 +101,8 @@ async def test_apply_creates_all_on_fresh_db(
         agent_payload.update(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_1",
-                type="agent",
-                name="daimon",
-                model=_AGENT_MODEL,
-                metadata={},
-                description=None,
-                created_at=_CREATED_AT,
-                updated_at=_CREATED_AT,
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
+            json=ma_agent(
+                id="ag_1", name="daimon", model=_AGENT_MODEL, created_at=_CREATED_AT
             ).model_dump(mode="json"),
         )
 
@@ -156,16 +131,7 @@ async def test_apply_second_run_skips_everything(
         r"/v1/environments",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaEnvironment(
-                id="env_1",
-                type="environment",
-                name="default",
-                config=EMPTY_CLOUD_CONFIG,
-                metadata={},
-                description="",
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-            ).model_dump(mode="json"),
+            json=ma_environment(id="env_1", name="default").model_dump(mode="json"),
         ),
     )
     router1.add(
@@ -173,20 +139,8 @@ async def test_apply_second_run_skips_everything(
         r"/v1/agents",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_1",
-                type="agent",
-                name="daimon",
-                model=_AGENT_MODEL,
-                metadata={},
-                description=None,
-                created_at=_CREATED_AT,
-                updated_at=_CREATED_AT,
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
+            json=ma_agent(
+                id="ag_1", name="daimon", model=_AGENT_MODEL, created_at=_CREATED_AT
             ).model_dump(mode="json"),
         ),
     )
@@ -203,36 +157,15 @@ async def test_apply_second_run_skips_everything(
 
     # --- second run: lists return the created resources; no writes expected ---
     tenant_id_str = await _get_tenant_id(db_session_factory)
-    existing_env = BetaEnvironment(
-        id="env_1",
-        type="environment",
-        name="default",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={
-            MA_METADATA_KEY_TENANT: tenant_id_str,
-            MA_METADATA_KEY_NAME: "default",
-        },
-        description="",
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-    ).model_dump(mode="json")
-    existing_agent = BetaManagedAgentsAgent(
+    existing_env = ma_environment(id="env_1", name="default", tenant_id=tenant_id_str).model_dump(
+        mode="json"
+    )
+    existing_agent = ma_agent(
         id="ag_1",
-        type="agent",
         name="daimon",
         model=_AGENT_MODEL,
-        metadata={
-            MA_METADATA_KEY_TENANT: tenant_id_str,
-            MA_METADATA_KEY_NAME: "daimon",
-        },
-        description=None,
+        tenant_id=tenant_id_str,
         created_at=_CREATED_AT,
-        updated_at=_CREATED_AT,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     ).model_dump(mode="json")
     # No write handlers registered — router raises if anything tries to write.
     # 2-state design: always update when resource found on MA.
@@ -310,16 +243,7 @@ async def test_apply_without_config_yaml_reports_empty_system_config(
         r"/v1/environments",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaEnvironment(
-                id="env_1",
-                type="environment",
-                name="default",
-                config=EMPTY_CLOUD_CONFIG,
-                metadata={},
-                description="",
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-            ).model_dump(mode="json"),
+            json=ma_environment(id="env_1", name="default").model_dump(mode="json"),
         ),
     )
     router.add(
@@ -327,20 +251,8 @@ async def test_apply_without_config_yaml_reports_empty_system_config(
         r"/v1/agents",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_1",
-                type="agent",
-                name="daimon",
-                model=_AGENT_MODEL,
-                metadata={},
-                description=None,
-                created_at=_CREATED_AT,
-                updated_at=_CREATED_AT,
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
+            json=ma_agent(
+                id="ag_1", name="daimon", model=_AGENT_MODEL, created_at=_CREATED_AT
             ).model_dump(mode="json"),
         ),
     )
@@ -378,20 +290,8 @@ async def test_apply_reports_failed_without_traceback_when_reconcile_raises_daim
         r"/v1/agents",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_1",
-                type="agent",
-                name="daimon",
-                model=_AGENT_MODEL,
-                metadata={},
-                description=None,
-                created_at=_CREATED_AT,
-                updated_at=_CREATED_AT,
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
+            json=ma_agent(
+                id="ag_1", name="daimon", model=_AGENT_MODEL, created_at=_CREATED_AT
             ).model_dump(mode="json"),
         ),
     )
@@ -443,20 +343,8 @@ async def test_apply_reports_failed_with_scrubbed_error_when_reconcile_raises_ty
         r"/v1/agents",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_1",
-                type="agent",
-                name="daimon",
-                model=_AGENT_MODEL,
-                metadata={},
-                description=None,
-                created_at=_CREATED_AT,
-                updated_at=_CREATED_AT,
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
+            json=ma_agent(
+                id="ag_1", name="daimon", model=_AGENT_MODEL, created_at=_CREATED_AT
             ).model_dump(mode="json"),
         ),
     )
@@ -507,23 +395,12 @@ async def test_apply_sweeps_previously_seeded_brainstorming_skill(
         updated_at="2026-04-21T00:00:00Z",
         source="custom",
     ).model_dump(mode="json")
-    existing_agent = BetaManagedAgentsAgent(
+    existing_agent = ma_agent(
         id="ag_old",
-        type="agent",
         name="daimon",
         model=_AGENT_MODEL,
-        metadata={
-            MA_METADATA_KEY_TENANT: tenant_id_str,
-            MA_METADATA_KEY_NAME: "daimon",
-        },
-        description=None,
+        tenant_id=tenant_id_str,
         created_at=_CREATED_AT,
-        updated_at=_CREATED_AT,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     ).model_dump(mode="json")
 
     router = _full_router(skills=[existing_skill], agents=[existing_agent])
@@ -533,16 +410,7 @@ async def test_apply_sweeps_previously_seeded_brainstorming_skill(
         r"/v1/environments",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaEnvironment(
-                id="env_1",
-                type="environment",
-                name="default",
-                config=EMPTY_CLOUD_CONFIG,
-                metadata={},
-                description="",
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-            ).model_dump(mode="json"),
+            json=ma_environment(id="env_1", name="default").model_dump(mode="json"),
         ),
     )
 
@@ -563,23 +431,13 @@ async def test_apply_sweeps_previously_seeded_brainstorming_skill(
         update_requests.append(req)
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_old",
-                type="agent",
                 name="daimon",
                 model=_AGENT_MODEL,
-                metadata={
-                    MA_METADATA_KEY_TENANT: tenant_id_str,
-                    MA_METADATA_KEY_NAME: "daimon",
-                },
-                description=None,
-                created_at=_CREATED_AT,
-                updated_at=_CREATED_AT,
+                tenant_id=tenant_id_str,
                 version=2,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
+                created_at=_CREATED_AT,
             ).model_dump(mode="json"),
         )
 

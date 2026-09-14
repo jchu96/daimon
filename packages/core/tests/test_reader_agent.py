@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaManagedAgentsAgent, SkillListResponse
+from anthropic.types.beta import SkillListResponse
 from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_ISOLATED,
     MA_METADATA_KEY_MANAGED,
@@ -26,6 +26,7 @@ from daimon.core.reader_agent import (
 )
 from daimon.core.specs import AgentSpec, SkillRef
 from daimon.testing.ma import MARouter, build_fake_anthropic, json_body, list_response
+from daimon.testing.ma_models import ma_agent
 
 TENANT_ID = uuid.UUID("00000000-0000-0000-0000-0000000000a1")
 ACCOUNT_ID = uuid.UUID("00000000-0000-0000-0000-0000000000a2")
@@ -163,23 +164,8 @@ def _source_agent_dict(
     }
     if spec_hash is not None:
         metadata[MA_METADATA_KEY_SPEC_HASH] = spec_hash
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": id_,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-sonnet-4-6"},
-            "metadata": metadata,
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-09-01T00:00:00Z",
-            "updated_at": "2026-09-01T00:00:00Z",
-            "version": version,
-            "mcp_servers": [],
-            "skills": [],
-            "tools": [],
-            "system": system,
-        }
+    return ma_agent(
+        id=id_, name=name, metadata=metadata, system=system, version=version
     ).model_dump(mode="json")
 
 
@@ -196,23 +182,13 @@ def _reader_agent_dict(
         MA_METADATA_KEY_NAME: name,
         **metadata_extra,
     }
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": id_,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-sonnet-4-6"},
-            "metadata": metadata,
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-09-01T00:00:00Z",
-            "updated_at": "2026-09-01T00:00:00Z",
-            "version": version,
-            "mcp_servers": [],
-            "skills": [{"type": "custom", "skill_id": "sk_reader_resolved", "version": "1"}],
-            "tools": [],
-            "system": "",
-        }
+    return ma_agent(
+        id=id_,
+        name=name,
+        metadata=metadata,
+        system="",
+        skills=[{"type": "custom", "skill_id": "sk_reader_resolved", "version": "1"}],
+        version=version,
     ).model_dump(mode="json")
 
 

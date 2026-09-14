@@ -20,9 +20,6 @@ from decimal import Decimal
 
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.adapters.scheduler.main import (
     _build_fire,  # pyright: ignore[reportPrivateUsage]  # test seam for balance gate + debit binding
     _CapsAdapter,  # pyright: ignore[reportPrivateUsage]  # named test seam for cap wiring
@@ -41,6 +38,7 @@ from daimon.core.stores.domain import RoutineRow
 from daimon.core.stores.identity import find_platform_principal
 from daimon.core.stores.routines import create_routine, get_routine
 from daimon.core.usage_recording import record_turn_usage
+from daimon.testing import ma_model_usage
 from daimon.testing.factories import make_tenant
 from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
@@ -68,12 +66,7 @@ async def test_caps_adapter_returns_true_when_user_over_cap(
         platform_user_id="u1",
         managed_session_id="prev_sess",
         model="claude-opus-4-7",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=10_000_000,
-            output_tokens=10_000_000,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=10_000_000, output_tokens=10_000_000),
         event_id="prev_evt",
     )
     await db_session.commit()
@@ -124,12 +117,7 @@ async def test_fire_skips_on_over_cap(
         platform_user_id="u1",
         managed_session_id="prev_sess",
         model="claude-opus-4-7",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=10_000_000,
-            output_tokens=10_000_000,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=10_000_000, output_tokens=10_000_000),
         event_id="prev_evt",
     )
     await db_session.commit()

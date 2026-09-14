@@ -43,6 +43,20 @@
 #       and packages/testing — which legitimately need ORM access — are never
 #       scanned. The only sanctioned importer for schema DDL is
 #       daimon.testing.db (outside T9_SEARCH_PATHS); no conftest is allowlisted.
+#   T10 Local re-definitions of the shared daimon.testing builders — banned.
+#       Definitions only (`def _?<name>(`), never calls or inline
+#       `BetaManagedAgents*(...)` constructors, which stay legitimate when the
+#       test is about the shape itself. The banned names are the helpers the
+#       consolidation retired from per-tree copies: make_ma_agent,
+#       make_fake_agent/environment/session, make_ma_environment,
+#       make_agent_env_handler, build_turn_router, build_anthropic,
+#       build_fake_anthropic, build_no_retry_anthropic, make_tarball,
+#       make_fernet, make_archive_agent_handler, lifespan,
+#       parse_jsonrpc(_response), call_tool_via_http, agent_response,
+#       environment_response. Sanctioned homes: packages/testing/daimon/testing/
+#       (the shared package), mcp/tests/hub/test_app.py (a Starlette router
+#       lifespan, not a harness copy) and apps/report-host/tests/conftest.py
+#       (the report host must not import daimon).
 #
 # Each rule emits a list of file:line matches. Exits non-zero with the number
 # of failing rules if any pattern is found outside an allow-list.
@@ -52,13 +66,18 @@
 
 set -euo pipefail
 
-# Scope: test trees only. Adjust as the implementation phase formalizes.
+# Scope: every test tree plus the shared daimon.testing package (T1-T3, T10).
 SEARCH_PATHS=(
   "packages/adapters/discord/tests"
   "packages/adapters/cli/tests"
   "packages/adapters/mcp/tests"
   "packages/adapters/slack/tests"
+  "packages/adapters/scheduler/tests"
   "packages/core/tests"
+  "packages/testing"
+  "tests"
+  "apps/notebook-host/tests"
+  "apps/report-host/tests"
 )
 
 # Scope: T9 only — adapter test trees + top-level integration/parity tests.
@@ -97,8 +116,8 @@ ALLOWLIST_T2=()  # model_construct
 # filters full path:line:content strings with grep -vF), so ONLY these two
 # exact expressions are exempt — not the files, not the directory.
 ALLOWLIST_T3=(
-  'anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())'
-  'anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())'
+  'anthropic.beta.agents.retrieve = AsyncMock(return_value=ma_agent())'
+  'anthropic.beta.environments.retrieve = AsyncMock(return_value=ma_environment())'
 )
 ALLOWLIST_T4=("ma_index.py" "ma.py")  # the legitimate filtered-list homes
 # Approved agent-creation chokepoints: each guarantees the base agent_toolset
@@ -137,6 +156,13 @@ ALLOWLIST_T8=(
 # rows are seeded through daimon.testing factories/store helpers. No conftest
 # needs the ORM any more, so the allow-list is empty.
 ALLOWLIST_T9=()
+# T10: the only places a builder from the banned list may be defined. Path
+# substrings (run_rule filters full path:line:content strings with grep -vF).
+ALLOWLIST_T10=(
+  "packages/testing/daimon/testing/"
+  "packages/adapters/mcp/tests/hub/test_app.py"
+  "apps/report-host/tests/conftest.py"
+)
 
 DIVIDER="------------------------------------------------------------------"
 PASS=0
@@ -313,6 +339,12 @@ run_rule_t9 "T9" \
   "Banned: daimon.core._models import under adapter/integration/parity test trees" \
   '(from daimon\.core(\.| import )_models\b|daimon\.core\._models\b)' \
   ALLOWLIST_T9
+
+# T10: local re-definitions of shared daimon.testing builders (definitions only).
+run_rule "T10" \
+  "Banned: re-defining a shared daimon.testing builder locally (import it from daimon.testing)" \
+  'def _?(make_ma_agent|make_fake_agent|make_fake_environment|make_fake_session|make_ma_environment|make_agent_env_handler|build_turn_router|build_anthropic|build_fake_anthropic|build_no_retry_anthropic|make_tarball|make_fernet|make_archive_agent_handler|lifespan|parse_jsonrpc(_response)?|call_tool_via_http|agent_response|environment_response)\s*\(' \
+  ALLOWLIST_T10
 
 
 echo "$DIVIDER"

@@ -65,7 +65,7 @@ async def require_disposable_workspace(client: AsyncAnthropic) -> None:
     It deliberately does NOT create the sentinel: auto-marking would make the
     guard wave through exactly the mistake it exists to catch.
 
-    Fails rather than skips, unlike `_require_api_key` — a suite aimed at the
+    Fails rather than skips, unlike `require_api_key` — a suite aimed at the
     wrong workspace must be loud, not quietly green.
     """
     if await find_workspace_disposable_sentinel(client) is None:

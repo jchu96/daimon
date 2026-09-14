@@ -19,16 +19,10 @@ from typing import cast
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.core.config import McpSettings
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores import tenant_ledger, usage_events
@@ -38,13 +32,19 @@ from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.prepare import PreparedTurn, bind_session
 from daimon.core.turn.run import run_prepared_turn
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     MARouter,
     build_fake_anthropic,
-    list_response,
     make_fake_memory_store_handler,
+    resolved_agent_env_router,
     send_events_response,
     sse_response,
+)
+from daimon.testing.ma_models import (
+    ma_agent,
+    ma_environment,
+    ma_model_usage,
+    ma_session,
+    ma_session_agent,
 )
 from daimon.testing.turn_fakes import RecordingLifecycle
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -60,41 +60,6 @@ from daimon.testing.factories import (  # isort: skip
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
 
-def _agent(*, agent_id: str, name: str, tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
-        id=agent_id,
-        type="agent",
-        name=name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        description=None,
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=now,
-        updated_at=now,
-        archived_at=None,
-    )
-
-
-def _env(*, env_id: str, name: str, tenant_id: uuid.UUID) -> BetaEnvironment:
-    now_iso = datetime.now(UTC).isoformat()
-    return BetaEnvironment(
-        id=env_id,
-        type="environment",
-        name=name,
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
-
-
 def _chokepoint_router(
     *, tenant_id: uuid.UUID, session_bodies: list[dict[str, object]]
 ) -> MARouter:
@@ -102,24 +67,10 @@ def _chokepoint_router(
     provisioning + session-create (each call assigns the next `sess_N` id),
     events.send, and events.stream (one span.model_request_end + terminal
     idle event for every session)."""
-    agent = _agent(agent_id="ag_1", name="daimon", tenant_id=tenant_id)
-    env = _env(env_id="env_1", name="default", tenant_id=tenant_id)
+    agent = ma_agent(id="ag_1", name="daimon", tenant_id=tenant_id)
+    env = ma_environment(id="env_1", name="default", tenant_id=tenant_id)
 
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent.model_dump(mode="json")]))
-    router.add(
-        "GET",
-        r"/v1/agents/ag_1",
-        lambda req, _m: httpx.Response(200, json=agent.model_dump(mode="json")),
-    )
-    router.add(
-        "GET", r"/v1/environments", lambda req, _m: list_response([env.model_dump(mode="json")])
-    )
-    router.add(
-        "GET",
-        r"/v1/environments/env_1",
-        lambda req, _m: httpx.Response(200, json=env.model_dump(mode="json")),
-    )
+    router = resolved_agent_env_router(agent, env)
 
     memory_handler = make_fake_memory_store_handler()
 
@@ -134,30 +85,11 @@ def _chokepoint_router(
         session_bodies.append(body)
         return httpx.Response(
             200,
-            json={
-                "id": new_id,
-                "type": "session",
-                "agent": {
-                    "id": body["agent"],
-                    "mcp_servers": [],
-                    "model": {"id": "claude-sonnet-4-6"},
-                    "name": "daimon",
-                    "skills": [],
-                    "tools": [],
-                    "type": "agent",
-                    "version": 1,
-                },
-                "created_at": "2026-07-28T00:00:00Z",
-                "outcome_evaluations": [],
-                "environment_id": body["environment_id"],
-                "metadata": {},
-                "resources": [],
-                "stats": {},
-                "status": "idle",
-                "updated_at": "2026-07-28T00:00:00Z",
-                "usage": {},
-                "vault_ids": [],
-            },
+            json=ma_session(
+                id=new_id,
+                agent=ma_session_agent(id=body["agent"], name="daimon"),
+                environment_id=body["environment_id"],
+            ).model_dump(mode="json"),
         )
 
     router.add("POST", r"/v1/sessions", _session_create)
@@ -172,12 +104,7 @@ def _chokepoint_router(
             id="evt_span",
             is_error=False,
             model_request_start_id="start_1",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                input_tokens=10,
-                output_tokens=20,
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-            ),
+            model_usage=ma_model_usage(input_tokens=10, output_tokens=20),
             processed_at=datetime.now(UTC),
             type="span.model_request_end",
         )

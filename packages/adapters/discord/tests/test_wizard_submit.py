@@ -17,7 +17,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
-import pytest
 from daimon.adapters.discord.wizard_submit import WizardSubmitButton
 from daimon.core.stores.domain import WizardSessionRow
 from daimon.core.stores.wizard_session import get_wizard_session
@@ -25,8 +24,6 @@ from daimon.core.wizard.spec import Option, Step, StepKind, WizardSpec
 from daimon.core.wizard.state import build_custom_id
 from daimon.testing.factories import make_wizard_session
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 _REQUESTER_ID = "300000000000000001"
 _OTHER_USER_ID = "400000000000000002"

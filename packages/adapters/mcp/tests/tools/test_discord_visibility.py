@@ -45,7 +45,6 @@ _tools_conftest = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tools_conftest)
 patch_discord_http = _tools_conftest.patch_discord_http
 
-pytestmark = pytest.mark.asyncio
 
 # ---------------------------------------------------------------------------
 # Permission flag constants (Discord docs).

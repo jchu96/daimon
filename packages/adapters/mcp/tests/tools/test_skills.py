@@ -11,7 +11,6 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
-    BetaManagedAgentsAgent,
     BetaManagedAgentsCustomSkill,
     SkillListResponse,
 )
@@ -28,12 +27,11 @@ from daimon.adapters.mcp.tools.skills import (
 )
 from daimon.core.defaults.report import Action, ResourceOutcome
 from daimon.core.scope import DeploymentDefault
+from daimon.testing import ma_agent
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-
-pytestmark = pytest.mark.asyncio
 
 
 def _runtime(client: AsyncAnthropic) -> McpRuntime:
@@ -418,25 +416,17 @@ async def test_sync_impl_rejects_path_traversal(tmp_path: Path) -> None:
 
 def _agent_json(*, agent_id: str, tenant_id: uuid.UUID, skill_ids: list[str]) -> dict[str, Any]:
     """A minimal MA agent payload tagged for ``tenant_id``, attaching ``skill_ids``."""
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=agent_id,
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
+        model="claude-opus-4-7",
         # daimon_name too: name lookups go through the metadata tag, not the
         # MA `name` field, so an agent without it is invisible to them.
         metadata={"daimon_tenant": str(tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
         skills=[
             BetaManagedAgentsCustomSkill(skill_id=skill_id, type="custom", version="1")
             for skill_id in skill_ids
         ],
-        tools=[],
-        system=None,
     ).model_dump(mode="json")
 
 

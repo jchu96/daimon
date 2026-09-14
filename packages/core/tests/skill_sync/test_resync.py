@@ -10,16 +10,12 @@ Patterns:
 
 from __future__ import annotations
 
-import io
 import re
-import tarfile
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 
 import httpx
-import pytest
-from cryptography.fernet import Fernet, MultiFernet
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.skill_sync.orchestrator import sync_agent_skills
@@ -30,6 +26,8 @@ from daimon.core.stores import agent_repo_binding as binding_store
 from daimon.core.stores import github_app_installations as install_store
 from daimon.core.stores import github_credentials as cred_store
 from daimon.core.stores.domain import RepoAccessProof, RepoProofKind
+from daimon.testing.archives import make_tarball
+from daimon.testing.crypto import make_fernet
 from daimon.testing.factories import make_account, make_cli_principal, make_tenant
 from daimon.testing.ma import (
     NotHandled,
@@ -39,27 +37,11 @@ from daimon.testing.ma import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _TEST_APP_ID = "123456"
-
-
-def _make_fernet() -> MultiFernet:
-    return MultiFernet([Fernet(Fernet.generate_key())])
-
-
-def _make_tarball(files: dict[str, bytes]) -> bytes:
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for path, content in files.items():
-            info = tarfile.TarInfo(name=path)
-            info.size = len(content)
-            tf.addfile(info, io.BytesIO(content))
-    return buf.getvalue()
 
 
 def _make_tarball_handler(tarball: bytes) -> tuple[list[httpx.Request], httpx.MockTransport]:
@@ -164,12 +146,12 @@ async def test_resync_persists_last_sync_on_success(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """resync_bound_repo calls update_last_sync with last_sync_at set + last_sync_error=None on success."""
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-success")
     tenant_id = cli.tenant_id
     repo_url = "owner/persist-test-repo"
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     _, tarball_transport = _make_tarball_handler(tarball)
     http_client = httpx.AsyncClient(transport=tarball_transport)
 
@@ -223,7 +205,7 @@ async def test_resync_records_error_on_failure(
     which propagates out of _resolve_agent_name_and_principal and gets caught at the
     _resync_one_binding named boundary, recording last_sync_error.
     """
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-fail")
     tenant_id = cli.tenant_id
     repo_url = "owner/error-test-repo"
@@ -266,7 +248,7 @@ async def test_resync_skips_push_to_non_default_branch(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A push to a non-default branch must not trigger a resync (no last_sync_at update)."""
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-branch")
     tenant_id = cli.tenant_id
     repo_url = "owner/branch-filter-repo"
@@ -326,7 +308,7 @@ async def test_resync_prefers_installation_token(
     from cryptography.hazmat.primitives.asymmetric import rsa
     from daimon.core.config import GithubSettings
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-apptoken")
     tenant_id = cli.tenant_id
     repo_url = "owner/app-token-repo"
@@ -353,7 +335,7 @@ async def test_resync_prefers_installation_token(
     )
     await db_session.commit()
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
 
     token_exchange_calls: list[httpx.Request] = []
     tarball_calls: list[httpx.Request] = []
@@ -429,7 +411,7 @@ async def test_resync_prefers_per_agent_pat_over_installation_token(
     from cryptography.hazmat.primitives.asymmetric import rsa
     from daimon.core.config import GithubSettings
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-pat-wins")
     tenant_id = cli.tenant_id
     repo_url = "owner/pat-beats-app-repo"
@@ -468,7 +450,7 @@ async def test_resync_prefers_per_agent_pat_over_installation_token(
     )
     await db_session.commit()
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     token_exchange_calls: list[httpx.Request] = []
     tarball_calls: list[httpx.Request] = []
 
@@ -537,7 +519,7 @@ async def test_resync_refuses_binding_with_no_recorded_proof_and_records_last_sy
     from cryptography.hazmat.primitives.asymmetric import rsa
     from daimon.core.config import GithubSettings
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-no-proof")
     tenant_id = cli.tenant_id
     repo_url = "owner/no-proof-repo"
@@ -625,7 +607,7 @@ async def test_resync_continues_batch_after_refusing_one_unproven_binding(
     """One binding with no recorded proof must not abort the resync batch --
     a second, proof-bearing binding on the same pushed repo still syncs.
     """
-    fernet = _make_fernet()
+    fernet = make_fernet()
     tenant = await make_tenant(db_session)
     tenant_id = tenant.id
     repo_url = "owner/batch-continues-repo"
@@ -664,7 +646,7 @@ async def test_resync_continues_batch_after_refusing_one_unproven_binding(
 
     # No SKILL.md -- avoids needing a skills-upload fake; only presence of a
     # successful fetch and last_sync_error=None is asserted for this binding.
-    tarball = _make_tarball({"r-main/README.md": b"no skills here"})
+    tarball = make_tarball({"r-main/README.md": b"no skills here"})
     tarball_calls: list[httpx.Request] = []
 
     def tarball_handler(request: httpx.Request) -> httpx.Response:
@@ -710,7 +692,7 @@ async def test_resync_uses_fallback_pat_for_verified_public_binding(
     """
     from daimon.core.config import GithubSettings
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-fallback-public")
     tenant_id = cli.tenant_id
     repo_url = "owner/fallback-public-repo"
@@ -730,7 +712,7 @@ async def test_resync_uses_fallback_pat_for_verified_public_binding(
     )
     await db_session.commit()
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     tarball_calls: list[httpx.Request] = []
 
     def tarball_handler(request: httpx.Request) -> httpx.Response:
@@ -769,7 +751,7 @@ async def test_resync_fetches_anonymously_for_verified_public_binding_without_fa
     is the legitimate anonymous case: refusing it would break public skill
     sync on any deployment that never configured an operator fallback token.
     """
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-anon-public")
     tenant_id = cli.tenant_id
     repo_url = "owner/anon-public-repo"
@@ -791,7 +773,7 @@ async def test_resync_fetches_anonymously_for_verified_public_binding_without_fa
 
     # No SKILL.md -- avoids needing a skills-upload fake; this test asserts
     # only on the fetch's auth header and the absence of a recorded error.
-    tarball = _make_tarball({"r-main/README.md": b"no skills here"})
+    tarball = make_tarball({"r-main/README.md": b"no skills here"})
     tarball_calls: list[httpx.Request] = []
 
     def tarball_handler(request: httpx.Request) -> httpx.Response:
@@ -837,7 +819,7 @@ async def test_resync_refuses_pat_kind_proof_binding_without_credential_even_wit
     """
     from daimon.core.config import GithubSettings
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-pat-proof-no-cred")
     tenant_id = cli.tenant_id
     repo_url = "owner/pat-proof-no-credential-repo"
@@ -901,7 +883,7 @@ async def test_resync_pat_tier_is_per_agent(
     Agent B's resync fetches with NO credential (anon/public).
     Neither ever resolves the principal-default credential.
     """
-    fernet = _make_fernet()
+    fernet = make_fernet()
     tenant = await make_tenant(db_session)
     tenant_id = tenant.id
     repo_url = "owner/d25-isolation-repo"
@@ -957,7 +939,7 @@ async def test_resync_pat_tier_is_per_agent(
     )
     await db_session.commit()
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
 
     # --- Run resync for agent A (has per-agent PAT) ---
     auth_headers_a: list[str | None] = []
@@ -1076,7 +1058,7 @@ async def test_panel_and_webhook_share_one_skill_ledger(
     synced=1), then runs the webhook resync (resync_bound_repo). With a shared ledger,
     the second run dedups: synced=0, updated=0, and skills.create fires exactly once.
     """
-    fernet = _make_fernet()
+    fernet = make_fernet()
     tenant = await make_tenant(db_session)
     tenant_id = tenant.id
     # Distinct Discord-user account (panel principal) — NOT the webhook system account.
@@ -1100,7 +1082,7 @@ async def test_panel_and_webhook_share_one_skill_ledger(
     )
     await db_session.commit()
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
 
     # --- Panel sync: Discord-user account principal ---
     panel_http = httpx.AsyncClient(
@@ -1169,7 +1151,7 @@ async def test_resync_honors_github_settings_max_tarball_bytes_cap(
     into GitHubTarballFetcher on this path."""
     from daimon.core.config import GithubSettings
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-tarball-cap")
     tenant_id = cli.tenant_id
     repo_url = "owner/tarball-cap-repo"
@@ -1190,7 +1172,7 @@ async def test_resync_honors_github_settings_max_tarball_bytes_cap(
     await db_session.commit()
 
     # Over-cap tarball body — larger than the 64-byte cap configured below.
-    over_cap_tarball = _make_tarball({"r-main/SKILL.md": b"x" * 4096})
+    over_cap_tarball = make_tarball({"r-main/SKILL.md": b"x" * 4096})
 
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=over_cap_tarball))
@@ -1233,7 +1215,7 @@ async def test_resync_persists_non_none_last_sync_error_on_partial_failure(
     last_sync_error naming the failed skill, not the initialized None."""
     from daimon.core.stores.user_skills import upsert_user_skill
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     cli = await make_cli_principal(db_session, os_user="resync-partial-fail")
     tenant_id = cli.tenant_id
     repo_url = "owner/partial-fail-repo"
@@ -1272,7 +1254,7 @@ async def test_resync_persists_non_none_last_sync_error_on_partial_failure(
             anthropic_latest_version="1",
         )
 
-    empty_tarball = _make_tarball({"r-main/README.md": b"no skills here"})
+    empty_tarball = make_tarball({"r-main/README.md": b"no skills here"})
 
     def ma_delete_fails(request: httpx.Request) -> httpx.Response:
         if request.method == "DELETE" and request.url.path == "/v1/skills/sk_doomed_partial":

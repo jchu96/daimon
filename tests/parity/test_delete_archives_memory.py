@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import cast
 
 import httpx
@@ -22,49 +21,15 @@ from daimon.testing.factories import make_tenant
 from daimon.testing.ma import (
     FakeMemoryStoreState,
     MARouter,
-    NotHandled,
     build_fake_anthropic,
     combine_handlers,
+    make_archive_agent_handler,
     make_fake_ma_handler,
     make_fake_memory_store_handler,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .drivers.protocol import PlatformDriver
-
-
-def _make_archive_agent_handler() -> Callable[[httpx.Request], httpx.Response]:
-    """`make_fake_ma_handler` doesn't implement POST .../archive -- add it here.
-
-    Mirrors packages/adapters/discord/tests/agent_setup/test_delete_agent_memory.py.
-    """
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        m = re.fullmatch(r"/v1/agents/(?P<id>[^/]+)/archive", request.url.path)
-        if request.method != "POST" or not m:
-            raise NotHandled
-        now = datetime.now(UTC).isoformat()
-        return httpx.Response(
-            200,
-            json={
-                "id": m.group("id"),
-                "type": "agent",
-                "name": "doomed",
-                "version": 2,
-                "model": {"id": "claude-sonnet-4-6", "speed": "standard"},
-                "system": None,
-                "metadata": {},
-                "mcp_servers": [],
-                "tools": [],
-                "skills": [],
-                "created_at": now,
-                "updated_at": now,
-                "archived_at": now,
-                "description": None,
-            },
-        )
-
-    return handler
 
 
 def _wrap_as_marouter_handler(
@@ -94,7 +59,7 @@ async def test_delete_agent_archives_memory_store(
 
     mem_state = FakeMemoryStoreState()
     combined = combine_handlers(
-        _make_archive_agent_handler(),
+        make_archive_agent_handler(),
         make_fake_memory_store_handler(mem_state),
         make_fake_ma_handler(),
     )

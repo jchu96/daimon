@@ -3,9 +3,9 @@
 Patterns enforced:
 - Real `AsyncAnthropic` backed by `httpx.MockTransport` via `MARouter` — no
   AsyncMock on `client.beta.*`.
-- SDK response objects constructed inline at every call site via real
-  constructors (`SkillListResponse`, `VersionCreateResponse`) — no
-  `model_construct`, no factory wrappers.
+- SDK response objects built via real constructors (`SkillListResponse`,
+  `VersionCreateResponse`) or the `daimon.testing` builders — no
+  `model_construct`.
 - Real Postgres via `db_session_factory`.
 """
 
@@ -13,10 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import re
-import tarfile
 import uuid
 from datetime import UTC, datetime
 
@@ -24,12 +22,11 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
-    BetaManagedAgentsAgent,
     BetaManagedAgentsCustomSkill,
     SkillListResponse,
 )
 from anthropic.types.beta.skills import VersionCreateResponse
-from cryptography.fernet import Fernet, MultiFernet
+from cryptography.fernet import MultiFernet
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.defaults.ma_index import (
@@ -50,25 +47,17 @@ from daimon.core.stores.user_skills import (
     load_user_skill,
     upsert_user_skill,
 )
+from daimon.testing.archives import make_tarball
+from daimon.testing.crypto import make_fernet
 from daimon.testing.factories import make_cli_principal
-from daimon.testing.ma import MARouter, list_response
+from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
+from daimon.testing.ma_models import ma_agent
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
-# Helpers (intentionally minimal — no SDK constructor wrappers)
+# Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_tarball(files: dict[str, bytes]) -> bytes:
-    """Build a tar.gz with the given path → content mapping."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for path, content in files.items():
-            info = tarfile.TarInfo(name=path)
-            info.size = len(content)
-            tf.addfile(info, io.BytesIO(content))
-    return buf.getvalue()
 
 
 async def _seed_pat(
@@ -86,10 +75,6 @@ async def _seed_pat(
             encrypted_token=encrypt_token(fernet, plaintext),
             scopes=("repo",),
         )
-
-
-def _make_fernet() -> MultiFernet:
-    return MultiFernet([Fernet(Fernet.generate_key())])
 
 
 def _generate_rsa_keypair() -> str:
@@ -160,10 +145,10 @@ async def test_pat_missing_falls_back_to_unauthenticated_fetch(
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured_requests: list[httpx.Request] = []
 
@@ -202,10 +187,10 @@ async def test_github_fallback_pat_used_when_no_overlay_and_no_override(
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured_requests: list[httpx.Request] = []
 
@@ -242,10 +227,10 @@ async def test_github_fallback_pat_omitted_behaves_as_before(
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured_requests: list[httpx.Request] = []
 
@@ -298,12 +283,12 @@ async def test_no_per_agent_token_with_recorded_proof_reaches_app_tier(
             ma_secret_ref="anon:",
             proof=RepoAccessProof(kind="pat", at=datetime.now(UTC), account_id=cli.account_id),
         )
-    fernet = _make_fernet()
+    fernet = make_fernet()
     # No PAT seeded.
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured: list[httpx.Request] = []
 
@@ -369,12 +354,12 @@ async def test_no_recorded_proof_never_reaches_app_tier_even_when_app_covers_rep
     tarball with it. Confirmed failing prior to the proof_kind gate."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     # No PAT seeded, no agent_repo_binding row for this repo at all.
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured: list[httpx.Request] = []
 
@@ -436,7 +421,7 @@ async def test_per_agent_token_short_circuits_before_installation_lookup(
     ZERO times (the ordering short-circuit, checked behaviorally)."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(
         sessionmaker=db_session_factory,
         fernet=fernet,
@@ -446,7 +431,7 @@ async def test_per_agent_token_short_circuits_before_installation_lookup(
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured: list[httpx.Request] = []
 
@@ -495,12 +480,12 @@ async def test_credential_override_wins_with_zero_installation_lookup_invocation
     with a counting async function, never a mock, per guideline:testing."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     # No PAT seeded — proves the override wins, not an internal resolution.
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured: list[httpx.Request] = []
 
@@ -547,11 +532,11 @@ async def test_installation_lookup_none_skips_app_tier_and_uses_fallback(
     as before this change, with zero App HTTP calls."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
 
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     captured: list[httpx.Request] = []
 
@@ -594,10 +579,10 @@ async def test_first_sync_creates_new_skill(
     """Empty user_skills → POST /v1/skills called → row written with returned id."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -624,7 +609,7 @@ async def test_first_sync_creates_new_skill(
     router.add("POST", r"/v1/skills", on_create)
     # Attach step lookup — empty list = no agent on MA → attach skipped.
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -660,7 +645,7 @@ async def test_subsequent_sync_with_changed_content_uploads_new_version(
     """Existing anthropic_id + new hash → POST /v1/skills/{id}/versions, row updated."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     # Seed an existing row with a stale content_hash.
@@ -680,7 +665,7 @@ async def test_subsequent_sync_with_changed_content_uploads_new_version(
             anthropic_latest_version="1",
         )
 
-    tarball = _make_tarball(
+    tarball = make_tarball(
         {"r-main/SKILL.md": b"---\nname: r\ndescription: changed\n---\nnew body"}
     )
     http_client = httpx.AsyncClient(
@@ -708,7 +693,7 @@ async def test_subsequent_sync_with_changed_content_uploads_new_version(
     router = MARouter()
     router.add("POST", r"/v1/skills/sk_old/versions", on_version)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -742,13 +727,13 @@ async def test_dedup_skips_upload_when_content_hash_matches(
     """Existing row's content_hash equals new build's hash → no MA call at all."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     # Build the tarball + compute the resulting bundled-zip hash that the
     # orchestrator will see. We mirror what bundler.extract_and_bundle does for
     # split=False: build_bundled_zip on the repo root.
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
 
     # Pre-compute the content_hash by running the same code path the orchestrator
     # uses, so we can seed an exact match.
@@ -802,7 +787,7 @@ async def test_dedup_skips_upload_when_content_hash_matches(
     # Attach step (41-02) will look up the agent because a user_skill row
     # exists; return no match so the attach step skips without an update call.
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -829,10 +814,10 @@ async def test_re_run_no_changes_yields_zero_synced_zero_updated(
     """Idempotency: first run creates, second run no-ops via dedup."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
 
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
@@ -860,7 +845,7 @@ async def test_re_run_no_changes_yields_zero_synced_zero_updated(
     router.add("GET", r"/v1/skills", lambda req, _m: list_response([]))
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     repos = [SkillRepo(url="https://github.com/o/r", branch="main", split=False)]
     first = await sync_agent_skills(
@@ -899,7 +884,7 @@ async def test_upload_concurrency_capped_at_six(
     """Twelve split-mode skills → at most 6 _process_one tasks in flight at once."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     # 12 skills via split-mode tarball — one SKILL.md per directory.
@@ -908,7 +893,7 @@ async def test_upload_concurrency_capped_at_six(
         files[f"r-main/skill_{i:02d}/SKILL.md"] = (
             f"---\nname: skill_{i:02d}\ndescription: d\n---\n".encode()
         )
-    tarball = _make_tarball(files)
+    tarball = make_tarball(files)
 
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
@@ -931,7 +916,7 @@ async def test_upload_concurrency_capped_at_six(
     router = MARouter()
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     in_flight = 0
     peak = 0
@@ -989,13 +974,13 @@ async def test_per_skill_timeout_isolates_failure(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     monkeypatch.setattr(orch_mod, "_PER_SKILL_TIMEOUT_S", 0.05)
 
     # Two split-mode skills.
-    tarball = _make_tarball(
+    tarball = make_tarball(
         {
             "r-main/skill-hangs/SKILL.md": b"---\nname: skill-hangs\ndescription: d\n---\n",
             "r-main/skill-fast/SKILL.md": b"---\nname: skill-fast\ndescription: d\n---\n",
@@ -1020,7 +1005,7 @@ async def test_per_skill_timeout_isolates_failure(
     # _process_one is stubbed; only the per-agent get_pat lookup hits MA.
     router = MARouter()
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1044,14 +1029,8 @@ async def test_per_skill_timeout_isolates_failure(
 
 
 # ---------------------------------------------------------------------------
-# Local helpers — no SDK constructor wrapping; transport assembly only
+# Local helpers
 # ---------------------------------------------------------------------------
-
-
-def _build_anthropic(router: MARouter) -> AsyncAnthropic:
-    transport = httpx.MockTransport(router.dispatch)
-    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
-    return AsyncAnthropic(api_key="test", http_client=http_client)
 
 
 def _unreachable_handler(request: httpx.Request) -> httpx.Response:
@@ -1108,10 +1087,10 @@ async def test_duplicate_display_title_recovery_lands_a_new_version(
     """409 on skills.create → find by display_title → versions.create on recovered id."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -1167,7 +1146,7 @@ async def test_duplicate_display_title_recovery_lands_a_new_version(
     router.add("GET", r"/v1/skills", on_list)
     router.add("POST", r"/v1/skills/sk_orphan/versions", on_version)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1208,10 +1187,10 @@ async def test_recovery_raises_skills_list_truncated_error_on_full_page(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -1241,7 +1220,7 @@ async def test_recovery_raises_skills_list_truncated_error_on_full_page(
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/skills", on_list)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1273,10 +1252,10 @@ async def test_non_duplicate_api_status_error_re_raises_to_failed_uploads(
     """A non-409, non-duplicate-message error skips recovery and lands in failed_uploads."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -1304,7 +1283,7 @@ async def test_non_duplicate_api_status_error_re_raises_to_failed_uploads(
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/skills", on_list)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1342,10 +1321,10 @@ async def test_400_with_display_title_substring_does_not_trigger_recovery(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -1372,7 +1351,7 @@ async def test_400_with_display_title_substring_does_not_trigger_recovery(
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/skills", on_list)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1403,7 +1382,7 @@ async def test_orphan_delete_only_fires_for_successfully_fetched_repos(
     """r1 fetched + empty (no skills) → r1's row orphan-deleted. r2 not in repos → untouched."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     # Seed two existing rows: one for r1 (will be orphaned), one for r2 (untouched).
@@ -1436,7 +1415,7 @@ async def test_orphan_delete_only_fires_for_successfully_fetched_repos(
         )
 
     # r1 fetches an empty tarball — no SKILL.md, split=True → bundler returns [].
-    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills here"})
+    empty_tarball = make_tarball({"r1-main/README.md": b"no skills here"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
     )
@@ -1452,7 +1431,7 @@ async def test_orphan_delete_only_fires_for_successfully_fetched_repos(
     router.add("DELETE", r"/v1/skills/sk_r2", on_delete)
     # Attach step (41-02): kept_from_r2 user_skills row remains → lookup fires.
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1497,7 +1476,7 @@ async def test_orphan_delete_skipped_when_repo_fetch_failed(
     """GitHub returns 503 → repo not in successfully_fetched → row preserved, no MA delete."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     async with db_session_factory() as s, s.begin():
@@ -1532,7 +1511,7 @@ async def test_orphan_delete_skipped_when_repo_fetch_failed(
     # Attach step (41-02): transient_orphan row survives the fetch failure →
     # lookup fires. Return no match so the attach step skips without update.
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1570,7 +1549,7 @@ async def test_orphan_delete_local_row_survives_when_ma_delete_fails(
     """MA delete returns 500 → warning logged, failed_uploads recorded, local row RETAINED."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     async with db_session_factory() as s, s.begin():
@@ -1588,7 +1567,7 @@ async def test_orphan_delete_local_row_survives_when_ma_delete_fails(
             anthropic_latest_version="1",
         )
 
-    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    empty_tarball = make_tarball({"r1-main/README.md": b"no skills"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
     )
@@ -1608,7 +1587,7 @@ async def test_orphan_delete_local_row_survives_when_ma_delete_fails(
     router = MARouter()
     router.add("DELETE", r"/v1/skills/sk_doomed", on_delete)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1652,7 +1631,7 @@ async def test_orphan_delete_retries_and_succeeds_on_second_sync(
     """First sync: MA delete fails, row survives. Second sync: MA delete succeeds, row gone."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     async with db_session_factory() as s, s.begin():
@@ -1670,7 +1649,7 @@ async def test_orphan_delete_retries_and_succeeds_on_second_sync(
             anthropic_latest_version="1",
         )
 
-    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    empty_tarball = make_tarball({"r1-main/README.md": b"no skills"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
     )
@@ -1685,7 +1664,7 @@ async def test_orphan_delete_retries_and_succeeds_on_second_sync(
         ),
     )
     router1.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client_1 = _build_anthropic(router1)
+    anthropic_client_1 = build_fake_anthropic(router1.dispatch)
 
     report1 = await sync_agent_skills(
         principal_id=cli.id,
@@ -1713,7 +1692,7 @@ async def test_orphan_delete_retries_and_succeeds_on_second_sync(
     router2 = MARouter()
     router2.add("DELETE", r"/v1/skills/sk_retry", lambda req, _m: httpx.Response(204))
     router2.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client_2 = _build_anthropic(router2)
+    anthropic_client_2 = build_fake_anthropic(router2.dispatch)
 
     report2 = await sync_agent_skills(
         principal_id=cli.id,
@@ -1752,7 +1731,7 @@ async def test_orphan_delete_404_treated_as_already_deleted(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     async with db_session_factory() as s, s.begin():
@@ -1770,7 +1749,7 @@ async def test_orphan_delete_404_treated_as_already_deleted(
             anthropic_latest_version="1",
         )
 
-    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    empty_tarball = make_tarball({"r1-main/README.md": b"no skills"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
     )
@@ -1788,7 +1767,7 @@ async def test_orphan_delete_404_treated_as_already_deleted(
         ),
     )
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1837,7 +1816,7 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     ledger_key = derive_agent_uuid(tenant_id=cli.tenant_id, ma_agent_id="ag_transient")
@@ -1857,7 +1836,7 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
             anthropic_latest_version="1",
         )
 
-    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    empty_tarball = make_tarball({"r1-main/README.md": b"no skills"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
     )
@@ -1881,23 +1860,13 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
         ),
     )
 
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_transient",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=3,
-        mcp_servers=[],
-        skills=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         tools=[_base_toolset],
-        system=None,
+        version=3,
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -1906,24 +1875,17 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_transient",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=4,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(
                         skill_id="sk_transient", type="custom", version="1"
                     )
                 ],
-                tools=[],
-                system=None,
+                version=4,
             ).model_dump(mode="json"),
         )
 
@@ -1943,7 +1905,7 @@ async def test_orphan_delete_transient_failure_retains_row_without_poisoning_att
         lambda req, _m: httpx.Response(200, json=agent_payload),
     )
     router.add("POST", r"/v1/agents/ag_transient", on_update)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -1983,7 +1945,7 @@ async def test_orphan_delete_lingering_row_dedups_readded_skill(
     """While a row lingers (MA delete failed), re-adding the same-named skill reuses anthropic_id."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     async with db_session_factory() as s, s.begin():
@@ -2001,7 +1963,7 @@ async def test_orphan_delete_lingering_row_dedups_readded_skill(
             anthropic_latest_version="1",
         )
 
-    empty_tarball = _make_tarball({"r1-main/README.md": b"no skills"})
+    empty_tarball = make_tarball({"r1-main/README.md": b"no skills"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=empty_tarball))
     )
@@ -2016,7 +1978,7 @@ async def test_orphan_delete_lingering_row_dedups_readded_skill(
         ),
     )
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     await sync_agent_skills(
         principal_id=cli.id,
@@ -2056,10 +2018,10 @@ async def test_sync_agent_skills_attaches_uploaded_skills_to_ma_agent(
     """After upload, agents.update is called with the newly-created skill_id."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -2081,23 +2043,12 @@ async def test_sync_agent_skills_attaches_uploaded_skills_to_ma_agent(
     def on_list_agents(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         return list_response(
             [
-                BetaManagedAgentsAgent(
+                ma_agent(
                     id="ag_target",
-                    type="agent",
                     name="agent",
-                    model={"id": "claude-opus-4-7"},
-                    metadata={
-                        "daimon_tenant": str(cli.tenant_id),
-                        "daimon_name": "agent",
-                    },
-                    description=None,
-                    created_at="2026-04-21T00:00:00Z",
-                    updated_at="2026-04-21T00:00:00Z",
+                    model="claude-opus-4-7",
+                    tenant_id=cli.tenant_id,
                     version=7,
-                    mcp_servers=[],
-                    skills=[],
-                    tools=[],
-                    system=None,
                 ).model_dump(mode="json")
             ]
         )
@@ -2108,46 +2059,21 @@ async def test_sync_agent_skills_attaches_uploaded_skills_to_ma_agent(
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_target",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={
-                    "daimon_tenant": str(cli.tenant_id),
-                    "daimon_name": "agent",
-                },
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=8,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(skill_id="sk_new", type="custom", version="1")
                 ],
-                tools=[],
-                system=None,
+                version=8,
             ).model_dump(mode="json"),
         )
 
     # update_agent_with_version_retry calls agents.retrieve before the update.
-    agent_payload = BetaManagedAgentsAgent(
-        id="ag_target",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=7,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+    agent_payload = ma_agent(
+        id="ag_target", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=7
     ).model_dump(mode="json")
 
     def on_retrieve_agent(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
@@ -2159,7 +2085,7 @@ async def test_sync_agent_skills_attaches_uploaded_skills_to_ma_agent(
     router.add("GET", r"/v1/agents", on_list_agents)
     router.add("GET", r"/v1/agents/ag_target", on_retrieve_agent)
     router.add("POST", r"/v1/agents/ag_target", on_update_agent)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -2192,7 +2118,7 @@ async def test_sync_agent_skills_attach_is_noop_when_skill_already_attached(
     """Dedup path + existing on-MA skill matches user_skill row → no agents.update call."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     # CR-01: the agent ("ag_target") is present on MA, so the user_skills ledger is
@@ -2206,7 +2132,7 @@ async def test_sync_agent_skills_attach_is_noop_when_skill_already_attached(
 
     from daimon.core.skill_sync.bundler import extract_and_bundle
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     extract_root = Path("/tmp") / f"daimon-test-attach-noop-{uuid.uuid4().hex}"
     extract_root.mkdir(parents=True, exist_ok=True)
     # Use owner-qualified repo_name to match the orchestrator's derivation for
@@ -2249,27 +2175,17 @@ async def test_sync_agent_skills_attach_is_noop_when_skill_already_attached(
     def on_list_agents(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         return list_response(
             [
-                BetaManagedAgentsAgent(
+                ma_agent(
                     id="ag_target",
-                    type="agent",
                     name="agent",
-                    model={"id": "claude-opus-4-7"},
-                    metadata={
-                        "daimon_tenant": str(cli.tenant_id),
-                        "daimon_name": "agent",
-                    },
-                    description=None,
-                    created_at="2026-04-21T00:00:00Z",
-                    updated_at="2026-04-21T00:00:00Z",
-                    version=7,
-                    mcp_servers=[],
+                    model="claude-opus-4-7",
+                    tenant_id=cli.tenant_id,
                     skills=[
                         BetaManagedAgentsCustomSkill(
                             skill_id="sk_existing", type="custom", version="1"
                         )
                     ],
-                    tools=[],
-                    system=None,
+                    version=7,
                 ).model_dump(mode="json")
             ]
         )
@@ -2277,7 +2193,7 @@ async def test_sync_agent_skills_attach_is_noop_when_skill_already_attached(
     router = MARouter()
     router.add("GET", r"/v1/agents", on_list_agents)
     router.add("POST", r"/v1/agents/ag_target", on_update_agent)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -2310,10 +2226,10 @@ async def test_sync_agent_skills_skips_attach_when_agent_not_found(
     """find_agent_by_daimon_tag returns None → warning logged, no agents.update."""
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -2347,7 +2263,7 @@ async def test_sync_agent_skills_skips_attach_when_agent_not_found(
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/agents", on_list_agents)
     router.add("POST", r"/v1/agents/.*", on_update_agent)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -2398,7 +2314,7 @@ async def test_bundled_sync_two_repos_same_trailing_segment_keeps_both_skills(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     url_a = "https://github.com/orgA/skills"
@@ -2407,10 +2323,10 @@ async def test_bundled_sync_two_repos_same_trailing_segment_keeps_both_skills(
     # Each repo gets a distinct tarball routed by request URL so the mock doesn't
     # return the wrong content.  The tarball path prefix matches how the fetcher
     # requests tarballs: /repos/{owner}/{repo}/tarball/{branch}.
-    tarball_a = _make_tarball(
+    tarball_a = make_tarball(
         {"skills-main/SKILL.md": b"---\nname: a-skill\ndescription: from orgA\n---\nbody"}
     )
-    tarball_b = _make_tarball(
+    tarball_b = make_tarball(
         {"skills-main/SKILL.md": b"---\nname: b-skill\ndescription: from orgB\n---\nbody"}
     )
 
@@ -2467,7 +2383,7 @@ async def test_bundled_sync_two_repos_same_trailing_segment_keeps_both_skills(
     router.add("POST", r"/v1/skills", on_create)
     router.add("DELETE", r"/v1/skills/.*", on_delete)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     # The test fixture's db_session_factory shares a single asyncpg connection
     # (per daimon.testing.db). Concurrent _process_one calls in _upload_all would
@@ -2579,12 +2495,12 @@ async def test_sync_creates_two_distinct_skills_when_two_tenants_sync_same_named
     cli_b = await make_cli_principal(db_session, os_user="guild_b")
     await db_session.commit()
 
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli_a.id)
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli_b.id)
 
     # Both tenants have the same agent name and same skill in their repo.
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -2620,7 +2536,7 @@ async def test_sync_creates_two_distinct_skills_when_two_tenants_sync_same_named
     router.add("POST", r"/v1/skills", on_create)
     router.add("POST", r"/v1/skills/.*/versions", on_version)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     # Force serial execution to avoid asyncpg "another operation in progress" on
     # the shared test connection.
@@ -2715,10 +2631,10 @@ async def test_recovery_refuses_to_push_version_onto_foreign_tenant_skill(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -2771,7 +2687,7 @@ async def test_recovery_refuses_to_push_version_onto_foreign_tenant_skill(
     router.add("POST", r"/v1/skills", on_create)
     router.add("POST", r"/v1/skills/sk_foreign/versions", on_version)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -2815,7 +2731,7 @@ async def test_attach_adds_base_toolset_when_agent_lacks_it(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     # CR-01: the orchestrator keys the ledger on the agent's derived UUID when the agent
@@ -2839,23 +2755,8 @@ async def test_attach_adds_base_toolset_when_agent_lacks_it(
         )
 
     # Toolless agent — no tools at all.
-    agent_payload = BetaManagedAgentsAgent(
-        id="ag_toolless",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=3,
-        mcp_servers=[],
-        skills=[],
-        tools=[],  # no agent_toolset_20260401
-        system=None,
+    agent_payload = ma_agent(
+        id="ag_toolless", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=3
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -2864,22 +2765,15 @@ async def test_attach_adds_base_toolset_when_agent_lacks_it(
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_toolless",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=4,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(skill_id="sk_new", type="custom", version="1")
                 ],
-                tools=[],
-                system=None,
+                version=4,
             ).model_dump(mode="json"),
         )
 
@@ -2890,7 +2784,7 @@ async def test_attach_adds_base_toolset_when_agent_lacks_it(
         "GET", r"/v1/agents/ag_toolless", lambda req, _m: httpx.Response(200, json=agent_payload)
     )
     router.add("POST", r"/v1/agents/ag_toolless", on_update)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable_handler))
 
@@ -2928,7 +2822,7 @@ async def test_attach_sends_skills_only_when_agent_has_base_toolset(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     ledger_key = derive_agent_uuid(tenant_id=cli.tenant_id, ma_agent_id="ag_with_toolset")
@@ -2968,23 +2862,13 @@ async def test_attach_sends_skills_only_when_agent_has_base_toolset(
     )
 
     # Agent already has the base toolset.
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_with_toolset",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={
-            "daimon_tenant": str(cli.tenant_id),
-            "daimon_name": "agent",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=5,
-        mcp_servers=[],
-        skills=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         tools=[_base_toolset],
-        system=None,
+        version=5,
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -2993,22 +2877,15 @@ async def test_attach_sends_skills_only_when_agent_has_base_toolset(
         update_calls.append(json.loads(req.content))
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_with_toolset",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=6,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(skill_id="sk_new", type="custom", version="1")
                 ],
-                tools=[],
-                system=None,
+                version=6,
             ).model_dump(mode="json"),
         )
 
@@ -3021,7 +2898,7 @@ async def test_attach_sends_skills_only_when_agent_has_base_toolset(
         lambda req, _m: httpx.Response(200, json=agent_payload),
     )
     router.add("POST", r"/v1/agents/ag_with_toolset", on_update)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable_handler))
 
@@ -3058,7 +2935,7 @@ async def test_attach_retries_once_on_version_conflict(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     ledger_key = derive_agent_uuid(tenant_id=cli.tenant_id, ma_agent_id="ag_conflict")
@@ -3080,37 +2957,18 @@ async def test_attach_retries_once_on_version_conflict(
         )
 
     # Initial list response: agent has no skills yet.
-    initial_agent = BetaManagedAgentsAgent(
-        id="ag_conflict",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=10,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+    initial_agent = ma_agent(
+        id="ag_conflict", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=10
     ).model_dump(mode="json")
 
     # Fresh retrieve (after conflict): agent now has sk_concurrent added concurrently.
-    fresh_agent = BetaManagedAgentsAgent(
+    fresh_agent = ma_agent(
         id="ag_conflict",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=11,
-        mcp_servers=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         skills=[BetaManagedAgentsCustomSkill(skill_id="sk_concurrent", type="custom", version="1")],
-        tools=[],
-        system=None,
+        version=11,
     ).model_dump(mode="json")
 
     retrieve_count = 0
@@ -3141,25 +2999,18 @@ async def test_attach_retries_once_on_version_conflict(
         # Second attempt: success
         return httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
+            json=ma_agent(
                 id="ag_conflict",
-                type="agent",
                 name="agent",
-                model={"id": "claude-opus-4-7"},
-                metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=12,
-                mcp_servers=[],
+                model="claude-opus-4-7",
+                tenant_id=cli.tenant_id,
                 skills=[
                     BetaManagedAgentsCustomSkill(
                         skill_id="sk_concurrent", type="custom", version="1"
                     ),
                     BetaManagedAgentsCustomSkill(skill_id="sk_target", type="custom", version="1"),
                 ],
-                tools=[],
-                system=None,
+                version=12,
             ).model_dump(mode="json"),
         )
 
@@ -3219,7 +3070,7 @@ async def test_attach_over_cap_records_failure_instead_of_raising(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
 
     ledger_key = derive_agent_uuid(tenant_id=cli.tenant_id, ma_agent_id="ag_cap")
     async with db_session_factory() as s, s.begin():
@@ -3237,20 +3088,8 @@ async def test_attach_over_cap_records_failure_instead_of_raising(
             anthropic_latest_version="1",
         )
 
-    agent_payload = BetaManagedAgentsAgent(
-        id="ag_cap",
-        type="agent",
-        name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=10,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+    agent_payload = ma_agent(
+        id="ag_cap", name="agent", model="claude-opus-4-7", tenant_id=cli.tenant_id, version=10
     ).model_dump(mode="json")
 
     update_calls: list[dict[str, object]] = []
@@ -3318,10 +3157,10 @@ async def test_first_sync_refuses_create_when_registry_skill_takes_the_mount_nam
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
-    tarball = _make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
+    tarball = make_tarball({"r-main/SKILL.md": b"---\nname: r\ndescription: d\n---\nbody"})
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, content=tarball))
     )
@@ -3347,7 +3186,7 @@ async def test_first_sync_refuses_create_when_registry_skill_takes_the_mount_nam
     router.add("GET", r"/v1/skills", lambda req, _m: _list_envelope([registry_skill]))
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await sync_agent_skills(
         principal_id=cli.id,
@@ -3384,7 +3223,7 @@ async def test_attach_refuses_union_when_legacy_registry_skill_shares_mount_name
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
 
     ledger_key = derive_agent_uuid(tenant_id=cli.tenant_id, ma_agent_id="ag_coll")
     async with db_session_factory() as s, s.begin():
@@ -3402,20 +3241,13 @@ async def test_attach_refuses_union_when_legacy_registry_skill_shares_mount_name
             anthropic_latest_version="1",
         )
 
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_coll",
-        type="agent",
         name="agent",
-        model={"id": "claude-opus-4-7"},
-        metadata={"daimon_tenant": str(cli.tenant_id), "daimon_name": "agent"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=10,
-        mcp_servers=[],
+        model="claude-opus-4-7",
+        tenant_id=cli.tenant_id,
         skills=[{"type": "custom", "skill_id": "sk_registry", "version": "1"}],
-        tools=[],
-        system=None,
+        version=10,
     ).model_dump(mode="json")
 
     registry_skill = SkillListResponse(
@@ -3452,7 +3284,7 @@ async def test_attach_refuses_union_when_legacy_registry_skill_shares_mount_name
         "GET", r"/v1/agents/ag_coll", lambda req, _m: httpx.Response(200, json=agent_payload)
     )
     router.add("POST", r"/v1/agents/ag_coll", on_update)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable_handler))
 
     report = await sync_agent_skills(
@@ -3496,19 +3328,19 @@ async def test_sync_duplicate_name_across_repos_still_uploads_every_other_skill(
     """
     cli = await make_cli_principal(db_session, os_user="alice")
     await db_session.commit()
-    fernet = _make_fernet()
+    fernet = make_fernet()
     await _seed_pat(sessionmaker=db_session_factory, fernet=fernet, principal_id=cli.id)
 
     url_a = "https://github.com/orgA/skills"
     url_b = "https://github.com/orgB/skills"
 
-    tarball_a = _make_tarball(
+    tarball_a = make_tarball(
         {
             "skills-main/shared/SKILL.md": b"---\nname: shared\ndescription: from orgA\n---\nbody",
             "skills-main/only-a/SKILL.md": b"---\nname: only-a\ndescription: only in A\n---\nbody",
         }
     )
-    tarball_b = _make_tarball(
+    tarball_b = make_tarball(
         {
             "skills-main/shared/SKILL.md": b"---\nname: shared\ndescription: from orgB\n---\nbody",
             "skills-main/only-b/SKILL.md": b"---\nname: only-b\ndescription: only in B\n---\nbody",
@@ -3550,7 +3382,7 @@ async def test_sync_duplicate_name_across_repos_still_uploads_every_other_skill(
     router.add("GET", r"/v1/skills", lambda req, _m: list_response([]))
     router.add("POST", r"/v1/skills", on_create)
     router.add("GET", r"/v1/agents", lambda req, _m: list_response([]))
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     monkeypatch.setattr(orch_mod, "_UPLOAD_CONCURRENCY", 1)
 

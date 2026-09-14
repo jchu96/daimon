@@ -22,10 +22,8 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.core.stores import usage_events
+from daimon.testing import ma_model_usage
 from daimon.testing.factories import make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,12 +44,7 @@ async def tenant_id(db_session: AsyncSession) -> uuid.UUID:
     tenant = await make_tenant(db_session, platform="slack", workspace_id=_TEAM_ID)
 
     # Seed usage for caller (1000 input + 1000 output tokens on claude-opus-4-7)
-    usage_caller = BetaManagedAgentsSpanModelUsage(
-        input_tokens=1000,
-        output_tokens=1000,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
+    usage_caller = ma_model_usage(input_tokens=1000, output_tokens=1000)
     await usage_events.record(
         db_session,
         tenant_id=tenant.id,
@@ -63,12 +56,7 @@ async def tenant_id(db_session: AsyncSession) -> uuid.UUID:
     )
 
     # Seed usage for the other user (larger spend so they appear above caller)
-    usage_other = BetaManagedAgentsSpanModelUsage(
-        input_tokens=10_000,
-        output_tokens=5_000,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
+    usage_other = ma_model_usage(input_tokens=10_000, output_tokens=5_000)
     await usage_events.record(
         db_session,
         tenant_id=tenant.id,
@@ -232,12 +220,7 @@ async def test_load_billing_snapshot_admin_caps_at_25_members(
             platform_user_id=f"U_MANY_{i:03d}",
             managed_session_id=f"sess-many-{i}",
             model="claude-opus-4-7",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                input_tokens=100 * (i + 1),
-                output_tokens=50 * (i + 1),
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-            ),
+            model_usage=ma_model_usage(input_tokens=100 * (i + 1), output_tokens=50 * (i + 1)),
             event_id=f"evt-many-{i}",
         )
     await db_session.commit()

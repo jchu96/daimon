@@ -12,14 +12,13 @@ from typing import Any
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
 from daimon.core.defaults import apply_defaults
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     MARouter,
     list_response,
 )
 from daimon.testing.ma import build_fake_anthropic as build_fake_anthropic_http
+from daimon.testing.ma_models import ma_agent, ma_environment
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -68,16 +67,7 @@ async def test_apply_does_not_write_tenant_config(
         r"/v1/environments",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaEnvironment(
-                id="env_1",
-                type="environment",
-                name="default",
-                config=EMPTY_CLOUD_CONFIG,
-                metadata={},
-                description="",
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-            ).model_dump(mode="json"),
+            json=ma_environment(id="env_1", name="default").model_dump(mode="json"),
         ),
     )
     router.add(
@@ -85,21 +75,9 @@ async def test_apply_does_not_write_tenant_config(
         r"/v1/agents",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_1",
-                type="agent",
-                name="daimon",
-                model={"id": "claude-opus-4-7"},
-                metadata={},
-                description=None,
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
-            ).model_dump(mode="json"),
+            json=ma_agent(id="ag_1", name="daimon", model="claude-opus-4-7").model_dump(
+                mode="json"
+            ),
         ),
     )
     client = build_fake_anthropic_http(router.dispatch)
@@ -156,25 +134,14 @@ async def test_apply_defaults_provisions_cli_local_deterministically(
     router = _full_router()
     from datetime import UTC, datetime  # noqa: PLC0415
 
-    from anthropic.types.beta.beta_managed_agents_model_config import (  # noqa: PLC0415
-        BetaManagedAgentsModelConfig,
-    )
-
     _ts = datetime(2026, 4, 21, tzinfo=UTC)
     router.add(
         "POST",
         r"/v1/environments",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaEnvironment(
-                id="env_det",
-                type="environment",
-                name="default",
-                config=EMPTY_CLOUD_CONFIG,
-                metadata={},
-                description="",
-                created_at=_ts.isoformat(),
-                updated_at=_ts.isoformat(),
+            json=ma_environment(
+                id="env_det", name="default", created_at=_ts.isoformat()
             ).model_dump(mode="json"),
         ),
     )
@@ -183,21 +150,7 @@ async def test_apply_defaults_provisions_cli_local_deterministically(
         r"/v1/agents",
         lambda req, _m: httpx.Response(
             200,
-            json=BetaManagedAgentsAgent(
-                id="ag_det",
-                type="agent",
-                name="daimon",
-                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-                metadata={},
-                description=None,
-                created_at=_ts,
-                updated_at=_ts,
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
-                system=None,
-            ).model_dump(mode="json"),
+            json=ma_agent(id="ag_det", name="daimon", created_at=_ts).model_dump(mode="json"),
         ),
     )
     client = build_fake_anthropic_http(router.dispatch)

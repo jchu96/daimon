@@ -10,25 +10,13 @@ inline what each file needs).
 
 from __future__ import annotations
 
-import re
 import types
 import uuid
-from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
-import httpx
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
-from anthropic.types.beta.beta_cloud_config import BetaCloudConfig
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
-from anthropic.types.beta.beta_packages import BetaPackages
-from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwork
-from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.feedback_seed import seed_feedback_reactions
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings, ThreadNamingSettings
@@ -41,9 +29,12 @@ from daimon.core.stores import tenant_ledger
 from daimon.core.support_escalation import ESCALATE
 from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.state import TextBlock, TurnState
+from daimon.testing import ma_session, resolved_agent_env_router
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import MARouter, build_stub_anthropic
+from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .harness import make_bot
 
 # --- unit tests: the helper alone -------------------------------------------
 
@@ -121,81 +112,6 @@ async def test_seed_is_a_no_op_for_a_channel_type_without_get_partial_message() 
 # --- integration: wired into _orchestrate's terminal-success branch --------
 
 
-def _make_fake_session(session_id: str = "sess_test") -> BetaManagedAgentsSession:
-    return BetaManagedAgentsSession(
-        id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_test",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at="2026-04-28T00:00:00Z",
-        environment_id="env_test",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at="2026-04-28T00:00:00Z",
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
-        outcome_evaluations=[],
-    )
-
-
-def _build_ma_router() -> MARouter:
-    """Serve the agent/environment retrieves admission makes, transport-level.
-
-    A method-level `AsyncMock` on `client.beta.*` would accept any kwargs and
-    silently absorb SDK-signature drift, which is why the testing guideline
-    bans it; routing real Beta models through `httpx.MockTransport` runs the
-    SDK's own parameter validation and response parsing in every test.
-    """
-
-    def _retrieve_agent(_request: httpx.Request, _match: re.Match[str]) -> httpx.Response:
-        agent = BetaManagedAgentsAgent(
-            id="ag_test",
-            version=1,
-            name="test-agent",
-            type="agent",
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
-            created_at=datetime(2026, 4, 28, tzinfo=UTC),
-            updated_at=datetime(2026, 4, 28, tzinfo=UTC),
-            mcp_servers=[],
-            metadata={},
-            skills=[],
-            tools=[],
-        )
-        return httpx.Response(200, json=agent.model_dump(mode="json"))
-
-    def _retrieve_environment(_request: httpx.Request, _match: re.Match[str]) -> httpx.Response:
-        environment = BetaEnvironment(
-            id="env_test",
-            name="test-env",
-            type="environment",
-            config=BetaCloudConfig(
-                type="cloud",
-                networking=BetaUnrestrictedNetwork(type="unrestricted"),
-                packages=BetaPackages(apt=[], cargo=[], gem=[], go=[], npm=[], pip=[]),
-            ),
-            created_at="2026-04-28T00:00:00Z",
-            updated_at="2026-04-28T00:00:00Z",
-            description="",
-            metadata={},
-        )
-        return httpx.Response(200, json=environment.model_dump(mode="json"))
-
-    router = MARouter()
-    router.add("GET", r"/v1/agents/[^/]+", _retrieve_agent)
-    router.add("GET", r"/v1/environments/[^/]+", _retrieve_environment)
-    return router
-
-
 def _make_turn_deps(
     settings: MagicMock,
     anthropic: AsyncAnthropic,
@@ -223,7 +139,7 @@ def _make_runtime(sessionmaker: async_sessionmaker[AsyncSession]) -> DiscordRunt
     discord_settings = MagicMock()
     discord_settings.max_concurrent_turns_per_tenant = 100
     settings.discord = discord_settings
-    anthropic = build_stub_anthropic(_build_ma_router().dispatch)
+    anthropic = build_stub_anthropic(resolved_agent_env_router().dispatch)
     resolver_cache = new_resolver_cache()
     deployment_default = DeploymentDefault()
     return DiscordRuntime(
@@ -242,16 +158,6 @@ def _make_runtime(sessionmaker: async_sessionmaker[AsyncSession]) -> DiscordRunt
             deployment_default=deployment_default,
         ),
     )
-
-
-def _make_bot(runtime: DiscordRuntime) -> DaimonBot:
-    intents = discord.Intents.default()
-    intents.message_content = True
-    bot = DaimonBot(runtime=runtime, intents=intents)
-    bot._connection.user = MagicMock(spec=discord.ClientUser)  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.id = 999  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.mentioned_in = MagicMock(return_value=True)  # pyright: ignore[reportPrivateUsage]
-    return bot
 
 
 class _AsyncIter:
@@ -362,7 +268,7 @@ async def test_a_real_text_answer_seeds_all_three_emoji_on_the_final_message(
     await _seed_balance(db_session, tenant.id)
 
     mock_resolve.return_value = _stub_resolved_config()
-    mock_create_session.return_value = _make_fake_session("sess-seed-1")
+    mock_create_session.return_value = ma_session(id="sess-seed-1")
     mock_run_turn.side_effect = _fake_run_turn(
         TurnState(content=[TextBlock(kind="text", text="the answer")])
     )
@@ -370,7 +276,7 @@ async def test_a_real_text_answer_seeds_all_three_emoji_on_the_final_message(
     mock_find_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_channel_message()
     mock_thread = _make_seeding_thread()
     message.create_thread.return_value = mock_thread  # pyright: ignore[reportAttributeAccessIssue]
@@ -401,7 +307,7 @@ async def test_a_cancelled_turn_seeds_nothing(
     await _seed_balance(db_session, tenant.id)
 
     mock_resolve.return_value = _stub_resolved_config()
-    mock_create_session.return_value = _make_fake_session("sess-seed-2")
+    mock_create_session.return_value = ma_session(id="sess-seed-2")
     mock_run_turn.side_effect = _fake_run_turn(
         TurnState()
     )  # no content/error -- cancellation shape
@@ -409,7 +315,7 @@ async def test_a_cancelled_turn_seeds_nothing(
     mock_find_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_channel_message(guild_id=123457)
     mock_thread = _make_seeding_thread()
     message.create_thread.return_value = mock_thread  # pyright: ignore[reportAttributeAccessIssue]
@@ -437,7 +343,7 @@ async def test_a_turn_that_ends_in_error_seeds_nothing(
     await _seed_balance(db_session, tenant.id)
 
     mock_resolve.return_value = _stub_resolved_config()
-    mock_create_session.return_value = _make_fake_session("sess-seed-3")
+    mock_create_session.return_value = ma_session(id="sess-seed-3")
     mock_run_turn.side_effect = _fake_run_turn(
         TurnState(error=TurnError(kind="reducer_bug", message="boom", cause=RuntimeError("boom")))
     )
@@ -445,7 +351,7 @@ async def test_a_turn_that_ends_in_error_seeds_nothing(
     mock_find_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_channel_message(guild_id=123458)
     mock_thread = _make_seeding_thread()
     message.create_thread.return_value = mock_thread  # pyright: ignore[reportAttributeAccessIssue]
@@ -480,7 +386,7 @@ async def test_seeding_forbidden_still_completes_the_turn_and_writes_the_waterma
     await db_session.commit()
 
     mock_resolve.return_value = _stub_resolved_config()
-    mock_create_session.return_value = _make_fake_session("sess-seed-4")
+    mock_create_session.return_value = ma_session(id="sess-seed-4")
     mock_run_turn.side_effect = _fake_run_turn(
         TurnState(content=[TextBlock(kind="text", text="the answer")])
     )
@@ -488,7 +394,7 @@ async def test_seeding_forbidden_still_completes_the_turn_and_writes_the_waterma
     mock_find_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_channel_message(guild_id=123459)
     mock_thread = _make_seeding_thread()
     mock_thread.get_partial_message.return_value.add_reaction = AsyncMock(

@@ -12,12 +12,9 @@ import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import httpx
 import pytest
 import pytest_asyncio
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.core.continuity.continuation import (
     ContinuationRequest,
     claim_continuation,
@@ -25,11 +22,11 @@ from daimon.core.continuity.continuation import (
     record_continuation,
     settle_continuation,
 )
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.errors import DaimonError
 from daimon.core.stores.task_continuations import get_continuation
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, not_found_response
+from daimon.testing.ma_models import ma_agent
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 _NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
@@ -68,25 +65,15 @@ def _request(
 
 
 def _live_target(tenant_id: uuid.UUID) -> AsyncAnthropic:
-    agent = BetaManagedAgentsAgent(
+    agent = ma_agent(
         id=_TARGET_ID,
-        type="agent",
         name="stats-bot",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: "stats-bot"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model="claude-sonnet-5",
+        tenant_id=tenant_id,
         created_at=_NOW,
-        updated_at=_NOW,
     )
     router = MARouter()
-    router.add(
-        "GET",
-        rf"/v1/agents/{_TARGET_ID}",
-        lambda _r, _m: httpx.Response(200, json=agent.model_dump(mode="json")),
-    )
+    router.add_agent(agent)
     return build_fake_anthropic(router.dispatch)
 
 
@@ -99,26 +86,16 @@ def _missing_target() -> AsyncAnthropic:
 
 
 def _archived_target(tenant_id: uuid.UUID) -> AsyncAnthropic:
-    archived = BetaManagedAgentsAgent(
+    archived = ma_agent(
         id=_TARGET_ID,
-        type="agent",
         name="stats-bot",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5", speed="standard"),
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: "stats-bot"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        model="claude-sonnet-5",
+        tenant_id=tenant_id,
         created_at=_NOW,
-        updated_at=_NOW,
         archived_at=_NOW,
     )
     router = MARouter()
-    router.add(
-        "GET",
-        rf"/v1/agents/{_TARGET_ID}",
-        lambda _r, _m: httpx.Response(200, json=archived.model_dump(mode="json")),
-    )
+    router.add_agent(archived)
     return build_fake_anthropic(router.dispatch)
 
 

@@ -25,14 +25,6 @@ import anthropic as _anthropic
 import discord
 import httpx
 import pytest
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent
-from anthropic.types.beta.beta_cloud_config import BetaCloudConfig
-from anthropic.types.beta.beta_managed_agents_model_config import (
-    BetaManagedAgentsModelConfig as _AgentModelConfig,
-)
-from anthropic.types.beta.beta_packages import BetaPackages
-from anthropic.types.beta.beta_unrestricted_network import BetaUnrestrictedNetwork
-from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.core.config import McpSettings, ThreadNamingSettings
 from daimon.core.continuity.messages import (
@@ -40,7 +32,6 @@ from daimon.core.continuity.messages import (
     render_replacement_summary,
     render_unexpected_loss,
 )
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_resolver import ResolverCache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
@@ -55,9 +46,12 @@ from daimon.core.turn.prepare import ContinuityOutcome, PreparedTurn
 from daimon.core.turn.run import RunOutcome
 from daimon.core.turn.state import TextBlock, TurnState
 from daimon.core.turn_origin import turn_origin as real_turn_origin
+from daimon.testing import ma_agent, ma_environment
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .harness import make_bot
 
 _TENANT_UUID_NS = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 
@@ -115,44 +109,6 @@ class _AsyncIter:
             raise StopAsyncIteration from err
 
 
-def _make_fake_agent(
-    *, agent_id: str = "ag_test", name: str = "test-agent", tenant_id: uuid.UUID | None = None
-) -> BetaManagedAgentsAgent:
-    metadata = {MA_METADATA_KEY_NAME: name}
-    if tenant_id is not None:
-        metadata[MA_METADATA_KEY_TENANT] = str(tenant_id)
-    return BetaManagedAgentsAgent(
-        id=agent_id,
-        version=1,
-        name=name,
-        type="agent",
-        model=_AgentModelConfig(id="claude-sonnet-4-5"),
-        created_at=datetime(2026, 4, 28, tzinfo=UTC),
-        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
-        mcp_servers=[],
-        metadata=metadata,
-        skills=[],
-        tools=[],
-    )
-
-
-def _make_fake_environment(name: str = "test-env") -> BetaEnvironment:
-    return BetaEnvironment(
-        id="env_test",
-        name=name,
-        type="environment",
-        config=BetaCloudConfig(
-            type="cloud",
-            networking=BetaUnrestrictedNetwork(type="unrestricted"),
-            packages=BetaPackages(apt=[], cargo=[], gem=[], go=[], npm=[], pip=[]),
-        ),
-        created_at="2026-04-28T00:00:00Z",
-        updated_at="2026-04-28T00:00:00Z",
-        description="",
-        metadata={},
-    )
-
-
 def _stub_resolved_config(
     *,
     thread_binding_id: uuid.UUID | None = None,
@@ -202,8 +158,8 @@ def _make_runtime(
     settings.thread_naming = ThreadNamingSettings(enabled=False)
     if anthropic is None:
         anthropic = AsyncMock()
-        anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())
-        anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())
+        anthropic.beta.agents.retrieve = AsyncMock(return_value=ma_agent())
+        anthropic.beta.environments.retrieve = AsyncMock(return_value=ma_environment())
         anthropic.beta.agents.list = MagicMock(return_value=_AsyncIter([]))
     from daimon.core.ma_resolver import new_resolver_cache
 
@@ -225,16 +181,6 @@ def _make_runtime(
             deployment_default=deployment_default,
         ),
     )
-
-
-def _make_bot(runtime: DiscordRuntime) -> DaimonBot:
-    intents = discord.Intents.default()
-    intents.message_content = True
-    bot = DaimonBot(runtime=runtime, intents=intents)
-    bot._connection.user = MagicMock(spec=discord.ClientUser)  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.id = 999  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.mentioned_in = MagicMock(return_value=True)  # pyright: ignore[reportPrivateUsage]
-    return bot
 
 
 def _make_thread_message(
@@ -274,8 +220,8 @@ def _make_prepared_turn(
 
     admission = Admission(
         account_id=account_id,
-        agent=_make_fake_agent(),
-        environment=_make_fake_environment(),
+        agent=ma_agent(),
+        environment=ma_environment(),
         config=_stub_resolved_config(),
     )
     return PreparedTurn(
@@ -320,7 +266,7 @@ async def test_session_preparation_failed_posts_copy_and_runs_no_turn(
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
 
     with (
@@ -371,11 +317,9 @@ async def test_responder_changed_without_handoff_posts_offer_and_runs_no_turn(
     # for the mismatch's `source_agent_id` so the copy names the real owner
     # rather than falling back to "the previous agent".
     runtime.anthropic.beta.agents.list = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
-        return_value=_AsyncIter(
-            [_make_fake_agent(agent_id="ag_owner", name="owner-bot", tenant_id=tenant_id)]
-        )
+        return_value=_AsyncIter([ma_agent(id="ag_owner", name="owner-bot", tenant_id=tenant_id)])
     )
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
 
     with (
@@ -427,13 +371,13 @@ async def test_is_setup_false_for_a_handoff_binding(
     mock_resolve_agent.return_value = "ag_test"
     mock_resolve_env.return_value = "env_test"
 
-    agent = _make_fake_agent(tenant_id=tenant_id)
+    agent = ma_agent(tenant_id=tenant_id)
 
     def _agents_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=agent.model_dump(mode="json"))
 
     runtime = _make_runtime(db_session_factory, anthropic=build_stub_anthropic(_agents_handler))
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     account_id = uuid.uuid4()
     mapping_id = uuid.uuid4()
@@ -496,7 +440,7 @@ async def test_bind_replaced_after_loss_never_fires_before_the_turn(
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     account_id = uuid.uuid4()
     mapping_id = uuid.uuid4()
@@ -574,7 +518,7 @@ async def test_outcome_replaced_after_loss_prepends_exactly_one_loss_notice_to_t
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     account_id = uuid.uuid4()
     mapping_id = uuid.uuid4()
@@ -634,7 +578,7 @@ async def test_ordinary_turn_posts_no_loss_notice(
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     account_id = uuid.uuid4()
     mapping_id = uuid.uuid4()
@@ -689,7 +633,7 @@ async def test_pending_change_posts_must_finish_copy_after_the_answer(
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     account_id = uuid.uuid4()
     mapping_id = uuid.uuid4()
@@ -749,7 +693,7 @@ async def test_replaced_makes_the_replacement_summary_the_answers_first_paragrap
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     mapping_id = uuid.uuid4()
     prepared = _make_prepared_turn(
@@ -812,7 +756,7 @@ async def test_replaced_falls_back_to_its_own_message_when_no_answer_is_revealed
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     mapping_id = uuid.uuid4()
     prepared = _make_prepared_turn(
@@ -873,7 +817,7 @@ async def test_replaced_with_no_transfer_kind_posts_no_summary_prefix(
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
     mapping_id = uuid.uuid4()
     prepared = _make_prepared_turn(
@@ -934,7 +878,7 @@ async def test_session_busy_posts_must_finish_copy_and_runs_no_turn(
     mock_resolve_env.return_value = "env_test"
 
     runtime = _make_runtime(db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_thread_message(guild_id=int(guild_id))
 
     with (

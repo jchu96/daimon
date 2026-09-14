@@ -17,13 +17,10 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
 
-import httpx
 import yarl
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.boot_sweep import retire_orphaned_turns
-from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_identity import derive_tenant_uuid
@@ -33,28 +30,14 @@ from daimon.core.stores.thread_sessions import (
     list_orphaned_turns,
     mark_turn_active,
 )
-from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .conftest import CHAT_OK_PAYLOAD
+from .harness import build_slack_runtime
 
 _NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
 _UPDATE_URL = yarl.URL("https://slack.com/api/chat.update")
 _POST_URL = yarl.URL("https://slack.com/api/chat.postMessage")
-
-
-def _build_runtime(fernet_key: str, db_factory: async_sessionmaker[AsyncSession]) -> SlackRuntime:
-    settings = MagicMock()
-    settings.crypto.keys = (SecretStr(fernet_key),)
-    return SlackRuntime(
-        settings=settings,
-        anthropic=MagicMock(),
-        sessionmaker=db_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-    )
 
 
 async def _seed_orphan(
@@ -115,7 +98,7 @@ async def test_sweep_edits_the_frozen_card_and_clears_the_marker(
         channel_id="C_REACHABLE",
         message_id="1111.1",
     )
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await retire_orphaned_turns(runtime, now=_NOW)
 
@@ -149,7 +132,7 @@ async def test_sweep_clears_the_marker_when_the_card_is_unreachable(
         payload={"ok": False, "error": "message_not_found"},
         repeat=True,
     )
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await retire_orphaned_turns(runtime, now=_NOW)  # must not raise
 
@@ -165,7 +148,7 @@ async def test_sweep_skips_the_api_call_and_still_clears_when_the_workspace_unin
 ) -> None:
     fernet_key = Fernet.generate_key().decode()
     await _seed_orphan(db_session_factory, fernet_key, team_id="T_UNINSTALLED", with_token=False)
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await retire_orphaned_turns(runtime, now=_NOW)
 
@@ -183,7 +166,7 @@ async def test_sweep_clears_a_legacy_row_with_no_channel_without_calling_slack(
 ) -> None:
     fernet_key = Fernet.generate_key().decode()
     await _seed_orphan(db_session_factory, fernet_key, team_id="T_LEGACY", channel_id=None)
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await retire_orphaned_turns(runtime, now=_NOW)
 
@@ -208,7 +191,7 @@ async def test_sweep_one_tenants_missing_token_does_not_stop_the_next_tenants_ed
         channel_id="C_HAS_TOKEN",
         message_id="2222.2",
     )
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await retire_orphaned_turns(runtime, now=_NOW)
 
@@ -268,7 +251,7 @@ async def test_sweep_leaves_a_marker_that_moved_while_the_sweep_was_running(
         callback=_admit_a_fresh_turn_mid_sweep,
         repeat=True,
     )
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await retire_orphaned_turns(runtime, now=_NOW)
 

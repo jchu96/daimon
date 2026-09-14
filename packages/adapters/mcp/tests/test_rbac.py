@@ -24,14 +24,13 @@ from daimon.core.config import (
 from daimon.core.mcp_auth import mint_jwt
 from daimon.core.stores import accounts
 from daimon.core.stores.domain import Role
+from daimon.testing.asgi import mcp_session
 from daimon.testing.factories import make_account, make_tenant
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
-from .factories import make_jwt, mcp_session
-
-pytestmark = pytest.mark.asyncio
+from .harness import make_jwt
 
 SECRET = "a" * 32
 _NOW = dt.datetime(2026, 4, 24, tzinfo=dt.UTC)

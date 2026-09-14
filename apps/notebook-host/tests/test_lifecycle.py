@@ -272,14 +272,41 @@ def test_safe_slug_raises_400_for_overlong_slug() -> None:
     assert exc_info.value.status_code == 400, "65-char slug should raise 400"
 
 
-def test_safe_slug_accepts_token_urlsafe_output() -> None:
-    """safe_slug accepts a 22-char secrets.token_urlsafe(16) string."""
-    import secrets
-
+# secrets.token_urlsafe(16) yields 22 chars from [A-Za-z0-9_-]. Fixed samples keep
+# the test deterministic; the leading-"-" case is split out below because
+# safe_slug rejects it on purpose.
+@pytest.mark.parametrize(
+    "minted",
+    [
+        "aB3dE5fG7hI9jK1lM3nO5p",  # letters and digits only
+        "_zY9xW7vU5tS3rQ1pO9nM7",  # leading "_" (allowed)
+        "Ab-cD_eF-gH_iJ-kL_mN-o",  # mixed "-" and "_" interior
+        "0123456789abcdefghij-_",  # trailing "-" and "_"
+        "ZZZZZZZZZZZZZZZZZZZZZZ",  # single repeated char
+    ],
+)
+def test_safe_slug_accepts_token_urlsafe_output(minted: str) -> None:
+    """safe_slug accepts 22-char strings shaped like secrets.token_urlsafe(16) output."""
     from notebook_host.lifecycle import safe_slug
 
-    # token_urlsafe(16) yields 22 chars from [A-Za-z0-9_-]
-    minted = secrets.token_urlsafe(16)
+    assert len(minted) == 22, "sample must match token_urlsafe(16) length"
+    assert safe_slug(minted) == minted, "bot-minted slug must round-trip cleanly"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=HTTPException,
+    reason=(
+        "secrets.token_urlsafe(16) starts with '-' about 1 time in 64, and safe_slug "
+        "rejects a leading '-' (argv-injection guard). The minting side in core should "
+        "avoid a leading '-' so bot-minted slugs always round-trip."
+    ),
+)
+def test_safe_slug_rejects_token_urlsafe_output_with_leading_dash() -> None:
+    """A token_urlsafe(16) string that happens to start with '-' is rejected by safe_slug."""
+    from notebook_host.lifecycle import safe_slug
+
+    minted = "-B3dE5fG7hI9jK1lM3nO5p"
     assert safe_slug(minted) == minted, "bot-minted slug must round-trip cleanly"
 
 

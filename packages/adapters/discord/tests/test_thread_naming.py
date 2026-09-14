@@ -10,7 +10,6 @@ production one. The ``discord.Thread`` returned by ``create_thread`` is a
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -21,11 +20,6 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 from anthropic.types import Message, TextBlock, Usage
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.adapters.discord.thread_naming import generate_thread_name
@@ -37,11 +31,10 @@ from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, ResolvedConfig
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.thread_naming import THREAD_NAMING_MODEL
+from daimon.testing import ma_session, resolved_agent_env_router
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import EMPTY_CLOUD_CONFIG, MARouter, build_fake_anthropic
+from daimon.testing.ma import MARouter, build_fake_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 
 def _message_payload(text: str) -> dict[str, Any]:
@@ -216,65 +209,6 @@ async def test_generate_thread_name_falls_back_without_metering_when_model_is_to
 # ---------------------------------------------------------------------------
 
 
-def _fake_session() -> BetaManagedAgentsSession:
-    return BetaManagedAgentsSession(
-        id="sess_naming",
-        agent=BetaManagedAgentsSessionAgent(
-            id="ag_test",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at="2026-04-28T00:00:00Z",
-        environment_id="env_test",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at="2026-04-28T00:00:00Z",
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
-        outcome_evaluations=[],
-    )
-
-
-def _ma_router() -> MARouter:
-    agent = BetaManagedAgentsAgent(
-        id="ag_test",
-        version=1,
-        name="test-agent",
-        type="agent",
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-5"),
-        created_at=datetime(2026, 4, 28, tzinfo=UTC),
-        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
-        mcp_servers=[],
-        metadata={},
-        skills=[],
-        tools=[],
-    ).model_dump(mode="json")
-    environment = BetaEnvironment(
-        id="env_test",
-        name="test-env",
-        type="environment",
-        config=EMPTY_CLOUD_CONFIG,
-        created_at="2026-04-28T00:00:00Z",
-        updated_at="2026-04-28T00:00:00Z",
-        description="",
-        metadata={},
-    ).model_dump(mode="json")
-    router = MARouter()
-    router.add("GET", r"/v1/agents/ag_test", lambda _req, _m: httpx.Response(200, json=agent))
-    router.add(
-        "GET", r"/v1/environments/env_test", lambda _req, _m: httpx.Response(200, json=environment)
-    )
-    return router
-
-
 def _runtime(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
@@ -398,14 +332,14 @@ async def test_on_message_creates_thread_under_generated_title_only_when_there_i
         environment_name="test-env",
         environment_name_tier="tenant",
     )
-    mock_create_session.return_value = _fake_session()
+    mock_create_session.return_value = ma_session(id="sess_naming")
     mock_resolve_agent.return_value = "ag_test"
     mock_resolve_environment.return_value = "env_test"
     mock_generate_name.return_value = "PyMC Divergences"
 
     runtime = _runtime(
         db_session_factory,
-        router=_ma_router(),
+        router=resolved_agent_env_router(),
         thread_naming=ThreadNamingSettings(
             enabled=enabled, max_input_chars=321, timeout_seconds=2.5
         ),

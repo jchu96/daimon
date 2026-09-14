@@ -39,8 +39,6 @@ from fastmcp.exceptions import ToolError
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 _ADMIN_REQUIRED = "requires a workspace or server admin"
 _CHANNEL = "chan-1"
 _THREAD = "thread-1"

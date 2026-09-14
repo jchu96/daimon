@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 from daimon.core._models import Account, UserConfig
 from daimon.core.stores.accounts import (
     account_exists,
@@ -17,8 +16,6 @@ from daimon.core.stores.accounts import (
 from daimon.core.stores.domain import AccountIdentityRow, AccountRow
 from daimon.testing.factories import make_account, make_platform_principal, make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
-
-pytestmark = pytest.mark.asyncio
 
 
 async def test_get_account_returns_row_when_present(db_session: AsyncSession) -> None:

@@ -16,7 +16,6 @@ import re
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import httpx
 import yarl
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.privacy_panel.actions import (
@@ -33,6 +32,8 @@ from daimon.core.stores.slack_user_tokens import get_slack_user_token, upsert_sl
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .harness import build_slack_runtime
+
 _AUTH_REVOKE_PATTERN = re.compile(r"https://slack\.com/api/auth\.revoke.*")
 
 
@@ -40,7 +41,6 @@ def _build_runtime(
     fernet_key: str, db_factory: async_sessionmaker[AsyncSession], *, mintable: bool = False
 ) -> SlackRuntime:
     settings = MagicMock()
-    settings.crypto.keys = (SecretStr(fernet_key),)
     if mintable:
         settings.slack.signing_secret = SecretStr("shh-secret")
         settings.slack.bot_display_name = "research-bot"
@@ -48,15 +48,7 @@ def _build_runtime(
     else:
         settings.slack = None
         settings.mcp.app_root_url = None
-    return SlackRuntime(
-        settings=settings,
-        anthropic=MagicMock(),
-        sessionmaker=db_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-    )
+    return build_slack_runtime(fernet_key, db_factory, anthropic=MagicMock(), settings=settings)
 
 
 def _disconnect_payload(*, team_id: str, user_id: str, view_id: str) -> dict[str, Any]:

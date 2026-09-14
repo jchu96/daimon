@@ -33,8 +33,6 @@ from report_host.mcp_client import (
 )
 from starlette.types import Receive, Scope, Send
 
-pytestmark = pytest.mark.asyncio
-
 # Local aliases for the fixture types `conftest.py` provides (`build_fake_seam`,
 # `fake_seam_lifespan`) — a plain `from conftest import ...` doesn't work under
 # this project's `--import-mode=importlib` pytest config, so these mirror

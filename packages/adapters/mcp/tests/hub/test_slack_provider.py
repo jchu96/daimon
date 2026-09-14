@@ -12,8 +12,6 @@ from daimon.testing.factories import make_tenant
 from key_value.aio.stores.memory import MemoryStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 _EXCHANGE_OK = {
     "ok": True,
     "team": {"id": "T1", "name": "Acme"},

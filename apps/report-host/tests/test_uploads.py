@@ -35,8 +35,6 @@ from report_host.uploads import (
     build_uploads_router,
 )
 
-pytestmark = pytest.mark.asyncio
-
 NOW = datetime(2026, 9, 8, 12, 0, 0, tzinfo=UTC)
 ADMIN_SECRET = "admin-secret"
 REPORT_PDF_BYTES = b"%PDF-1.4 fake report content for the archive root"

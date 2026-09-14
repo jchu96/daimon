@@ -16,9 +16,6 @@ import pytest
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.core import usage_recording
 from daimon.core.turn.posture import (
     AutoApprove,
@@ -27,6 +24,7 @@ from daimon.core.turn.posture import (
     RequireApproval,
     UsageRecorder,
 )
+from daimon.testing.ma_models import ma_model_usage
 
 
 def _make_event(*, event_id: str = "sevt_1") -> BetaManagedAgentsSpanModelRequestEndEvent:
@@ -34,12 +32,7 @@ def _make_event(*, event_id: str = "sevt_1") -> BetaManagedAgentsSpanModelReques
         id=event_id,
         type="span.model_request_end",
         model_request_start_id="mrs_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-            input_tokens=10,
-            output_tokens=5,
-        ),
+        model_usage=ma_model_usage(input_tokens=10, output_tokens=5),
         processed_at=datetime(2026, 1, 1, tzinfo=UTC),
         is_error=False,
     )

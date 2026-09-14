@@ -16,8 +16,6 @@ from starlette.applications import Starlette
 
 from .test_app import _lifespan, _runtime, _tools_list
 
-pytestmark = pytest.mark.asyncio
-
 TOKEN_SENTINEL = "hub-sentinel-upstream-token-DO-NOT-LOG"
 CLAIMS_SENTINEL = "hub-sentinel-workspace"
 

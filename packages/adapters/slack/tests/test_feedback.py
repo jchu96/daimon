@@ -28,9 +28,7 @@ from __future__ import annotations
 import json
 import uuid
 from typing import Any
-from unittest.mock import MagicMock
 
-import httpx
 import pytest
 import yarl
 from cryptography.fernet import Fernet
@@ -45,14 +43,13 @@ from daimon.adapters.slack.feedback import (
     run_feedback_text_submission,
     vote_for_action_id,
 )
-from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import build_fake_anthropic, make_fake_ma_handler
-from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .harness import build_slack_runtime
 
 # ---------------------------------------------------------------------------
 # build_feedback_actions_block
@@ -182,20 +179,6 @@ async def _seed_team(session: AsyncSession, *, team_id: str = _TEAM_ID) -> tuple
     return tenant.id, fernet_key
 
 
-def _build_runtime(fernet_key: str, db_factory: async_sessionmaker[AsyncSession]) -> SlackRuntime:
-    settings = MagicMock()
-    settings.crypto.keys = (SecretStr(fernet_key),)
-    return SlackRuntime(
-        settings=settings,
-        anthropic=build_fake_anthropic(make_fake_ma_handler()),
-        sessionmaker=db_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-    )
-
-
 def _vote_payload(action_id: str, *, team_id: str = _TEAM_ID) -> dict[str, Any]:
     return {
         "type": "block_actions",
@@ -228,7 +211,7 @@ async def test_up_vote_records_row_and_acks_ephemerally(
 ) -> None:
     _tenant_id, fernet_key = await _seed_team(db_session)
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_UP))
 
@@ -254,7 +237,7 @@ async def test_fresh_down_vote_opens_modal_with_row_id(
 ) -> None:
     _tenant_id, fernet_key = await _seed_team(db_session)
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_DOWN))
 
@@ -279,7 +262,7 @@ async def test_repeat_down_vote_does_not_reopen_modal(
 ) -> None:
     _tenant_id, fernet_key = await _seed_team(db_session)
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_DOWN))
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_DOWN))
@@ -301,7 +284,7 @@ async def test_unregistered_tenant_records_nothing(
         db_session, team_id="T_GHOST", encrypted_token=encrypt_token(fernet, "xoxb-test")
     )
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
 
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_UP, team_id="T_GHOST"))
 
@@ -318,7 +301,7 @@ async def test_submission_attaches_text_to_own_row(
 ) -> None:
     _tenant_id, fernet_key = await _seed_team(db_session)
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_DOWN))
     async with db_session_factory() as s:
         row_id = (await _vote_rows(s))[0]["id"]
@@ -345,7 +328,7 @@ async def test_submission_for_someone_elses_row_writes_nothing(
 ) -> None:
     _tenant_id, fernet_key = await _seed_team(db_session)
     await db_session.commit()
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     await handle_feedback_vote(runtime, _vote_payload(FEEDBACK_VOTE_DOWN))
     async with db_session_factory() as s:
         row_id = (await _vote_rows(s))[0]["id"]

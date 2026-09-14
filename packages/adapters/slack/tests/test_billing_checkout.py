@@ -54,8 +54,6 @@ _TEAM_ID = "T_CHECKOUT_TEST"
 _USER_ID = "U_CHECKOUT_ADMIN"
 _CHANNEL_ID = "C_CHECKOUT_CHAN"
 
-pytestmark = pytest.mark.asyncio
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

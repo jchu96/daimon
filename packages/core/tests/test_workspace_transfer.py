@@ -33,9 +33,6 @@ from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
     BetaManagedAgentsTextBlock,
 )
@@ -70,6 +67,7 @@ from daimon.testing.ma import (
     make_fake_ma_handler,
     make_fake_memory_store_handler,
 )
+from daimon.testing.ma_models import ma_model_usage
 from daimon.testing.ma_sessions import (
     FakeSessionsState,
     make_fake_sessions_handler,
@@ -361,12 +359,7 @@ async def test_transfer_bills_the_checkpoint_at_the_old_model_as_a_checkpoint_de
                 id="sevt_span",
                 type="span.model_request_end",
                 model_request_start_id="sevt_span_start",
-                model_usage=BetaManagedAgentsSpanModelUsage(
-                    input_tokens=1000,
-                    output_tokens=200,
-                    cache_creation_input_tokens=0,
-                    cache_read_input_tokens=0,
-                ),
+                model_usage=ma_model_usage(input_tokens=1000, output_tokens=200),
                 processed_at=NOW,
             ),
             BetaManagedAgentsSessionStatusIdleEvent(

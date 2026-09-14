@@ -20,30 +20,21 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
-import pytest
-from anthropic.types.beta import BetaManagedAgentsModelConfig, BetaManagedAgentsSession
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
 )
 from daimon.core._models import UsageEvent
 from daimon.core.defaults.metadata import MA_METADATA_KEY_ACCOUNT, MA_METADATA_KEY_TENANT
 from daimon.core.usage_sweep import sweep_headless_usage
 from daimon.testing.factories import make_platform_principal
 from daimon.testing.ma import (
-    EMPTY_SESSION_STATS,
-    EMPTY_SESSION_USAGE,
     MARouter,
     build_fake_anthropic,
     list_response,
 )
+from daimon.testing.ma_models import ma_model_usage, ma_session, ma_session_agent
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 NOW = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
 
@@ -56,36 +47,15 @@ def _session_dict(
     model: str = "claude-sonnet-4-6",
 ) -> dict[str, Any]:
     """A headless MA session tagged the way create_session tags it."""
-    s = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    s = ma_session(
         id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_headless1",
-            description=None,
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id=model),
-            name="headless-agent",
-            skills=[],
-            system=None,
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        archived_at=None,
-        created_at=NOW,
+        agent=ma_session_agent(id="agent_headless1", name="headless-agent", model=model),
         environment_id="env_headless1",
         metadata={
             MA_METADATA_KEY_TENANT: str(tenant_id),
             MA_METADATA_KEY_ACCOUNT: str(account_id),
         },
-        resources=[],
-        stats=EMPTY_SESSION_STATS,
-        status="idle",
-        title=None,
-        type="session",
-        updated_at=NOW,
-        usage=EMPTY_SESSION_USAGE,
-        vault_ids=[],
+        created_at=NOW,
     )
     return s.model_dump(mode="json")
 
@@ -97,12 +67,7 @@ def _model_request_end_dict(
         id=event_id,
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=input_tokens, output_tokens=output_tokens),
         processed_at=NOW,
         type="span.model_request_end",
     )
@@ -208,33 +173,11 @@ async def test_sweep_skips_session_without_tenant_tag(
 ) -> None:
     """An untagged session (no daimon_tenant — e.g. a DM or foreign session) is
     skipped: no usage row, and its events are never even fetched."""
-    s = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    s = ma_session(
         id="sesn_untagged",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_x",
-            description=None,
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-            name="x",
-            skills=[],
-            system=None,
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        archived_at=None,
-        created_at=NOW,
+        agent=ma_session_agent(id="agent_x", name="x"),
         environment_id="env_x",
-        metadata={},
-        resources=[],
-        stats=EMPTY_SESSION_STATS,
-        status="idle",
-        title=None,
-        type="session",
-        updated_at=NOW,
-        usage=EMPTY_SESSION_USAGE,
-        vault_ids=[],
+        created_at=NOW,
     )
     router = MARouter()
     router.add("GET", r"/v1/sessions", lambda req, m: list_response([s.model_dump(mode="json")]))

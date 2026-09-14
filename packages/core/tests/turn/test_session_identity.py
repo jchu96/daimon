@@ -7,16 +7,12 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 from anthropic import InternalServerError
-from anthropic.types.beta import BetaManagedAgentsSession
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from daimon.core.stores.thread_sessions import get_thread_session_by_id
 from daimon.core.turn.errors import SessionAgentMismatch
 from daimon.core.turn.session_identity import check_session_agent
 from daimon.testing.factories import make_thread_session
 from daimon.testing.ma import MARouter, build_fake_anthropic
+from daimon.testing.ma_models import ma_session, ma_session_agent
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -36,29 +32,11 @@ async def test_session_identity_preserves_mapping_and_watermark(
     )
     await db_session.commit()
     now = datetime.now(UTC)
-    observed = BetaManagedAgentsSession(
+    observed = ma_session(
         id="sess_work",
-        type="session",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_original",
-            name="original",
-            type="agent",
-            version=1,
-            mcp_servers=[],
-            skills=[],
-            tools=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        ),
-        created_at=now,
-        updated_at=now,
+        agent=ma_session_agent(id="agent_original", name="original"),
         environment_id="env_science",
-        metadata={},
-        outcome_evaluations=[],
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
+        created_at=now,
     )
     router = MARouter()
     router.add(

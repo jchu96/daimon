@@ -17,16 +17,12 @@ from typing import Any
 import httpx
 from daimon.adapters.slack.continuation_dispatch import dispatch_pending_continuations
 from daimon.core.continuity.continuation import ContinuationRequest, record_continuation
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores.domain import TaskContinuationRow
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.task_continuations import get_continuation, list_pending_continuations
 from daimon.core.turn.errors import SessionBusyError
+from daimon.testing import build_fake_anthropic, ma_agent
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import (
-    _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]
-)
-from daimon.testing.ma import build_fake_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _TARGET_AGENT_ID = "agent_continuation_target"
@@ -35,16 +31,8 @@ _TARGET_AGENT_ID = "agent_continuation_target"
 def _fake_target_agent_handler(tenant_id_str: str) -> Any:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == f"/v1/agents/{_TARGET_AGENT_ID}":
-            return httpx.Response(
-                200,
-                json=_agent_response(
-                    agent_id=_TARGET_AGENT_ID,
-                    metadata={
-                        MA_METADATA_KEY_TENANT: tenant_id_str,
-                        MA_METADATA_KEY_NAME: "receiving-agent",
-                    },
-                ),
-            )
+            agent = ma_agent(id=_TARGET_AGENT_ID, name="receiving-agent", tenant_id=tenant_id_str)
+            return httpx.Response(200, json=agent.model_dump(mode="json"))
         raise AssertionError(f"unhandled {request.method} {request.url.path}")
 
     return handler

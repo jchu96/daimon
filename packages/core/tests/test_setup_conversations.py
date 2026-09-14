@@ -7,11 +7,10 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.core.errors import DaimonError
 from daimon.core.setup_conversations import get_setup_responder, resolve_setup_agents
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
+from daimon.testing.ma_models import ma_agent
 
 
 @pytest.mark.parametrize("missing_target", [False, True])
@@ -20,35 +19,15 @@ async def test_setup_resolves_builtin_without_parent_default_or_namesake_fallbac
 ) -> None:
     tenant_id = uuid.uuid4()
     now = datetime.now(UTC)
-    daimon = BetaManagedAgentsAgent(
+    daimon = ma_agent(
         id="ag_builtin",
         name="daimon",
-        type="agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        mcp_servers=[],
-        tools=[],
-        skills=[],
+        tenant_id=tenant_id,
+        metadata={"daimon_managed": "true"},
         created_at=now,
-        updated_at=now,
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": "daimon",
-            "daimon_managed": "true",
-        },
     )
-    specialist = BetaManagedAgentsAgent(
-        id="ag_specialist",
-        name="specialist",
-        type="agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=now,
-        updated_at=now,
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
+    specialist = ma_agent(
+        id="ag_specialist", name="specialist", tenant_id=tenant_id, created_at=now
     )
     router = MARouter()
     router.add(

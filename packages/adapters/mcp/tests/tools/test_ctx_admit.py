@@ -11,8 +11,6 @@ from daimon.adapters.mcp.tools._ctx import _admit  # pyright: ignore[reportPriva
 from daimon.core.stores.domain import Role
 from fastmcp.exceptions import ToolError
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_admit_denies_when_over_balance() -> None:
     auth = AuthIdentity(

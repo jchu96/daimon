@@ -46,8 +46,6 @@ _parse_link_impl = _read_mod._parse_link_impl  # pyright: ignore[reportPrivateUs
 _read_thread_impl = _read_mod._read_thread_impl  # pyright: ignore[reportPrivateUsage]
 _list_threads_impl = _read_mod._list_threads_impl  # pyright: ignore[reportPrivateUsage]
 
-pytestmark = pytest.mark.asyncio
-
 
 # ---------------------------------------------------------------------------
 # Helpers

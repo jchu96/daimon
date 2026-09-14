@@ -14,13 +14,9 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import datetime as dt
-import json
 import re
 import uuid
-from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import BetaManagedAgentsSession, FileMetadata
+from anthropic.types.beta import FileMetadata
 from anthropic.types.beta.sessions import (
     BetaManagedAgentsSpanModelRequestEndEvent,
     BetaManagedAgentsSpanModelUsage,
@@ -71,6 +67,8 @@ from daimon.core.pricing import MODEL_PRICING, cost_of
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_repo_binding import set_binding
 from daimon.core.tenant_balance import debit_amount
+from daimon.testing import ma_agent, ma_model_usage, ma_session
+from daimon.testing.asgi import call_mcp_tool, mcp_session
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import (
     EMPTY_CLOUD_CONFIG,
@@ -80,7 +78,7 @@ from daimon.testing.ma import (
     list_response,
     send_events_response,
 )
-from factories import make_ma_agent
+from daimon.testing.ma_models import SessionStatus
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -90,9 +88,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import ImageContent
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.types import ASGIApp, Message
-
-pytestmark = pytest.mark.asyncio
+from starlette.types import ASGIApp
 
 _BUNDLE_SECRET = "test-bundle-handle-secret"
 _TENANT_ID = uuid.uuid4()
@@ -129,40 +125,15 @@ def _auth(agent_id: uuid.UUID | None = _AGENT_UUID) -> AuthIdentity:
     )
 
 
-def _make_fake_session(
+def _session_json(
     *,
     session_id: str = "ses_test001",
     agent_id: str = _MA_AGENT_ID,
-    status: str = "idle",
+    status: SessionStatus = "idle",
 ) -> dict[str, Any]:
-    """Build a BetaManagedAgentsSession payload using the real SDK constructor."""
-    return BetaManagedAgentsSession.model_validate(
-        {
-            "id": session_id,
-            "type": "session",
-            "agent": {
-                "id": agent_id,
-                "name": "test-agent",
-                "version": 1,
-                "type": "agent",
-                "model": {"id": "claude-sonnet-4-6"},
-                "mcp_servers": [],
-                "skills": [],
-                "tools": [],
-            },
-            "archived_at": None,
-            "created_at": "2026-06-23T00:00:00Z",
-            "updated_at": "2026-06-23T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": _ENV_ID,
-            "metadata": {},
-            "resources": [],
-            "stats": {},
-            "status": status,
-            "title": None,
-            "usage": {},
-            "vault_ids": [],
-        }
+    """A session payload under this module's fixed ids, as MA would serve it."""
+    return ma_session(
+        id=session_id, agent_id=agent_id, environment_id=_ENV_ID, status=status
     ).model_dump(mode="json")
 
 
@@ -224,77 +195,9 @@ def _make_thread_idle_event(*, stop_reason_type: str = "end_turn") -> dict[str, 
 # ---------------------------------------------------------------------------
 
 
-@contextlib.asynccontextmanager
-async def _lifespan(app: ASGIApp) -> AsyncIterator[None]:
-    send_q: asyncio.Queue[Message] = asyncio.Queue()
-    recv_q: asyncio.Queue[Message] = asyncio.Queue()
-
-    async def receive() -> Message:
-        return await recv_q.get()
-
-    async def send(message: Message) -> None:
-        await send_q.put(message)
-
-    async def run() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    task = asyncio.create_task(run())
-    await recv_q.put({"type": "lifespan.startup"})
-    msg = await send_q.get()
-    assert msg["type"] == "lifespan.startup.complete", msg
-    try:
-        yield
-    finally:
-        await recv_q.put({"type": "lifespan.shutdown"})
-        msg = await send_q.get()
-        assert msg["type"] == "lifespan.shutdown.complete", msg
-        await task
-
-
-def _parse_jsonrpc(resp: httpx.Response) -> dict[str, object]:
-    ct = resp.headers.get("content-type", "")
-    if "text/event-stream" in ct:
-        for line in resp.text.splitlines():
-            if line.startswith("data: "):
-                return json.loads(line[6:])  # type: ignore[return-value]
-        raise AssertionError(f"No data line in SSE: {resp.text!r}")
-    return resp.json()  # type: ignore[return-value]
-
-
 async def _tools_list_via_http(app: ASGIApp, token: str) -> list[str]:
     """Initialize an MCP HTTP session and call tools/list; return tool names."""
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
-                },
-            },
-            headers=headers,
-        )
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        list_resp = await c.post(
-            "/mcp",
-            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            headers=headers,
-        )
-        assert list_resp.status_code == 200, f"tools/list failed: {list_resp.text}"
-        result = _parse_jsonrpc(list_resp)
+    result = await mcp_session(app, token=token, method="tools/list")
     tools_payload = result.get("result", result)
     return [t["name"] for t in tools_payload.get("tools", [])]  # type: ignore[union-attr]
 
@@ -516,7 +419,7 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
     def on_session_retrieve(req: httpx.Request, m: re.Match[str]) -> httpx.Response:
         call_count["retrieve"] += 1
         status = "running" if call_count["retrieve"] == 1 else "idle"
-        return httpx.Response(200, json=_make_fake_session(status=status))
+        return httpx.Response(200, json=_session_json(status=status))
 
     env_payload = {
         "id": _ENV_ID,
@@ -538,7 +441,7 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -588,7 +491,9 @@ async def test_start_turn_then_poll_get_session_and_read_transcript(
     auth = _auth()
 
     # Build a fake session returned by the patched create_session
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
@@ -1177,7 +1082,7 @@ async def test_start_turn_resolves_env_from_deployment_default_when_no_tenant_ro
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1213,7 +1118,9 @@ async def test_start_turn_resolves_env_from_deployment_default_when_no_tenant_ro
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
 
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
         new=AsyncMock(return_value=fake_session),
@@ -1246,7 +1153,7 @@ async def test_get_session_raises_session_not_found_for_cross_tenant_handle() ->
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1263,7 +1170,7 @@ async def test_get_session_raises_session_not_found_for_cross_tenant_handle() ->
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_cross",
                 agent_id=other_agent_id,
                 status="idle",
@@ -1296,7 +1203,7 @@ def _sibling_tenant_agents_router() -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1304,7 +1211,7 @@ def _sibling_tenant_agents_router() -> MARouter:
                         "daimon_name": "test-agent",
                     },
                 ).model_dump(mode="json"),
-                make_ma_agent(
+                ma_agent(
                     id="ag_sibling",
                     name="sibling-agent",
                     metadata={
@@ -1332,7 +1239,7 @@ async def test_get_session_raises_session_not_found_for_same_tenant_other_agent_
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_sibling",
                 agent_id="ag_sibling",
                 status="running",
@@ -1359,7 +1266,7 @@ async def test_continue_turn_raises_session_not_found_for_same_tenant_other_agen
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_sibling",
                 agent_id="ag_sibling",
                 status="idle",
@@ -1441,8 +1348,8 @@ async def test_list_sessions_lists_only_the_callers_agent_sessions() -> None:
         seen_agent_ids.append(req.url.params.get("agent_id", ""))
         return list_response(
             [
-                _make_fake_session(session_id="ses_a", agent_id=_MA_AGENT_ID, status="idle"),
-                _make_fake_session(session_id="ses_b", agent_id=_MA_AGENT_ID, status="running"),
+                _session_json(session_id="ses_a", agent_id=_MA_AGENT_ID, status="idle"),
+                _session_json(session_id="ses_b", agent_id=_MA_AGENT_ID, status="running"),
             ]
         )
 
@@ -1452,7 +1359,7 @@ async def test_list_sessions_lists_only_the_callers_agent_sessions() -> None:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1490,7 +1397,7 @@ def _describe_agent_router() -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1551,54 +1458,6 @@ async def test_describe_agent_returns_none_repo_url_for_unbound_agent(
 # ---------------------------------------------------------------------------
 
 
-async def _call_tool_via_http(
-    app: ASGIApp, token: str, name: str, arguments: dict[str, object]
-) -> dict[str, object]:
-    """Initialize an MCP HTTP session and call tools/call; return the JSON-RPC result.
-
-    Goes through the full server pipeline (auth -> IdentityMiddleware -> tool ->
-    FastMCP OUTPUT VALIDATION) so it exercises the same output-schema check that
-    rejected the transcript in prod — unlike the _impl-level tests which bypass it.
-    """
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    transport = httpx.ASGITransport(app=app)  # pyright: ignore[reportArgumentType]
-    async with _lifespan(app), httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        init_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
-                },
-            },
-            headers=headers,
-        )
-        assert init_resp.status_code == 200, f"initialize failed: {init_resp.text}"
-        session_id = init_resp.headers.get("mcp-session-id")
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        call_resp = await c.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            },
-            headers=headers,
-        )
-        assert call_resp.status_code == 200, f"tools/call failed: {call_resp.text}"
-        return _parse_jsonrpc(call_resp)
-
-
 async def test_list_events_admits_thread_status_events_through_fastmcp() -> None:
     """list_events must return a transcript containing session.thread_status_idle
     (a variant the pinned SDK's event union does NOT model) without a FastMCP
@@ -1638,7 +1497,7 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
 
     mock_sessionmaker: async_sessionmaker[AsyncSession] = MagicMock()  # type: ignore[assignment]
@@ -1658,8 +1517,8 @@ async def test_list_events_admits_thread_status_events_through_fastmcp() -> None
     runtime = _runtime(build_fake_anthropic(router.dispatch), session_factory=mock_sessionmaker)
     register_agent_chat_tools(mcp, runtime, billing_config=None)
 
-    result = await _call_tool_via_http(
-        mcp.http_app(), token, "list_events", {"handle": "ses_test001"}
+    result = await call_mcp_tool(
+        mcp.http_app(), token=token, name="list_events", arguments={"handle": "ses_test001"}
     )
 
     payload = result.get("result", result)
@@ -1734,7 +1593,9 @@ async def test_turn_tools_refuse_over_balance_tenant_before_creating_session(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
         new=AsyncMock(),
     ) as mock_create_session:
-        result = await _call_tool_via_http(mcp.http_app(), token, tool_name, {"message": "hello"})
+        result = await call_mcp_tool(
+            mcp.http_app(), token=token, name=tool_name, arguments={"message": "hello"}
+        )
 
     payload = result.get("result", result)
     assert isinstance(payload, dict), f"unexpected tools/call shape: {result!r}"
@@ -1774,7 +1635,7 @@ def _agent_and_env_router() -> MARouter:
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -1810,7 +1671,7 @@ def _isolated_agent_and_env_router(*, ma_agent_id: str = _MA_AGENT_ID) -> MARout
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=ma_agent_id,
                     name="reader-agent",
                     metadata={
@@ -1874,7 +1735,7 @@ async def test_start_turn_with_bundle_mounts_the_single_resource_on_an_isolated_
 
     def on_create(request: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         create_bodies.append(json_body(request))
-        return httpx.Response(200, json=_make_fake_session(status="running"))
+        return httpx.Response(200, json=_session_json(status="running"))
 
     router = _isolated_agent_and_env_router()
     router.add("POST", r"/v1/sessions", on_create)
@@ -1932,9 +1793,7 @@ async def test_start_turn_with_bundle_preserves_the_boundary_return_shape(
         return fixed_at
 
     router = _isolated_agent_and_env_router()
-    router.add(
-        "POST", r"/v1/sessions", lambda _r, _m: httpx.Response(200, json=_make_fake_session())
-    )
+    router.add("POST", r"/v1/sessions", lambda _r, _m: httpx.Response(200, json=_session_json()))
     router.add(
         "GET",
         r"/v1/files/([^/]+)",
@@ -2190,7 +2049,9 @@ async def test_start_turn_returns_the_accepted_events_boundary(
     client = build_fake_anthropic(router.dispatch)
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
@@ -2240,7 +2101,7 @@ async def test_continue_turn_returns_boundary_from_its_own_send() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
 
     def on_send(_r: httpx.Request, _m: re.Match[str]) -> httpx.Response:
@@ -2286,7 +2147,9 @@ async def test_start_turn_raises_when_send_accepts_nothing(
     client = build_fake_anthropic(router.dispatch)
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with (
         patch(
@@ -2329,7 +2192,9 @@ async def test_start_turn_ignores_the_echos_processed_at_even_when_present(
     client = build_fake_anthropic(router.dispatch)
     runtime = _runtime(client, session_factory=db_session_factory, environment_name=_ENV_NAME)
     auth = _auth()
-    fake_session = BetaManagedAgentsSession.model_validate(_make_fake_session(status="running"))
+    fake_session = ma_session(
+        id="ses_test001", agent_id=_MA_AGENT_ID, environment_id=_ENV_ID, status="running"
+    )
 
     with patch(
         "daimon.adapters.mcp.tools.agent_chat.create_session",
@@ -2355,7 +2220,7 @@ async def test_list_events_forwards_created_at_gte_and_types() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", on_events)
     client = build_fake_anthropic(router.dispatch)
@@ -2395,7 +2260,7 @@ async def test_list_events_forwards_neither_when_not_given() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", on_events)
     client = build_fake_anthropic(router.dispatch)
@@ -2423,7 +2288,7 @@ async def test_archive_my_session_rejects_a_sibling_agents_session_and_issues_no
         archive_calls.append(m.group(1))
         return httpx.Response(
             200,
-            json=_make_fake_session(
+            json=_session_json(
                 session_id="ses_sibling", agent_id="ag_sibling", status="terminated"
             ),
         )
@@ -2434,7 +2299,7 @@ async def test_archive_my_session_rejects_a_sibling_agents_session_and_issues_no
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
+            json=_session_json(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
         ),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/archive", on_archive)
@@ -2454,13 +2319,13 @@ async def test_archive_my_session_archives_an_owned_session_exactly_once() -> No
 
     def on_archive(_req: httpx.Request, m: re.Match[str]) -> httpx.Response:
         archive_calls.append(m.group(1))
-        return httpx.Response(200, json=_make_fake_session(status="terminated"))
+        return httpx.Response(200, json=_session_json(status="terminated"))
 
     router = MARouter()
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/archive", on_archive)
     client = build_fake_anthropic(router.dispatch)
@@ -2493,7 +2358,7 @@ async def test_cancel_turn_sends_exactly_one_user_interrupt_event() -> None:
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="running")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="running")),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/events", on_send)
     client = build_fake_anthropic(router.dispatch)
@@ -2516,7 +2381,7 @@ async def test_cancel_turn_issues_no_status_precheck_between_ownership_and_send(
 
     def on_retrieve(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         calls.append("retrieve")
-        return httpx.Response(200, json=_make_fake_session(status="running"))
+        return httpx.Response(200, json=_session_json(status="running"))
 
     def on_send(_req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         calls.append("send")
@@ -2553,9 +2418,7 @@ async def test_cancel_turn_rejects_a_sibling_agents_session_and_issues_zero_send
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(
-                session_id="ses_sibling", agent_id="ag_sibling", status="running"
-            ),
+            json=_session_json(session_id="ses_sibling", agent_id="ag_sibling", status="running"),
         ),
     )
     router.add("POST", r"/v1/sessions/([^/]+)/events", on_send)
@@ -2575,7 +2438,7 @@ async def test_cancel_turn_on_already_idle_session_returns_idle_without_raising(
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add(
         "POST",
@@ -2618,13 +2481,8 @@ async def test_get_turn_cost_folds_events_to_the_same_figure_as_debit_amount_at_
     """The fold equals sum(debit_amount(cost_of(usage, rates), markup=1)) over
     the same events — the pre-markup cross-check SPEC 1.4 asks for."""
     rates = MODEL_PRICING["claude-sonnet-4-6"]
-    usage_a = BetaManagedAgentsSpanModelUsage(
-        input_tokens=1000,
-        output_tokens=500,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
-    usage_b = BetaManagedAgentsSpanModelUsage(
+    usage_a = ma_model_usage(input_tokens=1000, output_tokens=500)
+    usage_b = ma_model_usage(
         input_tokens=2000,
         output_tokens=100,
         cache_creation_input_tokens=50,
@@ -2634,7 +2492,7 @@ async def test_get_turn_cost_folds_events_to_the_same_figure_as_debit_amount_at_
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add(
         "GET",
@@ -2675,17 +2533,12 @@ async def test_get_turn_cost_folds_events_to_the_same_figure_as_debit_amount_at_
 async def test_get_turn_cost_excludes_the_boundary_event_itself() -> None:
     """Events at or before ``turn_event_id`` are excluded: of three seeded
     events, one IS the boundary, so ``event_count`` is 2, not 3."""
-    usage = BetaManagedAgentsSpanModelUsage(
-        input_tokens=100,
-        output_tokens=50,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
+    usage = ma_model_usage(input_tokens=100, output_tokens=50)
     router = MARouter()
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add(
         "GET",
@@ -2726,40 +2579,13 @@ async def test_get_turn_cost_excludes_the_boundary_event_itself() -> None:
 async def test_get_turn_cost_returns_none_but_still_counts_events_for_unpriced_model() -> None:
     """No pricing row -> cost_usd is None (never zero — zero would falsely
     claim the turn was free); event_count still counts the events (T-21-06-D)."""
-    session_json = BetaManagedAgentsSession.model_validate(
-        {
-            "id": "ses_test001",
-            "type": "session",
-            "agent": {
-                "id": _MA_AGENT_ID,
-                "name": "test-agent",
-                "version": 1,
-                "type": "agent",
-                "model": {"id": "claude-unpriced-model-x"},
-                "mcp_servers": [],
-                "skills": [],
-                "tools": [],
-            },
-            "archived_at": None,
-            "created_at": "2026-06-23T00:00:00Z",
-            "updated_at": "2026-06-23T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": _ENV_ID,
-            "metadata": {},
-            "resources": [],
-            "stats": {},
-            "status": "idle",
-            "title": None,
-            "usage": {},
-            "vault_ids": [],
-        }
+    session_json = ma_session(
+        id="ses_test001",
+        agent_id=_MA_AGENT_ID,
+        model="claude-unpriced-model-x",
+        environment_id=_ENV_ID,
     ).model_dump(mode="json")
-    usage = BetaManagedAgentsSpanModelUsage(
-        input_tokens=100,
-        output_tokens=50,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
+    usage = ma_model_usage(input_tokens=100, output_tokens=50)
     router = MARouter()
     router.add(
         "GET", r"/v1/sessions/([^/]+)", lambda _r, _m: httpx.Response(200, json=session_json)
@@ -2797,7 +2623,7 @@ async def test_get_turn_cost_returns_a_real_zero_when_priced_model_has_no_events
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, _m: httpx.Response(200, json=_make_fake_session(status="idle")),
+        lambda _r, _m: httpx.Response(200, json=_session_json(status="idle")),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", lambda _r, _m: list_response([]))
     client = build_fake_anthropic(router.dispatch)
@@ -2828,7 +2654,7 @@ async def test_get_turn_cost_rejects_a_sibling_agents_session_and_lists_no_event
         r"/v1/sessions/([^/]+)",
         lambda _r, _m: httpx.Response(
             200,
-            json=_make_fake_session(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
+            json=_session_json(session_id="ses_sibling", agent_id="ag_sibling", status="idle"),
         ),
     )
     router.add("GET", r"/v1/sessions/([^/]+)/events", on_events)
@@ -2881,7 +2707,7 @@ async def test_ask_with_handle_continues_instead_of_starting(
         r"/v1/agents",
         lambda _r, _m: list_response(
             [
-                make_ma_agent(
+                ma_agent(
                     id=_MA_AGENT_ID,
                     name="test-agent",
                     metadata={
@@ -2895,9 +2721,7 @@ async def test_ask_with_handle_continues_instead_of_starting(
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, m: httpx.Response(
-            200, json=_make_fake_session(session_id=m.group(1), status="idle")
-        ),
+        lambda _r, m: httpx.Response(200, json=_session_json(session_id=m.group(1), status="idle")),
     )
     sent: list[str] = []
 
@@ -2947,9 +2771,7 @@ async def test_ask_with_handle_reads_only_this_turns_reply(
     router.add(
         "GET",
         r"/v1/sessions/([^/]+)",
-        lambda _r, m: httpx.Response(
-            200, json=_make_fake_session(session_id=m.group(1), status="idle")
-        ),
+        lambda _r, m: httpx.Response(200, json=_session_json(session_id=m.group(1), status="idle")),
     )
     router.add(
         "POST",

@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import httpx
 import pytest
-from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.discord.agent_setup import write as write_mod
 from daimon.adapters.discord.agent_setup.panel import (
     AgentSetupView,
@@ -24,6 +23,7 @@ from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
+from daimon.testing import ma_agent
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -126,20 +126,11 @@ async def test_new_agent_calls_reconcile_with_blank_spec_and_account_id(
         if request.method == "GET" and request.url.path == "/v1/agents":
             return httpx.Response(200, json={"data": [], "next_page": None})
         if request.method == "GET" and request.url.path == "/v1/agents/ag_new":
-            agent = BetaManagedAgentsAgent(
+            agent = ma_agent(
                 id="ag_new",
-                type="agent",
                 name="research-bot",
-                model={"id": "claude-sonnet-4-6"},
                 metadata={"daimon_tenant": str(tenant_id)},
-                description=None,
                 system="be helpful",
-                created_at="2026-04-21T00:00:00Z",
-                updated_at="2026-04-21T00:00:00Z",
-                version=1,
-                mcp_servers=[],
-                skills=[],
-                tools=[],
             )
             return httpx.Response(200, json=agent.model_dump(mode="json"))
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
@@ -190,20 +181,10 @@ def _source_ma_agent(
     metadata: dict[str, str] = {"daimon_tenant": str(tenant_id), "daimon_name": name}
     if account_id is not None:
         metadata["daimon_account"] = str(account_id)
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id="ag_source",
-        type="agent",
         name=name,
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
         metadata=metadata,
-        description=None,
-        archived_at=None,
-        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
         system=system,
     ).model_dump(mode="json")
 
@@ -311,25 +292,11 @@ async def test_fork_rejects_when_name_collides_under_guild_account(
         name="source-bot", tenant_id=tenant_id, account_id=None, system=None
     )
     # Collision agent is owned by the GUILD account (not the personal account).
-    collision_payload = BetaManagedAgentsAgent(
+    collision_payload = ma_agent(
         id="ag_existing_copy",
-        type="agent",
         name="source-bot-v2",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": "source-bot-v2",
-            "daimon_account": str(guild_account),
-        },
-        description=None,
-        archived_at=None,
-        created_at="2026-05-02T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-02T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant_id,
+        metadata={"daimon_account": str(guild_account)},
     ).model_dump(mode="json")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -386,25 +353,11 @@ async def test_fork_blocks_collision_under_different_account(
     source_payload = _source_ma_agent(
         name="daimon", tenant_id=tenant_id, account_id=None, system="seeded"
     )
-    other_users_copy = BetaManagedAgentsAgent(
+    other_users_copy = ma_agent(
         id="ag_other_copy",
-        type="agent",
         name="daimon-copy",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": "daimon-copy",
-            "daimon_account": str(other_user_account),
-        },
-        description=None,
-        archived_at=None,
-        created_at="2026-05-02T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-02T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant_id,
+        metadata={"daimon_account": str(other_user_account)},
     ).model_dump(mode="json")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -460,21 +413,10 @@ async def test_delete_archives_ma_agent_and_jumps_selection(
 
     archive_calls: list[str] = []
     agents_payload = [
-        BetaManagedAgentsAgent(
+        ma_agent(
             id="ag_bravo",
-            type="agent",
             name="bravo",
-            model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-            metadata={"daimon_tenant": str(tenant_id), "daimon_name": "bravo"},
-            description=None,
-            archived_at=None,
-            created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-            updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-            version=1,
-            mcp_servers=[],
-            skills=[],
-            tools=[],
-            system=None,
+            tenant_id=tenant_id,
         ).model_dump(mode="json"),
     ]
 
@@ -530,21 +472,10 @@ async def test_delete_last_agent_disables_section_buttons(
     state = PanelState(roster=[only], selected=only, account_id=account_id, is_admin=True)
 
     agents_payload = [
-        BetaManagedAgentsAgent(
+        ma_agent(
             id="ag_solo",
-            type="agent",
             name="solo",
-            model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-            metadata={"daimon_tenant": str(tenant_id), "daimon_name": "solo"},
-            description=None,
-            archived_at=None,
-            created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-            updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-            version=1,
-            mcp_servers=[],
-            skills=[],
-            tools=[],
-            system=None,
+            tenant_id=tenant_id,
         ).model_dump(mode="json"),
     ]
 

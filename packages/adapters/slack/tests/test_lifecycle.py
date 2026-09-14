@@ -56,9 +56,6 @@ from typing import Any
 import aiohttp
 import pytest
 import yarl
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from daimon.adapters.slack import lifecycle as lifecycle_mod
 from daimon.adapters.slack.lifecycle import SlackTurnLifecycle
 from daimon.core.pricing import MODEL_PRICING, cost_of, format_cost
@@ -69,6 +66,7 @@ from daimon.core.turn.state import (
     TurnState,
     UsageTotals,
 )
+from daimon.testing import ma_model_usage
 from slack_sdk.errors import SlackApiError
 
 from .conftest import CHAT_OK_PAYLOAD
@@ -515,7 +513,7 @@ async def test_apply_usage_folds_usage_totals(fake_slack_web_client: Any) -> Non
 
     expected_cost = format_cost(
         cost_of(
-            BetaManagedAgentsSpanModelUsage(
+            ma_model_usage(
                 input_tokens=1000,
                 cache_creation_input_tokens=500,
                 cache_read_input_tokens=2000,

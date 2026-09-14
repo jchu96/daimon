@@ -8,44 +8,18 @@ import httpx
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
 from anthropic.types.beta.session_create_params import Resource
 from daimon.core.sessions import create_isolated_session
-from daimon.testing.ma import EMPTY_CLOUD_CONFIG
 from daimon.testing.ma import build_fake_anthropic as build_fake_anthropic_http
+from daimon.testing.ma_models import ma_agent, ma_environment, ma_session, ma_session_agent
 
 
 def _make_agent(*, anthropic_id: str = "ag_reader", name: str = "reader") -> BetaManagedAgentsAgent:
-    """Inline BetaManagedAgentsAgent construction — no DB needed."""
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": anthropic_id,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-opus-4-7"},
-            "metadata": {},
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-04-21T00:00:00Z",
-            "updated_at": "2026-04-21T00:00:00Z",
-            "version": 1,
-            "mcp_servers": [],
-            "skills": [],
-            "tools": [],
-            "system": None,
-        }
-    )
+    """An agent with this file's defaults — no DB needed."""
+    return ma_agent(id=anthropic_id, name=name, model="claude-opus-4-7")
 
 
 def _make_env(*, anthropic_id: str = "env_reader", name: str = "e") -> BetaEnvironment:
-    """Inline BetaEnvironment construction — no DB needed."""
-    return BetaEnvironment(
-        id=anthropic_id,
-        type="environment",
-        name=name,
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={},
-        description="",
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-    )
+    """An environment with this file's defaults — no DB needed."""
+    return ma_environment(id=anthropic_id, name=name)
 
 
 def _bundle_resource(file_id: str = "file_bundle") -> Resource:
@@ -60,31 +34,11 @@ def _session_body(
     metadata: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a BetaManagedAgentsSession JSON body via validated SDK models."""
-    return BetaManagedAgentsSession.model_validate(
-        {
-            "id": session_id,
-            "agent": {
-                "id": agent_id,
-                "mcp_servers": [],
-                "model": {"id": "claude-opus-4-7"},
-                "name": "reader",
-                "skills": [],
-                "tools": [],
-                "type": "agent",
-                "version": 1,
-            },
-            "created_at": "2026-04-21T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": environment_id,
-            "metadata": metadata or {},
-            "resources": [],
-            "stats": {},
-            "status": "idle",
-            "type": "session",
-            "updated_at": "2026-04-21T00:00:00Z",
-            "usage": {},
-            "vault_ids": [],
-        }
+    return ma_session(
+        id=session_id,
+        agent=ma_session_agent(id=agent_id, name="reader", model="claude-opus-4-7"),
+        environment_id=environment_id,
+        metadata=metadata,
     ).model_dump(mode="json")
 
 

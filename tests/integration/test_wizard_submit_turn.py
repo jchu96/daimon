@@ -16,42 +16,16 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import httpx
-import pytest
-from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
-from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
-    BetaManagedAgentsAgentMessageEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_end_turn import (
-    BetaManagedAgentsSessionEndTurn,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event import (
-    BetaManagedAgentsSessionStatusIdleEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
-    BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
-    BetaManagedAgentsTextBlock,
-)
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.runtime import DiscordRuntime, build_turn_deps
 from daimon.adapters.discord.wizard_submit import WizardSubmitButton
 from daimon.core.config import McpSettings
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
@@ -64,18 +38,13 @@ from daimon.core.stores.wizard_session import get_wizard_session
 from daimon.core.wizard.answers import format_answer_block
 from daimon.core.wizard.spec import Option, Step, StepKind, WizardSpec
 from daimon.core.wizard.state import WizardState, WizardStatus, build_custom_id
+from daimon.testing import build_turn_router, ma_session
 from daimon.testing.factories import make_tenant, make_thread_session, make_wizard_session
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     MARouter,
     build_fake_anthropic,
-    json_body,
-    list_response,
-    sse_response,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 _AGENT_ID = "ag_wizard_submit_test"
 _ENV_ID = "env_wizard_submit_test"
@@ -105,90 +74,32 @@ def _build_router(
     sent_events: list[dict[str, Any]],
     stream_hits: list[str],
 ) -> MARouter:
-    """MARouter handling agent/environment resolution plus a turn SSE stream
-    that emits an `agent.message`, a `span.model_request_end` (the event the
-    billing chokepoint metering binds on), then `session.status_idle`.
-    `sent_events` records every `POST .../events` body (the resumed turn's
-    user message); `stream_hits` records every session id the SSE stream was
-    opened against (which session id the turn actually ran on)."""
-    agent_item = BetaManagedAgentsAgent(
-        id=_AGENT_ID,
-        type="agent",
-        name="test-agent",
-        model=BetaManagedAgentsModelConfig(id=_MODEL_ID),
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-agent"},
-        description=None,
-        created_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        updated_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    ).model_dump(mode="json")
-
-    env_item = BetaEnvironment(
-        id=_ENV_ID,
-        type="environment",
-        name="test-env",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-env"},
-        description="",
-        created_at="2026-06-14T00:00:00Z",
-        updated_at="2026-06-14T00:00:00Z",
-    ).model_dump(mode="json")
-
-    now = datetime.now(UTC)
-    agent_message_event = BetaManagedAgentsAgentMessageEvent(
-        id="evt_wizard_submit_msg",
-        type="agent.message",
-        processed_at=now,
-        content=[BetaManagedAgentsTextBlock(type="text", text=_AGENT_TEXT)],
-    ).model_dump(mode="json")
-    model_request_end_event = BetaManagedAgentsSpanModelRequestEndEvent(
-        id="evt_wizard_submit_usage",
-        is_error=False,
-        model_request_start_id="start_wizard_submit",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
-        processed_at=now,
-        type="span.model_request_end",
-    ).model_dump(mode="json")
-    idle_event = BetaManagedAgentsSessionStatusIdleEvent(
-        id="evt_wizard_submit_idle",
-        type="session.status_idle",
-        processed_at=now,
-        stop_reason=BetaManagedAgentsSessionEndTurn(type="end_turn"),
-    ).model_dump(mode="json")
-
-    def _handle_send_events(request: httpx.Request, _match: re.Match[str]) -> httpx.Response:
-        sent_events.append(json_body(request))
-        return httpx.Response(200, json={"data": None})
-
-    def _handle_stream(request: httpx.Request, match: re.Match[str]) -> httpx.Response:
-        stream_hits.append(match["session_id"])
-        return sse_response([agent_message_event, model_request_end_event, idle_event])
-
-    router = MARouter()
-    router.add("GET", r"/v1/agents", lambda req, _m: list_response([agent_item]))
-    router.add("GET", r"/v1/agents/[^/]+", lambda req, _m: httpx.Response(200, json=agent_item))
-    router.add("GET", r"/v1/environments", lambda req, _m: list_response([env_item]))
-    router.add("GET", r"/v1/environments/[^/]+", lambda req, _m: httpx.Response(200, json=env_item))
+    """The shared turn router (agent/environment resolution plus a turn SSE
+    stream whose `span.model_request_end` the billing chokepoint metering
+    binds on) with a session retrieve route on top. `sent_events` records
+    every `POST .../events` body (the resumed turn's user message);
+    `stream_hits` records every session id the SSE stream was opened
+    against (which session id the turn actually ran on)."""
+    router = build_turn_router(
+        tenant_id_str,
+        agent_id=_AGENT_ID,
+        env_id=_ENV_ID,
+        model_id=_MODEL_ID,
+        agent_text=_AGENT_TEXT,
+        usage_event_id="evt_wizard_submit_usage",
+        sent_event_bodies=sent_events,
+        stream_hits=stream_hits,
+    )
 
     def _handle_session_retrieve(_request: httpx.Request, match: re.Match[str]) -> httpx.Response:
         # A mapping row written before sessions recorded their configuration
         # makes the bind read the session once, to learn what it is running.
-        return httpx.Response(
-            200, json=_make_fake_session(session_id=match["session_id"]).model_dump(mode="json")
+        session = ma_session(
+            id=match["session_id"], agent_id=_AGENT_ID, model=_MODEL_ID, environment_id=_ENV_ID
         )
+        return httpx.Response(200, json=session.model_dump(mode="json"))
 
     router.add("GET", r"/v1/sessions/(?P<session_id>[^/]+)", _handle_session_retrieve)
-    router.add("POST", r"/v1/sessions/(?P<session_id>[^/]+)/events", _handle_send_events)
-    router.add("GET", r"/v1/sessions/(?P<session_id>[^/]+)/events/stream", _handle_stream)
     return router
 
 
@@ -276,34 +187,6 @@ def _submit_match(short_id: str) -> re.Match[str]:
     matched = WizardSubmitButton.__discord_ui_compiled_template__.fullmatch(custom_id)
     assert matched is not None, "test action must satisfy WizardSubmitButton's own template"
     return matched
-
-
-def _make_fake_session(*, session_id: str) -> BetaManagedAgentsSession:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsSession(
-        id=session_id,
-        agent=BetaManagedAgentsSessionAgent(
-            id=_AGENT_ID,
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id=_MODEL_ID),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=now,
-        environment_id=_ENV_ID,
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
-        outcome_evaluations=[],
-    )
 
 
 async def _seed_funded_tenant(db_session: AsyncSession, *, workspace_id: str) -> TenantRow:
@@ -418,7 +301,9 @@ async def test_submitting_a_form_sends_the_keyed_answer_block_as_the_user_messag
     interaction = _interaction(user_id=_REQUESTER_ID, client=bot, channel=channel, guild_id=123)
 
     with patch("daimon.core.turn.prepare.create_session") as mock_create_session:
-        mock_create_session.return_value = _make_fake_session(session_id="sess_fresh_msg")
+        mock_create_session.return_value = ma_session(
+            id="sess_fresh_msg", agent_id=_AGENT_ID, model=_MODEL_ID, environment_id=_ENV_ID
+        )
         item = await WizardSubmitButton.from_custom_id(
             interaction, MagicMock(), _submit_match(row.id)
         )
@@ -472,7 +357,9 @@ async def test_submitting_a_form_records_usage(
     interaction = _interaction(user_id=_REQUESTER_ID, client=bot, channel=channel, guild_id=123)
 
     with patch("daimon.core.turn.prepare.create_session") as mock_create_session:
-        mock_create_session.return_value = _make_fake_session(session_id="sess_fresh_usage")
+        mock_create_session.return_value = ma_session(
+            id="sess_fresh_usage", agent_id=_AGENT_ID, model=_MODEL_ID, environment_id=_ENV_ID
+        )
         item = await WizardSubmitButton.from_custom_id(
             interaction, MagicMock(), _submit_match(row.id)
         )
@@ -504,7 +391,9 @@ async def test_two_concurrent_submits_bill_exactly_one_turn(
     interaction_b = _interaction(user_id=_REQUESTER_ID, client=bot, channel=channel, guild_id=123)
 
     with patch("daimon.core.turn.prepare.create_session") as mock_create_session:
-        mock_create_session.return_value = _make_fake_session(session_id="sess_fresh_concurrent")
+        mock_create_session.return_value = ma_session(
+            id="sess_fresh_concurrent", agent_id=_AGENT_ID, model=_MODEL_ID, environment_id=_ENV_ID
+        )
         item_a = await WizardSubmitButton.from_custom_id(
             interaction_a, MagicMock(), _submit_match(row.id)
         )
@@ -550,7 +439,9 @@ async def test_a_submit_turn_claims_and_releases_a_per_tenant_in_flight_slot(
     interaction = _interaction(user_id=_REQUESTER_ID, client=bot, channel=channel, guild_id=123)
 
     with patch("daimon.core.turn.prepare.create_session") as mock_create_session:
-        mock_create_session.return_value = _make_fake_session(session_id="sess_fresh_slot")
+        mock_create_session.return_value = ma_session(
+            id="sess_fresh_slot", agent_id=_AGENT_ID, model=_MODEL_ID, environment_id=_ENV_ID
+        )
         item = await WizardSubmitButton.from_custom_id(
             interaction, MagicMock(), _submit_match(row.id)
         )
@@ -706,7 +597,9 @@ async def test_a_ceiling_outcome_takes_the_existing_turn_error_branch(
             "daimon.adapters.discord.wizard_submit.run_prepared_turn", new_callable=AsyncMock
         ) as mock_run_prepared_turn,
     ):
-        mock_create_session.return_value = _make_fake_session(session_id="sess_ceiling_wizard")
+        mock_create_session.return_value = ma_session(
+            id="sess_ceiling_wizard", agent_id=_AGENT_ID, model=_MODEL_ID, environment_id=_ENV_ID
+        )
         mock_run_prepared_turn.return_value = ceiling_outcome
         item = await WizardSubmitButton.from_custom_id(
             interaction, MagicMock(), _submit_match(row.id)

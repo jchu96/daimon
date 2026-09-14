@@ -22,12 +22,6 @@ from typing import Any
 import httpx
 import pytest
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import (
-    BetaEnvironment,
-    BetaManagedAgentsAgent,
-    BetaManagedAgentsSession,
-    BetaManagedAgentsSessionAgent,
-)
 from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from anthropic.types.beta.sessions import BetaManagedAgentsSessionEvent
 from anthropic.types.beta.sessions.beta_managed_agents_agent_message_event import (
@@ -48,9 +42,6 @@ from anthropic.types.beta.sessions.beta_managed_agents_session_status_idle_event
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
-)
 from anthropic.types.beta.sessions.beta_managed_agents_text_block import (
     BetaManagedAgentsTextBlock,
 )
@@ -65,14 +56,18 @@ from daimon.core.stores import accounts as accounts_store
 from daimon.core.stores import tenant_ledger, usage_events
 from daimon.core.stores import tenants as tenants_store
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
-    EMPTY_SESSION_STATS,
-    EMPTY_SESSION_USAGE,
     MARouter,
     build_fake_anthropic,
     list_response,
     session_response,
     sse_response,
+)
+from daimon.testing.ma_models import (
+    ma_agent,
+    ma_environment,
+    ma_model_usage,
+    ma_session,
+    ma_session_agent,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -93,20 +88,12 @@ def _write_seed_tree(root: Path) -> None:
 def _agent_json(
     agent_id: str, *, metadata: dict[str, Any], archived_at: datetime | None = None
 ) -> dict[str, Any]:
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=agent_id,
-        type="agent",
         name=metadata.get("daimon_name", "daimon"),
         model=_AGENT_MODEL,
         metadata=metadata,
-        description=None,
         created_at=_CREATED_AT,
-        updated_at=_CREATED_AT,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
         archived_at=archived_at,
     ).model_dump(mode="json")
 
@@ -114,15 +101,10 @@ def _agent_json(
 def _env_json(
     env_id: str, *, metadata: dict[str, Any], archived_at: str | None = None
 ) -> dict[str, Any]:
-    return BetaEnvironment(
+    return ma_environment(
         id=env_id,
-        type="environment",
         name=metadata.get("daimon_name", "default"),
-        config=EMPTY_CLOUD_CONFIG,
         metadata=metadata,
-        description="",
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
         archived_at=archived_at,
     ).model_dump(mode="json")
 
@@ -248,29 +230,11 @@ def _register_turn_routes(
     consume loop, so the stream ending right after one is a clean close that
     triggers a status check.
     """
-    session_json = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    session_json = ma_session(
         id=session_id,
-        type="session",
-        status="idle",
+        agent=ma_session_agent(id="agent_x", name="daimon", model=model_id),
         environment_id="env_x",
-        metadata={},
-        resources=[],
-        vault_ids=[],
         created_at=_CREATED_AT,
-        updated_at=_CREATED_AT,
-        stats=EMPTY_SESSION_STATS,
-        usage=EMPTY_SESSION_USAGE,
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_x",
-            type="agent",
-            name="daimon",
-            version=1,
-            model=BetaManagedAgentsModelConfig(id=model_id),  # type: ignore[arg-type]
-            mcp_servers=[],
-            tools=[],
-            skills=[],
-        ),
     ).model_dump(mode="json")
 
     def handle_create(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
@@ -325,12 +289,7 @@ def _happy_events(*, id_prefix: str = "evt") -> list[BetaManagedAgentsSessionEve
             type="span.model_request_end",
             processed_at=_CREATED_AT,
             model_request_start_id=f"{id_prefix}_span_start_1",
-            model_usage=BetaManagedAgentsSpanModelUsage(
-                cache_creation_input_tokens=0,
-                cache_read_input_tokens=0,
-                input_tokens=10,
-                output_tokens=5,
-            ),
+            model_usage=ma_model_usage(input_tokens=10, output_tokens=5),
         ),
         BetaManagedAgentsAgentMessageEvent(
             id=f"{id_prefix}_msg_1",

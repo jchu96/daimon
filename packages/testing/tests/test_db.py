@@ -37,15 +37,15 @@ async def test_db_engine_creates_engine(db_engine: AsyncEngine) -> None:
 
 @pytest.mark.asyncio
 async def test_db_session_provides_isolation(db_session: AsyncSession) -> None:
-    """db_session is an AsyncSession pinned to a per-test schema starting with 'test_'."""
+    """db_session is an AsyncSession pinned to the worker's schema, named test_*."""
     assert isinstance(db_session, AsyncSession), (
         "db_session fixture should provide an AsyncSession instance"
     )
-    # Verify schema-per-test isolation: current_schema() should start with 'test_'
+    # Verify the worker schema is in effect: current_schema() should start with 'test_'
     result = await db_session.execute(text("SELECT current_schema()"))
     schema_name: str = result.scalar_one()
     assert schema_name.startswith("test_"), (
-        f"db_session should be pinned to a per-test schema (got: {schema_name!r})"
+        f"db_session should be pinned to a worker test schema (got: {schema_name!r})"
     )
 
 

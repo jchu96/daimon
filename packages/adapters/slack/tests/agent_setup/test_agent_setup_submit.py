@@ -1390,7 +1390,7 @@ async def test_run_paste_secrets_submission_when_admin_and_two_pairs_posts_count
     from daimon.testing.factories import make_tenant
 
     # We need a Tenant row so put_agent_file's FK resolves. Seed it via a
-    # one-shot session from the factory (per-test schema isolation is active).
+    # one-shot session from the factory (the fixture kit wipes the worker schema between tests).
     async with db_session_factory() as session:
         tenant = await make_tenant(session, platform="slack", workspace_id=_TEAM_ID)
         tenant_id = tenant.id

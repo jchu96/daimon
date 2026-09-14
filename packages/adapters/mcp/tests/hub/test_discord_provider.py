@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import httpx
-import pytest
 from daimon.adapters.mcp.hub.discord_provider import DaimonDiscordProvider, fetch_discord_workspaces
 from daimon.testing.factories import make_tenant
 from key_value.aio.stores.memory import MemoryStore
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 
 def _discord_http(*, user_id: str, guilds: list[tuple[str, str]]) -> httpx.AsyncClient:

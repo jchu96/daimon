@@ -16,22 +16,13 @@ import pytest
 from anthropic.types.beta import (
     BetaEnvironment,
     BetaManagedAgentsAgent,
-    BetaManagedAgentsSession,
 )
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
-from anthropic.types.beta.beta_managed_agents_session_agent import BetaManagedAgentsSessionAgent
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
-)
-from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-    BetaManagedAgentsSpanModelUsage,
 )
 from cryptography.fernet import Fernet
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
 from daimon.core.config import McpSettings
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.errors import TurnError
 from daimon.core.github_credentials import build_multifernet
 from daimon.core.ma_identity import derive_agent_uuid
@@ -59,10 +50,16 @@ from daimon.core.turn.deps import TurnDeps
 from daimon.core.turn.errors import SessionBusyError
 from daimon.core.turn.prepare import PreparedTurn, bind_session
 from daimon.testing.ma import (
-    EMPTY_CLOUD_CONFIG,
     MARouter,
     build_fake_anthropic,
     make_fake_memory_store_handler,
+)
+from daimon.testing.ma_models import (
+    ma_agent,
+    ma_environment,
+    ma_model_usage,
+    ma_session,
+    ma_session_agent,
 )
 from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -74,47 +71,6 @@ from daimon.testing.factories import (  # isort: skip
 )
 
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
-
-
-def _agent(
-    *,
-    agent_id: str,
-    tenant_id: uuid.UUID,
-    name: str = "daimon",
-    model_id: str = "claude-sonnet-4-6",
-) -> BetaManagedAgentsAgent:
-    now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
-        id=agent_id,
-        type="agent",
-        name=name,
-        version=1,
-        model=BetaManagedAgentsModelConfig(id=model_id, speed="standard"),
-        system=None,
-        description=None,
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
-        created_at=now,
-        updated_at=now,
-        archived_at=None,
-    )
-
-
-def _env(*, env_id: str, tenant_id: uuid.UUID, name: str = "default") -> BetaEnvironment:
-    now_iso = datetime.now(UTC).isoformat()
-    return BetaEnvironment(
-        id=env_id,
-        type="environment",
-        name=name,
-        description="",
-        config=EMPTY_CLOUD_CONFIG,
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: name},
-        created_at=now_iso,
-        updated_at=now_iso,
-        archived_at=None,
-    )
 
 
 def _admission(
@@ -288,8 +244,8 @@ async def test_bind_session_reuses_live_row_when_reuse_existing_true_and_row_exi
     router = MARouter()
     router.add("POST", r"/v1/sessions", _explode)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -320,8 +276,8 @@ async def test_bind_session_creates_session_and_writes_mapping_when_no_live_row(
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -377,8 +333,8 @@ async def test_bind_session_always_creates_fresh_session_when_reuse_existing_fal
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -410,8 +366,8 @@ async def test_bind_session_recorder_writes_usage_event_matching_ma_session_id(
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -429,12 +385,7 @@ async def test_bind_session_recorder_writes_usage_event_matching_ma_session_id(
         id="evt_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=10,
-            output_tokens=20,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=10, output_tokens=20),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -490,7 +441,7 @@ async def test_bind_session_syncs_agent_mcp_credential_into_a_reused_session_vau
 
     public_url = "https://mcp.example.com/mcp"
     fernet = build_multifernet((Fernet.generate_key().decode(),))
-    agent = _agent(agent_id="ag_reuse", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_reuse", tenant_id=tenant.id)
     agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id="ag_reuse")
 
     # Someone else (the admin) attached the server and stored the token.
@@ -583,7 +534,7 @@ async def test_bind_session_syncs_agent_mcp_credential_into_a_reused_session_vau
         mcp=McpSettings(jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)),
     )
     admission = _admission(
-        account_id=account.id, agent=agent, env=_env(env_id="env_reuse", tenant_id=tenant.id)
+        account_id=account.id, agent=agent, env=ma_environment(id="env_reuse", tenant_id=tenant.id)
     )
 
     prepared = await bind_session(
@@ -646,8 +597,8 @@ async def test_bind_session_reuse_skips_mcp_sync_when_agent_has_no_stored_creden
     )
     admission = _admission(
         account_id=account.id,
-        agent=_agent(agent_id="ag_plain", tenant_id=tenant.id),
-        env=_env(env_id="env_plain", tenant_id=tenant.id),
+        agent=ma_agent(id="ag_plain", tenant_id=tenant.id),
+        env=ma_environment(id="env_plain", tenant_id=tenant.id),
     )
 
     prepared = await bind_session(
@@ -675,8 +626,8 @@ async def test_bind_session_fresh_bind_raises_ceiling_error_when_deadline_alread
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     past_deadline = datetime.now(UTC) - timedelta(seconds=5)
@@ -708,8 +659,8 @@ async def test_bind_session_ceiling_breach_leaves_no_orphan_mapping_row(
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     past_deadline = datetime.now(UTC) - timedelta(seconds=5)
@@ -764,8 +715,8 @@ async def test_bind_session_reuse_path_raises_ceiling_error_when_deadline_alread
 
     router.add("POST", r"/v1/sessions", _explode)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     past_deadline = datetime.now(UTC) - timedelta(seconds=5)
@@ -800,8 +751,8 @@ async def test_bind_session_default_deadline_none_still_succeeds_on_the_happy_pa
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -832,8 +783,8 @@ async def test_bind_session_with_generous_explicit_deadline_matches_no_deadline_
     session_bodies: list[dict[str, object]] = []
     router = _router_with_session_create(session_bodies=session_bodies)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id)
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id)
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     future_deadline = datetime.now(UTC) + timedelta(hours=1)
@@ -894,8 +845,8 @@ async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_mod
     router.add("GET", r"/v1/sessions/.*", _explode)
     deps = _deps(sessionmaker=db_session_factory, router=router)
     # The responder agent has since been moved to opus.
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id, model_id="claude-opus-5")
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id, model="claude-opus-5")
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -915,12 +866,7 @@ async def test_bind_recorder_bills_the_session_snapshot_model_when_the_agent_mod
         id="evt_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1_000_000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1_000_000, output_tokens=0),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -953,8 +899,8 @@ async def test_fresh_session_records_a_snapshot_with_fingerprints(
     deps = _deps(sessionmaker=db_session_factory, router=router)
     # The router's created session reports sonnet whatever we ask for, so an
     # opus agent here proves the recorded model is read off the response.
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id, model_id="claude-opus-5")
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id, model="claude-opus-5")
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -1025,30 +971,12 @@ async def test_legacy_row_without_snapshot_is_backfilled_with_one_retrieve(
     assert row.effective_config is None, "the legacy shape is a row with no recorded configuration"
 
     now = datetime.now(UTC)
-    observed = BetaManagedAgentsSession(
+    observed = ma_session(
         id="sess_legacy",
-        type="session",
-        agent=BetaManagedAgentsSessionAgent(
-            id="ag_1",
-            type="agent",
-            name="daimon",
-            version=3,
-            model=BetaManagedAgentsModelConfig(id="claude-haiku-4-5"),
-            mcp_servers=[],
-            skills=[],
-            tools=[],
-            system=None,
-        ),
-        created_at=now,
-        updated_at=now,
+        agent=ma_session_agent(id="ag_1", name="daimon", version=3, model="claude-haiku-4-5"),
         environment_id="env_legacy",
-        metadata={},
-        outcome_evaluations=[],
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        usage=BetaManagedAgentsSessionUsage(),
         vault_ids=["vlt_legacy"],
+        created_at=now,
     )
     retrieves: list[str] = []
 
@@ -1063,8 +991,8 @@ async def test_legacy_row_without_snapshot_is_backfilled_with_one_retrieve(
     router.add("GET", r"/v1/sessions/sess_legacy", _retrieve)
     router.add("POST", r"/v1/sessions", _explode)
     deps = _deps(sessionmaker=db_session_factory, router=router)
-    agent = _agent(agent_id="ag_1", tenant_id=tenant.id, model_id="claude-opus-5")
-    env = _env(env_id="env_1", tenant_id=tenant.id)
+    agent = ma_agent(id="ag_1", tenant_id=tenant.id, model="claude-opus-5")
+    env = ma_environment(id="env_1", tenant_id=tenant.id)
     admission = _admission(account_id=account.id, agent=agent, env=env)
 
     prepared = await bind_session(
@@ -1102,12 +1030,7 @@ async def test_legacy_row_without_snapshot_is_backfilled_with_one_retrieve(
         id="evt_legacy",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=1_000_000,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(input_tokens=1_000_000, output_tokens=0),
         processed_at=datetime.now(UTC),
         type="span.model_request_end",
     )
@@ -1158,8 +1081,8 @@ async def test_bind_session_raises_session_busy_when_a_handoff_lands_mid_turn(
     deps = _deps(sessionmaker=db_session_factory, router=router)
     destination = Admission(
         account_id=account.id,
-        agent=_agent(agent_id="ag_destination", tenant_id=tenant.id, name="research-bot"),
-        environment=_env(env_id="env_1", tenant_id=tenant.id),
+        agent=ma_agent(id="ag_destination", tenant_id=tenant.id, name="research-bot"),
+        environment=ma_environment(id="env_1", tenant_id=tenant.id),
         config=ResolvedConfig(
             agent_name="research-bot",
             environment_name="default",

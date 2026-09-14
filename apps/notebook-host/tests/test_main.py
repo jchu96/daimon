@@ -25,8 +25,6 @@ set_unjailed_test_env: Callable[[pytest.MonkeyPatch], None] = runpy.run_path(
     str(Path(__file__).parent / "conftest.py")
 )["set_unjailed_test_env"]
 
-pytestmark = pytest.mark.asyncio
-
 
 def _make_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, alive: bool = True

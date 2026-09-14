@@ -44,11 +44,10 @@ from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault, TenantScopeRef
 from daimon.core.specs import AgentSpec
 from daimon.core.stores import scoped_config_write
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_fake_anthropic, build_stub_anthropic, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 # `make_tenant` derives the tenant id from `workspace_id` the exact same way
 # `derive_tenant_uuid(platform="discord", workspace_id=str(interaction.guild_id))`
@@ -122,20 +121,10 @@ def _make_agent(
     metadata = {"daimon_tenant": str(tenant_id)}
     if managed:
         metadata["daimon_managed"] = "true"
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=ma_agent_id,
-        type="agent",
         name=name,
-        model={"id": "claude-sonnet-4-6"},
         metadata=metadata,
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     )
 
 

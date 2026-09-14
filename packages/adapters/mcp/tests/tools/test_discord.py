@@ -58,8 +58,6 @@ _post_credential_button_impl = (
     _discord_mod._post_credential_button_impl  # pyright: ignore[reportPrivateUsage]
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 # ---------------------------------------------------------------------------
 # Tiny aiohttp fake used by the two attachment-streaming tests.

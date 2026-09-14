@@ -35,7 +35,6 @@ from daimon.core.continuity.messages import (
     render_responder_changed_without_handoff,
     render_unexpected_loss,
 )
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_identity import derive_tenant_uuid
@@ -59,44 +58,13 @@ from daimon.core.turn.prepare import ContinuityOutcome, PreparedTurn
 from daimon.core.turn.run import RunOutcome
 from daimon.core.turn.state import TextBlock, TurnState
 from daimon.core.turn_origin import turn_origin as real_turn_origin
-from daimon.testing.ma import (
-    _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]
-)
-from daimon.testing.ma import (
-    _environment_response as _environment_response,  # pyright: ignore[reportPrivateUsage]
-)
-from daimon.testing.ma import build_fake_anthropic
+from daimon.testing import build_fake_anthropic, ma_agent, ma_environment, resolved_agent_env_router
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from yarl import URL
 
 _AGENT_ID = "agent_continuity_test"
 _ENV_ID = "env_continuity_test"
-
-
-def _make_agent_env_handler(tenant_id_str: str) -> Any:
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if request.method == "GET" and path == f"/v1/agents/{_AGENT_ID}":
-            return httpx.Response(
-                200,
-                json=_agent_response(
-                    agent_id=_AGENT_ID,
-                    metadata={
-                        MA_METADATA_KEY_TENANT: tenant_id_str,
-                        MA_METADATA_KEY_NAME: "uat-agent",
-                    },
-                ),
-            )
-        if request.method == "GET" and path == f"/v1/environments/{_ENV_ID}":
-            env = _environment_response(
-                environment_id=_ENV_ID,
-                metadata={MA_METADATA_KEY_TENANT: tenant_id_str, MA_METADATA_KEY_NAME: "test-env"},
-            )
-            return httpx.Response(200, json=env.model_dump(mode="json"))
-        raise AssertionError(f"_make_agent_env_handler: unhandled {request.method} {path}")
-
-    return handler
 
 
 def _make_app(sessionmaker: async_sessionmaker[AsyncSession], *, tenant_id_str: str) -> SlackApp:
@@ -109,7 +77,12 @@ def _make_app(sessionmaker: async_sessionmaker[AsyncSession], *, tenant_id_str: 
     settings.defaults_root = MagicMock()
     settings.billing.markup = Decimal("1.0")
 
-    anthropic_client = build_fake_anthropic(_make_agent_env_handler(tenant_id_str))
+    anthropic_client = build_fake_anthropic(
+        resolved_agent_env_router(
+            ma_agent(id=_AGENT_ID, name="uat-agent", tenant_id=tenant_id_str),
+            ma_environment(id=_ENV_ID, name="test-env", tenant_id=tenant_id_str),
+        ).dispatch
+    )
     deployment_default = DeploymentDefault(agent_name="uat-agent", environment_name="test-env")
     resolver_cache = new_resolver_cache()
     turn_deps = build_turn_deps(

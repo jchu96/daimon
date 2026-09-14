@@ -9,20 +9,18 @@ from typing import Any
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaManagedAgentsSession
 from daimon.adapters.mcp.hub.app import build_hub_app
 from daimon.adapters.mcp.hub.claims import encode_hub_claims
 from daimon.core.defaults.metadata import MA_METADATA_KEY_ACCOUNT
 from daimon.core.hub_identity import HubTenant
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.testing import AGENT_ID, build_turn_router, ma_session
 from daimon.testing.factories import make_ledger_entry, make_platform_principal, make_tenant
 from daimon.testing.ma import build_fake_anthropic, list_response, session_response
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .test_turn_parity import AGENT_ID, _call_tool, _runtime, build_turn_router
-
-pytestmark = pytest.mark.asyncio
+from .test_turn_parity import _call_tool, _runtime
 
 _TOKEN = "tok"
 _HANDLE = "ses_wrap_001"
@@ -37,33 +35,11 @@ def _foreign_daimon_id() -> str:
 
 
 def _session_payload(session_id: str, *, account_id: str) -> dict[str, Any]:
-    return BetaManagedAgentsSession.model_validate(
-        {
-            "id": session_id,
-            "type": "session",
-            "agent": {
-                "id": AGENT_ID,
-                "name": "test-agent",
-                "version": 1,
-                "type": "agent",
-                "model": {"id": "claude-sonnet-4-6"},
-                "mcp_servers": [],
-                "skills": [],
-                "tools": [],
-            },
-            "archived_at": None,
-            "created_at": "2026-06-23T00:00:00Z",
-            "updated_at": "2026-06-23T00:00:00Z",
-            "outcome_evaluations": [],
-            "environment_id": "env_parity_test",
-            "metadata": {MA_METADATA_KEY_ACCOUNT: account_id},
-            "resources": [],
-            "stats": {},
-            "status": "idle",
-            "title": None,
-            "usage": {},
-            "vault_ids": [],
-        }
+    return ma_session(
+        id=session_id,
+        agent_id=AGENT_ID,
+        environment_id="env_parity_test",
+        metadata={MA_METADATA_KEY_ACCOUNT: account_id},
     ).model_dump(mode="json")
 
 

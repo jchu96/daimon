@@ -24,8 +24,6 @@ from daimon.testing.ma import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_cold_path_creates_store_and_binding(
     db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]

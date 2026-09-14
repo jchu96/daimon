@@ -17,7 +17,6 @@ from typing import Any
 
 import httpx
 import pytest
-from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.core.config import ReportHostSettings
 from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_NAME,
@@ -39,10 +38,9 @@ from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.mcp_tokens import get_mcp_token, list_live_tokens_by_label
 from daimon.testing.factories import make_account, make_mcp_token, make_tenant
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
+from daimon.testing.ma_models import ma_agent
 from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=UTC)
 _JWT_SECRET = b"jwt-shared-secret-well-over-the-32-byte-minimum"
@@ -67,23 +65,12 @@ def _source_agent_dict(
         MA_METADATA_KEY_NAME: name,
         MA_METADATA_KEY_SPEC_HASH: spec_hash,
     }
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": id_,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-sonnet-4-6"},
-            "metadata": metadata,
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-06-01T00:00:00Z",
-            "updated_at": "2026-06-01T00:00:00Z",
-            "version": version,
-            "mcp_servers": [],
-            "skills": [],
-            "tools": [],
-            "system": "You are alpha, a data analyst.",
-        }
+    return ma_agent(
+        id=id_,
+        name=name,
+        metadata=metadata,
+        system="You are alpha, a data analyst.",
+        version=version,
     ).model_dump(mode="json")
 
 
@@ -153,27 +140,14 @@ def _add_create_route(router: MARouter, captured: dict[str, Any], *, reader_id: 
 def _reader_agent_dict(
     *, id_: str, name: str, tenant_id: uuid.UUID, metadata: dict[str, str], version: int = 1
 ) -> dict[str, Any]:
-    return BetaManagedAgentsAgent.model_validate(
-        {
-            "id": id_,
-            "type": "agent",
-            "name": name,
-            "model": {"id": "claude-sonnet-4-6"},
-            "metadata": {
-                MA_METADATA_KEY_TENANT: str(tenant_id),
-                MA_METADATA_KEY_NAME: name,
-                **metadata,
-            },
-            "description": None,
-            "archived_at": None,
-            "created_at": "2026-06-01T00:00:00Z",
-            "updated_at": "2026-06-01T00:00:00Z",
-            "version": version,
-            "mcp_servers": [],
-            "skills": [{"type": "custom", "skill_id": "sk_reader_resolved", "version": "1"}],
-            "tools": [],
-            "system": "",
-        }
+    return ma_agent(
+        id=id_,
+        name=name,
+        tenant_id=tenant_id,
+        metadata=metadata,
+        system="",
+        skills=[{"type": "custom", "skill_id": "sk_reader_resolved", "version": "1"}],
+        version=version,
     ).model_dump(mode="json")
 
 
