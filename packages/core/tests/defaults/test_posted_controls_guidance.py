@@ -176,6 +176,30 @@ def test_reply_shape_posts_the_card_before_any_clarifying_question() -> None:
         )
 
 
+def test_reply_shape_scopes_pending_task_to_work_that_runs_after_the_save() -> None:
+    """A save-only request ends at the card: no pending_task, so no billed continuation."""
+    for label, section in _reply_shape_sections():
+        assert "omit `pending_task`" in section, (
+            f"{label} must tell the model to omit pending_task when the person only asked "
+            "to add, save or replace a key and named no further work"
+        )
+        assert "Never put the key request itself in `pending_task`" in section, (
+            f"{label} must forbid passing the key request back as the waiting task"
+        )
+        assert "nothing runs after the save" in section, (
+            f"{label} must say a save-only request ends at the card with nothing running after it"
+        )
+
+
+def test_reply_shape_keeps_tool_names_out_of_the_reply() -> None:
+    """D24-QA-07: `request_agent_key` reached the person as an instruction in prose."""
+    for label, section in _reply_shape_sections():
+        assert "Never name a tool" in section, (
+            f"{label} must forbid naming a tool in the reply; tools are how the agent acts, "
+            "not what it says"
+        )
+
+
 def test_reply_shape_forbids_describing_a_form_that_was_not_posted() -> None:
     """D24-QA-06: the agent told the person about a key-request form it never posted."""
     for label, section in _reply_shape_sections():
