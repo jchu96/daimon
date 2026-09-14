@@ -979,13 +979,127 @@ async def test_mcp_modal_disables_the_button_even_when_the_write_below_it_fails(
     await modal.on_submit(interaction)
 
     edits = _card_edits(interaction)
-    assert len(edits) == 1 and RECEIVED_FOOTER in _card_text(edits[0]), (
+    assert RECEIVED_FOOTER in _card_text(edits[0]), (
         "a consumed request moves its card to received regardless of the write's outcome"
     )
     assert _card_buttons(edits[0]) == [], "the received card offers no button to click again"
+    assert "Nothing was saved for tester." in _card_text(edits[-1]), (
+        "a card left on 'Saving…' would describe a save that has already stopped"
+    )
     message = interaction.followup.send.call_args.args[0]
     assert "saving the MCP token did not finish" in message, "the failure must still be reported"
     assert "APIConnectionError" not in message, "exception classes stay in operator logs"
+    async with db_session_factory() as session:
+        persisted = await peek_credential_request(session, token=row.token)
+    assert persisted is not None and persisted.outcome == "write_failed", (
+        "the spent request records that nothing was written"
+    )
+    assert await _queued_continuation(db_session_factory, row) is None, (
+        "no turn may resume on a token that never reached a store"
+    )
+
+
+async def test_mcp_missing_server_url_records_write_failed_rather_than_staying_pending(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A row that lost the server it named cannot be saved against anything.
+
+    The consume already happened, so the request has to end somewhere: it
+    ends as `write_failed`, and no continuation is queued, because there is
+    no connection for a waiting turn to use.
+    """
+    row = await _seed_mcp_request(db_session_factory, mcp_server_url=None)
+    runtime = _runtime(
+        sessionmaker=db_session_factory,
+        anthropic=build_stub_anthropic(
+            _vault_handler(
+                "vlt_no_url",
+                f"daimon-mcp:{row.account_id}:{row.agent_id}",
+                [],
+                tenant_id=str(row.tenant_id),
+            )
+        ),
+        public_url=HttpUrl("https://mcp.example.com/mcp"),
+        jwt_secret="x" * 32,
+    )
+    modal = McpCredentialModal(runtime=runtime, request_row=row)
+    modal.token_input._value = _MCP_TOKEN  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _interaction()
+    await modal.on_submit(interaction)
+
+    assert "missing its server URL" in _sent_message(interaction), (
+        "the submitter is still told why nothing happened"
+    )
+    async with db_session_factory() as session:
+        persisted = await peek_credential_request(session, token=row.token)
+    assert persisted is not None and persisted.outcome == "write_failed", (
+        "the spent request must not sit with no recorded outcome"
+    )
+    assert await _queued_continuation(db_session_factory, row) is None, (
+        "nothing was saved, so no turn is owed"
+    )
+
+
+async def test_mcp_agent_gone_after_the_vault_write_renders_partial(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The token landed; the agent it was for did not survive the form.
+
+    Same shape as the attach failure below it — the save is real, the
+    connection is not — so the card is `partial` rather than a refusal, and
+    the continuation carries no work.
+    """
+    row = await _seed_mcp_request(
+        db_session_factory, with_origin=True, requested_work="pull this week's open issues"
+    )
+    vault = _vault_handler(
+        "vlt_agent_gone",
+        f"daimon-mcp:{row.account_id}:{row.agent_id}",
+        [],
+        tenant_id=str(row.tenant_id),
+    )
+
+    # The agent survives the pre-consume target check and is gone by the time
+    # the attach looks it up — the only window in which this branch is real.
+    lookups = 0
+
+    def _agent_gone(request: httpx.Request) -> httpx.Response:
+        nonlocal lookups
+        if request.method == "GET" and request.url.path == "/v1/agents":
+            lookups += 1
+            if lookups > 1:
+                return httpx.Response(200, json={"data": [], "has_more": False})
+        return vault(request)
+
+    runtime = _runtime(
+        sessionmaker=db_session_factory,
+        anthropic=build_stub_anthropic(_agent_gone),
+        public_url=HttpUrl("https://mcp.example.com/mcp"),
+        jwt_secret="x" * 32,
+    )
+    modal = McpCredentialModal(runtime=runtime, request_row=row)
+    modal.token_input._value = _MCP_TOKEN  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _card_interaction()
+    await modal.on_submit(interaction)
+
+    card = _card_text(_card_edits(interaction)[-1])
+    assert "linear token saved for tester." in card, "the card must credit what was saved"
+    assert "The connection did not finish, so its tools are not available yet." in card, (
+        "and must not claim a connection nothing could attach"
+    )
+    assert RECEIVED_FOOTER not in card, "the card must not stay on 'Saving…'"
+    async with db_session_factory() as session:
+        persisted = await peek_credential_request(session, token=row.token)
+    assert persisted is not None and persisted.outcome == "write_failed", (
+        "a connection that was never attached is not an applied request"
+    )
+    queued = await _queued_continuation(db_session_factory, row)
+    assert queued is not None, "the spent request is still recorded for the trail"
+    assert queued.requested_work is None, (
+        "the waiting work must not resume against tools that are not connected"
+    )
 
 
 async def test_mcp_modal_never_logs_the_raw_token(

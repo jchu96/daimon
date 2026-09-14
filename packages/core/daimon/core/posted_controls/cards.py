@@ -68,7 +68,16 @@ CardState = Literal[
 #: `env_file` is a bulk upload of one .env file; the other four match the
 #: single-value request kinds in `daimon.core.credential_requests`.
 CardKind = Literal["env", "env_file", "mcp", "repo", "skill_repo"]
-RefusalReason = Literal["admin_required", "replacement_admin_required", "env_file_invalid"]
+RefusalReason = Literal[
+    "admin_required",
+    "replacement_admin_required",
+    "env_file_invalid",
+    #: Nothing was saved because the thing being configured is gone or
+    #: misconfigured — the agent no longer resolves, or the request row lost
+    #: the server it named. Deliberately not an error string: the person who
+    #: filled in the form did nothing wrong, and asking again is the way out.
+    "target_unavailable",
+]
 
 #: `requested` footer, with the two placeholders each renderer fills from
 #: `requester_platform_user_id` and `expires_at_unix`.
@@ -323,6 +332,11 @@ def _refusal_content(
             f"🛡️ {target} was not replaced for {agent_name}.",
             f"An admin can ask {responder_name} to replace {target} on {agent_name}.",
             "The existing key is unchanged.",
+        )
+    if refusal == "target_unavailable":
+        return (
+            f"🛡️ Nothing was saved for {agent_name}.",
+            f"{agent_name} is not available right now. Ask {responder_name} again.",
         )
     if not refusal_lines:
         raise ValueError("refusal='env_file_invalid' requires refusal_lines")

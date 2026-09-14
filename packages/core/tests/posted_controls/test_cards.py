@@ -353,6 +353,19 @@ def test_replacement_refusal_names_the_key_it_did_not_replace() -> None:
     ), "a refused replacement states the next step and that nothing changed"
 
 
+def test_target_unavailable_refusal_says_nothing_was_saved_and_how_to_ask_again() -> None:
+    card = build("mcp", "refused", refusal="target_unavailable")
+
+    assert card.headline == f"🛡️ Nothing was saved for {AGENT}.", (
+        "the person who filled in the form must not be left guessing what landed"
+    )
+    assert card.facts == (
+        f"{AGENT} is not available right now. Ask {RESPONDER} again.",
+        # No blame and no error string: the target went away, the submitter
+        # did nothing wrong, and asking again is the whole remedy.
+    ), "a target that is gone offers the one way forward there is"
+
+
 def test_env_file_refusal_shows_the_supplied_reasons_verbatim() -> None:
     reasons = ("Line 4: no = sign.", "Line 9: key name has a space.")
 
