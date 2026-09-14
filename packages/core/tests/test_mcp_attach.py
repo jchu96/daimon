@@ -10,9 +10,11 @@ must ALWAYS produce — a returned server list is worthless if its matching
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from anthropic.types.beta import BetaManagedAgentsAgent
+from anthropic.types.beta.beta_managed_agents_agent import Tool
 from anthropic.types.beta.beta_managed_agents_agent_toolset20260401 import (
     BetaManagedAgentsAgentToolset20260401,
 )
@@ -57,7 +59,7 @@ def _mcp_toolset(server_name: str) -> BetaManagedAgentsMCPToolset:
 def _agent(
     *,
     mcp_servers: list[dict[str, str]],
-    tools: list[object],
+    tools: Sequence[Tool],
 ) -> BetaManagedAgentsAgent:
     now = datetime(2026, 8, 7, tzinfo=UTC)
     return ma_agent(
