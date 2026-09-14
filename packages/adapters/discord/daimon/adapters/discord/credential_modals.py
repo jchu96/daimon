@@ -33,12 +33,15 @@ and writes nothing.
 
 Every `on_submit` acks with a bare `defer()`, never `thinking=True`. On a
 modal opened from a component click that is a `deferred_message_update`,
-whose `@original` is the message the button lives on — which is what lets
-`_mark_button_consumed` disable the button in place once the row is spent.
-`thinking=True` would point `@original` at a fresh ephemeral instead and the
-edit would land there, the defect `agent_setup/credentials.py` already fixed
-on the setup panel. Ephemeral followups still work after this ack, so every
-validation, error and success toast below is unchanged.
+whose `@original` is the message the button lives on. `thinking=True` would
+point `@original` at a fresh ephemeral instead, the defect
+`agent_setup/credentials.py` already fixed on the setup panel. Ephemeral
+followups still work after this ack, so every validation, error and success
+toast below is unchanged. The posted card itself is re-rendered by message
+id (`posted_controls.edit_posted_card`), not through `@original`, so it
+moves to its `received` state the moment the consume commits — before the
+vault/binding/import below is known to have worked, and still correct when
+one of those fails.
 
 `RepoBindModal`'s write is additionally admin-gated on a shared agent: token
 consumption alone is sufficient authorization for an env secret or an MCP
@@ -74,6 +77,7 @@ from daimon.adapters.discord.credential_repo_bind import (
     refuse_if_shared_and_not_admin_for_request,
     resolve_repo_binding_credential,
 )
+from daimon.adapters.discord.posted_controls import edit_posted_card
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
@@ -98,47 +102,6 @@ import discord
 _log = structlog.get_logger()
 
 _NO_LONGER_VALID = "This request is no longer valid — ask again."
-
-_CONSUMED_BUTTON_LABEL = "✓ Received"
-"""Replaces the request's own label once the row is consumed. Deliberately
-kind-agnostic and about the SUBMISSION rather than the write: this runs the
-moment the consume commits, before the vault/binding/import below it is known
-to have worked, and one of those failing still leaves the button dead."""
-
-
-async def _mark_button_consumed(
-    interaction: discord.Interaction, *, kind: str, row: CredentialRequestRow
-) -> None:
-    """Swap the request's button for a disabled confirmation, in place.
-
-    The bare `defer()` every `on_submit` opens with makes this interaction's
-    `@original` the message the button lives on (`deferred_message_update`),
-    so this edit lands on the button itself rather than on a fresh ephemeral —
-    the same ack shape `agent_setup/credentials.py` uses to land its paste
-    re-render on the panel.
-
-    Called once the row is durably consumed. From that point the button can
-    only ever be refused by `interaction_check`, so leaving it looking live
-    invites a click that cannot succeed, and leaves a thread with no durable
-    record that the credential was ever supplied — the ephemeral reply is
-    gone on refresh and was never visible to anyone else.
-    """
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button[discord.ui.View](label=_CONSUMED_BUTTON_LABEL, disabled=True))
-    try:
-        if row.origin_thread_id is not None and row.posted_message_id is not None:
-            channel = interaction.client.get_partial_messageable(int(row.origin_thread_id))
-            await channel.get_partial_message(int(row.posted_message_id)).edit(view=view)
-        else:
-            await interaction.edit_original_response(view=view)
-    except discord.HTTPException as err:
-        # The consume already committed. A confirmation edit that fails
-        # (message deleted, thread archived, permissions lost) must not read
-        # as a failed submission — the ephemeral reply still carries the
-        # outcome, so this is a downgrade in feedback, not in correctness.
-        _log.warning(
-            "credential_modal.consumed_edit_failed", kind=kind, err_type=type(err).__name__
-        )
 
 
 class EnvCredentialModal(discord.ui.Modal, title="Add key"):
@@ -209,7 +172,7 @@ class EnvCredentialModal(discord.ui.Modal, title="Add key"):
         # After the transaction, not inside it: the consume and the file write
         # commit together here, so this is the first point the row is durably
         # spent, and it keeps a Discord round trip out of an open transaction.
-        await _mark_button_consumed(interaction, kind="env", row=consumed_row)
+        await edit_posted_card(interaction.client, row=consumed_row, state="received")
         agent = await find_agent_by_derived_uuid(
             self._runtime.anthropic,
             tenant_id=consumed_row.tenant_id,
@@ -275,7 +238,7 @@ class McpCredentialModal(discord.ui.Modal, title="Add MCP token"):
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
 
-        await _mark_button_consumed(interaction, kind="mcp", row=consumed_row)
+        await edit_posted_card(interaction.client, row=consumed_row, state="received")
 
         mcp_server_url = consumed_row.mcp_server_url
         if mcp_server_url is None:
@@ -451,7 +414,7 @@ class SkillRepoModal(discord.ui.Modal, title="Import skills"):
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
 
-        await _mark_button_consumed(interaction, kind="skill_repo", row=consumed_row)
+        await edit_posted_card(interaction.client, row=consumed_row, state="received")
 
         url, branch, path = split_skill_repo_target(consumed_row.target)
         # The token appears only as a masked tail, never in full, and never
@@ -687,7 +650,7 @@ class RepoBindModal(discord.ui.Modal, title="Bind repo"):
             await interaction.followup.send(_NO_LONGER_VALID, ephemeral=True)
             return
 
-        await _mark_button_consumed(interaction, kind="repo", row=consumed_row)
+        await edit_posted_card(interaction.client, row=consumed_row, state="received")
 
         # Log the repo and branch, and the token ONLY as a masked tail when
         # present — never the plain value, never the (now-consumed) request

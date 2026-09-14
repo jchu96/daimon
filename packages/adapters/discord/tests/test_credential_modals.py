@@ -46,6 +46,7 @@ from daimon.core.github_credentials import build_multifernet
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
+from daimon.core.posted_controls import RECEIVED_FOOTER
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.agent_repo_binding import get_binding
@@ -312,6 +313,7 @@ async def _seed_mcp_request(
     db_session_factory: async_sessionmaker[AsyncSession],
     *,
     mcp_server_url: str = "https://ext.example.com/mcp",
+    with_origin: bool = False,
 ) -> CredentialRequestRow:
     token = mint_request_token()
     async with db_session_factory() as session, session.begin():
@@ -329,7 +331,11 @@ async def _seed_mcp_request(
             target="linear",
             mcp_server_url=mcp_server_url,
             requester_platform_user_id="100000000000000001",
-            channel_id="chan-1",
+            channel_id="333" if with_origin else "chan-1",
+            platform="discord" if with_origin else None,
+            parent_channel_id="222" if with_origin else None,
+            origin_thread_id="333" if with_origin else None,
+            posted_message_id="444" if with_origin else None,
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
             idempotency_key=uuid.uuid4(),
             target_ma_agent_id="ag_test",
@@ -349,18 +355,44 @@ def _interaction() -> MagicMock:
     return interaction
 
 
-def _consumed_button_labels(interaction: MagicMock) -> list[str]:
-    """Labels of the disabled buttons the modal edited onto the request message."""
-    labels: list[str] = []
-    for call in interaction.edit_original_response.call_args_list:
-        view = call.kwargs.get("view")
-        if view is None:
-            continue
-        for item in view.children:
-            if isinstance(item, discord.ui.Button):
-                labels.append(str(item.label))
-                assert item.disabled, "the confirmation button must be disabled"
-    return labels
+def _card_interaction() -> MagicMock:
+    """A modal submit shaped like one on a row seeded `with_origin=True`.
+
+    `is_credential_interaction_valid` compares the thread, parent and posted
+    message against the row, so a card-carrying row needs an interaction that
+    agrees with it; the partial-message chain is the seam
+    `edit_posted_card` re-renders the card through.
+    """
+    interaction = _interaction()
+    interaction.type = discord.InteractionType.modal_submit
+    interaction.message = None
+    interaction.channel_id = 333
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.parent_id = 222
+    _partial_card(interaction).edit = AsyncMock()
+    return interaction
+
+
+def _partial_card(interaction: MagicMock) -> MagicMock:
+    """The partial message `edit_posted_card` re-renders, off the mock chain."""
+    channel = interaction.client.get_partial_messageable.return_value
+    return channel.get_partial_message.return_value  # pyright: ignore[reportAny]
+
+
+def _card_edits(interaction: MagicMock) -> list[discord.ui.LayoutView]:
+    """Every view the modal re-rendered the request's own card with."""
+    return [call.kwargs["view"] for call in _partial_card(interaction).edit.call_args_list]
+
+
+def _card_text(view: discord.ui.LayoutView) -> str:
+    """All text the rendered card shows, newline-joined."""
+    return "\n".join(
+        item.content for item in view.walk_children() if isinstance(item, discord.ui.TextDisplay)
+    )
+
+
+def _card_buttons(view: discord.ui.LayoutView) -> list[discord.ui.Button[Any]]:
+    return [item for item in view.walk_children() if isinstance(item, discord.ui.Button)]
 
 
 # --- EnvCredentialModal ------------------------------------------------------
@@ -388,70 +420,76 @@ async def test_env_modal_submit_consumes_token_and_writes_agent_file(
     assert _SECRET_VALUE not in toast, "confirmation never echoes the secret value"
 
 
-async def test_env_modal_successful_submit_disables_the_request_button(
+async def test_env_modal_successful_submit_edits_the_card_into_the_received_state(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    row = await _seed_env_request(db_session_factory, target="STRIPE_KEY")
+    row = await _seed_env_request(db_session_factory, target="STRIPE_KEY", with_origin=True)
     runtime = _runtime(sessionmaker=db_session_factory)
     modal = EnvCredentialModal(runtime=runtime, request_row=row)
     modal.value_input._value = _SECRET_VALUE  # pyright: ignore[reportPrivateUsage]
 
-    interaction = _interaction()
+    interaction = _card_interaction()
     await modal.on_submit(interaction)
 
     interaction.response.defer.assert_awaited_once_with()
-    assert _consumed_button_labels(interaction) == ["✓ Received"], (
-        "a spent request must leave a disabled confirmation on the button's own message"
+    edits = _card_edits(interaction)
+    assert len(edits) == 1, "a spent request must re-render its own card exactly once"
+    assert RECEIVED_FOOTER in _card_text(edits[0]), (
+        "the received card must say the value arrived and is being saved"
     )
+    assert _card_buttons(edits[0]) == [], "a spent request must offer no button to click again"
 
 
 async def test_env_modal_rejected_value_leaves_the_request_button_live(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    row = await _seed_env_request(db_session_factory, target="NEVER_SET")
+    row = await _seed_env_request(db_session_factory, target="NEVER_SET", with_origin=True)
     runtime = _runtime(sessionmaker=db_session_factory)
     modal = EnvCredentialModal(runtime=runtime, request_row=row)
     modal.value_input._value = "   "  # pyright: ignore[reportPrivateUsage]
 
-    interaction = _interaction()
+    interaction = _card_interaction()
     await modal.on_submit(interaction)
 
     interaction.edit_original_response.assert_not_awaited()
-    assert _consumed_button_labels(interaction) == [], (
-        "nothing was consumed, so the button must stay clickable for a real value"
+    assert _card_edits(interaction) == [], (
+        "nothing was consumed, so the card must stay in its requested state"
     )
 
 
 async def test_env_modal_dead_request_does_not_touch_the_button(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    row = await _seed_env_request(db_session_factory, target="ONE_SHOT")
+    row = await _seed_env_request(db_session_factory, target="ONE_SHOT", with_origin=True)
     runtime = _runtime(sessionmaker=db_session_factory)
 
     first = EnvCredentialModal(runtime=runtime, request_row=row)
     first.value_input._value = "first-value"  # pyright: ignore[reportPrivateUsage]
-    await first.on_submit(_interaction())
+    await first.on_submit(_card_interaction())
 
     second = EnvCredentialModal(runtime=runtime, request_row=row)
     second.value_input._value = "second-value"  # pyright: ignore[reportPrivateUsage]
-    second_interaction = _interaction()
+    second_interaction = _card_interaction()
     await second.on_submit(second_interaction)
 
-    # The resubmission consumed nothing, so it must not redraw the button.
+    # The resubmission consumed nothing, so it must not redraw the card.
     second_interaction.edit_original_response.assert_not_awaited()
+    assert _card_edits(second_interaction) == [], (
+        "a resubmission on a spent request must leave the card as the first one left it"
+    )
 
 
 async def test_env_modal_reports_success_even_when_the_button_edit_fails(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    row = await _seed_env_request(db_session_factory, target="EDIT_FAILS")
+    row = await _seed_env_request(db_session_factory, target="EDIT_FAILS", with_origin=True)
     runtime = _runtime(sessionmaker=db_session_factory)
     modal = EnvCredentialModal(runtime=runtime, request_row=row)
     modal.value_input._value = _SECRET_VALUE  # pyright: ignore[reportPrivateUsage]
 
-    interaction = _interaction()
-    interaction.edit_original_response = AsyncMock(
+    interaction = _card_interaction()
+    _partial_card(interaction).edit = AsyncMock(
         side_effect=discord.HTTPException(MagicMock(), "message deleted")
     )
     await modal.on_submit(interaction)
@@ -849,7 +887,7 @@ async def test_mcp_modal_disables_the_button_even_when_the_write_below_it_fails(
             return list_response([agent.model_dump(mode="json")])
         raise httpx.ConnectError("upstream reset by peer")
 
-    row = await _seed_mcp_request(db_session_factory)
+    row = await _seed_mcp_request(db_session_factory, with_origin=True)
     runtime = _runtime(
         sessionmaker=db_session_factory,
         anthropic=build_stub_anthropic(_failing_vault),
@@ -859,12 +897,14 @@ async def test_mcp_modal_disables_the_button_even_when_the_write_below_it_fails(
     modal = McpCredentialModal(runtime=runtime, request_row=row)
     modal.token_input._value = _MCP_TOKEN  # pyright: ignore[reportPrivateUsage]
 
-    interaction = _interaction()
+    interaction = _card_interaction()
     await modal.on_submit(interaction)
 
-    assert _consumed_button_labels(interaction) == ["✓ Received"], (
-        "a consumed request disables its button regardless of the write's outcome"
+    edits = _card_edits(interaction)
+    assert len(edits) == 1 and RECEIVED_FOOTER in _card_text(edits[0]), (
+        "a consumed request moves its card to received regardless of the write's outcome"
     )
+    assert _card_buttons(edits[0]) == [], "the received card offers no button to click again"
     message = interaction.followup.send.call_args.args[0]
     assert "saving the MCP token did not finish" in message, "the failure must still be reported"
     assert "APIConnectionError" not in message, "exception classes stay in operator logs"

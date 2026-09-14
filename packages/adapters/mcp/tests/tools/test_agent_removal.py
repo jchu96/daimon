@@ -758,23 +758,105 @@ async def test_remove_agent_key_impl_raises_when_agent_not_found(
         )
 
 
-async def test_remove_agent_key_impl_callable_by_non_admin_on_default_agent(
+async def _seed_key_on_default_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: str,
+    key: str,
+) -> uuid.UUID:
+    """A tenant whose default agent is `scoped-agent`, holding one stored key."""
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    async with db_session_factory() as session, session.begin():
+        await put_agent_file(
+            session,
+            tenant_id=tenant_id,
+            agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_id),
+            key=key,
+            content="v1",
+            set_by_account_id=None,
+        )
+    return tenant_id
+
+
+async def test_remove_agent_key_impl_refuses_non_admin_on_default_agent_and_deletes_nothing(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Adding a key is open; taking one away from everyone is not. The key has
+    to survive the refusal — a gate that refuses after deleting is no gate."""
+    account_id = uuid.uuid4()
+    tenant_id = await _seed_key_on_default_agent(
+        db_session_factory, agent_id="ag_scoped2", key="SHARED_KEY"
+    )
+    client = _agent_only_router(
+        tenant_id=tenant_id, agent_name="scoped-agent", agent_id="ag_scoped2", account_id=account_id
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
+    runtime = _runtime(client, session_factory=db_session_factory)
+    with pytest.raises(ToolError, match="needs a workspace or server admin"):
+        await _remove_agent_key_impl(runtime, auth, agent_name="scoped-agent", key="SHARED_KEY")
+
+    admin = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    assert await _list_agent_keys_impl(runtime, admin, agent_name="scoped-agent") == [
+        "SHARED_KEY"
+    ], "a refused removal must leave the stored key exactly where it was"
+
+
+async def test_remove_agent_key_impl_allows_admin_on_default_agent(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     account_id = uuid.uuid4()
-    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="scoped-agent")
+    tenant_id = await _seed_key_on_default_agent(
+        db_session_factory, agent_id="ag_scoped3", key="SHARED_KEY"
+    )
     client = _agent_only_router(
-        tenant_id=tenant_id, agent_name="scoped-agent", agent_id="ag_scoped2", account_id=account_id
+        tenant_id=tenant_id, agent_name="scoped-agent", agent_id="ag_scoped3", account_id=account_id
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    result = await _remove_agent_key_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="scoped-agent",
+        key="SHARED_KEY",
+    )
+    assert result.removed is True, (
+        "the gate exists to route removal through an admin, not to stop it"
+    )
+
+
+async def test_remove_agent_key_impl_allows_non_admin_when_agent_unreachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An agent nobody has scoped has a blast radius of one agent, so its owner
+    can still clean up their own keys without finding an admin."""
+    account_id = uuid.uuid4()
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    agent_id = "ag_unscoped_key"
+    async with db_session_factory() as session, session.begin():
+        await put_agent_file(
+            session,
+            tenant_id=tenant_id,
+            agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=agent_id),
+            key="MY_KEY",
+            content="v1",
+            set_by_account_id=None,
+        )
+    client = _agent_only_router(
+        tenant_id=tenant_id,
+        agent_name="unscoped-agent",
+        agent_id=agent_id,
+        account_id=account_id,
     )
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
     result = await _remove_agent_key_impl(
         _runtime(client, session_factory=db_session_factory),
         auth,
-        agent_name="scoped-agent",
-        key="ANY_KEY",
+        agent_name="unscoped-agent",
+        key="MY_KEY",
     )
-    assert result.removed is False, "removal is not reachability-gated, even on a default agent"
+    assert result.removed is True, "an unreachable agent's key removal is not gated"
 
 
 async def test_remove_agent_key_impl_succeeds_against_seeded_agent_with_no_daimon_account(

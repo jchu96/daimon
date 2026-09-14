@@ -1,19 +1,22 @@
-"""Post the credential-request button to a Slack channel.
+"""Post the credential-request card to a Slack channel.
 
 Posted from the MCP process (Cloud Run); dispatched later by the Slack bot
-process via `handle_credential_request_click`. The two processes cannot
-import each other (import-linter's independence contract), so this module
-imports only the core wire-contract pieces (`SLACK_ACTION_ID`,
-`build_button_label`) — never the Slack adapter's handler, and never a
-re-derived action id. A divergent copy here would silently stop the button
-from dispatching in the other process.
+process via `handle_credential_request_click`, and edited in place by that
+same process via `daimon.adapters.slack.posted_controls.edit_posted_card`.
+The two processes cannot import each other (import-linter's independence
+contract), so the card itself is built in core
+(`daimon.core.posted_controls`) and both sides render the same four slots
+from it. A divergent copy here would silently drift the posted card from the
+one the bot edits it into, and drop the button's `action_id` out of
+dispatch range.
 
 Unlike Discord's custom_id encoding, Slack routes block_actions by
 `action_id` and a button carries a free-form `value`, so the opaque
-single-use token rides in `value` under the fixed `SLACK_ACTION_ID`.
+single-use token rides in `value` under the fixed `SLACK_ACTION_ID`
+(`build_card_blocks` puts it there).
 
 Reuses the read tools' channel-visibility discipline (`conversations.info` →
-`check_channel_access`) so posting a credential button proves the requester
+`check_channel_access`) so posting a credential card proves the requester
 may see the channel before anything lands in it.
 
 The validated turn origin supplies the parent channel and thread timestamp.
@@ -21,6 +24,7 @@ The validated turn origin supplies the parent channel and thread timestamp.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
@@ -32,50 +36,31 @@ from daimon.adapters.mcp.tools.slack._client import (
 )
 from daimon.adapters.mcp.tools.slack._visibility import check_channel_access
 from daimon.core.credential_requests import (
-    MAX_SLACK_BUTTON_LABEL_CHARS,
-    SLACK_ACTION_ID,
     CredentialRequestKind,
-    build_button_label,
+    split_skill_repo_target,
+)
+from daimon.core.github_repo_auth import normalize_owner_repo
+from daimon.core.posted_controls import (
+    build_card_blocks,
+    build_posted_card,
+    card_notification_text,
 )
 from fastmcp.exceptions import ToolError
 from slack_sdk.errors import SlackApiError
 
-_KIND_NOUN: dict[CredentialRequestKind, str] = {
-    "env": "an API key",
-    "env_file": "keys from a .env file",
-    "mcp": "an MCP server token",
-    "repo": "a working repo",
-    "skill_repo": "a GitHub token for a skill repo",
-}
+_REPO_KINDS: frozenset[CredentialRequestKind] = frozenset({"repo", "skill_repo"})
 
 
-def _build_message_text(
-    *,
-    requester_platform_user_id: str,
-    agent_name: str,
-    kind: CredentialRequestKind,
-    target: str,
-    purpose: str,
-) -> str:
-    """The message body, in Slack mrkdwn (single-asterisk bold, `<@U…>` mention)."""
-    if kind == "repo":
-        return (
-            f"<@{requester_platform_user_id}> wants to set a working repo for *{agent_name}* "
-            f"(`{target}`) — {purpose}\n"
-            "Click the button below to open a private form confirming the branch, "
-            "and — only if the repo isn't publicly readable — a GitHub token that "
-            "never appears in this channel. Only the requester can open this form; "
-            "the request expires 30 minutes after creation."
-        )
-    return (
-        f"<@{requester_platform_user_id}> *{agent_name}* needs {_KIND_NOUN[kind]} "
-        f"(`{target}`) — {purpose}\n"
-        "Click the button below to enter the value privately in a form; "
-        "it will never appear in this channel. Only the requester can open this form; "
-        "the request expires 30 minutes after creation.\n"
-        f"Once added, everyone who talks to "
-        f"*{agent_name}* can use the {'key' if kind == 'env' else 'connection'}."
-    )
+def _repo_display(kind: CredentialRequestKind, target: str) -> str | None:
+    """`owner/repo` for the two repo kinds, `None` for every other kind.
+
+    The repo kinds pack `repo_url@branch#path` into `target`; the card names
+    the repo, not the packed string.
+    """
+    if kind not in _REPO_KINDS:
+        return None
+    repo_url, _, _ = split_skill_repo_target(target)
+    return normalize_owner_repo(repo_url)
 
 
 async def _post_slack_credential_button_impl(  # pyright: ignore[reportUnusedFunction]
@@ -88,47 +73,45 @@ async def _post_slack_credential_button_impl(  # pyright: ignore[reportUnusedFun
     token: str,
     agent_name: str,
     purpose: str,
+    expires_at: datetime,
+    responder_name: str,
+    mcp_server_url: str | None = None,
+    branch: str | None = None,
     thread_ts: str | None = None,
 ) -> str:
-    """Post a target-naming credential button. Returns the sent message ts."""
+    """Post the `requested` card for one credential request. Returns its ts.
+
+    `purpose` is the agent's reason for asking; it is deliberately not
+    rendered — the card's facts say what the value is for in the product's
+    own words, and the free-text reason belongs in the turn that asked.
+    """
     requester_id = _require_slack_identity(auth)
     team_id = _require_team_id(auth)
     client = await slack_web_client(runtime, team_id=team_id)
+
+    card = build_posted_card(
+        kind=kind,
+        state="requested",
+        agent_name=agent_name,
+        responder_name=responder_name,
+        target=target,
+        requester_platform_user_id=requester_id,
+        expires_at=expires_at,
+        token=token,
+        mcp_server_url=mcp_server_url,
+        repo=_repo_display(kind, target),
+        branch=branch,
+    )
 
     try:
         info = await client.conversations_info(channel=channel_id)  # pyright: ignore[reportUnknownMemberType]
         channel: dict[str, Any] = dict(info.get("channel") or {})  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
         await check_channel_access(client, channel=channel, user_id=requester_id)
-        text = _build_message_text(
-            requester_platform_user_id=requester_id,
-            agent_name=agent_name,
-            kind=kind,
-            target=target,
-            purpose=purpose,
-        )
         sent = await client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
             channel=channel_id,
             thread_ts=thread_ts,
-            text=text,
-            blocks=[
-                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "action_id": SLACK_ACTION_ID,
-                            "value": token,
-                            "text": {
-                                "type": "plain_text",
-                                "text": build_button_label(
-                                    kind, target, max_chars=MAX_SLACK_BUTTON_LABEL_CHARS
-                                ),
-                            },
-                        }
-                    ],
-                },
-            ],
+            text=card_notification_text(card),
+            blocks=build_card_blocks(card, token=token),
         )
     except SlackApiError as err:
         code = str(err.response.get("error", "slack_api_error"))  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # slack_sdk response is dict-like

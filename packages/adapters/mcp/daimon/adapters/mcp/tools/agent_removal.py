@@ -36,9 +36,12 @@ from daimon.adapters.mcp.tools.agents import (
 )
 from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
+from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.operation_policy import TargetFacts, decide_operation, needs_reachability_read
 from daimon.core.stores.agent_files import delete_agent_file, list_agent_files
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
@@ -198,15 +201,44 @@ async def _remove_agent_key_impl(
     key: str,
     expected_ma_agent_id: str | None = None,
 ) -> RemoveEnvCredentialResult:
-    # Same rationale as _list_agent_keys_impl above: env variables
-    # are per-agent daimon rows outside the MA spec, so neither
-    # _reject_system_agent nor require_admin_for_reachable_agent applies here
-    # — and the existing chat credential button already writes these rows for
-    # the seeded agent, so gating removal would leave a write with no
-    # matching delete.
+    # Adding and removing a key are deliberately NOT symmetric. Adding is a
+    # contribution: one new value, held by the requester alone, that overwrites
+    # nothing — so any member may add one, to the seeded agent included. Removing
+    # takes a key away from everyone who talks to the agent, and on a shared or
+    # built-in agent that is the whole install's blast radius, so it needs an
+    # admin. `key_remove` is in `decide_operation`'s attachment family, where the
+    # admin check comes first: an admin can still remove a key from the built-in
+    # agent, which is the point of gating rather than forbidding.
+    #
+    # _reject_system_agent and require_admin_for_reachable_agent still do not
+    # apply: those guard the MA agent spec, and these keys are per-agent daimon
+    # rows that never enter it.
     agent = await resolve_setup_agent(
         runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
+    is_daimon_managed = agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
+    reachable = False
+    if needs_reachability_read(
+        "key_remove", is_admin=auth.is_admin, is_daimon_managed=is_daimon_managed
+    ):
+        async with runtime.session_factory() as session:
+            reachable = await is_agent_reachable_in_tenant(
+                session,
+                tenant_id=auth.tenant_id,
+                agent_name=agent_name,
+                default=runtime.deployment_default,
+            )
+    outcome = decide_operation(
+        "key_remove",
+        is_admin=auth.is_admin,
+        target=TargetFacts(is_daimon_managed=is_daimon_managed, is_reachable_in_tenant=reachable),
+    )
+    if outcome != "allow":
+        raise ToolError(
+            f"Removing {key} from '{agent_name}' needs a workspace or server admin, and the "
+            f"caller is not one. Tell them an admin can ask Daimon: remove {key} from "
+            f"{agent_name}. The key is unchanged. Do not retry."
+        )
     agent_id: uuid.UUID = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
     async with runtime.session_factory.begin() as session:
         # The store delete is idempotent (no raise when absent) — read first
@@ -286,7 +318,9 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         inspect stored names. Removing a missing key also succeeds; ``removed`` says
         whether it was present. This deletes the stored environment variable and never
         returns its secret value. Removing it stops it being supplied from the next
-        message; it does not cancel it at the service or stop work already using it."""
+        message; it does not cancel it at the service or stop work already using it.
+        Anyone may add a key, but removing one from an agent that answers a channel
+        or the whole workspace needs an admin."""
         return await _remove_agent_key_impl(
             runtime,
             await _auth(ctx),

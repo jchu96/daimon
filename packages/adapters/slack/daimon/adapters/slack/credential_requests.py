@@ -48,13 +48,12 @@ from daimon.adapters.slack.agent_setup.write import (
     store_inline_pat,
 )
 from daimon.adapters.slack.interactions import resolve_web_client
+from daimon.adapters.slack.posted_controls import edit_posted_card
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.credential_requests import (
-    MAX_SLACK_BUTTON_LABEL_CHARS,
     CredentialRequestKind,
-    build_button_label,
     split_skill_repo_target,
 )
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid, find_attach_mount_collision
@@ -483,43 +482,19 @@ async def handle_credential_request_click(runtime: SlackRuntime, payload: dict[s
     )
 
 
-async def _mark_button_consumed(
-    client: AsyncWebClient,
-    *,
-    channel_id: str,
-    message_ts: str,
-    kind: CredentialRequestKind,
-    target: str,
-) -> None:
-    """Swap the request message for a durable consumed marker, in place.
+async def _mark_button_consumed(client: AsyncWebClient, *, row: CredentialRequestRow) -> None:
+    """Re-render the request's card in the `received` state, in place.
 
     Kind-agnostic and about the SUBMISSION rather than the write, exactly as
     on Discord: this runs the moment the consume commits, before the
     vault/binding/import after it is known to have worked, and one of those
     failing still leaves the button dead — leaving it looking live invites a
-    click that cannot succeed. A failed edit is a downgrade in feedback, not
-    in correctness, so it only logs.
+    click that cannot succeed.
+
+    The card keeps its headline and facts and loses only the button, so the
+    person who just submitted still sees what they submitted to.
     """
-    label = build_button_label(kind, target, max_chars=MAX_SLACK_BUTTON_LABEL_CHARS)
-    text = f"✓ Received — {label}"
-    try:
-        await client.chat_update(  # pyright: ignore[reportUnknownMemberType]
-            channel=channel_id,
-            ts=message_ts,
-            text=text,
-            blocks=[
-                {
-                    "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": text}],
-                }
-            ],
-        )
-    except Exception as err:
-        log.warning(
-            "credential_request.consumed_edit_failed",
-            kind=kind,
-            err_type=type(err).__name__,
-        )
+    await edit_posted_card(client, row=row, state="received")
 
 
 async def _consume(
@@ -659,9 +634,7 @@ async def run_env_credential_submission(
 
     # Log the key NAME only — never the value.
     log.info("credential_request.env.submit", key=consumed.target)
-    await _mark_button_consumed(
-        client, channel_id=channel_id, message_ts=message_ts, kind="env", target=consumed.target
-    )
+    await _mark_button_consumed(client, row=consumed)
     agent = await find_agent_by_derived_uuid(
         runtime.anthropic, tenant_id=consumed.tenant_id, agent_id=consumed.agent_id
     )
@@ -741,9 +714,7 @@ async def run_mcp_credential_submission(
         )
         return
 
-    await _mark_button_consumed(
-        client, channel_id=channel_id, message_ts=message_ts, kind="mcp", target=consumed.target
-    )
+    await _mark_button_consumed(client, row=consumed)
 
     mcp_server_url = consumed.mcp_server_url
     if mcp_server_url is None:
@@ -1077,13 +1048,7 @@ async def run_skill_repo_credential_submission(
         )
         return
 
-    await _mark_button_consumed(
-        client,
-        channel_id=channel_id,
-        message_ts=message_ts,
-        kind="skill_repo",
-        target=consumed.target,
-    )
+    await _mark_button_consumed(client, row=consumed)
 
     url, branch, path = split_skill_repo_target(consumed.target)
     log.info(
@@ -1265,9 +1230,7 @@ async def run_repo_bind_credential_submission(
         )
         return
 
-    await _mark_button_consumed(
-        client, channel_id=channel_id, message_ts=message_ts, kind="repo", target=consumed.target
-    )
+    await _mark_button_consumed(client, row=consumed)
 
     pat = value.strip()
     # Log the repo and branch, and the token ONLY as a masked tail when
