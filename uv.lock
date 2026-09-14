@@ -22,6 +22,7 @@ members = [
     "daimon-adapter-scheduler",
     "daimon-adapter-slack",
     "daimon-core",
+    "daimon-mux",
     "daimon-testing",
     "notebook-host",
     "report-host",
@@ -1045,6 +1046,21 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "structlog", specifier = ">=24.1" },
     { name = "tenacity", specifier = ">=9.0" },
+]
+
+[[package]]
+name = "daimon-mux"
+version = "0.1.0"
+source = { editable = "packages/mux" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pydantic", specifier = ">=2.8" },
 ]
 
 [[package]]
