@@ -201,7 +201,7 @@ async def test_tool_error_with_bundle_expired_wording_raises_bundle_expired_erro
     build_fake_seam: FakeSeamBuilder, fake_seam_lifespan: FakeSeamLifespan
 ) -> None:
     def start_turn(_args: dict[str, object]) -> dict[str, object]:
-        raise Exception("bundle expired; re-upload")  # noqa: TRY002
+        raise Exception("bundle expired; re-upload")
 
     captured: list[str] = []
     app = build_fake_seam(behaviors={"start_turn": start_turn}, captured_auth=captured)
@@ -214,7 +214,7 @@ async def test_tool_error_with_other_wording_raises_seam_error_not_bundle_expire
     build_fake_seam: FakeSeamBuilder, fake_seam_lifespan: FakeSeamLifespan
 ) -> None:
     def start_turn(_args: dict[str, object]) -> dict[str, object]:
-        raise Exception("bundle not found")  # noqa: TRY002
+        raise Exception("bundle not found")
 
     captured: list[str] = []
     app = build_fake_seam(behaviors={"start_turn": start_turn}, captured_auth=captured)

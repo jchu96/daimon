@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 import httpx
 import structlog
 from anthropic import AsyncAnthropic
-from cryptography.fernet import MultiFernet  # noqa: I001
+from cryptography.fernet import MultiFernet
 from daimon.core.config import GithubSettings
 from daimon.core.errors import DaimonError
 from daimon.core.github_app_auth import build_app_jwt, mint_installation_token
@@ -106,7 +106,7 @@ async def _resolve_agent_name_and_principal(
 
     # Local import breaks the ma.py <-> defaults circular dependency and routes
     # the listing through the tenant-filtered home (T4: no raw agents.list here).
-    from daimon.core.defaults.ma_index import list_agents_by_tenant  # noqa: PLC0415
+    from daimon.core.defaults.ma_index import list_agents_by_tenant
 
     resolved_agent_name: str | None = None
     for ma_agent in await list_agents_by_tenant(anthropic_client, tenant_id=tenant_id):
@@ -439,7 +439,7 @@ async def _resync_one_binding(
                 )
                 await asyncio.sleep(backoff)
 
-    except Exception as err:  # noqa: BLE001 — named boundary; per-binding failures captured
+    except Exception as err:  # named boundary; per-binding failures captured
         last_sync_error = str(err)
         _log.warning(
             "github.resync.failed",

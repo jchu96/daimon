@@ -81,7 +81,7 @@ def _make_runtime(
     # degrades it to the history-only rung, same as before that rescue path
     # existed.
     anthropic.beta.sessions.events.list = MagicMock(return_value=_AsyncIter([]))
-    from daimon.core.ma_resolver import new_resolver_cache  # noqa: PLC0415
+    from daimon.core.ma_resolver import new_resolver_cache
 
     resolver_cache = new_resolver_cache()
     deployment_default = DeploymentDefault()

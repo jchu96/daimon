@@ -1117,7 +1117,7 @@ async def test_panel_and_webhook_share_one_skill_ledger(
 
     # Inspect the ledger: there must be exactly ONE user_skills row for this agent
     # (under the shared, agent-stable key) — not two disjoint ledgers.
-    from daimon.core.stores.user_skills import list_user_skills_for_agent  # noqa: PLC0415
+    from daimon.core.stores.user_skills import list_user_skills_for_agent
 
     async with db_session_factory() as check:
         rows_under_agent = await list_user_skills_for_agent(

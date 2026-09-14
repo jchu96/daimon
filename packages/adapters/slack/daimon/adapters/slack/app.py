@@ -314,7 +314,7 @@ class SlackApp:
                 notice_keys=self._delivery_notice_keys,
                 team_id=team_id,
             )
-        except Exception as exc:  # noqa: BLE001 -- named boundary: a sweep failure must never escape
+        except Exception as exc:  # named boundary: a sweep failure must never escape
             log.warning(
                 "slack.output_delivery.unhandled_error",
                 session_id=session_id,

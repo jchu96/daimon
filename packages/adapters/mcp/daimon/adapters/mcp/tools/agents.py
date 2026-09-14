@@ -19,6 +19,7 @@ import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsSkillParams
 from anthropic.types.beta.agent_create_params import Tool
+from anthropic.types.beta.beta_managed_agents_agent import Tool as MATool
 from anthropic.types.beta.beta_managed_agents_model_param import BetaManagedAgentsModelParam
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
@@ -201,7 +202,7 @@ _DEFAULT_MCP_TOOLSET_CONFIG: Final[dict[str, Any]] = {
 }
 
 
-def _ma_tool_to_param(tool: Any) -> Tool:
+def _ma_tool_to_param(tool: MATool) -> Tool:
     """Dump an MA response Tool to a Params dict suitable for the SDK update body."""
     return cast(Tool, tool.model_dump(mode="json", exclude_none=True))
 

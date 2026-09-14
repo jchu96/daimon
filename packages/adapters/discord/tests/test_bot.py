@@ -1463,8 +1463,8 @@ class TestPerCallerSessionKeying:
         mock_build_context_xml.return_value = ("<context></context>", [])
 
         # First call to run_turn returns a dead-session state; second call succeeds.
-        import anthropic as _anthropic  # noqa: PLC0415
-        from daimon.core.errors import TurnError  # noqa: PLC0415
+        import anthropic as _anthropic
+        from daimon.core.errors import TurnError
 
         fake_response = MagicMock()
         fake_response.status_code = 404
@@ -1633,7 +1633,7 @@ class TestPerCallerSessionKeying:
 
         # Insert a couple of real accounts and confirm the sentinel is not among them.
         async with db_session_factory() as s:
-            from daimon.testing.factories import make_account, make_tenant  # noqa: PLC0415
+            from daimon.testing.factories import make_account, make_tenant
 
             tenant = await make_tenant(s)
             acct1 = await make_account(s, tenant=tenant)
@@ -2000,9 +2000,9 @@ class TestDrainLoopDeCoalescing:
 
         G1 closes the confused-deputy hole on the drain hot path.
         """
-        from unittest.mock import patch as _patch  # noqa: PLC0415
+        from unittest.mock import patch as _patch
 
-        from daimon.core.defaults.provisioning import provision_tenant  # noqa: PLC0415
+        from daimon.core.defaults.provisioning import provision_tenant
 
         guild_id = "804000001"
         thread_id = 8040001

@@ -89,7 +89,9 @@ class FeedbackReactionCog(commands.Cog):
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         try:
             await self._record_vote_from_reaction(payload)
-        except Exception as err:  # noqa: BLE001 -- listener dispatch is an adapter boundary (see module docstring); discord.py's own event dispatcher swallows anything raised here
+        except Exception as err:
+            # listener dispatch is an adapter boundary (see module docstring); discord.py's own
+            # event dispatcher swallows anything raised here
             log.exception("feedback_reactions.handler_failed", err_type=type(err).__name__)
 
     async def _record_vote_from_reaction(self, payload: discord.RawReactionActionEvent) -> None:

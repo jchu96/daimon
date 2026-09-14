@@ -215,7 +215,7 @@ async def sweep_session_outputs(
         except OutputPostingUnavailable:
             _log.warning("output_delivery.aborted", session_id=session_id, file_id=meta.id)
             raise
-        except Exception as exc:  # noqa: BLE001 -- named boundary: per-file failures must not kill the sweep
+        except Exception as exc:  # named boundary: per-file failures must not kill the sweep
             _log.warning(
                 "output_delivery.file_failed",
                 session_id=session_id,

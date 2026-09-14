@@ -350,9 +350,9 @@ async def test_whole_server_writes_tenant_config(
 
     This test is RED until Plan 03 (TenantScopeRef) + Plan 07 (panel.py re-key) land.
     """
-    from daimon.adapters.discord.agent_setup.scope_default import do_propagate  # noqa: PLC0415
-    from daimon.core.scope import TenantScopeRef  # noqa: PLC0415
-    from daimon.core.stores.scoped_config_read import get_scope  # noqa: PLC0415
+    from daimon.adapters.discord.agent_setup.scope_default import do_propagate
+    from daimon.core.scope import TenantScopeRef
+    from daimon.core.stores.scoped_config_read import get_scope
 
     t = await make_tenant(db_session)
     actor = await make_account(db_session, tenant=t)

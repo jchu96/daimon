@@ -398,7 +398,7 @@ def _extract_text(view: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _collect_text(obj: Any, parts: list[str]) -> None:  # noqa: ANN401 — test helper
+def _collect_text(obj: Any, parts: list[str]) -> None:  # test helper
     if isinstance(obj, dict):
         text_type = obj.get("type")
         if text_type in ("mrkdwn", "plain_text"):
@@ -417,7 +417,7 @@ def _has_url_button(view: dict[str, Any], url: str) -> bool:
     return _find_url_button(view, url)
 
 
-def _find_url_button(obj: Any, url: str) -> bool:  # noqa: ANN401 — test helper
+def _find_url_button(obj: Any, url: str) -> bool:  # test helper
     if isinstance(obj, dict):
         if obj.get("type") == "button" and obj.get("url") == url:
             return True

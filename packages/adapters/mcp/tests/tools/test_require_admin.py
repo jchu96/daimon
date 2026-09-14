@@ -295,7 +295,7 @@ async def test_create_environment_impl_does_not_refuse_non_admin() -> None:
         is_admin=False,
     )
     spec = EnvironmentSpec(name="e")
-    with pytest.raises(Exception) as exc_info:  # noqa: B017, PT011
+    with pytest.raises(Exception) as exc_info:
         await _create_environment_impl(_env_runtime(MagicMock(spec=AsyncAnthropic)), auth, spec)
     assert _ADMIN_REQUIRED not in str(exc_info.value), (
         "create_environment must not refuse a non-admin -- gating it blocks the "

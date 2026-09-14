@@ -71,7 +71,7 @@ class _SlackTokenClient:
         self.client_secret = client_secret
 
     async def fetch_token(
-        self, *, url: str, code: str, redirect_uri: str, **_: Any
+        self, *, url: str, code: str, redirect_uri: str, **_: object
     ) -> dict[str, Any]:
         response = await self._http.post(
             url,
@@ -141,7 +141,7 @@ class SlackHubProvider(OAuthProxy):
         query.append(("user_scope", ",".join(SLACK_USER_SCOPES)))
         return urlunsplit(parts._replace(query=urlencode(query)))
 
-    def _create_upstream_oauth_client(self) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def _create_upstream_oauth_client(self) -> _SlackTokenClient:  # pyright: ignore[reportIncompatibleMethodOverride]
         secret = self._upstream_client_secret
         return _SlackTokenClient(
             http=self._http,

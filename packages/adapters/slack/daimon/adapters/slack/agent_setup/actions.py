@@ -129,6 +129,7 @@ from daimon.core.specs import AgentSpec
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant, resolve
 from daimon.core.stores.thread_agent_bindings import list_active_bindings
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 from sqlalchemy.exc import SQLAlchemyError
 
 log = structlog.get_logger()
@@ -159,7 +160,7 @@ def _new_request_id() -> str:
 
 
 async def _render_stale_l1(
-    client: Any,
+    client: AsyncWebClient,
     *,
     view_id: str,
     team_id: str,

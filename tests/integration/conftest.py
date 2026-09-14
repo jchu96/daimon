@@ -12,11 +12,11 @@ import pytest_asyncio
 from daimon.core.db import build_session_factory
 from daimon.core.stores import tenant_ledger
 from daimon.testing.db import build_test_engine
-from daimon.testing.db import db_clean as db_clean  # noqa: F401
-from daimon.testing.db import db_engine as db_engine  # noqa: F401
-from daimon.testing.db import db_schema as db_schema  # noqa: F401
-from daimon.testing.db import db_session as db_session  # noqa: F401
-from daimon.testing.db import db_session_factory as db_session_factory  # noqa: F401
+from daimon.testing.db import db_clean as db_clean
+from daimon.testing.db import db_engine as db_engine
+from daimon.testing.db import db_schema as db_schema
+from daimon.testing.db import db_session as db_session
+from daimon.testing.db import db_session_factory as db_session_factory
 from daimon.testing.factories import make_tenant
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -30,8 +30,8 @@ def _schema_engine_test_dsn() -> str:
 
 @pytest_asyncio.fixture
 async def schema_engine(
-    db_schema: str,  # noqa: F811
-    db_clean: None,  # noqa: F811  # orders the seed after the per-test wipe
+    db_schema: str,
+    db_clean: None,  # orders the seed after the per-test wipe
 ) -> AsyncIterator[tuple[AsyncEngine, async_sessionmaker[AsyncSession], uuid.UUID]]:
     """Own pooled engine on the worker schema + sessionmaker, seeded with a funded tenant.
 

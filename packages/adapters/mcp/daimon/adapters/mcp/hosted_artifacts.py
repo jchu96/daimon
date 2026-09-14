@@ -216,7 +216,7 @@ async def _deliver_hosted_charts_impl(
             session_id=session_id,
             turn_started_at=turn_started_at,
         )
-    except Exception as exc:  # noqa: BLE001 — degrade-not-block boundary
+    except Exception as exc:  # degrade-not-block boundary
         record_failure(stage="discovery", key=None, exc=exc)
         return HostedChartDelivery(message=message)
 
@@ -243,14 +243,14 @@ async def _deliver_hosted_charts_impl(
             if len(content) > _MAX_BYTES:
                 raise ValueError("artifact exceeds the per-chart byte limit")
             content_type = _image_content_type(filename, content)
-        except Exception as exc:  # noqa: BLE001 — one chart cannot block the answer
+        except Exception as exc:  # one chart cannot block the answer
             record_failure(stage="download", key=None, exc=exc)
             continue
 
         if embed_images and len(image_blocks) < _MAX_IMAGE_BLOCKS:
             try:
                 image_block = await asyncio.to_thread(_bounded_image_block, content, content_type)
-            except Exception as exc:  # noqa: BLE001 — optional URLs can still succeed
+            except Exception as exc:  # optional URLs can still succeed
                 record_failure(stage="embed", key=None, exc=exc)
             else:
                 if image_block is not None:
@@ -308,7 +308,7 @@ async def _deliver_hosted_charts_impl(
                 key=key,
                 ttl_seconds=settings.url_ttl_seconds,
             )
-        except Exception as exc:  # noqa: BLE001 — embedding remains available
+        except Exception as exc:  # embedding remains available
             record_failure(stage="storage", key=key, exc=exc)
 
     delivered_message = f"{message}\n\n" + "\n".join(lines) if lines else message

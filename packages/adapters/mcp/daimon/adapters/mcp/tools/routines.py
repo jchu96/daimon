@@ -80,7 +80,7 @@ def _compute_next_fire_at(cron_expr: str, tz: str) -> datetime:
         raise ToolError(f"unknown timezone: {tz!r}") from e
     try:
         return next_slot_at_or_after(cron_expr, tz, datetime.now(UTC))
-    except Exception as e:  # noqa: BLE001  # croniter raises mixed exception types; named boundary
+    except Exception as e:  # croniter raises mixed exception types; named boundary
         raise ToolError(f"invalid cron expression: {cron_expr!r}") from e
 
 

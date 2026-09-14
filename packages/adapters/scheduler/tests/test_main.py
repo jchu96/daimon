@@ -565,7 +565,7 @@ async def test_fire_uses_deployment_default(
     instead of hardcoded 'daimon'/'default' string literals.
     RED until Plan 03 (DeploymentDefault) + Plan 08 (_build_fire signature update) land.
     """
-    from daimon.core.scope import DeploymentDefault  # noqa: PLC0415
+    from daimon.core.scope import DeploymentDefault
 
     now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 

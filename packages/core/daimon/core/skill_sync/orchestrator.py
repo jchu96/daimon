@@ -397,7 +397,7 @@ async def _upload_all(
                     report.failed_uploads.append(
                         (pending.name, f"timeout after {_PER_SKILL_TIMEOUT_S:.0f}s")
                     )
-            except Exception as err:  # noqa: BLE001 — orchestrator IS the named boundary
+            except Exception as err:  # orchestrator IS the named boundary
                 _log.warning("skill_sync.skill_failed", name=pending.name, error=str(err))
                 async with report_lock:
                     report.failed_uploads.append((pending.name, str(err)))
@@ -580,7 +580,7 @@ async def sync_agent_skills(
             except (GitHubAuthError, GitHubUnreachable, TarballTooLarge) as err:
                 report.skipped_repos.append((repo.url, type(err).__name__))
                 continue
-            except Exception as err:  # noqa: BLE001 — boundary
+            except Exception as err:  # boundary
                 _log.warning("skill_sync.repo_fetch_failed", url=repo.url, error=str(err))
                 report.skipped_repos.append((repo.url, str(err)))
                 continue
@@ -607,7 +607,7 @@ async def sync_agent_skills(
                     max_tarball_decompressed_bytes=max_tarball_decompressed_bytes,
                     max_tarball_members=max_tarball_members,
                 )
-            except Exception as err:  # noqa: BLE001 — boundary
+            except Exception as err:  # boundary
                 _log.warning("skill_sync.repo_bundle_failed", url=repo.url, error=str(err))
                 report.skipped_repos.append((repo.url, str(err)))
                 continue

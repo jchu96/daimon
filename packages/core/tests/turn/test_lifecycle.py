@@ -24,13 +24,13 @@ class _MinimalImpl(TurnLifecycle):
     duck typing).
     """
 
-    async def on_render(self, state: TurnState) -> None:  # noqa: ARG002
+    async def on_render(self, state: TurnState) -> None:
         return None
 
-    async def on_terminal_success(self, state: TurnState) -> None:  # noqa: ARG002
+    async def on_terminal_success(self, state: TurnState) -> None:
         return None
 
-    async def on_terminal_failure(self, state: TurnState, err: Exception) -> None:  # noqa: ARG002
+    async def on_terminal_failure(self, state: TurnState, err: Exception) -> None:
         return None
 
 

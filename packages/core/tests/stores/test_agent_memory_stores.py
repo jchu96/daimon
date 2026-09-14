@@ -116,7 +116,7 @@ class _ChurnSession:
         self._agent_id = agent_id
         self._churns = churns
 
-    async def execute(self, stmt, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+    async def execute(self, stmt, *args, **kwargs):
         if getattr(stmt, "is_select", False) and self._churns > 0:
             self._churns -= 1
             await self._real.execute(

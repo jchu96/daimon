@@ -57,8 +57,8 @@ async def test_apply_does_not_write_tenant_config(
     This test is RED until Plan 03 (DeploymentDefault) + Plan 04 (resolve() signature
     update) + Plan 05 (delete _reconcile_system_config) land. That is expected.
     """
-    from daimon.core.scope import DeploymentDefault, ScopeContext  # noqa: PLC0415
-    from daimon.core.stores.scoped_config_read import resolve  # noqa: PLC0415
+    from daimon.core.scope import DeploymentDefault, ScopeContext
+    from daimon.core.stores.scoped_config_read import resolve
 
     _write_tree(tmp_path)
     router = _full_router()
@@ -105,8 +105,8 @@ async def test_apply_does_not_write_tenant_config(
     )
 
     # Resolution must still yield daimon/default via the injected DeploymentDefault
-    from daimon.core._models import Tenant  # noqa: PLC0415
-    from sqlalchemy import select  # noqa: PLC0415
+    from daimon.core._models import Tenant
+    from sqlalchemy import select
 
     tenant = (await db_session.execute(select(Tenant).limit(1))).scalar_one_or_none()
     if tenant is not None:
@@ -127,12 +127,12 @@ async def test_apply_defaults_provisions_cli_local_deterministically(
 ) -> None:
     """Req 4: fresh DB + apply_defaults yields exactly one tenant with
     id == derive_tenant_uuid('cli','local'), zero orphans, no tenant_ledger row."""
-    from daimon.core._models import Tenant, TenantLedger  # noqa: PLC0415
-    from daimon.core.ma_identity import derive_tenant_uuid  # noqa: PLC0415
+    from daimon.core._models import Tenant, TenantLedger
+    from daimon.core.ma_identity import derive_tenant_uuid
 
     _write_tree(tmp_path)
     router = _full_router()
-    from datetime import UTC, datetime  # noqa: PLC0415
+    from datetime import UTC, datetime
 
     _ts = datetime(2026, 4, 21, tzinfo=UTC)
     router.add(

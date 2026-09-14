@@ -178,7 +178,7 @@ def test_put_data_before_publish_lands_under_data_dir_owned_by_resolved_uid(
     import notebook_host.admin as admin_mod
 
     self_uid = os.getuid()
-    monkeypatch.setattr(admin_mod, "resolve_jail_uid", lambda *a, **kw: self_uid)  # noqa: ARG005
+    monkeypatch.setattr(admin_mod, "resolve_jail_uid", lambda *a, **kw: self_uid)
 
     client, _, _, _ = _make_test_app(tmp_path, monkeypatch)
     resp = client.put(

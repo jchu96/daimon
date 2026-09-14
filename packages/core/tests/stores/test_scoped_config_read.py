@@ -398,7 +398,7 @@ async def test_cross_tenant_isolation(db_session: AsyncSession) -> None:
 
     Pins threat T-58.3-01: cross-tenant config isolation.
     """
-    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+    from daimon.core.stores.scoped_config_write import set_fields
 
     tenant_a = await make_tenant(db_session)
     tenant_b = await make_tenant(db_session)
@@ -471,7 +471,7 @@ async def test_is_agent_reachable_in_tenant_true_after_channel_propagation(
     db_session: AsyncSession,
 ) -> None:
     """After scoping an agent to one channel, that agent answers True for the tenant."""
-    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+    from daimon.core.stores.scoped_config_write import set_fields
 
     t = await make_tenant(db_session)
     await set_fields(
@@ -490,7 +490,7 @@ async def test_is_agent_reachable_in_tenant_false_for_default_after_tenant_propa
     db_session: AsyncSession,
 ) -> None:
     """After scoping the tenant to a different agent, the deployment default stops answering True."""
-    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+    from daimon.core.stores.scoped_config_write import set_fields
 
     t = await make_tenant(db_session)
     await set_fields(
@@ -511,7 +511,7 @@ async def test_is_agent_reachable_in_tenant_is_isolated_per_tenant(
     db_session: AsyncSession,
 ) -> None:
     """One tenant scoping an agent must not make it reachable in a sibling tenant."""
-    from daimon.core.stores.scoped_config_write import set_fields  # noqa: PLC0415
+    from daimon.core.stores.scoped_config_write import set_fields
 
     t1 = await make_tenant(db_session)
     t2 = await make_tenant(db_session)

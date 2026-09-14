@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
-from typing import Any
 
 import httpx
 from daimon.core.config import ReportHostSettings
@@ -132,9 +131,19 @@ def _bearer_headers(admin_secret: SecretStr) -> dict[str, str]:
     return {"Authorization": f"Bearer {admin_secret.get_secret_value()}"}
 
 
-async def _send(client: httpx.AsyncClient, method: str, url: str, **kwargs: Any) -> httpx.Response:
+async def _send(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    json: object | None = None,
+    params: dict[str, str] | None = None,
+) -> httpx.Response:
     try:
-        return await client.request(method, url, timeout=_TIMEOUT_SECONDS, **kwargs)
+        return await client.request(
+            method, url, timeout=_TIMEOUT_SECONDS, headers=headers, json=json, params=params
+        )
     except httpx.HTTPError as exc:
         raise ReportHostError(f"report host request failed: {exc}") from exc
 
