@@ -26,8 +26,6 @@ from report_host.mcp_client import SeamClient
 from report_host.routes import build_reader_router
 from starlette.types import Receive, Scope, Send
 
-pytestmark = pytest.mark.asyncio
-
 NOW = datetime(2026, 9, 8, 12, 0, 0, tzinfo=UTC)
 
 # Local aliases mirroring conftest's fixture types (see test_mcp_client.py for
