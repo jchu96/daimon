@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 import structlog
-from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
+from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.discord.agent_setup import credentials as credentials_mod
 from daimon.adapters.discord.agent_setup import edit_view as edit_view_mod
 from daimon.adapters.discord.agent_setup.credentials import (
@@ -32,6 +32,7 @@ from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_files import get_agent_file, list_agent_files, put_agent_file
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -1015,20 +1016,10 @@ async def test_editview_env_vars_button_opens_subview(
         )
 
     now = dt.datetime.now(dt.UTC)
-    real_agent = BetaManagedAgentsAgent(
+    real_agent = ma_agent(
         id=ma_agent_id,
-        type="agent",
         name="bot",
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        metadata={},
-        description=None,
         created_at=now,
-        updated_at=now,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     )
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
@@ -1088,20 +1079,10 @@ async def test_subview_opens_and_lists_key_names_for_a_non_admin_on_a_shared_age
         )
 
     now = dt.datetime.now(dt.UTC)
-    real_agent = BetaManagedAgentsAgent(
+    real_agent = ma_agent(
         id=ma_agent_id,
-        type="agent",
         name="daimon",
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        metadata={},
-        description=None,
         created_at=now,
-        updated_at=now,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     )
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:

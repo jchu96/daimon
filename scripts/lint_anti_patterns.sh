@@ -97,8 +97,8 @@ ALLOWLIST_T2=()  # model_construct
 # filters full path:line:content strings with grep -vF), so ONLY these two
 # exact expressions are exempt — not the files, not the directory.
 ALLOWLIST_T3=(
-  'anthropic.beta.agents.retrieve = AsyncMock(return_value=_make_fake_agent())'
-  'anthropic.beta.environments.retrieve = AsyncMock(return_value=_make_fake_environment())'
+  'anthropic.beta.agents.retrieve = AsyncMock(return_value=ma_agent())'
+  'anthropic.beta.environments.retrieve = AsyncMock(return_value=ma_environment())'
 )
 ALLOWLIST_T4=("ma_index.py" "ma.py")  # the legitimate filtered-list homes
 # Approved agent-creation chokepoints: each guarantees the base agent_toolset

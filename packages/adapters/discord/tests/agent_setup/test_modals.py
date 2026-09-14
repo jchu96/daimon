@@ -17,9 +17,6 @@ import httpx
 import pytest
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import (
-    BetaManagedAgentsModelConfig,
-)
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
@@ -47,6 +44,7 @@ from daimon.core.specs import AgentSpec
 from daimon.core.stores import github_credentials as creds_store
 from daimon.core.stores.agent_repo_binding import get_binding
 from daimon.core.stores.identity import get_or_create_cli_principal
+from daimon.testing import ma_agent, ma_model_config
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from pydantic import HttpUrl, SecretStr
@@ -154,18 +152,12 @@ async def test_pat_masked_in_embed_and_logs(
         from datetime import UTC, datetime
 
         now = datetime.now(UTC)
-        return BetaManagedAgentsAgent(
+        return ma_agent(
             id="agent_017vXaNG5P7Fu1g4orggSwEY",
-            type="agent",
             name="a",
-            version=1,
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+            model=ma_model_config("claude-sonnet-4-6", speed="standard"),
+            tenant_id=tenant_id,
             created_at=now,
-            updated_at=now,
-            metadata={"daimon_tenant": str(tenant_id), "daimon_name": "a"},
-            mcp_servers=[],
-            tools=[],
-            skills=[],
         )
 
     monkeypatch.setattr(modals_mod, "store_inline_pat", fake_store_inline_pat)
@@ -647,18 +639,12 @@ _VAULT_MA_AGENT_ID = "agent_vaulttest_abcdefgh1234"
 def _fake_ma_agent_for_vault(tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
     """Real SDK BetaManagedAgentsAgent used by vault tests to stub find_agent_by_daimon_tag."""
     now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=_VAULT_MA_AGENT_ID,
-        type="agent",
         name="a",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        model=ma_model_config("claude-sonnet-4-6", speed="standard"),
+        tenant_id=tenant_id,
         created_at=now,
-        updated_at=now,
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "a"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
     )
 
 
@@ -1078,18 +1064,12 @@ async def test_skill_modal_toasts_failure_on_exception(
 
 def _fake_ma_agent_for_bind(tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
     now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id="agent_bindtest_abcdefgh1234",
-        type="agent",
         name="a",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        model=ma_model_config("claude-sonnet-4-6", speed="standard"),
+        tenant_id=tenant_id,
         created_at=now,
-        updated_at=now,
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "a"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
     )
 
 

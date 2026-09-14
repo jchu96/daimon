@@ -28,6 +28,8 @@ from daimon.core.scope import DeploymentDefault
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .harness import make_bot
+
 
 def _make_runtime(
     tenant_id: uuid.UUID,
@@ -49,15 +51,6 @@ def _make_runtime(
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # _handle_mention/_orchestrate stubbed per-test
     )
-
-
-def _make_bot(runtime: DiscordRuntime) -> DaimonBot:
-    intents = discord.Intents.default()
-    bot = DaimonBot(runtime=runtime, intents=intents)
-    bot._connection.user = MagicMock()  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.id = 999  # pyright: ignore[reportPrivateUsage]
-    bot._connection.user.mentioned_in = MagicMock(return_value=True)  # pyright: ignore[reportPrivateUsage]
-    return bot
 
 
 def _make_channel_message(
@@ -157,7 +150,7 @@ async def queued_bot(
     result = await provision_tenant(db_session_factory, platform="discord", workspace_id="123456")
 
     runtime = _make_runtime(result.tenant_id, db_session_factory)
-    return _make_bot(runtime)
+    return make_bot(runtime)
 
 
 @pytest.mark.asyncio
@@ -448,7 +441,7 @@ async def test_handle_mention_catches_sqlalchemy_error_from_orchestrate(
     """
     tenant_id = uuid.uuid4()
     runtime = _make_runtime(tenant_id, db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
 
     async def _raise_db_error(*args: object, **kwargs: object) -> None:
         raise SQLAlchemyError("db down")
@@ -477,7 +470,7 @@ async def test_handle_mention_catches_unexpected_exception_from_orchestrate(
     """
     tenant_id = uuid.uuid4()
     runtime = _make_runtime(tenant_id, db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
 
     async def _raise_unexpected(*args: object, **kwargs: object) -> None:
         raise RuntimeError("boom")
@@ -511,7 +504,7 @@ async def test_on_message_prologue_failure_never_escapes_and_sends_error(
 
     tenant_id = uuid.uuid4()
     runtime = _make_runtime(tenant_id, db_session_factory)
-    bot = _make_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_channel_message()
 
     await bot.on_message(message)  # must not raise

@@ -15,17 +15,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import httpx
-from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import BetaManagedAgentsModelConfig
 from daimon.adapters.discord.continuation_dispatch import dispatch_pending_continuations
 from daimon.core.continuity.continuation import ContinuationDecision
-from daimon.core.defaults.metadata import MA_METADATA_KEY_NAME, MA_METADATA_KEY_TENANT
 from daimon.core.stores.domain import TaskContinuationRow
 from daimon.core.stores.task_continuations import (
     get_continuation,
     list_pending_continuations,
     record_continuation,
 )
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -238,20 +236,10 @@ def _reachable_agent_handler(
     tenant_id: uuid.UUID, *, ma_agent_id: str
 ) -> Callable[[httpx.Request], httpx.Response]:
     """`GET /v1/agents/{id}` handler for a real, tenant-owned, non-archived agent."""
-    agent = BetaManagedAgentsAgent(
+    agent = ma_agent(
         id=ma_agent_id,
-        type="agent",
         name="target-agent",
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        metadata={MA_METADATA_KEY_TENANT: str(tenant_id), MA_METADATA_KEY_NAME: "target-agent"},
-        description=None,
-        created_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        updated_at="2026-06-14T00:00:00Z",  # pyright: ignore[reportArgumentType]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant_id,
     )
 
     def _handler(request: httpx.Request) -> httpx.Response:

@@ -17,9 +17,6 @@ import discord
 import httpx
 import pytest
 from anthropic.types.beta import BetaManagedAgentsAgent
-from anthropic.types.beta.beta_managed_agents_model_config import (
-    BetaManagedAgentsModelConfig,
-)
 from cryptography.fernet import Fernet
 from daimon.adapters.discord.agent_setup import modals_mcp as modals_mcp_mod
 from daimon.adapters.discord.agent_setup.modals import AddMcpModal
@@ -32,6 +29,7 @@ from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores import agent_mcp_credentials as cred_store
+from daimon.testing import ma_agent, ma_model_config
 from daimon.testing.factories import make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from pydantic import HttpUrl
@@ -56,18 +54,12 @@ def _entry(name: str, *, is_system: bool = False) -> RosterEntry:
 def _fake_ma_agent(tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
     """Real SDK BetaManagedAgentsAgent — no model_construct, no MagicMock."""
     now = datetime.now(UTC)
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=_MA_AGENT_ID,
-        type="agent",
         name="my-agent",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
+        model=ma_model_config("claude-sonnet-4-6", speed="standard"),
+        tenant_id=tenant_id,
         created_at=now,
-        updated_at=now,
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "my-agent"},
-        mcp_servers=[],
-        tools=[],
-        skills=[],
     )
 
 

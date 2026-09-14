@@ -26,6 +26,7 @@ from daimon.core.stores.thread_sessions import (
     list_orphaned_turns,
     mark_turn_active,
 )
+from daimon.testing import ma_session
 from daimon.testing.factories import make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -165,12 +166,9 @@ async def test_ceiling_outcome_still_clears_the_active_turn_marker(
     from daimon.core.turn.state import TurnState
     from daimon.testing.factories import make_tenant
 
-    from .test_orchestration import (
-        _make_bot as _make_full_bot,  # pyright: ignore[reportPrivateUsage]
-    )
+    from .harness import make_bot
     from .test_orchestration import (
         _make_channel_message,  # pyright: ignore[reportPrivateUsage]
-        _make_fake_session,  # pyright: ignore[reportPrivateUsage]
         _make_runtime,  # pyright: ignore[reportPrivateUsage]
         _stub_resolved_config,  # pyright: ignore[reportPrivateUsage]
     )
@@ -187,7 +185,7 @@ async def test_ceiling_outcome_still_clears_the_active_turn_marker(
     await db_session.commit()
 
     runtime = _make_runtime(tenant.id, db_session_factory)
-    bot = _make_full_bot(runtime)
+    bot = make_bot(runtime)
     message = _make_channel_message()
     mock_thread = MagicMock(spec=discord.Thread)
     mock_thread.id = 9999
@@ -217,7 +215,7 @@ async def test_ceiling_outcome_still_clears_the_active_turn_marker(
         ) as mock_run_prepared_turn,
     ):
         mock_resolve.return_value = _stub_resolved_config()
-        mock_create_session.return_value = _make_fake_session("sess-ceiling")
+        mock_create_session.return_value = ma_session(id="sess-ceiling")
         mock_find_agent.return_value = "ag_test"
         mock_find_env.return_value = "env_test"
         mock_run_prepared_turn.return_value = ceiling_outcome

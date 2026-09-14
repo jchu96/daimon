@@ -15,7 +15,6 @@ an SDK model is expected.
 
 from __future__ import annotations
 
-import datetime as dt
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -23,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import jwt as pyjwt
 import pytest
-from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
+from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.discord.agent_setup import mcp_access as mcp_access_mod
 from daimon.adapters.discord.agent_setup.mcp_access import send_connect_via_mcp
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
@@ -35,6 +34,7 @@ from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.domain import AccountRow, TenantRow
 from daimon.core.stores.mcp_tokens import get_mcp_token
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -85,28 +85,6 @@ def _make_interaction(*, user_id: int = 42) -> MagicMock:
     return interaction
 
 
-def _make_ma_agent(ma_agent_id: str, name: str, tenant_id: uuid.UUID) -> BetaManagedAgentsAgent:
-    now = dt.datetime.now(dt.UTC)
-    return BetaManagedAgentsAgent(
-        id=ma_agent_id,
-        type="agent",
-        name=name,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6"),
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": name,
-        },
-        description=None,
-        created_at=now,
-        updated_at=now,
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    )
-
-
 async def _setup_tenant_and_account(
     db_session: AsyncSession,
     *,
@@ -151,7 +129,7 @@ async def test_on_talk_via_mcp_writes_row_and_replies_with_config_block(
 
     ma_agent_id = "agent_017abc_77_panel01"
     agent_id = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=ma_agent_id)
-    real_agent = _make_ma_agent(ma_agent_id, "expert-bot", tenant_id)
+    real_agent = ma_agent(id=ma_agent_id, name="expert-bot", tenant_id=tenant_id)
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
         return real_agent
@@ -239,7 +217,7 @@ async def test_on_talk_via_mcp_reply_is_ephemeral(
     )
 
     ma_agent_id = "agent_017abc_77_ephemeral"
-    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-2", tenant_id)
+    real_agent = ma_agent(id=ma_agent_id, name="expert-bot-2", tenant_id=tenant_id)
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
         return real_agent
@@ -295,7 +273,7 @@ async def test_revoke_callback_flips_revoked_at(
     )
 
     ma_agent_id = "agent_017abc_77_revoke"
-    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-3", tenant_id)
+    real_agent = ma_agent(id=ma_agent_id, name="expert-bot-3", tenant_id=tenant_id)
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
         return real_agent
@@ -382,7 +360,7 @@ async def test_revoke_confirmation_edits_message_content_and_clears_view(
     )
 
     ma_agent_id = "agent_017abc_77_wr01"
-    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-wr01", tenant_id)
+    real_agent = ma_agent(id=ma_agent_id, name="expert-bot-wr01", tenant_id=tenant_id)
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
         return real_agent
@@ -454,7 +432,7 @@ async def test_mcp_access_timeout_disables_revoke_and_keeps_the_config_block(
     )
 
     ma_agent_id = "agent_017abc_77_timeout"
-    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-timeout", tenant_id)
+    real_agent = ma_agent(id=ma_agent_id, name="expert-bot-timeout", tenant_id=tenant_id)
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
         return real_agent
@@ -514,7 +492,7 @@ async def test_revoke_stops_the_view_so_the_timer_cannot_fire(
     )
 
     ma_agent_id = "agent_017abc_77_stop"
-    real_agent = _make_ma_agent(ma_agent_id, "expert-bot-stop", tenant_id)
+    real_agent = ma_agent(id=ma_agent_id, name="expert-bot-stop", tenant_id=tenant_id)
 
     async def fake_find(*_a: Any, **_k: Any) -> BetaManagedAgentsAgent:
         return real_agent

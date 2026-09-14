@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import httpx
 import pytest
-from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.discord.agent_setup.conversations import open_setup_conversation
 from daimon.adapters.discord.agent_setup.panel import AgentSetupView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
@@ -19,6 +18,7 @@ from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.thread_agent_bindings import get_binding
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -32,39 +32,16 @@ async def test_setup_entry_binds_exact_target_before_ready_without_a_billed_turn
     async with db_session_factory() as session, session.begin():
         tenant = await make_tenant(session, platform="discord", workspace_id="111")
         account = await make_account(session, tenant=tenant)
-    responder = BetaManagedAgentsAgent(
+    responder = ma_agent(
         id="agent_daimon",
-        type="agent",
         name="daimon",
-        model={"id": "claude-sonnet-4-6"},
-        metadata={
-            "daimon_tenant": str(tenant.id),
-            "daimon_name": "daimon",
-            "daimon_managed": "true",
-        },
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant.id,
+        metadata={"daimon_managed": "true"},
     )
-    target = BetaManagedAgentsAgent(
+    target = ma_agent(
         id="agent_specialist",
-        type="agent",
         name="specialist",
-        model={"id": "claude-sonnet-4-6"},
-        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "specialist"},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant.id,
     )
     requests: list[httpx.Request] = []
 

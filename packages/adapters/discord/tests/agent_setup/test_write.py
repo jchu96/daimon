@@ -34,6 +34,7 @@ from daimon.core.specs import AgentSpec
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import get_binding, set_binding
 from daimon.core.stores.github_credentials import delete_credential_for_principal
+from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_stub_anthropic
 from pydantic import HttpUrl
@@ -61,21 +62,10 @@ def _agent_dict(
         metadata["daimon_account"] = str(account_id)
     if managed:
         metadata["daimon_managed"] = "true"
-    return BetaManagedAgentsAgent(
+    return ma_agent(
         id=id_,
-        type="agent",
         name=name,
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]  # SDK model uses TypedDict + Pydantic forgives dict
         metadata=metadata,
-        description=None,
-        archived_at=None,
-        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]  # SDK accepts ISO string into datetime
-        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     ).model_dump(mode="json")
 
 
@@ -277,21 +267,10 @@ async def test_load_tenant_roster_explicit_managed_false_stays_editable(
         "daimon_account": str(account_id),
         "daimon_managed": "false",
     }
-    agent_payload = BetaManagedAgentsAgent(
+    agent_payload = ma_agent(
         id="ag_explicit_false",
-        type="agent",
         name="explicit-false",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
         metadata=metadata,
-        description=None,
-        archived_at=None,
-        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     ).model_dump(mode="json")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -982,21 +961,10 @@ async def test_create_blank_agent_rejects_duplicate_tenant_name(
         "daimon_name": "existing-agent",
         "daimon_account": str(guild_account),
     }
-    existing_agent = BetaManagedAgentsAgent(
+    existing_agent = ma_agent(
         id="ag_existing",
-        type="agent",
         name="existing-agent",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
         metadata=existing_meta,
-        description=None,
-        archived_at=None,
-        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     )
 
     async def _collision_found(*args: Any, **kwargs: Any) -> list[Any]:
@@ -1035,25 +1003,11 @@ async def test_create_blank_agent_rejects_name_held_by_other_owner(
     other_account = uuid.UUID("00000000-0000-0000-0000-0000000000ff")
 
     # Agent stamped with a different account — NOT the caller's account_id.
-    existing_agent = BetaManagedAgentsAgent(
+    existing_agent = ma_agent(
         id="ag_other_owner",
-        type="agent",
         name="taken-name",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": "taken-name",
-            "daimon_account": str(other_account),  # different owner
-        },
-        description=None,
-        archived_at=None,
-        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant_id,
+        metadata={"daimon_account": str(other_account)},  # different owner
     )
 
     async def _collision_found(*args: Any, **kwargs: Any) -> list[Any]:
@@ -1100,25 +1054,11 @@ async def test_fork_agent_rejects_new_name_held_by_other_owner(
 
     other_account = uuid.UUID("00000000-0000-0000-0000-0000000000ee")
 
-    existing_agent = BetaManagedAgentsAgent(
+    existing_agent = ma_agent(
         id="ag_other_fork",
-        type="agent",
         name="fork-target",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": "fork-target",
-            "daimon_account": str(other_account),  # different owner
-        },
-        description=None,
-        archived_at=None,
-        created_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-05-01T00:00:00Z",  # type: ignore[arg-type]
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
+        tenant_id=tenant_id,
+        metadata={"daimon_account": str(other_account)},  # different owner
     )
 
     create_calls: list[Any] = []
@@ -1937,25 +1877,12 @@ async def test_replace_agent_resources_retries_once_on_version_conflict(
     returns the agent again; second update returns 200.
     Assert: outcome is UPDATED, exactly two update attempts, and a second retrieve fired.
     """
-    ma_agent_json = BetaManagedAgentsAgent(
+    ma_agent_json = ma_agent(
         id="ag_retry",
-        type="agent",
         name="retry-bot",
-        model={"id": "claude-sonnet-4-6"},  # type: ignore[arg-type]
-        metadata={
-            "daimon_tenant": str(tenant_id),
-            "daimon_name": "retry-bot",
-            "daimon_account": str(account_id),
-        },
-        description=None,
-        archived_at=None,
-        created_at="2026-06-01T00:00:00Z",  # type: ignore[arg-type]
-        updated_at="2026-06-01T00:00:00Z",  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        metadata={"daimon_account": str(account_id)},
         version=3,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
     ).model_dump(mode="json")
     updated_json = {**ma_agent_json, "version": 4}
 
