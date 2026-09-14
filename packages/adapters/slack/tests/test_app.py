@@ -16,9 +16,8 @@ import dataclasses
 import json
 import pathlib
 import re
-import re as _re
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -29,23 +28,15 @@ import httpx
 import pytest
 import structlog.testing
 from anthropic import AsyncAnthropic
-from anthropic.types.beta import (
-    BetaManagedAgentsAgent,
-    BetaManagedAgentsModelConfig,
-    BetaManagedAgentsSession,
-    BetaManagedAgentsSessionAgent,
-)
-from anthropic.types.beta.beta_managed_agents_session_stats import BetaManagedAgentsSessionStats
-from anthropic.types.beta.beta_managed_agents_session_usage import BetaManagedAgentsSessionUsage
+from anthropic.types.beta import BetaManagedAgentsSession
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.app import SlackApp
-from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
+from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.continuity.messages import render_unexpected_loss
 from daimon.core.defaults.provisioning import provision_tenant
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.ma_identity import derive_tenant_uuid
-from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault
 from daimon.core.session_snapshot import (
     SessionSnapshot,
@@ -65,19 +56,15 @@ from daimon.core.stores.thread_sessions import (
 )
 from daimon.core.turn.posture import Billed, BillingPosture
 from daimon.core.turn.state import TextBlock, ToolUseBlock, TurnState
-from daimon.testing.ma import (
-    _agent_response as _agent_response,  # pyright: ignore[reportPrivateUsage]  # test-only
-)
-from daimon.testing.ma import (
-    _environment_response as _environment_response,  # pyright: ignore[reportPrivateUsage]  # test-only
-)
-from daimon.testing.ma import build_fake_anthropic, session_response
+from daimon.testing import ma_agent, ma_model_usage, ma_session, ma_session_agent
 from pydantic import SecretStr
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from yarl import URL
+
+from .harness import make_orchestrate_app
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,7 +81,7 @@ def _seeded_snapshot(*, agent_id: str, environment_id: str) -> SessionSnapshot:
     and replaces the session instead of reusing it. Seeding what the session
     would actually have frozen keeps these tests about what they test.
     """
-    agent = BetaManagedAgentsAgent.model_validate(_agent_response(agent_id=agent_id))
+    agent = ma_agent(id=agent_id)
     return desired_snapshot(
         agent,
         environment_id=environment_id,
@@ -104,35 +91,6 @@ def _seeded_snapshot(*, agent_id: str, environment_id: str) -> SessionSnapshot:
         memory_store_id=None,
         vault_id=None,
     )
-
-
-def _make_agent_env_handler() -> Callable[[httpx.Request], httpx.Response]:
-    """Minimal httpx.MockTransport handler for MA agent/environment retrieves.
-
-    Handles GET /v1/agents/{id} and GET /v1/environments/{id} — the two
-    endpoints called by _run_thread_turn when creating a new MA session —
-    plus GET /v1/sessions/{id}, which a reused session with no recorded
-    configuration is read through. Raises AssertionError for any other path
-    so unexpected calls are visible.
-    """
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        m = _re.match(r"^/v1/agents/(?P<id>[^/]+)$", path)
-        if m and request.method == "GET":
-            return httpx.Response(200, json=_agent_response(agent_id=m.group("id")))
-        m = _re.match(r"^/v1/environments/(?P<id>[^/]+)$", path)
-        if m and request.method == "GET":
-            env = _environment_response(environment_id=m.group("id"))
-            return httpx.Response(200, json=env.model_dump(mode="json"))
-        m = _re.match(r"^/v1/sessions/(?P<id>[^/]+)$", path)
-        if m and request.method == "GET":
-            # A mapping row seeded without a recorded configuration makes the
-            # bind read its session once to learn which model it runs.
-            return session_response(session_id=m.group("id"))
-        raise AssertionError(f"_make_agent_env_handler: unhandled {request.method} {path}")
-
-    return handler
 
 
 @dataclasses.dataclass
@@ -757,68 +715,6 @@ def test_per_event_client_never_assigned_to_self_or_runtime() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_orchestrate_app(
-    sessionmaker: async_sessionmaker[AsyncSession],
-    *,
-    max_concurrent_turns_per_tenant: int = 3,
-    deployment_default: DeploymentDefault | None = None,
-    crypto_key: str | None = None,
-) -> tuple[SlackApp, AsyncAnthropic]:
-    """Build a SlackApp for orchestration tests.
-
-    Returns (app, anthropic_client). The anthropic client is a real
-    AsyncAnthropic backed by a httpx.MockTransport that handles
-    GET /v1/agents/{id} and GET /v1/environments/{id} — the two MA endpoints
-    called when creating a new session in _run_thread_turn.
-
-    ``deployment_default`` defaults to the seeded defaults/config.yaml values
-    (agent "daimon", environment "default") so tests without scoped rows
-    resolve the same tags a fresh deployment would.
-
-    ``crypto_key`` is None by default (matching the pre-existing behavior of
-    every caller of this helper); pass one when the test also drives
-    ``_handle_app_mention``, whose per-event token decrypt needs a real key.
-    """
-    settings = MagicMock()
-    settings.crypto.keys = (SecretStr(crypto_key),) if crypto_key is not None else ()
-    settings.slack.max_concurrent_turns_per_tenant = max_concurrent_turns_per_tenant
-    settings.slack.bot_display_name = "daimon"
-    settings.mcp.public_url = None
-    # app_root_url=None short-circuits _maybe_post_connect_nudge (Task 11) — these
-    # orchestration tests don't exercise the connect-nudge flow.
-    settings.mcp.app_root_url = None
-    settings.defaults_root = MagicMock()
-    settings.billing.markup = Decimal("1.0")
-
-    anthropic_client = build_fake_anthropic(_make_agent_env_handler())
-    resolved_deployment_default = (
-        deployment_default
-        if deployment_default is not None
-        else DeploymentDefault(agent_name="daimon", environment_name="default")
-    )
-    resolver_cache = new_resolver_cache()
-    turn_deps = build_turn_deps(
-        settings,
-        anthropic_client,
-        sessionmaker,
-        deployment_default=resolved_deployment_default,
-        resolver_cache=resolver_cache,
-        billing_config=None,
-    )
-
-    runtime = SlackRuntime(
-        settings=settings,
-        anthropic=anthropic_client,
-        sessionmaker=sessionmaker,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=resolver_cache,
-        turn_deps=turn_deps,
-        deployment_default=resolved_deployment_default,
-    )
-    return SlackApp(runtime=runtime), anthropic_client
-
-
 async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_writes_watermark(
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
@@ -848,7 +744,7 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     # fake_run_turn calls lifecycle.on_terminal_success so final_ts is set.
     # The ToolUseBlock matters: the post-turn output sweep is gated on the
@@ -875,33 +771,10 @@ async def test_orchestrate_first_turn_when_new_thread_creates_session_row_and_wr
         "text": "<@U_BOT> hello",
     }
 
-    # Build a real BetaManagedAgentsSession inline — no MagicMock shortcuts so
-    # ma_session_id carries a real string id, not a mock attribute.
-    _now = datetime.now(UTC)
-    _agent_snapshot = BetaManagedAgentsSessionAgent(
-        id="agent_test_id",
-        mcp_servers=[],
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        name="test-agent",
-        skills=[],
-        tools=[],
-        type="agent",
-        version=1,
-    )
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-first-001",
-        agent=_agent_snapshot,
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     with (
@@ -1036,7 +909,7 @@ async def test_orchestrate_continuation_when_live_session_exists_calls_build_del
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(content=[TextBlock(kind="text", text="Continuation!")])
@@ -1125,7 +998,7 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     turn_count = 0
     # Gate that pauses the first run_turn call so event2 can arrive while task1
@@ -1224,31 +1097,10 @@ async def test_orchestrate_queue_coalesce_when_thread_in_flight_adds_hourglass_a
         mock_create_ts.return_value = fake_thread_session_row
         mock_resolve_agent.return_value = "agent_coalesce_id"
         mock_resolve_env.return_value = "env_coalesce_id"
-        _now_c = datetime.now(UTC)
-        _agent_snap_c = BetaManagedAgentsSessionAgent(
-            id="agent_coalesce_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        )
-        mock_create_session.return_value = BetaManagedAgentsSession(
-            outcome_evaluations=[],
+        mock_create_session.return_value = ma_session(
             id="sess-coalesce-001",
-            agent=_agent_snap_c,
-            created_at=_now_c,
+            agent=ma_session_agent(id="agent_coalesce_id"),
             environment_id="env_coalesce_id",
-            metadata={},
-            resources=[],
-            stats=BetaManagedAgentsSessionStats(),
-            status="idle",
-            type="session",
-            updated_at=_now_c,
-            usage=BetaManagedAgentsSessionUsage(),
-            vault_ids=[],
         )
         mock_run_turn.side_effect = _fake_run_turn
         mock_deliver_outputs.side_effect = [RuntimeError("delivery exploded"), None]
@@ -1342,7 +1194,7 @@ async def test_drain_partitions_queued_mentions_by_author_when_two_users_queue_i
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     turn_count = 0
     # Gate that pauses the first run_turn call so event2 can arrive while task1
@@ -1442,31 +1294,10 @@ async def test_drain_partitions_queued_mentions_by_author_when_two_users_queue_i
         mock_create_ts.return_value = fake_row
         mock_resolve_agent.return_value = "agent_partition_id"
         mock_resolve_env.return_value = "env_partition_id"
-        _now_p = datetime.now(UTC)
-        _agent_snap_p = BetaManagedAgentsSessionAgent(
-            id="agent_partition_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        )
-        mock_create_session.return_value = BetaManagedAgentsSession(
-            outcome_evaluations=[],
+        mock_create_session.return_value = ma_session(
             id="sess-partition-001",
-            agent=_agent_snap_p,
-            created_at=_now_p,
+            agent=ma_session_agent(id="agent_partition_id"),
             environment_id="env_partition_id",
-            metadata={},
-            resources=[],
-            stats=BetaManagedAgentsSessionStats(),
-            status="idle",
-            type="session",
-            updated_at=_now_p,
-            usage=BetaManagedAgentsSessionUsage(),
-            vault_ids=[],
         )
         mock_run_turn.side_effect = _fake_run_turn
         mock_deliver_outputs.side_effect = [RuntimeError("delivery exploded"), None, None]
@@ -1653,7 +1484,7 @@ async def test_drain_merges_each_authors_files_and_never_crosses_them_between_au
     await provision_tenant(
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     calls = await _drive_drain(
         app,
@@ -1721,7 +1552,7 @@ async def test_drain_runs_remaining_authors_when_one_authors_turn_raises(
     await provision_tenant(
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     def _explode_for_a(event: dict[str, Any]) -> None:
         if event.get("user") == "U_A":
@@ -1787,7 +1618,7 @@ async def test_drain_skips_an_event_with_no_author_and_still_runs_the_real_ones(
     await provision_tenant(
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     calls = await _drive_drain(
         app,
@@ -1869,7 +1700,7 @@ async def test_run_thread_turn_text_only_turn_spawns_no_output_sweep(
     await provision_tenant(
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(content=[TextBlock(kind="text", text="Just words.")])
@@ -1902,29 +1733,10 @@ async def test_run_thread_turn_text_only_turn_spawns_no_output_sweep(
     ):
         mock_resolve_agent.return_value = "agent_sweep_id"
         mock_resolve_env.return_value = "env_sweep_id"
-        mock_create_session.return_value = BetaManagedAgentsSession(
-            outcome_evaluations=[],
+        mock_create_session.return_value = ma_session(
             id="sess-gate-001",
-            agent=BetaManagedAgentsSessionAgent(
-                id="agent_sweep_id",
-                mcp_servers=[],
-                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-                name="test-agent",
-                skills=[],
-                tools=[],
-                type="agent",
-                version=1,
-            ),
-            created_at=datetime.now(UTC),
+            agent=ma_session_agent(id="agent_sweep_id"),
             environment_id="env_sweep_id",
-            metadata={},
-            resources=[],
-            stats=BetaManagedAgentsSessionStats(),
-            status="idle",
-            type="session",
-            updated_at=datetime.now(UTC),
-            usage=BetaManagedAgentsSessionUsage(),
-            vault_ids=[],
         )
         mock_run_turn.side_effect = _fake_run_turn
 
@@ -1964,7 +1776,7 @@ async def test_run_thread_turn_output_sweep_is_detached_from_turn_path(
     await provision_tenant(
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(
@@ -2010,29 +1822,10 @@ async def test_run_thread_turn_output_sweep_is_detached_from_turn_path(
     ):
         mock_resolve_agent.return_value = "agent_sweep_id"
         mock_resolve_env.return_value = "env_sweep_id"
-        mock_create_session.return_value = BetaManagedAgentsSession(
-            outcome_evaluations=[],
+        mock_create_session.return_value = ma_session(
             id="sess-detach-001",
-            agent=BetaManagedAgentsSessionAgent(
-                id="agent_sweep_id",
-                mcp_servers=[],
-                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-                name="test-agent",
-                skills=[],
-                tools=[],
-                type="agent",
-                version=1,
-            ),
-            created_at=datetime.now(UTC),
+            agent=ma_session_agent(id="agent_sweep_id"),
             environment_id="env_sweep_id",
-            metadata={},
-            resources=[],
-            stats=BetaManagedAgentsSessionStats(),
-            status="idle",
-            type="session",
-            updated_at=datetime.now(UTC),
-            usage=BetaManagedAgentsSessionUsage(),
-            vault_ids=[],
         )
         mock_run_turn.side_effect = _fake_run_turn
         mock_deliver_outputs.side_effect = _blocked_delivery
@@ -2080,7 +1873,7 @@ async def test_run_thread_turn_two_turns_same_session_chain_sweeps_serially(
     await provision_tenant(
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(
@@ -2167,29 +1960,10 @@ async def test_run_thread_turn_two_turns_same_session_chain_sweeps_serially(
         mock_resolve_agent.return_value = "agent_sweep_id"
         mock_resolve_env.return_value = "env_sweep_id"
         # Both turns land on the SAME MA session id — the chain key.
-        mock_create_session.return_value = BetaManagedAgentsSession(
-            outcome_evaluations=[],
+        mock_create_session.return_value = ma_session(
             id="sess-chain-001",
-            agent=BetaManagedAgentsSessionAgent(
-                id="agent_sweep_id",
-                mcp_servers=[],
-                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-                name="test-agent",
-                skills=[],
-                tools=[],
-                type="agent",
-                version=1,
-            ),
-            created_at=datetime.now(UTC),
+            agent=ma_session_agent(id="agent_sweep_id"),
             environment_id="env_sweep_id",
-            metadata={},
-            resources=[],
-            stats=BetaManagedAgentsSessionStats(),
-            status="idle",
-            type="session",
-            updated_at=datetime.now(UTC),
-            usage=BetaManagedAgentsSessionUsage(),
-            vault_ids=[],
         )
         mock_run_turn.side_effect = _fake_run_turn
         mock_deliver_outputs.side_effect = _recording_delivery
@@ -2241,7 +2015,7 @@ async def test_orchestrate_first_mention_adds_eyes_reaction_before_turn(
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
@@ -2257,31 +2031,10 @@ async def test_orchestrate_first_mention_adds_eyes_reaction_before_turn(
         "text": "<@U_BOT> hello",
     }
 
-    _now = datetime.now(UTC)
-    _agent_snapshot = BetaManagedAgentsSessionAgent(
-        id="agent_eyes_id",
-        mcp_servers=[],
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        name="test-agent",
-        skills=[],
-        tools=[],
-        type="agent",
-        version=1,
-    )
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-eyes-001",
-        agent=_agent_snapshot,
-        created_at=_now,
+        agent=ma_session_agent(id="agent_eyes_id"),
         environment_id="env_eyes_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     with (
@@ -2343,7 +2096,7 @@ async def test_orchestrate_eyes_reaction_transport_error_does_not_leak_thread_sl
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     # Override the shared fixture's repeat=True 200-OK reactions.add matcher:
     # aioresponses matches in registration order, so the fixture's default
@@ -2402,31 +2155,10 @@ async def test_orchestrate_eyes_reaction_transport_error_does_not_leak_thread_sl
         "text": "<@U_BOT> hello",
     }
 
-    _now = datetime.now(UTC)
-    _agent_snapshot = BetaManagedAgentsSessionAgent(
-        id="agent_eyes_xport_id",
-        mcp_servers=[],
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        name="test-agent",
-        skills=[],
-        tools=[],
-        type="agent",
-        version=1,
-    )
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-eyes-xport-001",
-        agent=_agent_snapshot,
-        created_at=_now,
+        agent=ma_session_agent(id="agent_eyes_xport_id"),
         environment_id="env_eyes_xport_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     with (
@@ -2484,7 +2216,7 @@ async def test_orchestrate_tenant_cap_when_exhausted_sends_ephemeral_and_skips_t
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory, max_concurrent_turns_per_tenant=cap)
+    app, _ = make_orchestrate_app(db_session_factory, max_concurrent_turns_per_tenant=cap)
 
     # Saturate the tenant in-flight count.
     app._inflight[tenant_id] = cap  # pyright: ignore[reportPrivateUsage]
@@ -2562,7 +2294,7 @@ async def test_orchestrate_first_turn_when_channel_agent_propagated_resolves_cha
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
@@ -2578,30 +2310,10 @@ async def test_orchestrate_first_turn_when_channel_agent_propagated_resolves_cha
         "text": "<@U_BOT> hello",
     }
 
-    _now = datetime.now(UTC)
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-scoped-001",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_scoped_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="marketing-bot",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=_now,
+        agent=ma_session_agent(id="agent_scoped_id", name="marketing-bot"),
         environment_id="env_scoped_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     with (
@@ -2656,7 +2368,7 @@ async def test_orchestrate_first_turn_when_no_agent_configured_posts_guidance_an
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory, deployment_default=DeploymentDefault())
+    app, _ = make_orchestrate_app(db_session_factory, deployment_default=DeploymentDefault())
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -2722,7 +2434,7 @@ async def test_run_thread_turn_when_over_balance_blocks_before_session_create(
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
     assert app.runtime.settings.slack is not None
     app.runtime.settings.slack.bot_display_name = display_name
 
@@ -2804,7 +2516,7 @@ async def test_run_thread_turn_when_over_cap_blocks_before_session_create(
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -2888,9 +2600,6 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
     from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
         BetaManagedAgentsSpanModelRequestEndEvent,
     )
-    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-        BetaManagedAgentsSpanModelUsage,
-    )
 
     team_id = "T_ORCH_USAGE_BILLED"
     channel = "C_TEST"
@@ -2899,7 +2608,7 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -2911,42 +2620,17 @@ async def test_run_thread_turn_when_unblocked_writes_usage_event_and_ledger_debi
     }
 
     _now = datetime.now(UTC)
-    _agent_snapshot = BetaManagedAgentsSessionAgent(
-        id="agent_test_id",
-        mcp_servers=[],
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        name="test-agent",
-        skills=[],
-        tools=[],
-        type="agent",
-        version=1,
-    )
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-usage-billed",
-        agent=_agent_snapshot,
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     model_request_end_event = BetaManagedAgentsSpanModelRequestEndEvent(
         id="evt_slack_usage_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(),
         processed_at=_now,
         type="span.model_request_end",
     )
@@ -3048,7 +2732,7 @@ async def test_run_thread_turn_reused_session_over_balance_blocks_and_skips_run_
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -3144,7 +2828,7 @@ async def test_run_thread_turn_reused_session_over_cap_blocks_and_skips_run_turn
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -3225,9 +2909,6 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
     from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
         BetaManagedAgentsSpanModelRequestEndEvent,
     )
-    from anthropic.types.beta.sessions.beta_managed_agents_span_model_usage import (
-        BetaManagedAgentsSpanModelUsage,
-    )
     from daimon.core.stores.identity import get_or_create_platform_principal
 
     team_id = "T_ORCH_REUSED_USAGE_BILLED"
@@ -3259,7 +2940,7 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -3276,12 +2957,7 @@ async def test_run_thread_turn_reused_session_unblocked_writes_usage_event_and_l
         id="evt_slack_reused_usage_1",
         is_error=False,
         model_request_start_id="start_1",
-        model_usage=BetaManagedAgentsSpanModelUsage(
-            input_tokens=100,
-            output_tokens=50,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
+        model_usage=ma_model_usage(),
         processed_at=_now,
         type="span.model_request_end",
     )
@@ -3370,7 +3046,7 @@ async def test_run_thread_turn_passes_one_shared_deadline_to_bind_and_run(
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -3381,31 +3057,10 @@ async def test_run_thread_turn_passes_one_shared_deadline_to_bind_and_run(
         "text": "<@U_BOT> hello",
     }
 
-    _now = datetime.now(UTC)
-    _agent_snapshot = BetaManagedAgentsSessionAgent(
-        id="agent_test_id",
-        mcp_servers=[],
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        name="test-agent",
-        skills=[],
-        tools=[],
-        type="agent",
-        version=1,
-    )
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-shared-deadline",
-        agent=_agent_snapshot,
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
@@ -3510,7 +3165,7 @@ async def test_run_thread_turn_bind_phase_ceiling_does_not_escape_handle_app_men
     )
     await db_session.flush()
 
-    app, _ = _make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
+    app, _ = make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -3614,32 +3269,12 @@ async def test_run_thread_turn_pump_phase_ceiling_renders_terminal_error_in_thre
         db_session_factory, platform="slack", workspace_id=team_id, signup_credit=Decimal("10")
     )
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
-    _now = datetime.now(UTC)
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-pump-ceiling-001",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_test_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     event: dict[str, Any] = {
@@ -3745,7 +3380,7 @@ async def test_bind_phase_failure_leaves_no_cancel_registry_entry(
     )
     await db_session.flush()
 
-    app, _ = _make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
+    app, _ = make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
 
     event: dict[str, Any] = {
         "type": "app_mention",
@@ -3824,32 +3459,12 @@ async def test_interstitial_failure_clears_the_marker_and_the_cancel_registry(
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
+    app, _ = make_orchestrate_app(db_session_factory, crypto_key=fernet_key)
 
-    _now = datetime.now(UTC)
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-interstitial-001",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_test_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     event: dict[str, Any] = {
@@ -3922,7 +3537,7 @@ async def test_run_thread_turn_clears_the_active_turn_marker_on_success(
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
         state = TurnState(
@@ -3945,30 +3560,10 @@ async def test_run_thread_turn_clears_the_active_turn_marker_on_success(
         "text": "<@U_BOT> hello",
     }
 
-    _now = datetime.now(UTC)
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-marker-clear-001",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_test_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     with (
@@ -4047,7 +3642,7 @@ async def test_marker_is_written_with_channel_before_the_turn_runs(
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     observed: dict[str, Any] = {}
 
@@ -4086,30 +3681,10 @@ async def test_marker_is_written_with_channel_before_the_turn_runs(
         "text": "<@U_BOT> hello",
     }
 
-    _now = datetime.now(UTC)
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-marker-mid-001",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_test_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     with (
@@ -4210,34 +3785,13 @@ async def test_a_recovered_turn_keeps_editing_the_card_the_marker_points_at(
         )
         await s.commit()
 
-    app, _ = _make_orchestrate_app(db_session_factory)
-
-    _now = datetime.now(UTC)
+    app, _ = make_orchestrate_app(db_session_factory)
 
     def _fake_session(session_id: str) -> BetaManagedAgentsSession:
-        return BetaManagedAgentsSession(
-            outcome_evaluations=[],
+        return ma_session(
             id=session_id,
-            agent=BetaManagedAgentsSessionAgent(
-                id="agent_test_id",
-                mcp_servers=[],
-                model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-                name="test-agent",
-                skills=[],
-                tools=[],
-                type="agent",
-                version=1,
-            ),
-            created_at=_now,
+            agent=ma_session_agent(id="agent_test_id"),
             environment_id="env_test_id",
-            metadata={},
-            resources=[],
-            stats=BetaManagedAgentsSessionStats(),
-            status="idle",
-            type="session",
-            updated_at=_now,
-            usage=BetaManagedAgentsSessionUsage(),
-            vault_ids=[],
         )
 
     first_session = _fake_session("sess-recover-first-001")
@@ -4881,7 +4435,7 @@ async def test_orchestrate_tenant_cap_when_in_thread_sheds_in_thread(
 
     await provision_tenant(db_session_factory, platform="slack", workspace_id=team_id)
 
-    app, _ = _make_orchestrate_app(db_session_factory, max_concurrent_turns_per_tenant=cap)
+    app, _ = make_orchestrate_app(db_session_factory, max_concurrent_turns_per_tenant=cap)
     app._inflight[tenant_id] = cap  # pyright: ignore[reportPrivateUsage]
 
     event: dict[str, Any] = {
@@ -4977,7 +4531,7 @@ async def test_ceiling_breach_releases_tenant_slot_and_thread_flag(
     )
     await db_session.flush()
 
-    app, _ = _make_orchestrate_app(
+    app, _ = make_orchestrate_app(
         db_session_factory, max_concurrent_turns_per_tenant=1, crypto_key=fernet_key
     )
 
@@ -4992,30 +4546,10 @@ async def test_ceiling_breach_releases_tenant_slot_and_thread_flag(
             "text": "<@U_BOT> hello",
         }
 
-    _now = datetime.now(UTC)
-    _fake_session = BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    _fake_session = ma_session(
         id="sess-ceiling-release-001",
-        agent=BetaManagedAgentsSessionAgent(
-            id="agent_test_id",
-            mcp_servers=[],
-            model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-            name="test-agent",
-            skills=[],
-            tools=[],
-            type="agent",
-            version=1,
-        ),
-        created_at=_now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=_now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
     async def _sleepy_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
@@ -5098,32 +4632,11 @@ _USERS_INFO_PATTERN = re.compile(r"https://slack\.com/api/users\.info.*")
 
 
 def _fake_ma_session(session_id: str) -> BetaManagedAgentsSession:
-    """Build a real BetaManagedAgentsSession inline (no MagicMock shortcuts)."""
-    now = datetime.now(UTC)
-    agent_snapshot = BetaManagedAgentsSessionAgent(
-        id="agent_test_id",
-        mcp_servers=[],
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        name="test-agent",
-        skills=[],
-        tools=[],
-        type="agent",
-        version=1,
-    )
-    return BetaManagedAgentsSession(
-        outcome_evaluations=[],
+    """The session a faked create returns for this test's thread."""
+    return ma_session(
         id=session_id,
-        agent=agent_snapshot,
-        created_at=now,
+        agent=ma_session_agent(id="agent_test_id"),
         environment_id="env_test_id",
-        metadata={},
-        resources=[],
-        stats=BetaManagedAgentsSessionStats(),
-        status="idle",
-        type="session",
-        updated_at=now,
-        usage=BetaManagedAgentsSessionUsage(),
-        vault_ids=[],
     )
 
 
@@ -5205,7 +4718,7 @@ class TestPerTurnRoleUpsert:
             },
         )
 
-        app, _ = _make_orchestrate_app(db_session_factory)
+        app, _ = make_orchestrate_app(db_session_factory)
 
         async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
             state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
@@ -5294,7 +4807,7 @@ class TestPerTurnRoleUpsert:
         # conftest's default users.info payload (non-admin) is already registered
         # by fake_slack_web_client; no override needed.
 
-        app, _ = _make_orchestrate_app(db_session_factory)
+        app, _ = make_orchestrate_app(db_session_factory)
 
         async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
             state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
@@ -5385,7 +4898,7 @@ class TestPerTurnRoleUpsert:
             payload={"ok": False, "error": "internal_error"},
         )
 
-        app, _ = _make_orchestrate_app(db_session_factory)
+        app, _ = make_orchestrate_app(db_session_factory)
 
         async def _fake_run_turn(*, lifecycle: Any, **kwargs: Any) -> TurnState:
             state = TurnState(content=[TextBlock(kind="text", text="Hello!")])
@@ -5487,7 +5000,7 @@ class TestPerTurnRoleUpsert:
             },
         )
 
-        app, _ = _make_orchestrate_app(db_session_factory)
+        app, _ = make_orchestrate_app(db_session_factory)
 
         event: dict[str, Any] = {
             "type": "app_mention",

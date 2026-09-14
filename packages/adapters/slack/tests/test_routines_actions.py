@@ -12,19 +12,17 @@ import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
-import httpx
 import pytest
 import yarl
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.routines_panel.actions import handle_routine_action
-from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.github_credentials import build_multifernet, encrypt_token
 from daimon.core.stores.routines import create_routine, get_routine, record_result
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import build_fake_anthropic, make_fake_ma_handler
-from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .harness import build_slack_runtime
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,20 +94,6 @@ async def _seed_team(
     return tenant_id, fernet_key, encrypted
 
 
-def _build_runtime(fernet_key: str, db_factory: async_sessionmaker[AsyncSession]) -> SlackRuntime:
-    settings = MagicMock()
-    settings.crypto.keys = (SecretStr(fernet_key),)
-    return SlackRuntime(
-        settings=settings,
-        anthropic=build_fake_anthropic(make_fake_ma_handler()),
-        sessionmaker=db_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-    )
-
-
 def _pause_payload(
     routine_id: uuid.UUID, *, team_id: str = _TEAM_ID, user_id: str = _USER_ID
 ) -> dict[str, object]:
@@ -170,7 +154,7 @@ async def test_handle_routine_action_pause_flips_enabled_to_false_and_triggers_v
     )
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     payload = _pause_payload(routine.id)
 
     await handle_routine_action(runtime, payload)  # type: ignore[arg-type]
@@ -212,7 +196,7 @@ async def test_handle_routine_action_non_admin_non_creator_leaves_enabled_unchan
     )
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     # Clicker is _OTHER_USER_ID (non-creator); aioresponses default returns non-admin
     payload = _pause_payload(routine.id, team_id="T_GATE", user_id=_OTHER_USER_ID)
 
@@ -256,7 +240,7 @@ async def test_handle_routine_action_cross_tenant_routine_id_is_refused_with_no_
     _, fernet_key_b, _ = await _seed_team(db_session, team_id="T_CROSS_B")
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key_b, db_session_factory)
+    runtime = build_slack_runtime(fernet_key_b, db_session_factory)
     # Payload is from team B but references routine from tenant A
     payload = _pause_payload(routine_a.id, team_id="T_CROSS_B", user_id=_USER_ID)
 
@@ -302,7 +286,7 @@ async def test_handle_routine_action_delete_by_creator_pushes_confirm_modal_and_
     )
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     payload = _delete_payload(routine.id, team_id="T_DEL_CREATOR", user_id=_USER_ID)
 
     await handle_routine_action(runtime, payload)  # type: ignore[arg-type]
@@ -340,7 +324,7 @@ async def test_handle_routine_action_delete_by_non_admin_non_creator_is_refused(
     )
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     payload = _delete_payload(routine.id, team_id="T_DEL_GATE", user_id=_OTHER_USER_ID)
 
     await handle_routine_action(runtime, payload)  # type: ignore[arg-type]
@@ -456,7 +440,7 @@ async def test_handle_routine_action_output_by_non_admin_non_creator_does_not_le
     await record_result(db_session, routine.id, tail="Q3 revenue was 4.2M", error=None)
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     payload = _output_payload(routine.id, team_id="T_OUT_GATE", user_id=_OTHER_USER_ID)
 
     await handle_routine_action(runtime, payload)  # type: ignore[arg-type]
@@ -494,7 +478,7 @@ async def test_handle_routine_action_output_by_creator_returns_last_output(
     await record_result(db_session, routine.id, tail="Q3 revenue was 4.2M", error=None)
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     payload = _output_payload(routine.id, team_id="T_OUT_OK", user_id=_USER_ID)
 
     await handle_routine_action(runtime, payload)  # type: ignore[arg-type]
@@ -536,7 +520,7 @@ async def test_handle_routine_action_output_by_admin_non_creator_returns_last_ou
     await record_result(db_session, routine.id, tail="Q3 revenue was 4.2M", error=None)
     await db_session.flush()
 
-    runtime = _build_runtime(fernet_key, db_session_factory)
+    runtime = build_slack_runtime(fernet_key, db_session_factory)
     payload = _output_payload(routine.id, team_id="T_OUT_ADMIN", user_id=_ADMIN_USER_ID)
 
     await handle_routine_action(runtime, payload)  # type: ignore[arg-type]

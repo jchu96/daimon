@@ -42,7 +42,6 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import yarl
-from anthropic.types.beta import BetaManagedAgentsAgent, BetaManagedAgentsModelConfig
 from cryptography.fernet import Fernet
 from daimon.adapters.slack import credential_requests as credential_requests_mod
 from daimon.adapters.slack.credential_requests import (
@@ -68,11 +67,12 @@ from daimon.core.stores.credential_requests import (
     peek_credential_request,
 )
 from daimon.core.stores.slack_bot_tokens import upsert_slack_bot_token
+from daimon.testing import build_fake_anthropic, list_response, ma_agent, make_fake_ma_handler
 from daimon.testing.factories import make_account, make_tenant
-from daimon.testing.ma import build_fake_anthropic, list_response, make_fake_ma_handler
-from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .harness import build_slack_runtime
 
 _TEAM_ID = "T_CRED"
 _USER_ID = "U_REQUESTER"
@@ -288,18 +288,14 @@ def _build_runtime(
     anthropic_handler: Any = None,
 ) -> SlackRuntime:
     settings = MagicMock()
-    settings.crypto.keys = (SecretStr(fernet_key),)
     settings.mcp.public_url = None
     settings.mcp.jwt_secret = None
     settings.github.oauth_scopes = ("repo",)
-    return SlackRuntime(
-        settings=settings,
+    return build_slack_runtime(
+        fernet_key,
+        db_factory,
         anthropic=build_fake_anthropic(anthropic_handler or make_fake_ma_handler()),
-        sessionmaker=db_factory,
-        billing_config=None,
-        http_client=MagicMock(spec=httpx.AsyncClient),
-        resolver_cache=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
-        turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # stub, turn path not exercised
+        settings=settings,
     )
 
 
@@ -499,21 +495,7 @@ async def test_env_submission_consumes_row_and_writes_the_secret(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    now = datetime.now(UTC)
-    live_agent = BetaManagedAgentsAgent(
-        id="agent_credentials",
-        type="agent",
-        name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        tools=[],
-        skills=[],
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
-        created_at=now,
-        updated_at=now,
-    )
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
 
     def ma_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/agents":
@@ -558,21 +540,7 @@ async def test_env_submission_of_consumed_row_writes_nothing(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    now = datetime.now(UTC)
-    live_agent = BetaManagedAgentsAgent(
-        id="agent_credentials",
-        type="agent",
-        name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        tools=[],
-        skills=[],
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
-        created_at=now,
-        updated_at=now,
-    )
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
 
     def ma_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/agents":
@@ -617,21 +585,7 @@ async def test_mcp_submission_with_unconfigured_mcp_refuses_before_the_consume(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    now = datetime.now(UTC)
-    live_agent = BetaManagedAgentsAgent(
-        id="agent_credentials",
-        type="agent",
-        name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        tools=[],
-        skills=[],
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
-        created_at=now,
-        updated_at=now,
-    )
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
 
     def ma_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/agents":
@@ -725,21 +679,7 @@ async def test_repo_submission_by_admin_binds_a_public_repo(
     monkeypatch.setattr(credential_requests_mod, "is_public_repo", AsyncMock(return_value=True))
     _override_users_info_admin(fake_slack_web_client.mock)
     tenant_id, fernet_key = await _seed_team(db_session)
-    now = datetime.now(UTC)
-    live_agent = BetaManagedAgentsAgent(
-        id="agent_credentials",
-        type="agent",
-        name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        tools=[],
-        skills=[],
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
-        created_at=now,
-        updated_at=now,
-    )
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
 
     def ma_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/agents":
@@ -779,24 +719,6 @@ async def test_repo_submission_by_admin_binds_a_public_repo(
 # ---------------------------------------------------------------------------
 # run_skill_repo_credential_submission
 # ---------------------------------------------------------------------------
-
-
-def _make_ma_agent(*, ma_agent_id: str, tenant_id: uuid.UUID, name: str) -> BetaManagedAgentsAgent:
-    return BetaManagedAgentsAgent(
-        id=ma_agent_id,
-        type="agent",
-        name=name,
-        model={"id": "claude-sonnet-4-6"},
-        metadata={"daimon_tenant": str(tenant_id)},
-        description=None,
-        created_at="2026-04-21T00:00:00Z",
-        updated_at="2026-04-21T00:00:00Z",
-        version=1,
-        mcp_servers=[],
-        skills=[],
-        tools=[],
-        system=None,
-    )
 
 
 @pytest.mark.asyncio
@@ -842,7 +764,7 @@ async def test_skill_repo_submission_binds_and_attaches_the_imported_skills(
     )
     await db_session.commit()
 
-    agent = _make_ma_agent(ma_agent_id=ma_agent_id, tenant_id=tenant_id, name="daimon")
+    agent = ma_agent(id=ma_agent_id, name="daimon", tenant_id=tenant_id)
     updates: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -893,21 +815,7 @@ async def test_skill_repo_failure_receipt_reflects_confirmed_token_storage(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    now = datetime.now(UTC)
-    live_agent = BetaManagedAgentsAgent(
-        id="agent_credentials",
-        type="agent",
-        name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        tools=[],
-        skills=[],
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
-        created_at=now,
-        updated_at=now,
-    )
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
 
     def ma_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/agents":
@@ -1019,21 +927,7 @@ async def test_env_submission_uses_durable_destination_after_origin_turn_ends(
     fake_slack_web_client: Any,
 ) -> None:
     tenant_id, fernet_key = await _seed_team(db_session)
-    now = datetime.now(UTC)
-    live_agent = BetaManagedAgentsAgent(
-        id="agent_credentials",
-        type="agent",
-        name="specialist",
-        version=1,
-        model=BetaManagedAgentsModelConfig(id="claude-sonnet-4-6", speed="standard"),
-        system=None,
-        tools=[],
-        skills=[],
-        mcp_servers=[],
-        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "specialist"},
-        created_at=now,
-        updated_at=now,
-    )
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
 
     def ma_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/agents":
