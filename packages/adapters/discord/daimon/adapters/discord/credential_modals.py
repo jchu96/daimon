@@ -323,6 +323,27 @@ async def _record_refused_outcome(runtime: DiscordRuntime, row: CredentialReques
         )
 
 
+async def _refuse_for_unavailable_target(
+    runtime: DiscordRuntime, interaction: discord.Interaction, row: CredentialRequestRow
+) -> None:
+    """Close a SPENT request whose target turned out to be unusable.
+
+    Unlike `_record_refused_outcome`, whose request is still live, the consume
+    has already happened here — so leaving the card on `received` would have it
+    say "Saving…" about a save that stopped. Nothing is known to have reached a
+    store on this path, so the terminal state is `refused` rather than
+    `partial`, and no continuation is queued: work waiting on this value must
+    not resume on a value that never landed.
+    """
+    async with runtime.sessionmaker.begin() as session:
+        await credential_requests.set_credential_request_outcome(
+            session, token=row.token, outcome="write_failed"
+        )
+    await edit_posted_card(
+        interaction.client, row=row, state="refused", refusal="target_unavailable"
+    )
+
+
 async def _dispatch_origin_thread(
     interaction: discord.Interaction, row: CredentialRequestRow
 ) -> None:
@@ -817,6 +838,7 @@ class McpCredentialModal(discord.ui.Modal):
         mcp_server_url = consumed_row.mcp_server_url
         if mcp_server_url is None:
             _log.error("credential_modal.mcp_missing_server_url", token_tail=self._row.token[-4:])
+            await _refuse_for_unavailable_target(self._runtime, interaction, consumed_row)
             await interaction.followup.send(
                 "This request is missing its server URL — please ask again.", ephemeral=True
             )
@@ -865,6 +887,7 @@ class McpCredentialModal(discord.ui.Modal):
             )
             # Keep exception details in the operator log; SDK failures can
             # include the request envelope.
+            await _refuse_for_unavailable_target(self._runtime, interaction, consumed_row)
             await interaction.followup.send(
                 "This request was used, but saving the MCP token did not finish. "
                 "Some changes may have been saved. Ask for a new request to retry.",
@@ -889,11 +912,33 @@ class McpCredentialModal(discord.ui.Modal):
                 "credential_modal.mcp_agent_not_found",
                 agent_id=str(consumed_row.agent_id),
             )
+            # The token IS stored, so this is `partial`, not a refusal — and
+            # the continuation carries no work, because the connection the
+            # waiting turn needs is not usable.
+            is_queued = await _settle_spent_request(
+                self._runtime,
+                row=consumed_row,
+                outcome="write_failed",
+                carries_work=False,
+            )
+            await edit_posted_card(
+                interaction.client,
+                row=consumed_row,
+                state="partial",
+                outcome=ConfigurationChange(
+                    target_name=_agent_name(consumed_row),
+                    kind="mcp",
+                    availability="preparation_failed",
+                    detail=consumed_row.target,
+                ),
+            )
             await interaction.followup.send(
                 "Auth token stored, but the agent could not be found to attach "
                 f"`{mcp_server_url}` to it. The server is not connected yet.",
                 ephemeral=True,
             )
+            if is_queued:
+                await _dispatch_origin_thread(interaction, consumed_row)
             return
         try:
             await attach_mcp_server_to_agent(
