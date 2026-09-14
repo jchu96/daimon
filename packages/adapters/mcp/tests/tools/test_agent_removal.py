@@ -569,13 +569,28 @@ async def test_list_agent_keys_impl_returns_sorted_key_names_only(
     async with db_session_factory() as session, session.begin():
         await make_tenant(session, platform="discord", id=tenant_id)
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_uuid, key="ZKEY", content="v1"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="ZKEY",
+            content="v1",
+            set_by_account_id=None,
         )
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_uuid, key="AKEY", content="v2"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="AKEY",
+            content="v2",
+            set_by_account_id=None,
         )
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_uuid, key="MKEY", content="v3"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="MKEY",
+            content="v3",
+            set_by_account_id=None,
         )
 
     auth = AuthIdentity(
@@ -639,6 +654,7 @@ async def test_list_agent_keys_impl_never_returns_a_stored_value(
             agent_id=agent_uuid,
             key="API_KEY",
             content=distinctive_value,
+            set_by_account_id=None,
         )
 
     auth = AuthIdentity(
@@ -681,7 +697,12 @@ async def test_remove_agent_key_impl_removes_existing_key(
     async with db_session_factory() as session, session.begin():
         await make_tenant(session, platform="discord", id=tenant_id)
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_uuid, key="API_KEY", content="v1"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="API_KEY",
+            content="v1",
+            set_by_account_id=None,
         )
 
     auth = AuthIdentity(
@@ -768,7 +789,12 @@ async def test_remove_agent_key_impl_succeeds_against_seeded_agent_with_no_daimo
     async with db_session_factory() as session, session.begin():
         await make_tenant(session, platform="discord", id=tenant_id)
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_uuid, key="SEEDED_KEY", content="v1"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key="SEEDED_KEY",
+            content="v1",
+            set_by_account_id=None,
         )
 
     auth = AuthIdentity(
@@ -800,10 +826,20 @@ async def test_remove_agent_key_impl_isolates_between_agents_in_same_tenant(
     async with db_session_factory() as session, session.begin():
         await make_tenant(session, platform="discord", id=tenant_id)
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_a_uuid, key="SHARED", content="a-value"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_a_uuid,
+            key="SHARED",
+            content="a-value",
+            set_by_account_id=None,
         )
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_b_uuid, key="SHARED", content="b-value"
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_b_uuid,
+            key="SHARED",
+            content="b-value",
+            set_by_account_id=None,
         )
 
     auth = AuthIdentity(

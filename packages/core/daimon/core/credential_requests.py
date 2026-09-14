@@ -22,10 +22,11 @@ not a prefix search, so a template that merely starts with the right prefix
 would never dispatch (or could over-match unrelated ids).
 
 Each kind puts something different in `target`: for `env` it is the
-environment variable's key name, for `mcp` it is the MCP server name, and
-for `repo` it is the repo URL. A `repo` request's branch is collected in the
-modal at click time, not stored on the row — `credential_requests` has no
-branch column, and this module adds none.
+environment variable's key name, for `env_file` it is the fixed
+`ENV_FILE_TARGET` sentinel (a whole-file import names no single key, and the
+column is NOT NULL), for `mcp` it is the MCP server name, and for `repo` and
+`skill_repo` it is the repo URL, optionally packed with a branch and path by
+`build_skill_repo_target`.
 """
 
 from __future__ import annotations
@@ -45,7 +46,17 @@ TOKEN_BYTES: Final[int] = 16
 CUSTOM_ID_TEMPLATE: Final[str] = r"ztc:(?P<token>[A-Za-z0-9_-]{16,64})"
 CUSTOM_ID_PATTERN: Final[re.Pattern[str]] = re.compile(CUSTOM_ID_TEMPLATE)
 
-CredentialRequestKind = Literal["env", "mcp", "repo", "skill_repo"]
+CredentialRequestKind = Literal["env", "env_file", "mcp", "repo", "skill_repo"]
+
+# How a consumed request actually ended, recorded on the row after the click.
+# "applied" — the write landed. "stale_replacement" — the compare-and-set
+# precondition the card promised no longer held (someone else wrote, or the
+# key was removed). "write_failed" — the write itself raised.
+CredentialRequestOutcome = Literal["applied", "stale_replacement", "write_failed"]
+
+# `target` for kind='env_file'. The column is NOT NULL and a whole-file import
+# names no single key, so every env_file request carries this one sentinel.
+ENV_FILE_TARGET: Final[str] = ".env"
 
 # TTL bounds the replay window for a never-clicked button sitting in channel
 # scrollback; combined with the store's single-use consume, this is the full
@@ -71,6 +82,7 @@ SLACK_ACTION_ID: Final[str] = "credential_request"
 # request description explains that side effect before the form is posted.
 _KIND_LABEL_PREFIX: Final[dict[CredentialRequestKind, str]] = {
     "env": "Add key: ",
+    "env_file": "Add keys from ",
     "mcp": "Add MCP token: ",
     "repo": "Set working repo: ",
     "skill_repo": "Import skills from: ",

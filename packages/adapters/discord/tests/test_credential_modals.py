@@ -205,6 +205,10 @@ async def _seed_repo_request(
             requester_platform_user_id="100000000000000001",
             channel_id="chan-1",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
     return row
 
@@ -237,6 +241,10 @@ async def _seed_skill_repo_request(
             requester_platform_user_id="100000000000000001",
             channel_id="chan-1",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
     return row
 
@@ -292,6 +300,10 @@ async def _seed_env_request(
             origin_thread_id="333" if with_origin else None,
             posted_message_id="444" if with_origin else None,
             expires_at=expires_at or (datetime.now(UTC) + timedelta(minutes=30)),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
     return row
 
@@ -319,6 +331,10 @@ async def _seed_mcp_request(
             requester_platform_user_id="100000000000000001",
             channel_id="chan-1",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
     return row
 

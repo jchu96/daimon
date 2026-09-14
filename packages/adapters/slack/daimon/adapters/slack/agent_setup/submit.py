@@ -1381,6 +1381,7 @@ async def run_paste_secrets_submission(
                     agent_id=agent_uuid,
                     key=key,
                     content=value,
+                    set_by_account_id=None,
                 )
                 key_names_written.append(key)
 

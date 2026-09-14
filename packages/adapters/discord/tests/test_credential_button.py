@@ -129,6 +129,7 @@ def _row(
     """Build a CredentialRequestRow in memory -- no DB needed for interaction_check/callback tests."""
     now = datetime.now(UTC)
     return CredentialRequestRow(
+        idempotency_key=uuid.uuid4(),
         token=token,
         kind=kind,
         tenant_id=tenant_id or derive_tenant_uuid(platform="discord", workspace_id=str(_GUILD_ID)),
@@ -192,6 +193,10 @@ async def _seed_repo_row(
             requester_platform_user_id=_REQUESTER_ID,
             channel_id="chan-1",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
     return row
 
@@ -220,6 +225,10 @@ async def _seed_request(
             requester_platform_user_id=requester_platform_user_id,
             channel_id="chan-1",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
     return token
 

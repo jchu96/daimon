@@ -1302,6 +1302,10 @@ async def test_purge_principal_platform_deletes_credential_request_and_reports_c
         requester_platform_user_id="user-cred-req",
         channel_id="C1",
         expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await db_session.commit()
 
@@ -1357,6 +1361,10 @@ async def test_purge_principal_credential_requests_does_not_delete_same_user_in_
         requester_platform_user_id="shared-user-id",
         channel_id="C1",
         expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await credential_requests_store.create_credential_request(
         db_session,
@@ -1370,6 +1378,10 @@ async def test_purge_principal_credential_requests_does_not_delete_same_user_in_
         requester_platform_user_id="shared-user-id",
         channel_id="C1",
         expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await db_session.commit()
 

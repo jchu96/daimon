@@ -48,6 +48,22 @@ def test_assemble_env_bytes_single_row_has_trailing_newline() -> None:
     )
 
 
+def test_assemble_env_bytes_is_unchanged_for_plain_values() -> None:
+    rows = [_row("TOGGL_TOKEN", "abc123"), _row("OPENAI_API_KEY", "sk-proj-xyz")]
+    assert assemble_env_bytes(rows) == b"TOGGL_TOKEN=abc123\nOPENAI_API_KEY=sk-proj-xyz\n", (
+        "plain values must serialize exactly as they always have: these bytes are hashed "
+        "into the fingerprint that decides whether a live agent's mounted .env is current, "
+        "so extra quoting would invalidate every agent at once"
+    )
+
+
+def test_assemble_env_bytes_quotes_a_value_that_needs_it() -> None:
+    rows = [_row("MULTILINE", "-----BEGIN KEY-----\nabc\n-----END KEY-----")]
+    assert assemble_env_bytes(rows) == (
+        b'MULTILINE="-----BEGIN KEY-----\\nabc\\n-----END KEY-----"\n'
+    ), "a value with newlines is double-quoted and escaped so it can be read back"
+
+
 def test_assemble_env_bytes_unicode_roundtrips_byte_exact() -> None:
     value = "café-π-密钥"
     rows = [_row("UNICODE", value)]
@@ -99,8 +115,22 @@ async def test_upload_env_and_mount_uploads_env_and_returns_mount_dict(
 ) -> None:
     tenant = await make_tenant(db_session)
     agent_id = uuid.uuid4()
-    await put_agent_file(db_session, tenant_id=tenant.id, agent_id=agent_id, key="A", content="1")
-    await put_agent_file(db_session, tenant_id=tenant.id, agent_id=agent_id, key="B", content="2")
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        key="A",
+        content="1",
+        set_by_account_id=None,
+    )
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        key="B",
+        content="2",
+        set_by_account_id=None,
+    )
     await db_session.commit()
 
     capture = _UploadCapture(file_id="file_test123")
@@ -147,7 +177,14 @@ async def test_upload_env_and_mount_enqueues_ttl_delete(
 ) -> None:
     tenant = await make_tenant(db_session)
     agent_id = uuid.uuid4()
-    await put_agent_file(db_session, tenant_id=tenant.id, agent_id=agent_id, key="A", content="1")
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        key="A",
+        content="1",
+        set_by_account_id=None,
+    )
     await db_session.commit()
 
     capture = _UploadCapture(file_id="file_ttl")
@@ -178,10 +215,20 @@ async def test_upload_env_and_mount_is_tenant_isolated(
     tenant_b = await make_tenant(db_session)
     agent_id = uuid.uuid4()  # same agent_id across tenants
     await put_agent_file(
-        db_session, tenant_id=tenant_a.id, agent_id=agent_id, key="A_KEY", content="aval"
+        db_session,
+        tenant_id=tenant_a.id,
+        agent_id=agent_id,
+        key="A_KEY",
+        content="aval",
+        set_by_account_id=None,
     )
     await put_agent_file(
-        db_session, tenant_id=tenant_b.id, agent_id=agent_id, key="B_KEY", content="bval"
+        db_session,
+        tenant_id=tenant_b.id,
+        agent_id=agent_id,
+        key="B_KEY",
+        content="bval",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -210,6 +257,7 @@ async def test_upload_env_and_mount_never_logs_secret_values(
         agent_id=agent_id,
         key="SECRET",
         content=secret_value,
+        set_by_account_id=None,
     )
     await db_session.commit()
 

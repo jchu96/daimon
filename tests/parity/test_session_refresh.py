@@ -211,7 +211,12 @@ async def _put_key(
     agent_uuid = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=AGENT_ID)
     async with sessionmaker() as session, session.begin():
         await put_agent_file(
-            session, tenant_id=tenant_id, agent_id=agent_uuid, key=key, content=value
+            session,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            key=key,
+            content=value,
+            set_by_account_id=None,
         )
     async with sessionmaker() as session:
         rows = await list_agent_files(session, tenant_id=tenant_id, agent_id=agent_uuid)

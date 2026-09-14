@@ -745,6 +745,17 @@ class AgentFile(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     key: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Attribution, not authorization: who first created the key and who last
+    # replaced its value. No FK to accounts.id, matching CredentialRequest's
+    # rationale — these rows are erased by the platform-user-scoped helper,
+    # not by an accounts.id cascade. Both stay NULL for pre-migration rows and
+    # for writes with no acting person (a self-edit tool run headless).
+    created_by_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    last_set_by_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -798,6 +809,56 @@ class AgentRepoBinding(Base):
         ForeignKey("accounts.id", ondelete="SET NULL"),
         nullable=True,
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class AgentSkillRepoCredential(Base):
+    """Per-(tenant, agent, repo) token for importing skills from a git repo.
+
+    Deliberately NOT a column on `AgentRepoBinding`. That table is keyed
+    (tenant_id, agent_id) because an agent has exactly one working repo — the
+    one it clones — whereas it may import skills from any number of repos. If
+    the skill token lived on the binding, enrolling a skill repo would
+    re-point the working repo (and enrolling a second skill repo would evict
+    the first). The two must never move each other, so they are two tables and
+    this one carries `repo_url` in its primary key.
+
+    `repo_url` is the canonical `owner/repo` form; the store normalizes it on
+    every write and every read key. `path` is the in-repo subdirectory skills
+    are read from, empty string for the repo root. The three proof columns
+    mirror `AgentRepoBinding`'s: what was established about read access at
+    enrollment time, and by whom.
+    """
+
+    __tablename__ = "agent_skill_repo_credentials"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "tenant_id", "agent_id", "repo_url", name="pk_agent_skill_repo_credentials"
+        ),
+        Index("ix_agent_skill_repo_credentials_tenant_repo", "tenant_id", "repo_url"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    repo_url: Mapped[str] = mapped_column(Text, nullable=False)
+    default_branch: Mapped[str] = mapped_column(Text, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    ma_secret_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    proof_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proof_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    proof_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -978,12 +1039,27 @@ class CredentialRequest(Base):
     platform-user-scoped erasure helper (mirroring how the OAuth handshake
     table `github_oauth_states` is erased), not through an accounts.id
     cascade.
+
+    The provenance columns (`target_ma_agent_id`, `target_name`,
+    `responder_name`, `requested_work`) record who the control was minted for
+    and what was waiting on it, so a card rehydrated long after its turn still
+    names its target. `replaces_updated_at` is the compare-and-set
+    precondition the card promised; `outcome` is how the click actually ended.
     """
 
     __tablename__ = "credential_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('env', 'env_file', 'mcp', 'repo', 'skill_repo')",
+            name="ck_credential_requests_kind",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_credential_requests_idempotency_key"),
+    )
 
     token: Mapped[str] = mapped_column(Text, primary_key=True)
-    kind: Mapped[str] = mapped_column(Text, nullable=False)  # "env" | "mcp"
+    # Constrained by ck_credential_requests_kind; the vocabulary itself is
+    # `daimon.core.credential_requests.CredentialRequestKind`.
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("tenants.id", ondelete="CASCADE"),
@@ -999,6 +1075,18 @@ class CredentialRequest(Base):
     parent_channel_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     origin_thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     posted_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    requested_work: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_ma_agent_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    responder_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    replaces_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Untyped Text with no CHECK, like `thread_sessions.pending_unsaved_work`:
+    # the vocabulary is pinned by `CredentialRequestOutcome` in
+    # `daimon.core.credential_requests`.
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

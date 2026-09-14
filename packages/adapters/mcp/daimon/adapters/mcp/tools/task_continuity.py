@@ -22,7 +22,11 @@ from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
 from daimon.adapters.mcp.tools.setup_target import require_turn_origin
-from daimon.core.continuity.continuation import MAX_REQUESTED_WORK, ContinuationRequest
+from daimon.core.continuity.continuation import (
+    MAX_REQUESTED_WORK,
+    ContinuationRequest,
+    sanitize_requested_work,
+)
 from daimon.core.continuity.handoff import (
     HandoffRefused,
     HandoffRefusedInSetupThread,
@@ -51,32 +55,6 @@ from pydantic import Field
 #: What the model must do with the returned copy. Both tools return final
 #: person-facing text, so the model's job is to relay it, not to rewrite it.
 _REPLY_VERBATIM = "Reply with `confirmation` verbatim and nothing else."
-
-#: Below this length a `continuation` is too short to be a real work
-#: description -- almost always the model echoing the destination's name or
-#: a one-word restatement of the switch itself.
-_MIN_CONTINUATION_LENGTH = 8
-
-
-def _sanitize_continuation(continuation: str | None, *, destination_name: str) -> str | None:
-    """Null out a `continuation` that cannot be a real request to carry on work.
-
-    Deterministic backstop for Issue 2 (staging QA, 2026-09-13): the model
-    invented a continuation restating already-finished work for a bare
-    "take over this task", billing an unrequested second turn. This cannot
-    read the turn's own triggering message -- `TurnOriginRow` carries no such
-    text -- so it only catches the shapes that are never a legitimate
-    continuation regardless of what was said: empty, too short to describe
-    work, or just the destination's own name.
-    """
-    if continuation is None:
-        return None
-    normalized = continuation.strip().lower()
-    if not normalized or len(normalized) < _MIN_CONTINUATION_LENGTH:
-        return None
-    if normalized == destination_name.strip().lower():
-        return None
-    return continuation
 
 
 def _channel_mention(platform: Literal["discord", "slack"], channel_id: str) -> str:
@@ -158,7 +136,7 @@ async def _hand_off_task_impl(
             "That agent has no configuration name, so nobody can reach it by name. "
             "Choose a named agent in this workspace. Nothing was changed."
         )
-    continuation = _sanitize_continuation(continuation, destination_name=destination_name)
+    continuation = sanitize_requested_work(continuation, echoes=(destination_name,))
     if continuation is not None and auth.platform_user_id is None:
         raise ToolError(
             "Continuing work needs the requester's platform identity, which this "

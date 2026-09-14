@@ -490,6 +490,10 @@ async def test_collect_purge_preview_credential_requests_matches_purge_account(
         requester_platform_user_id="PV_CRED_TARGET",
         channel_id="C1",
         expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await db_session.commit()
 

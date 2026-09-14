@@ -1,11 +1,13 @@
 """The names-only projection of an agent's stored keys, and its XML renderer.
 
 This module defines the contract for naming an agent's stored keys on a turn.
-**Nothing calls these functions today.** Enabling injection requires a
-mechanism that refreshes a reused session's mounted resources — re-syncing
-the `.env` a session reads from — which does not exist yet. Wiring either
-function into a turn today would tell the model a key is available when the
-answering session cannot actually read it.
+The intended caller is each adapter, right after `bind_session`, reading the
+live `thread_sessions` row it just bound: it passes that row's
+`effective_config.env_sha256` to `list_mounted_key_names`, which names the
+stored keys only while the mounted `.env` is still assembled from exactly
+those rows. A session bound before the latest key change runs an older `.env`,
+and its hash no longer matches; naming today's keys then would tell the model
+a key is available that the answering session cannot read, so nothing is named.
 
 Stored key names are configuration metadata, never evidence that the
 answering session has those keys mounted. `list_turn_key_names` is not the
@@ -34,6 +36,8 @@ import uuid
 from collections.abc import Sequence
 from xml.sax.saxutils import quoteattr
 
+from daimon.core.credential_env import assemble_env_bytes
+from daimon.core.session_snapshot import hash_env_bytes
 from daimon.core.stores.agent_files import list_agent_files
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +61,32 @@ async def list_turn_key_names(
     values-never-ride property a type guarantee rather than a convention.
     """
     rows = await list_agent_files(session, tenant_id=tenant_id, agent_id=agent_id)
+    return tuple(row.key for row in rows)
+
+
+async def list_mounted_key_names(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    env_sha256: str | None,
+) -> tuple[str, ...]:
+    """Stored key names, but only when the mounted `.env` is these exact rows.
+
+    `env_sha256` is what the answering session froze
+    (`thread_sessions.effective_config.env_sha256`). When it differs from
+    `hash_env_bytes(assemble_env_bytes(rows))` the session runs an older `.env`
+    and naming today's keys would tell the model a key is available that it
+    cannot read — returns `()`.
+
+    A session that froze no hash mounted no `.env` at all, so it has nothing
+    to name either.
+    """
+    if env_sha256 is None:
+        return ()
+    rows = await list_agent_files(session, tenant_id=tenant_id, agent_id=agent_id)
+    if not rows or hash_env_bytes(assemble_env_bytes(rows)) != env_sha256:
+        return ()
     return tuple(row.key for row in rows)
 
 

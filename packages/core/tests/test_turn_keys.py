@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from daimon.core.stores.agent_files import put_agent_file
-from daimon.core.turn_keys import list_turn_key_names, render_keys_element
+import uuid
+
+from daimon.core.credential_env import assemble_env_bytes
+from daimon.core.session_snapshot import hash_env_bytes
+from daimon.core.stores.agent_files import list_agent_files, put_agent_file
+from daimon.core.turn_keys import (
+    list_mounted_key_names,
+    list_turn_key_names,
+    render_keys_element,
+)
 from daimon.testing.factories import make_tenant
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +22,12 @@ async def test_list_turn_key_names_returns_ascending_by_key(db_session: AsyncSes
 
     for key in ("ZED", "ALPHA", "mid"):
         await put_agent_file(
-            db_session, tenant_id=tenant.id, agent_id=agent_id, key=key, content="secret-value"
+            db_session,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key=key,
+            content="secret-value",
+            set_by_account_id=None,
         )
 
     names = await list_turn_key_names(db_session, tenant_id=tenant.id, agent_id=agent_id)
@@ -35,7 +48,12 @@ async def test_list_turn_key_names_empty_for_agent_with_no_rows(db_session: Asyn
 async def test_list_turn_key_names_returns_a_plain_tuple_of_str(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=tenant.id, key="TOGGL_TOKEN", content="v"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=tenant.id,
+        key="TOGGL_TOKEN",
+        content="v",
+        set_by_account_id=None,
     )
 
     names = await list_turn_key_names(db_session, tenant_id=tenant.id, agent_id=tenant.id)
@@ -59,6 +77,7 @@ async def test_list_turn_key_names_and_render_never_leak_a_stored_value(
         agent_id=tenant.id,
         key="OPENAI_API_KEY",
         content=sentinel_value,
+        set_by_account_id=None,
     )
 
     names = await list_turn_key_names(db_session, tenant_id=tenant.id, agent_id=tenant.id)
@@ -99,4 +118,114 @@ def test_render_keys_element_escapes_xml_metacharacters() -> None:
     )
     assert rendered.count("<key ") == 1, (
         "an escaped metacharacter must not be interpreted as closing the element early"
+    )
+
+
+async def _mounted_hash(session: AsyncSession, *, tenant_id: uuid.UUID) -> str:
+    """The hash a session freezes when it mounts this agent's current keys."""
+    rows = await list_agent_files(session, tenant_id=tenant_id, agent_id=tenant_id)
+    return hash_env_bytes(assemble_env_bytes(rows))
+
+
+async def test_list_mounted_key_names_returns_names_when_hash_matches(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    for key in ("ALPHA", "ZED"):
+        await put_agent_file(
+            db_session,
+            tenant_id=tenant.id,
+            agent_id=tenant.id,
+            key=key,
+            content="secret-value",
+            set_by_account_id=None,
+        )
+    env_sha256 = await _mounted_hash(db_session, tenant_id=tenant.id)
+
+    names = await list_mounted_key_names(
+        db_session, tenant_id=tenant.id, agent_id=tenant.id, env_sha256=env_sha256
+    )
+
+    assert names == ("ALPHA", "ZED"), (
+        "a session whose mounted .env is these exact rows may be told their names"
+    )
+
+
+async def test_list_mounted_key_names_returns_empty_when_hash_is_stale(
+    db_session: AsyncSession,
+) -> None:
+    """A key added after the session mounted its .env is not readable by that session."""
+    tenant = await make_tenant(db_session)
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=tenant.id,
+        key="ALPHA",
+        content="secret-value",
+        set_by_account_id=None,
+    )
+    frozen = await _mounted_hash(db_session, tenant_id=tenant.id)
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=tenant.id,
+        key="ZED",
+        content="added-after-the-mount",
+        set_by_account_id=None,
+    )
+
+    names = await list_mounted_key_names(
+        db_session, tenant_id=tenant.id, agent_id=tenant.id, env_sha256=frozen
+    )
+
+    assert names == (), (
+        "naming today's keys to a session running an older .env would promise a key it cannot read"
+    )
+
+
+async def test_list_mounted_key_names_returns_empty_without_a_hash(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=tenant.id,
+        key="ALPHA",
+        content="secret-value",
+        set_by_account_id=None,
+    )
+
+    names = await list_mounted_key_names(
+        db_session, tenant_id=tenant.id, agent_id=tenant.id, env_sha256=None
+    )
+
+    assert names == (), "a session that froze no hash mounted no .env, so it has nothing to name"
+
+
+async def test_list_mounted_key_names_never_leaks_a_stored_value(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    sentinel_value = "sk-sentinel-do-not-leak-9f3a1c"
+    await put_agent_file(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=tenant.id,
+        key="OPENAI_API_KEY",
+        content=sentinel_value,
+        set_by_account_id=None,
+    )
+    env_sha256 = await _mounted_hash(db_session, tenant_id=tenant.id)
+
+    names = await list_mounted_key_names(
+        db_session, tenant_id=tenant.id, agent_id=tenant.id, env_sha256=env_sha256
+    )
+
+    assert names == ("OPENAI_API_KEY",), "the matching session is told the key name"
+    assert sentinel_value not in repr(names), (
+        "a stored value must not be reachable from the projection's repr"
+    )
+    assert sentinel_value not in render_keys_element(names), (
+        "a stored value must not be reachable from the rendered <keys> element"
     )

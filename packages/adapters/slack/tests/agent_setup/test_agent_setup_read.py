@@ -115,6 +115,7 @@ async def test_load_section_data_secrets_returns_key_names_only_and_value_is_abs
         agent_id=agent_uuid,
         key=secret_key,
         content=secret_value,
+        set_by_account_id=None,
     )
 
     # Build a fake MA handler that returns exactly one agent for this tenant

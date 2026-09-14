@@ -644,6 +644,7 @@ async def run_env_credential_submission(
                 agent_id=consumed.agent_id,
                 key=consumed.target,
                 content=value,
+                set_by_account_id=consumed.account_id,
             )
     except Exception:
         log.exception("credential_request.env_write_failed", key_present=True)

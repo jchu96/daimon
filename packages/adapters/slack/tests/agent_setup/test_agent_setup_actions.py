@@ -1175,6 +1175,7 @@ async def test_handle_agent_setup_action_remove_secret_non_admin_on_default_agen
             agent_id=agent_uuid,
             key="SOME_KEY",
             content="some-value",
+            set_by_account_id=None,
         )
 
     payload = _action_payload(
@@ -1225,6 +1226,7 @@ async def test_handle_agent_setup_action_remove_secret_admin_on_default_agent_de
             agent_id=agent_uuid,
             key="SOME_KEY",
             content="some-value",
+            set_by_account_id=None,
         )
 
     client_fake: Any = fake_slack_web_client

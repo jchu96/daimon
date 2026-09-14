@@ -433,6 +433,8 @@ class AgentFileRow(BaseModel):
     agent_id: uuid.UUID
     key: str
     content: str
+    created_by_account_id: uuid.UUID | None = None
+    last_set_by_account_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -487,6 +489,29 @@ class AgentRepoBindingRow(BaseModel):
     updated_at: datetime
 
 
+class AgentSkillRepoCredentialRow(BaseModel):
+    """Pydantic row for AgentSkillRepoCredential — a per-repo skill-import token.
+
+    Separate from `AgentRepoBindingRow` for the reason its ORM docstring
+    gives: one working repo per agent, any number of skill repos, and
+    enrolling one must never move the other.
+    """
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    repo_url: str
+    default_branch: str
+    path: str
+    ma_secret_ref: str
+    proof_kind: RepoProofKind | None = None
+    proof_at: datetime | None = None
+    proof_account_id: uuid.UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class AgentMemoryStoreRow(BaseModel):
     """Pydantic row for AgentMemoryStore (agent memory feature)."""
 
@@ -528,6 +553,13 @@ class CredentialRequestRow(BaseModel):
     parent_channel_id: str | None = None
     origin_thread_id: str | None = None
     posted_message_id: str | None = None
+    idempotency_key: uuid.UUID
+    requested_work: str | None = None
+    target_ma_agent_id: str | None = None
+    target_name: str | None = None
+    responder_name: str | None = None
+    replaces_updated_at: datetime | None = None
+    outcome: str | None = None
     created_at: datetime
     expires_at: datetime
     used_at: datetime | None

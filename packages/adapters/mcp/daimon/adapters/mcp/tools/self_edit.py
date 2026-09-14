@@ -149,6 +149,7 @@ async def _self_write_file_impl(
                 agent_id=agent_id,
                 key=key,
                 content=content,
+                set_by_account_id=auth.account_id,
             )
     except StoreError as e:
         logger.warning(

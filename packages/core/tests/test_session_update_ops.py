@@ -226,7 +226,12 @@ async def test_env_replacement_deletes_the_old_resource_before_adding_the_new_on
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="TOGGL_TOKEN", content="tok"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="TOGGL_TOKEN",
+        content="tok",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -290,7 +295,12 @@ async def test_env_replacement_enqueues_the_new_file_for_ttl_deletion(
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="KEY", content="v"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="KEY",
+        content="v",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -325,7 +335,12 @@ async def test_env_replacement_finds_the_mounted_env_when_no_resource_id_was_rec
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="KEY", content="v"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="KEY",
+        content="v",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -365,7 +380,12 @@ async def test_env_replacement_clears_the_recorded_env_when_the_add_fails_after_
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="KEY", content="v"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="KEY",
+        content="v",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -539,7 +559,12 @@ async def test_update_defers_as_session_busy_when_ma_refuses_a_running_session(
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="KEY", content="v"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="KEY",
+        content="v",
+        set_by_account_id=None,
     )
     await db_session.commit()
 

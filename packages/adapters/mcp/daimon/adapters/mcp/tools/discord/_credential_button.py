@@ -42,6 +42,7 @@ from fastmcp.exceptions import ToolError
 
 _KIND_NOUN: dict[CredentialRequestKind, str] = {
     "env": "an API key",
+    "env_file": "keys from a .env file",
     "mcp": "an MCP server token",
     "repo": "a working repo",
     "skill_repo": "a GitHub token for a skill repo",

@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from daimon.core._models import CredentialRequest
-from daimon.core.credential_requests import CredentialRequestKind
+from daimon.core.credential_requests import CredentialRequestKind, CredentialRequestOutcome
 from daimon.core.stores.domain import CredentialRequestRow
 from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,12 +34,27 @@ async def create_credential_request(
     requester_platform_user_id: str,
     channel_id: str,
     expires_at: datetime,
+    idempotency_key: uuid.UUID,
+    target_ma_agent_id: str,
+    target_name: str,
+    requested_work: str | None,
+    responder_name: str | None = None,
+    replaces_updated_at: datetime | None = None,
     platform: str | None = None,
     parent_channel_id: str | None = None,
     origin_thread_id: str | None = None,
     posted_message_id: str | None = None,
 ) -> CredentialRequestRow:
-    """Insert a fresh, unused credential-request row and return it."""
+    """Insert a fresh, unused credential-request row and return it.
+
+    `idempotency_key`, `target_ma_agent_id`, `target_name` and
+    `requested_work` have no defaults: provenance must be stated, not
+    defaulted into. A mint site that does not know which agent the control
+    targets, or what work is waiting on it, is a mint site that should not be
+    posting a control — and `requested_work=None` said explicitly is the
+    legitimate way to record "nothing was waiting", the same discipline
+    `agent_repo_binding.set_binding` applies to `proof`.
+    """
     orm = CredentialRequest(
         token=token,
         kind=kind,
@@ -51,6 +66,12 @@ async def create_credential_request(
         requester_platform_user_id=requester_platform_user_id,
         channel_id=channel_id,
         expires_at=expires_at,
+        idempotency_key=idempotency_key,
+        target_ma_agent_id=target_ma_agent_id,
+        target_name=target_name,
+        requested_work=requested_work,
+        responder_name=responder_name,
+        replaces_updated_at=replaces_updated_at,
         platform=platform,
         parent_channel_id=parent_channel_id,
         origin_thread_id=origin_thread_id,
@@ -110,6 +131,24 @@ async def consume_credential_request(
     if orm is None:
         return None
     return CredentialRequestRow.model_validate(orm)
+
+
+async def set_credential_request_outcome(
+    session: AsyncSession,
+    *,
+    token: str,
+    outcome: CredentialRequestOutcome,
+) -> None:
+    """Record how the consumed request actually ended. Idempotent; no raise if absent.
+
+    Written after `consume_credential_request` has already spent the row, so
+    this never gates anything — it is the durable trace of what the click did
+    ("applied", "stale_replacement", "write_failed"), which the posted card's
+    final state is rendered from.
+    """
+    await session.execute(
+        update(CredentialRequest).where(CredentialRequest.token == token).values(outcome=outcome)
+    )
 
 
 async def delete_credential_requests_for_platform_user(

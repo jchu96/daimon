@@ -120,6 +120,10 @@ async def test_discord_env_key_add_ack_matches_core_renderer(
             requester_platform_user_id=str(requester_user_id),
             channel_id="chan-1",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
         )
 
     agent = ma_agent(id=ma_agent_id, name="stripe-bot", tenant_id=tenant.id)
