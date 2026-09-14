@@ -13,7 +13,6 @@ import re
 import uuid
 
 import httpx
-from anthropic import AsyncAnthropic
 from anthropic.types.beta import (
     BetaManagedAgentsAgent,
     BetaManagedAgentsCustomSkill,
@@ -27,7 +26,7 @@ from daimon.core.stores.user_skills import (
     upsert_user_skill,
 )
 from daimon.testing.factories import make_tenant
-from daimon.testing.ma import MARouter, list_response
+from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -66,12 +65,6 @@ def test_compute_skills_after_removal_returns_empty_list_when_clearing_last_skil
 # ---------------------------------------------------------------------------
 # remove_agent_skill_repo — end to end
 # ---------------------------------------------------------------------------
-
-
-def _build_anthropic(router: MARouter) -> AsyncAnthropic:
-    transport = httpx.MockTransport(router.dispatch)
-    http_client = httpx.AsyncClient(transport=transport, base_url="https://api.anthropic.com")
-    return AsyncAnthropic(api_key="test", http_client=http_client)
 
 
 def _agent_payload(
@@ -157,7 +150,7 @@ async def test_remove_agent_skill_repo_detaches_deletes_and_prunes_rows(
     router.add("POST", r"/v1/agents/ag1", on_update_agent)
     router.add("GET", r"/v1/skills/(?P<sid>[^/]+)/versions", on_list_versions)
     router.add("DELETE", r"/v1/skills/(?P<sid>[^/]+)", on_delete_skill)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await remove_agent_skill_repo(
         tenant_id=tenant.id,
@@ -197,7 +190,7 @@ async def test_remove_agent_skill_repo_noop_when_repo_has_no_rows(
 
     router = MARouter()
     router.add("GET", r"/v1/agents", _explode)
-    anthropic_client = _build_anthropic(router)
+    anthropic_client = build_fake_anthropic(router.dispatch)
 
     report = await remove_agent_skill_repo(
         tenant_id=tenant.id,

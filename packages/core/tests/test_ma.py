@@ -46,7 +46,13 @@ from daimon.core.ma import (
     terminal_stop_reason,
     update_agent_with_version_retry,
 )
-from daimon.testing.ma import MARouter, build_fake_anthropic, list_response, sse_response
+from daimon.testing.ma import (
+    MARouter,
+    build_fake_anthropic,
+    build_no_retry_anthropic,
+    list_response,
+    sse_response,
+)
 
 
 def _user_message(event_id: str, text: str) -> BetaManagedAgentsUserMessageEvent:
@@ -533,24 +539,6 @@ def _conflict_response() -> httpx.Response:
     )
 
 
-def _build_no_retry_anthropic(router: MARouter) -> AsyncAnthropic:
-    """Build an AsyncAnthropic with max_retries=0 backed by the given MARouter.
-
-    The SDK auto-retries 409 by default (max_retries=2). Tests for
-    update_agent_with_version_retry must disable SDK retries so the helper's
-    own retry logic is exercised in isolation — otherwise the SDK consumes
-    the first conflict internally before our code can inspect it.
-    """
-    return AsyncAnthropic(
-        api_key="test",
-        http_client=httpx.AsyncClient(
-            transport=httpx.MockTransport(router.dispatch),
-            base_url="https://api.anthropic.com",
-        ),
-        max_retries=0,
-    )
-
-
 async def test_update_agent_with_version_retry_refetches_once_when_first_update_conflicts() -> None:
     """On first update returning 409, helper retrieves fresh agent and retries exactly once.
 
@@ -596,7 +584,7 @@ async def test_update_agent_with_version_retry_refetches_once_when_first_update_
     router = MARouter()
     router.add("GET", r"/v1/agents/[^/]+", handle_retrieve)
     router.add("POST", r"/v1/agents/[^/]+", handle_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     async def apply_update(agent: BetaManagedAgentsAgent) -> BetaManagedAgentsAgent:
         return await client.beta.agents.update(agent.id, version=agent.version, system="updated")
@@ -651,7 +639,7 @@ async def test_update_agent_with_version_retry_reraises_when_error_is_not_confli
     router = MARouter()
     router.add("GET", r"/v1/agents/[^/]+", handle_retrieve)
     router.add("POST", r"/v1/agents/[^/]+", handle_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     async def apply_update(agent: BetaManagedAgentsAgent) -> BetaManagedAgentsAgent:
         return await client.beta.agents.update(agent.id, version=agent.version, system="bad")
@@ -703,7 +691,7 @@ async def test_update_agent_with_version_retry_propagates_second_conflict() -> N
     router = MARouter()
     router.add("GET", r"/v1/agents/[^/]+", handle_retrieve)
     router.add("POST", r"/v1/agents/[^/]+", handle_update)
-    client = _build_no_retry_anthropic(router)
+    client = build_no_retry_anthropic(router)
 
     async def apply_update(agent: BetaManagedAgentsAgent) -> BetaManagedAgentsAgent:
         return await client.beta.agents.update(agent.id, version=agent.version, system="retry")
