@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Final
+
 from daimon.core.pricing import AGENT_MODEL_PRICING
 
 # The Anthropic models the product offers for Prompt & model. Single source of truth:
@@ -11,6 +13,19 @@ from daimon.core.pricing import AGENT_MODEL_PRICING
 #
 # The model input is free-text, so submission validates against this tuple.
 ALLOWED_MODEL_IDS: tuple[str, ...] = tuple(AGENT_MODEL_PRICING.keys())
+
+# Human-readable label for each selectable model, keyed by the same ids as
+# `ALLOWED_MODEL_IDS`. Every entry in `pricing.AGENT_MODEL_PRICING` must have
+# one here — `models_catalog.list_model_choices` falls back to the raw id for
+# any id missing from this map, and `test_models_catalog` asserts none does.
+MODEL_DISPLAY_NAMES: Final[dict[str, str]] = {
+    "claude-opus-5": "Opus 5",
+    "claude-opus-4-8": "Opus 4.8",
+    "claude-opus-4-7": "Opus 4.7",
+    "claude-sonnet-5": "Sonnet 5",
+    "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-haiku-4-5": "Haiku 4.5",
+}
 
 # What a new agent gets when the creator does not name a model: every panel
 # prefill and every "no model supplied" fallback reads this one value. It used

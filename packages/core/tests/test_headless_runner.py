@@ -877,7 +877,12 @@ async def test_run_turn_mounts_env_resource_when_agent_has_secrets(
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="API_KEY", content="secret"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="API_KEY",
+        content="secret",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -1122,7 +1127,12 @@ async def test_run_turn_composes_resources_alongside_vault_ids(
     account_id = uuid.uuid4()
     public_url = "https://mcp.example.local/mcp"
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="API_KEY", content="secret"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="API_KEY",
+        content="secret",
+        set_by_account_id=None,
     )
     await db_session.commit()
 

@@ -18,22 +18,24 @@ What is deliberately NOT here: preparing the session and running the turn.
 owns the second, because running a turn needs the platform's lifecycle hooks.
 This module decides; the adapter acts.
 
-The private-input completion flow adds one producer
-(`reason='private_input_applied'`) and reuses every function below unchanged.
-That is the entire contract between the two flows.
+The private-input completion flow adds one producer —
+`build_input_continuation`, which turns a consumed credential-request row into
+a `reason='private_input_applied'` request — and reuses every function below
+unchanged. That is the entire contract between the two flows.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Literal
+from typing import Final, Literal
 
 from anthropic import AsyncAnthropic
 from daimon.core.continuity.messages import render_current_work_must_finish
 from daimon.core.errors import DaimonError
 from daimon.core.setup_conversations import get_setup_agent
-from daimon.core.stores.domain import ContinuationReason
+from daimon.core.stores.domain import ContinuationReason, CredentialRequestRow
 from daimon.core.stores.task_continuations import (
     claim_continuation as _claim_continuation_row,
 )
@@ -50,19 +52,45 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 __all__ = [
+    "MAX_REQUESTED_WORK",
+    "MIN_REQUESTED_WORK",
     "ContinuationAction",
     "ContinuationDecision",
     "ContinuationRequest",
+    "build_input_continuation",
     "claim_continuation",
     "decide_continuation",
     "record_continuation",
+    "sanitize_requested_work",
     "settle_continuation",
 ]
+
+#: Below this length requested work is too short to describe work — almost
+#: always a one-word restatement of the switch itself rather than a request.
+MIN_REQUESTED_WORK: Final[int] = 8
 
 #: The longest continuation we will carry into a seed message. The person's own
 #: words, bounded — a continuation is a sentence about what to do next, not a
 #: document, and it is untrusted text that ends up inside turn controls.
-MAX_REQUESTED_WORK = 500
+MAX_REQUESTED_WORK: Final[int] = 500
+
+
+def sanitize_requested_work(text: str | None, *, echoes: Sequence[str]) -> str | None:
+    """Null out text that cannot be a real request to carry on work.
+
+    Empty, shorter than `MIN_REQUESTED_WORK`, or equal (case-folded, stripped)
+    to one of `echoes` — the names a model is most likely to restate instead of
+    describing work. Not truncation: callers slice to `MAX_REQUESTED_WORK`.
+    """
+    if text is None:
+        return None
+    normalized = text.strip().lower()
+    if not normalized or len(normalized) < MIN_REQUESTED_WORK:
+        return None
+    if any(normalized == echo.strip().lower() for echo in echoes):
+        return None
+    return text
+
 
 ContinuationAction = Literal[
     "dispatch",
@@ -111,6 +139,34 @@ class ContinuationDecision(BaseModel):
     action: ContinuationAction
     message: str | None = None
     seed_user_message: str | None = None
+
+
+def build_input_continuation(
+    row: CredentialRequestRow, *, platform: Literal["discord", "slack"]
+) -> ContinuationRequest | None:
+    """The continuation a consumed private-input request owes, or None.
+
+    None when the row predates the frozen-target columns or carries no origin
+    thread: a delayed form must never resume against an agent re-resolved by
+    name.
+    """
+    if row.origin_thread_id is None:
+        return None
+    if row.target_ma_agent_id is None or row.target_name is None:
+        return None
+    return ContinuationRequest(
+        tenant_id=row.tenant_id,
+        platform=platform,
+        parent_channel_id=row.parent_channel_id or row.channel_id,
+        thread_id=row.origin_thread_id,
+        requester_account_id=row.account_id,
+        requester_external_user_id=row.requester_platform_user_id,
+        target_ma_agent_id=row.target_ma_agent_id,
+        target_name=row.target_name,
+        requested_work=row.requested_work,
+        reason="private_input_applied",
+        idempotency_key=row.idempotency_key,
+    )
 
 
 def _render_target_changed(target_name: str) -> str:
@@ -244,7 +300,9 @@ async def decide_continuation(
     if active_turn:
         return ContinuationDecision(
             action="skip_turn_running",
-            message=render_current_work_must_finish(request.target_name, handoff=True),
+            message=render_current_work_must_finish(
+                request.target_name, handoff=request.reason == "task_handoff"
+            ),
         )
 
     return ContinuationDecision(action="dispatch", seed_user_message=request.requested_work)

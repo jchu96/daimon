@@ -389,7 +389,12 @@ async def test_create_session_mounts_env_resource_when_agent_has_secrets(
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="API_KEY", content="secret"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="API_KEY",
+        content="secret",
+        set_by_account_id=None,
     )
     await db_session.commit()
 
@@ -568,7 +573,12 @@ async def test_create_session_composes_resources_alongside_vault_ids(
     agent_uuid = uuid.uuid4()
     account_id = uuid.UUID("00000000-0000-0000-0000-000000000055")
     await put_agent_file(
-        db_session, tenant_id=tenant.id, agent_id=agent_uuid, key="API_KEY", content="secret"
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        key="API_KEY",
+        content="secret",
+        set_by_account_id=None,
     )
     await db_session.commit()
 

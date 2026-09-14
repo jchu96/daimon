@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from typing import get_args
+
 from daimon.core.credential_requests import (
     CUSTOM_ID_PATTERN,
+    ENV_FILE_TARGET,
     MAX_BUTTON_LABEL_CHARS,
+    CredentialRequestKind,
     build_button_label,
     build_custom_id,
     build_skill_repo_target,
@@ -143,3 +147,19 @@ def test_build_button_label_honours_slack_label_limit() -> None:
 def test_build_button_label_default_limit_unchanged() -> None:
     label = build_button_label("mcp", "x" * 200)
     assert len(label) == MAX_BUTTON_LABEL_CHARS == 80
+
+
+def test_build_button_label_covers_every_kind() -> None:
+    """Every declared kind must have a label prefix — a missing one is a KeyError at click time."""
+    kinds = get_args(CredentialRequestKind)
+    assert kinds, "CredentialRequestKind must declare at least one kind"
+    for kind in kinds:
+        label = build_button_label(kind, "acme/skills")
+        assert label.endswith("acme/skills"), f"kind {kind} must name its target in the label"
+        assert label != "acme/skills", f"kind {kind} must carry a prefix explaining the action"
+
+
+def test_env_file_label_reads_as_a_file_import() -> None:
+    assert build_button_label("env_file", ENV_FILE_TARGET) == "Add keys from .env", (
+        "the env_file button must say it imports a whole file, not a single key"
+    )

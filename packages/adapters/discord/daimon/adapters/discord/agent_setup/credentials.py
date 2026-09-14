@@ -208,6 +208,7 @@ class PasteSecretModal(discord.ui.Modal, title="Add keys"):
                         agent_id=self._agent_id,
                         key=key,
                         content=value,
+                        set_by_account_id=None,
                     )
         except Exception:
             _log.exception("credentials.paste.failed", key_count=len(pairs))

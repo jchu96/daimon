@@ -310,6 +310,7 @@ async def test_a_new_key_is_swapped_into_the_live_session_without_replacing_it(
             agent_id=agent_uuid,
             key="TOGGL_TOKEN",
             content="tok",
+            set_by_account_id=None,
         )
 
     second = await _prepare(deps, admission, tenant=tenant, account=account)
@@ -393,6 +394,7 @@ async def test_an_in_place_change_is_deferred_while_a_turn_is_running(
             agent_id=derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=_AGENT_ID),
             key="KEY",
             content="v",
+            set_by_account_id=None,
         )
         await mark_turn_active(session, id=row.id, active_turn_message_id="msg-in-flight", now=_NOW)
     before = len(transport.calls)
@@ -783,6 +785,7 @@ async def test_two_callers_in_one_thread_each_refresh_only_their_own_session(
             agent_id=derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=_AGENT_ID),
             key="KEY",
             content="v",
+            set_by_account_id=None,
         )
 
     refreshed = await _prepare(

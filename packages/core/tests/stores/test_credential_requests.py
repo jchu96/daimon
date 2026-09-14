@@ -10,12 +10,18 @@ import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import cast, get_args
 
 import pytest
-from daimon.core.credential_requests import mint_request_token
+from daimon.core.credential_requests import (
+    ENV_FILE_TARGET,
+    CredentialRequestKind,
+    mint_request_token,
+)
 from daimon.core.stores import credential_requests as store
 from daimon.core.stores.domain import CredentialRequestRow
 from daimon.testing.factories import make_account, make_tenant
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 
@@ -40,6 +46,10 @@ async def _seed_request(
         requester_platform_user_id=requester_platform_user_id,
         channel_id="chan-1",
         expires_at=expires_at or (datetime.now(tz=UTC) + timedelta(minutes=30)),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
 
 
@@ -302,3 +312,179 @@ async def test_concurrent_consume_of_one_token_succeeds_exactly_once() -> None:
     finally:
         await engine_a.dispose()
         await engine_b.dispose()
+
+
+async def test_credential_requests_rejects_unknown_kind(db_session: AsyncSession) -> None:
+    """The CHECK is the durable half of the Literal: a kind nobody declared cannot land."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+
+    with pytest.raises(IntegrityError):
+        await store.create_credential_request(
+            db_session,
+            token=mint_request_token(),
+            kind=cast(CredentialRequestKind, "telepathy"),
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            account_id=account.id,
+            target="OPENAI_API_KEY",
+            mcp_server_url=None,
+            requester_platform_user_id="requester-1",
+            channel_id="chan-1",
+            expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
+        )
+    await db_session.rollback()
+
+
+async def test_credential_requests_accepts_every_declared_kind(db_session: AsyncSession) -> None:
+    """Every kind the Literal declares must survive the CHECK — no dead vocabulary."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+
+    kinds = get_args(CredentialRequestKind)
+    assert kinds, "CredentialRequestKind must declare at least one kind"
+    for kind in kinds:
+        row = await store.create_credential_request(
+            db_session,
+            token=mint_request_token(),
+            kind=kind,
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            account_id=account.id,
+            target=ENV_FILE_TARGET if kind == "env_file" else "TARGET",
+            mcp_server_url=None,
+            requester_platform_user_id="requester-1",
+            channel_id="chan-1",
+            expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
+        )
+        assert row.kind == kind, f"kind {kind} must round-trip through the store"
+
+
+async def test_credential_requests_idempotency_key_is_unique(db_session: AsyncSession) -> None:
+    """One idempotency key names one control; a re-post must collide, not stack."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    shared_key = uuid.uuid4()
+
+    await _seed_request(db_session, tenant_id=tenant.id, account_id=account.id)
+    await store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="env",
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        account_id=account.id,
+        target="A",
+        mcp_server_url=None,
+        requester_platform_user_id="requester-1",
+        channel_id="chan-1",
+        expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+        idempotency_key=shared_key,
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
+    )
+
+    with pytest.raises(IntegrityError):
+        await store.create_credential_request(
+            db_session,
+            token=mint_request_token(),
+            kind="env",
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            account_id=account.id,
+            target="B",
+            mcp_server_url=None,
+            requester_platform_user_id="requester-1",
+            channel_id="chan-1",
+            expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+            idempotency_key=shared_key,
+            target_ma_agent_id="ag_test",
+            target_name="tester",
+            requested_work=None,
+        )
+    await db_session.rollback()
+
+
+async def test_create_credential_request_round_trips_its_provenance(
+    db_session: AsyncSession,
+) -> None:
+    """The provenance the mint site states must be readable back off the row."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    replaces = datetime.now(tz=UTC) - timedelta(minutes=5)
+    key = uuid.uuid4()
+
+    row = await store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="env",
+        tenant_id=tenant.id,
+        agent_id=uuid.uuid4(),
+        account_id=account.id,
+        target="OPENAI_API_KEY",
+        mcp_server_url=None,
+        requester_platform_user_id="requester-1",
+        channel_id="chan-1",
+        expires_at=datetime.now(tz=UTC) + timedelta(minutes=30),
+        idempotency_key=key,
+        target_ma_agent_id="ag_target",
+        target_name="research-bot",
+        requested_work="pull last week's Toggl hours",
+        responder_name="daimon",
+        replaces_updated_at=replaces,
+    )
+
+    assert row.idempotency_key == key, "idempotency_key must round-trip"
+    assert row.target_ma_agent_id == "ag_target", "target_ma_agent_id must round-trip"
+    assert row.target_name == "research-bot", "target_name must round-trip"
+    assert row.requested_work == "pull last week's Toggl hours", "requested_work must round-trip"
+    assert row.responder_name == "daimon", "responder_name must round-trip"
+    assert row.replaces_updated_at == replaces, "replaces_updated_at must round-trip"
+    assert row.outcome is None, "a freshly minted control has no outcome yet"
+
+
+async def test_set_credential_request_outcome_records_the_outcome(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await _seed_request(db_session, tenant_id=tenant.id, account_id=account.id)
+
+    await store.set_credential_request_outcome(db_session, token=row.token, outcome="applied")
+
+    after = await store.peek_credential_request(db_session, token=row.token)
+    assert after is not None, "the row must still exist after recording its outcome"
+    assert after.outcome == "applied", "the recorded outcome must be readable back"
+
+
+async def test_set_credential_request_outcome_is_last_write_wins_and_idempotent(
+    db_session: AsyncSession,
+) -> None:
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    row = await _seed_request(db_session, tenant_id=tenant.id, account_id=account.id)
+
+    await store.set_credential_request_outcome(db_session, token=row.token, outcome="write_failed")
+    await store.set_credential_request_outcome(
+        db_session, token=row.token, outcome="stale_replacement"
+    )
+
+    after = await store.peek_credential_request(db_session, token=row.token)
+    assert after is not None, "the row must still exist"
+    assert after.outcome == "stale_replacement", "the last recorded outcome must win"
+
+
+async def test_set_credential_request_outcome_does_not_raise_for_unknown_token(
+    db_session: AsyncSession,
+) -> None:
+    """No raise if absent — the outcome is a trace, never a gate."""
+    await store.set_credential_request_outcome(db_session, token="no-such-token", outcome="applied")

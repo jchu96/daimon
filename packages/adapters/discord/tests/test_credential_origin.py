@@ -31,6 +31,7 @@ def test_credential_origin_rechecks_requester_install_and_stored_destination(
 ) -> None:
     now = datetime.now(UTC)
     row = CredentialRequestRow(
+        idempotency_key=uuid4(),
         token="request-token",
         kind="env",
         tenant_id=derive_tenant_uuid(platform="discord", workspace_id="111"),

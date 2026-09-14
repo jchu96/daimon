@@ -48,7 +48,12 @@ async def _seed_stored_keys(session: AsyncSession) -> None:
         (_STORED_KEY_TWO, _STORED_VALUE_TWO),
     ):
         await put_agent_file(
-            session, tenant_id=tenant.id, agent_id=tenant.id, key=key, content=value
+            session,
+            tenant_id=tenant.id,
+            agent_id=tenant.id,
+            key=key,
+            content=value,
+            set_by_account_id=None,
         )
 
 

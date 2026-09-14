@@ -819,10 +819,20 @@ async def test_remove_deletes_the_key_and_rerenders(
     agent_id = uuid.uuid4()
     async with db_session_factory() as s, s.begin():
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="XERO_API_KEY",
+            content=_SECRET_VALUE,
+            set_by_account_id=None,
         )
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="KEEP_ME", content="keep"
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="KEEP_ME",
+            content="keep",
+            set_by_account_id=None,
         )
 
     entry = _entry("bot")
@@ -875,10 +885,20 @@ async def test_remove_refuses_delete_on_reachable_agent_for_non_admin(
     agent_id = uuid.uuid4()
     async with db_session_factory() as s, s.begin():
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="XERO_API_KEY",
+            content=_SECRET_VALUE,
+            set_by_account_id=None,
         )
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="KEEP_ME", content="keep"
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="KEEP_ME",
+            content="keep",
+            set_by_account_id=None,
         )
 
     entry = _entry("bot")
@@ -922,10 +942,20 @@ async def test_remove_still_deletes_on_reachable_system_agent_for_admin(
     agent_id = uuid.uuid4()
     async with db_session_factory() as s, s.begin():
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="XERO_API_KEY",
+            content=_SECRET_VALUE,
+            set_by_account_id=None,
         )
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="KEEP_ME", content="keep"
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="KEEP_ME",
+            content="keep",
+            set_by_account_id=None,
         )
 
     entry = _entry("daimon", is_system=True)
@@ -1012,7 +1042,12 @@ async def test_editview_env_vars_button_opens_subview(
     agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)
     async with db_session_factory() as s, s.begin():
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="XERO_API_KEY",
+            content=_SECRET_VALUE,
+            set_by_account_id=None,
         )
 
     now = dt.datetime.now(dt.UTC)
@@ -1075,7 +1110,12 @@ async def test_subview_opens_and_lists_key_names_for_a_non_admin_on_a_shared_age
     agent_id = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=ma_agent_id)
     async with db_session_factory() as s, s.begin():
         await put_agent_file(
-            s, tenant_id=tenant.id, agent_id=agent_id, key="XERO_API_KEY", content=_SECRET_VALUE
+            s,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            key="XERO_API_KEY",
+            content=_SECRET_VALUE,
+            set_by_account_id=None,
         )
 
     now = dt.datetime.now(dt.UTC)

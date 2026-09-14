@@ -34,7 +34,7 @@ Model:
 - A worker that dies by SIGKILL leaves its schema behind; ``sweep_orphan_schemas``
   reclaims a bounded number of such orphans at engine setup.
 - Schema DDL runs in small transactions. One ``DROP SCHEMA ... CASCADE`` over
-  the 44 ORM tables holds ~970 locks and ``create_all`` ~380; the server's lock
+  the 45 ORM tables holds ~970 locks and ``create_all`` ~380; the server's lock
   table (``max_locks_per_transaction`` × ``max_connections``, 6,400 by default)
   fits about six such drops, and 16 workers finishing together used to fail
   with "out of shared memory". Tables are therefore created in chunks and

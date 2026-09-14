@@ -276,6 +276,10 @@ async def _seed_request(
         requester_platform_user_id=requester,
         channel_id=_CHANNEL_ID,
         expires_at=datetime.now(UTC) + expires_in,
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await session.flush()
     return token
@@ -903,6 +907,10 @@ async def test_env_submission_rechecks_request_identity_before_consuming(
         channel_id=_CHANNEL_ID,
         platform="discord" if wrong_dimension == "platform" else "slack",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await db_session.commit()
     await run_env_credential_submission(
@@ -951,6 +959,10 @@ async def test_env_submission_uses_durable_destination_after_origin_turn_ends(
         origin_thread_id="123.456",
         posted_message_id="123.789",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_test",
+        target_name="tester",
+        requested_work=None,
     )
     await db_session.commit()
     await run_env_credential_submission(

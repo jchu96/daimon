@@ -195,6 +195,7 @@ class EnvCredentialModal(discord.ui.Modal, title="Add key"):
                     agent_id=consumed_row.agent_id,
                     key=consumed_row.target,
                     content=raw_value,
+                    set_by_account_id=consumed_row.account_id,
                 )
         except Exception:
             _log.exception("credential_modal.env_write_failed", key=self._row.target)

@@ -17,8 +17,9 @@ Lines are joined with ``"\\n"`` and never end in a trailing newline.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal
+from typing import Final, Literal
 
+from daimon.core.env_file import EnvProblem, EnvRejection
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "UnsavedWorkChoice",
     "render_change_confirmation",
     "render_current_work_must_finish",
+    "render_env_import_applied",
+    "render_env_import_rejected",
     "render_fresh_start",
     "render_handoff_acknowledged",
     "render_preparation_failed",
@@ -47,6 +50,7 @@ ChangeKind = Literal[
     "instructions",
     "skill",
     "skill_removed",
+    "skills_bulk",
     "mcp",
     "mcp_removed",
     "repo",
@@ -168,6 +172,34 @@ def _render_skill_removed(target_name: str, skill: str | None) -> str:
     )
 
 
+def _render_skills_bulk_added(change: ConfigurationChange) -> str:
+    if change.detail is not None:
+        raise ValueError("kind='skills_bulk' does not use detail; it names no single skill")
+    if change.count is None:
+        raise ValueError("kind='skills_bulk' requires count")
+    if change.count < 1:
+        raise ValueError("kind='skills_bulk' count must be >= 1")
+    if change.repo is None:
+        raise ValueError("kind='skills_bulk' requires repo (where the skills came from)")
+    target_name = change.target_name
+    if change.availability == "preparation_failed":
+        return "\n".join(
+            [
+                f"Your GitHub token is saved for {target_name}.",
+                "The skills did not import.",
+                f"Ask me to add skills from {change.repo} again to retry.",
+            ]
+        )
+    noun = "skill" if change.count == 1 else "skills"
+    pronoun = "it" if change.count == 1 else "them"
+    return "\n".join(
+        [
+            f"{change.count} {noun} added to {target_name} from {change.repo}.",
+            f"It can use {pronoun} from your next message here.",
+        ]
+    )
+
+
 def _render_mcp_connected(
     target_name: str, service: str | None, availability: ChangeAvailability
 ) -> str:
@@ -284,6 +316,8 @@ def render_change_confirmation(change: ConfigurationChange) -> str:
         return _render_skill_added(change.target_name, change.detail)
     if kind == "skill_removed":
         return _render_skill_removed(change.target_name, change.detail)
+    if kind == "skills_bulk":
+        return _render_skills_bulk_added(change)
     if kind == "mcp":
         return _render_mcp_connected(change.target_name, change.detail, change.availability)
     if kind == "mcp_removed":
@@ -293,6 +327,85 @@ def render_change_confirmation(change: ConfigurationChange) -> str:
     if kind == "environment":
         return _render_environment_changed(change.target_name, change.detail)
     raise ValueError(f"unknown ChangeKind: {kind!r}")
+
+
+#: Per-line reason for a rejected `.env` upload, one phrase per rejection kind.
+#: ``{name}`` is filled only where the parser knows the name is a valid key
+#: name; a value is never available to these templates.
+_ENV_LINE_REASONS: Final[dict[EnvRejection, str]] = {
+    "syntax": "I could not read this line.",
+    "bad_name": "the name here is not usable as a key name.",
+    "duplicate_name": "{name} is set more than once.",
+    "value_too_large": "{name} is too long.",
+    "too_many_entries": "{name} is past the number of keys I can take at once.",
+    "file_too_large": "this line could not be read.",
+    "not_utf8": "this line could not be read.",
+    "empty": "this line could not be read.",
+}
+
+#: Whole-file reason, used when the rejection points at no particular line.
+_ENV_FILE_REASONS: Final[dict[EnvRejection, str]] = {
+    "file_too_large": "The file is too big to read.",
+    "not_utf8": "The file is not plain text.",
+    "empty": "There are no keys in the file.",
+    "syntax": "I could not read the file.",
+    "bad_name": "The names in the file are not usable as key names.",
+    "duplicate_name": "The same name is set more than once.",
+    "value_too_large": "One of the keys is too long.",
+    "too_many_entries": "There are more keys in the file than I can take at once.",
+}
+
+_ENV_PROBLEM_LINES_SHOWN: Final[int] = 3
+_ENV_NAMES_SHOWN: Final[int] = 8
+
+
+def render_env_import_rejected(
+    rejection: EnvRejection, problems: Sequence[EnvProblem], *, target_name: str
+) -> str:
+    """Tell the person their uploaded file was rejected whole, and why.
+
+    `problems` carries line numbers and — only where the parser knew it — key
+    names. No value ever reaches this copy; the problem type has no field for
+    one.
+    """
+    lines = [f"No keys were saved for {target_name}."]
+    if problems:
+        reason = _ENV_LINE_REASONS[rejection]
+        for problem in problems[:_ENV_PROBLEM_LINES_SHOWN]:
+            lines.append(f"line {problem.line}: {reason.format(name=problem.name)}")
+        remaining = len(problems) - _ENV_PROBLEM_LINES_SHOWN
+        if remaining > 0:
+            lines.append(f"…and {remaining} more.")
+    else:
+        lines.append(_ENV_FILE_REASONS[rejection])
+    lines.append("Nothing was changed. Upload a corrected file.")
+    return "\n".join(lines)
+
+
+def _render_env_names(names: Sequence[str]) -> str:
+    shown = ", ".join(names[:_ENV_NAMES_SHOWN])
+    remaining = len(names) - _ENV_NAMES_SHOWN
+    if remaining > 0:
+        return f"{shown}, … and {remaining} more."
+    return f"{shown}."
+
+
+def render_env_import_applied(
+    *, target_name: str, added: int, replaced: int, names: Sequence[str]
+) -> str:
+    """Confirm an accepted `.env` upload: how many keys landed, and which."""
+    if added < 0 or replaced < 0:
+        raise ValueError("added and replaced must be >= 0")
+    if not names:
+        raise ValueError("render_env_import_applied requires the names that were saved")
+    added_noun = "key" if added == 1 else "keys"
+    return "\n".join(
+        [
+            f"{added} {added_noun} added and {replaced} replaced for {target_name}.",
+            _render_env_names(names),
+            f"Anyone who talks to {target_name} can use them.",
+        ]
+    )
 
 
 def render_unsaved_work_question(repo: str) -> str:

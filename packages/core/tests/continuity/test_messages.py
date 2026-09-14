@@ -18,6 +18,8 @@ from daimon.core.continuity.messages import (
     ConfigurationChange,
     render_change_confirmation,
     render_current_work_must_finish,
+    render_env_import_applied,
+    render_env_import_rejected,
     render_fresh_start,
     render_handoff_acknowledged,
     render_preparation_failed,
@@ -31,6 +33,7 @@ from daimon.core.continuity.tool_messages import (
     render_tool_refusal_unreachable,
     render_tool_unsaved_work_question,
 )
+from daimon.core.env_file import EnvProblem
 
 # --- A. key / keys_bulk / key_removed ---------------------------------------
 
@@ -584,6 +587,169 @@ def test_render_change_confirmation_raises_when_copied_file_count_set_without_co
         render_change_confirmation(change)
 
 
+# --- skills_bulk ------------------------------------------------------------
+
+
+def test_render_change_confirmation_renders_skills_bulk_added() -> None:
+    change = ConfigurationChange(
+        target_name="Ada",
+        kind="skills_bulk",
+        availability="next_message",
+        count=4,
+        repo="acme/widgets",
+    )
+    assert render_change_confirmation(change) == (
+        "4 skills added to Ada from acme/widgets.\nIt can use them from your next message here."
+    ), "a bulk skill import names the count, the target and where the skills came from"
+
+
+def test_render_change_confirmation_singularizes_skills_bulk_when_count_is_one() -> None:
+    change = ConfigurationChange(
+        target_name="Ada",
+        kind="skills_bulk",
+        availability="next_message",
+        count=1,
+        repo="acme/widgets",
+    )
+    assert render_change_confirmation(change) == (
+        "1 skill added to Ada from acme/widgets.\nIt can use it from your next message here."
+    ), "one skill reads as 'skill', not 'skills'"
+
+
+def test_render_change_confirmation_renders_skills_bulk_preparation_failed() -> None:
+    change = ConfigurationChange(
+        target_name="Ada",
+        kind="skills_bulk",
+        availability="preparation_failed",
+        count=4,
+        repo="acme/widgets",
+    )
+    assert render_change_confirmation(change) == (
+        "Your GitHub token is saved for Ada.\n"
+        "The skills did not import.\n"
+        "Ask me to add skills from acme/widgets again to retry."
+    ), "a failed import says what was kept, what failed, and how to retry"
+
+
+def test_render_change_confirmation_raises_when_skills_bulk_missing_count() -> None:
+    change = ConfigurationChange(
+        target_name="Ada", kind="skills_bulk", availability="saved", repo="acme/widgets"
+    )
+    with pytest.raises(ValueError, match="requires count"):
+        render_change_confirmation(change)
+
+
+def test_render_change_confirmation_raises_when_skills_bulk_count_is_zero() -> None:
+    change = ConfigurationChange(
+        target_name="Ada", kind="skills_bulk", availability="saved", count=0, repo="acme/widgets"
+    )
+    with pytest.raises(ValueError, match="count must be >= 1"):
+        render_change_confirmation(change)
+
+
+def test_render_change_confirmation_raises_when_skills_bulk_missing_repo() -> None:
+    change = ConfigurationChange(
+        target_name="Ada", kind="skills_bulk", availability="saved", count=2
+    )
+    with pytest.raises(ValueError, match="requires repo"):
+        render_change_confirmation(change)
+
+
+def test_render_change_confirmation_raises_when_skills_bulk_has_detail() -> None:
+    change = ConfigurationChange(
+        target_name="Ada",
+        kind="skills_bulk",
+        availability="saved",
+        count=2,
+        repo="acme/widgets",
+        detail="pdf-tools",
+    )
+    with pytest.raises(ValueError, match="does not use detail"):
+        render_change_confirmation(change)
+
+
+# --- env import -------------------------------------------------------------
+
+
+def test_render_env_import_rejected_lists_the_offending_lines() -> None:
+    problems = [EnvProblem(name="TOGGL_TOKEN", line=3), EnvProblem(name="TOGGL_TOKEN", line=9)]
+    assert render_env_import_rejected("duplicate_name", problems, target_name="Ada") == (
+        "No keys were saved for Ada.\n"
+        "line 3: TOGGL_TOKEN is set more than once.\n"
+        "line 9: TOGGL_TOKEN is set more than once.\n"
+        "Nothing was changed. Upload a corrected file."
+    ), "a duplicate rejection names every offending line and the key that repeats"
+
+
+def test_render_env_import_rejected_truncates_past_three_lines() -> None:
+    problems = [EnvProblem(name=None, line=number) for number in (2, 4, 6, 8, 11)]
+    rendered = render_env_import_rejected("syntax", problems, target_name="Ada")
+    assert rendered == (
+        "No keys were saved for Ada.\n"
+        "line 2: I could not read this line.\n"
+        "line 4: I could not read this line.\n"
+        "line 6: I could not read this line.\n"
+        "…and 2 more.\n"
+        "Nothing was changed. Upload a corrected file."
+    ), "at most three lines are shown; the rest are counted"
+
+
+def test_render_env_import_rejected_falls_back_to_a_whole_file_reason() -> None:
+    assert render_env_import_rejected("not_utf8", [], target_name="Ada") == (
+        "No keys were saved for Ada.\n"
+        "The file is not plain text.\n"
+        "Nothing was changed. Upload a corrected file."
+    ), "a rejection that points at no line still says what was wrong with the file"
+
+
+def test_render_env_import_rejected_never_contains_a_value() -> None:
+    # EnvProblem has no value field at all, so the only thing a caller could
+    # leak is the name -- this pins that the copy shows nothing else.
+    problems = [EnvProblem(name="API_KEY", line=1)]
+    for rejection in (
+        "file_too_large",
+        "not_utf8",
+        "syntax",
+        "bad_name",
+        "duplicate_name",
+        "value_too_large",
+        "too_many_entries",
+        "empty",
+    ):
+        for supplied in (problems, []):
+            rendered = render_env_import_rejected(rejection, supplied, target_name="Ada")
+            _assert_clean(f"render_env_import_rejected({rejection!r}, {supplied!r})", rendered)
+            assert "hunter2" not in rendered, "no rejection path can render a value"
+
+
+def test_render_env_import_applied_names_the_keys_that_landed() -> None:
+    assert render_env_import_applied(
+        target_name="Ada", added=2, replaced=1, names=["A_KEY", "B_KEY", "C_KEY"]
+    ) == (
+        "2 keys added and 1 replaced for Ada.\nA_KEY, B_KEY, C_KEY.\n"
+        "Anyone who talks to Ada can use them."
+    ), "an applied import counts what changed and names the keys"
+
+
+def test_render_env_import_applied_singularizes_one_added_key() -> None:
+    assert render_env_import_applied(target_name="Ada", added=1, replaced=0, names=["A_KEY"]) == (
+        "1 key added and 0 replaced for Ada.\nA_KEY.\nAnyone who talks to Ada can use them."
+    ), "one added key reads as 'key', not 'keys'"
+
+
+def test_render_env_import_applied_summarises_past_eight_names() -> None:
+    names = [f"KEY_{index}" for index in range(11)]
+    rendered = render_env_import_applied(target_name="Ada", added=11, replaced=0, names=names)
+    assert rendered.split("\n")[1] == (
+        "KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, … and 3 more."
+    ), "past eight names the list is summarised rather than dumped"
+
+
+def test_render_env_import_applied_raises_without_names() -> None:
+    with pytest.raises(ValueError, match="requires the names"):
+        render_env_import_applied(target_name="Ada", added=0, replaced=0, names=[])
+
+
 # --- Sweep: no forbidden tokens, no trailing newline, no blank lines ------------------
 
 _ALL_AVAILABILITIES: tuple[ChangeAvailability, ...] = (
@@ -622,6 +788,16 @@ def _valid_matrix() -> list[ConfigurationChange]:
                 target_name="Ada", kind="keys_bulk", availability=availability, count=3
             )
         )
+        for skill_count in (1, 4):
+            changes.append(
+                ConfigurationChange(
+                    target_name="Ada",
+                    kind="skills_bulk",
+                    availability=availability,
+                    count=skill_count,
+                    repo="acme/widgets",
+                )
+            )
         changes.append(
             ConfigurationChange(
                 target_name="Ada", kind="keys_bulk", availability=availability, count=1
@@ -711,6 +887,20 @@ def test_other_render_functions_never_contain_forbidden_tokens_or_blank_lines() 
         "render_tool_refusal_unreachable": render_tool_refusal_unreachable("Ada", "#data"),
         "render_tool_refusal_setup_thread": render_tool_refusal_setup_thread("Ada"),
         "render_tool_unsaved_work_question": render_tool_unsaved_work_question("acme/widgets"),
+        "render_env_import_rejected (lines)": render_env_import_rejected(
+            "duplicate_name",
+            [EnvProblem(name="A_KEY", line=n) for n in (1, 2, 3, 4)],
+            target_name="Ada",
+        ),
+        "render_env_import_rejected (whole file)": render_env_import_rejected(
+            "empty", [], target_name="Ada"
+        ),
+        "render_env_import_applied (short)": render_env_import_applied(
+            target_name="Ada", added=1, replaced=2, names=["A_KEY", "B_KEY", "C_KEY"]
+        ),
+        "render_env_import_applied (summarised)": render_env_import_applied(
+            target_name="Ada", added=9, replaced=0, names=[f"K{n}" for n in range(9)]
+        ),
     }
     for label, rendered in other_rendered.items():
         _assert_clean(label, rendered)

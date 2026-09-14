@@ -22,6 +22,7 @@ from anthropic.types.beta import FileMetadata
 from anthropic.types.beta.beta_managed_agents_file_resource_params import (
     BetaManagedAgentsFileResourceParams,
 )
+from daimon.core.env_file import serialize_env_file
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.domain import AgentFileRow
 from daimon.core.stores.pending_file_deletes import enqueue_pending_file_delete
@@ -36,9 +37,14 @@ def assemble_env_bytes(rows: list[AgentFileRow]) -> bytes:
 
     Returns empty bytes for empty rows (caller decides whether to skip upload).
     Each row becomes a `KEY=VALUE` line; the blob has a trailing newline.
+
+    Quoting is delegated to `serialize_env_file`, which quotes only values that
+    could not otherwise be read back. That minimalism is load-bearing: these
+    bytes are hashed into the fingerprint session compatibility diffs, so
+    quoting values that never needed it would invalidate every live agent's
+    mounted `.env` at once.
     """
-    lines = [f"{row.key}={row.content}" for row in rows]
-    return ("\n".join(lines) + "\n").encode() if lines else b""
+    return serialize_env_file([(row.key, row.content) for row in rows])
 
 
 async def upload_env_file(

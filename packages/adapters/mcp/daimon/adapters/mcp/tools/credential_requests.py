@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from urllib.parse import urlparse
 
+from anthropic.types.beta import BetaManagedAgentsAgent
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.tools._ctx import _auth  # pyright: ignore[reportPrivateUsage]
@@ -89,7 +90,14 @@ async def _resolve_agent_uuid(
     agent_name: str,
     expected_ma_agent_id: str | None,
     origin: TurnOriginRow,
-) -> uuid.UUID:
+) -> tuple[uuid.UUID, BetaManagedAgentsAgent]:
+    """Return the derived agent UUID and the MA agent it was derived from.
+
+    The MA agent is threaded back out rather than discarded because the minted
+    row now records which agent the control targets (`target_ma_agent_id` /
+    `target_name`), and re-resolving it at the mint site would be a second
+    round trip that could disagree with this one.
+    """
     if expected_ma_agent_id is None:
         if agent_name == origin.configuration_target_name:
             expected_ma_agent_id = origin.configuration_target_ma_agent_id
@@ -98,7 +106,8 @@ async def _resolve_agent_uuid(
     ma_agent = await resolve_setup_agent(
         runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    return derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(ma_agent.id))
+    agent_uuid = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(ma_agent.id))
+    return agent_uuid, ma_agent
 
 
 async def _mint_and_post(
@@ -109,6 +118,7 @@ async def _mint_and_post(
     target: str,
     mcp_server_url: str | None,
     agent_id: uuid.UUID,
+    ma_agent: BetaManagedAgentsAgent,
     requester_platform_user_id: str,
     agent_name: str,
     purpose: str,
@@ -145,6 +155,13 @@ async def _mint_and_post(
             requester_platform_user_id=requester_platform_user_id,
             channel_id=channel_id,
             expires_at=expires_at,
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id=str(ma_agent.id),
+            target_name=ma_agent.name,
+            # Nothing is queued behind a credential request minted here: the
+            # tool returns to the agent mid-turn and the click resumes nothing.
+            requested_work=None,
+            responder_name=origin.responder_name,
             platform=origin.platform,
             parent_channel_id=origin.parent_channel_id,
             origin_thread_id=origin.thread_id,
@@ -205,7 +222,9 @@ async def _request_agent_key_impl(
             "(letters, digits, underscores; must not start with a digit)"
         )
     origin = await require_turn_origin(runtime, auth, origin_context_id)
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
+    agent_id, ma_agent = await _resolve_agent_uuid(
+        runtime, auth, agent_name, expected_ma_agent_id, origin
+    )
     return await _mint_and_post(
         runtime,
         auth,
@@ -213,6 +232,7 @@ async def _request_agent_key_impl(
         target=key,
         mcp_server_url=None,
         agent_id=agent_id,
+        ma_agent=ma_agent,
         requester_platform_user_id=requester,
         agent_name=agent_name,
         purpose=purpose,
@@ -243,7 +263,9 @@ async def _request_mcp_token_impl(
     # slashed form while the vault held the bare one.
     url = url.rstrip("/")
     origin = await require_turn_origin(runtime, auth, origin_context_id)
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
+    agent_id, ma_agent = await _resolve_agent_uuid(
+        runtime, auth, agent_name, expected_ma_agent_id, origin
+    )
     return await _mint_and_post(
         runtime,
         auth,
@@ -251,6 +273,7 @@ async def _request_mcp_token_impl(
         target=server_name,
         mcp_server_url=url,
         agent_id=agent_id,
+        ma_agent=ma_agent,
         requester_platform_user_id=requester,
         agent_name=agent_name,
         purpose=f"connecting the MCP server '{server_name}'",
@@ -291,7 +314,9 @@ async def _request_skill_repo_token_impl(
     if "#" in path:
         raise ToolError("path must not contain '#'")
     origin = await require_turn_origin(runtime, auth, origin_context_id)
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
+    agent_id, ma_agent = await _resolve_agent_uuid(
+        runtime, auth, agent_name, expected_ma_agent_id, origin
+    )
     return await _mint_and_post(
         runtime,
         auth,
@@ -299,6 +324,7 @@ async def _request_skill_repo_token_impl(
         target=build_skill_repo_target(repo_url, branch, path),
         mcp_server_url=None,
         agent_id=agent_id,
+        ma_agent=ma_agent,
         requester_platform_user_id=requester,
         agent_name=agent_name,
         purpose=purpose,
@@ -326,7 +352,9 @@ async def _request_repo_binding_impl(
             "repo url must name exactly one owner/repo, e.g. https://github.com/owner/repo"
         )
     origin = await require_turn_origin(runtime, auth, origin_context_id)
-    agent_id = await _resolve_agent_uuid(runtime, auth, agent_name, expected_ma_agent_id, origin)
+    agent_id, ma_agent = await _resolve_agent_uuid(
+        runtime, auth, agent_name, expected_ma_agent_id, origin
+    )
     return await _mint_and_post(
         runtime,
         auth,
@@ -334,6 +362,7 @@ async def _request_repo_binding_impl(
         target=repo_url,
         mcp_server_url=None,
         agent_id=agent_id,
+        ma_agent=ma_agent,
         requester_platform_user_id=requester,
         agent_name=agent_name,
         purpose=purpose,
