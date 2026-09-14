@@ -170,30 +170,32 @@ async def test_sweep_orphan_schemas_drops_dead_pid_and_keeps_live_pid(
         await conn.execute(text(f'CREATE SCHEMA "{live}"'))
         await conn.execute(text(f'CREATE SCHEMA "{dead}"'))
 
-    try:
-        dropped: list[str] = []
-        # Another worker's engine setup may hold the sweep lock while it drops
-        # up to 8 orphans (~1s each), so keep trying for a while.
-        for _ in range(200):
-            dropped = await sweep_orphan_schemas(db_engine, limit=10_000)
-            if dead in dropped:
-                break
-            await asyncio.sleep(0.1)
-
-        assert dead in dropped, f"schema of a dead pid must be swept, got {dropped!r}"
-        assert live not in dropped, "schema of a live pid must survive the sweep"
+    async def _remaining() -> list[str]:
         async with db_engine.connect() as conn:
-            remaining = (
-                (
-                    await conn.execute(
-                        text("SELECT nspname FROM pg_namespace WHERE nspname IN (:live, :dead)"),
-                        {"live": live, "dead": dead},
-                    )
-                )
-                .scalars()
-                .all()
+            rows = await conn.execute(
+                text("SELECT nspname FROM pg_namespace WHERE nspname IN (:live, :dead)"),
+                {"live": live, "dead": dead},
             )
-        assert list(remaining) == [live], f"only the live schema should remain, got {remaining!r}"
+            return list(rows.scalars().all())
+
+    try:
+        # Another worker's engine setup may hold the sweep lock (in which case
+        # this call returns [] and we retry) or may itself sweep the dead schema
+        # before this call sees it. Either way the observable outcome is the
+        # same: the dead schema is gone and the live one survives.
+        remaining = await _remaining()
+        for _ in range(200):
+            if dead not in remaining:
+                break
+            dropped = await sweep_orphan_schemas(db_engine, limit=10_000)
+            assert live not in dropped, "schema of a live pid must survive the sweep"
+            remaining = await _remaining()
+            if dead in remaining:
+                await asyncio.sleep(0.1)
+
+        assert remaining == [live], (
+            f"the dead-pid schema must be swept and the live one kept, got {remaining!r}"
+        )
     finally:
         async with db_engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{live}" CASCADE'))
