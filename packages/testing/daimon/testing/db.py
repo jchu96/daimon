@@ -33,6 +33,12 @@ Model:
   (CREATE / create_all / DROP around the test). Use it for tests that run DDL.
 - A worker that dies by SIGKILL leaves its schema behind; ``sweep_orphan_schemas``
   reclaims a bounded number of such orphans at engine setup.
+- Schema DDL runs in small transactions. One ``DROP SCHEMA ... CASCADE`` over
+  the 44 ORM tables holds ~970 locks and ``create_all`` ~380; the server's lock
+  table (``max_locks_per_transaction`` × ``max_connections``, 6,400 by default)
+  fits about six such drops, and 16 workers finishing together used to fail
+  with "out of shared memory". Tables are therefore created in chunks and
+  dropped one per transaction.
 """
 
 from __future__ import annotations
@@ -65,6 +71,7 @@ _IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _INTERVAL_PATTERN = re.compile(r"^\d+(ms|s|min)?$")
 _SWEEP_LOCK_KEY = "daimon:test-schema-sweep"
 _LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+_CREATE_CHUNK_SIZE = 8
 
 # nodeid of the last test that used the DB in this worker; named in the error
 # when the next test's wipe times out on a lock that test left behind.
@@ -184,50 +191,59 @@ async def truncate_all(conn: AsyncConnection, schema: str, *, lock_timeout: str 
         raise
 
 
-async def sweep_orphan_schemas(conn: AsyncConnection, *, limit: int = 8) -> list[str]:
+async def sweep_orphan_schemas(engine: AsyncEngine, *, limit: int = 8) -> list[str]:
     """Drop up to ``limit`` per-worker schemas whose owning process is gone.
 
     A ``test_[wf]<pid>_<hex>`` schema is an orphan when no backend on this
     database reports it as ``application_name`` AND ``pid`` is not alive on
     this host. Legacy ``test_<32hex>`` names are never touched here
     (``scripts/db/sweep_test_schemas.py --include-legacy`` handles those).
-    One sweeper runs at a time, serialised by a transaction-scoped advisory
-    lock; a caller that loses the lock does nothing. Returns the dropped names.
+    One sweeper runs at a time, serialised by a session-level advisory lock
+    held on a dedicated connection; a caller that loses the lock does nothing.
+    Each orphan is dropped in small transactions (see ``_drop_schema``).
+    Returns the dropped names.
     """
-    took_lock = (
-        await conn.execute(
-            text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"), {"key": _SWEEP_LOCK_KEY}
-        )
-    ).scalar_one()
-    if not took_lock:
-        return []
-    candidates: Sequence[str] = (
-        (
-            await conn.execute(
-                text(
-                    "SELECT nspname FROM pg_namespace "
-                    "WHERE nspname ~ :pattern "
-                    "AND nspname NOT IN ("
-                    "  SELECT application_name FROM pg_stat_activity "
-                    "  WHERE datname = current_database()"
-                    ") ORDER BY nspname"
-                ),
-                {"pattern": WORKER_SCHEMA_PATTERN.pattern},
+    async with engine.connect() as lock_conn:
+        took_lock = (
+            await lock_conn.execute(
+                text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": _SWEEP_LOCK_KEY}
             )
-        )
-        .scalars()
-        .all()
-    )
-    dropped: list[str] = []
-    for schema in candidates:
-        if len(dropped) >= limit:
-            break
-        match = WORKER_SCHEMA_PATTERN.match(schema)
-        if match is None or _pid_is_alive(int(match.group(1))):
-            continue
-        await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        dropped.append(schema)
-    return dropped
+        ).scalar_one()
+        if not took_lock:
+            return []
+        try:
+            candidates: Sequence[str] = (
+                (
+                    await lock_conn.execute(
+                        text(
+                            "SELECT nspname FROM pg_namespace "
+                            "WHERE nspname ~ :pattern "
+                            "AND nspname NOT IN ("
+                            "  SELECT application_name FROM pg_stat_activity "
+                            "  WHERE datname = current_database()"
+                            ") ORDER BY nspname"
+                        ),
+                        {"pattern": WORKER_SCHEMA_PATTERN.pattern},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            dropped: list[str] = []
+            for schema in candidates:
+                if len(dropped) >= limit:
+                    break
+                match = WORKER_SCHEMA_PATTERN.match(schema)
+                if match is None or _pid_is_alive(int(match.group(1))):
+                    continue
+                await _drop_schema(engine, schema)
+                dropped.append(schema)
+            return dropped
+        finally:
+            await lock_conn.execute(
+                text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": _SWEEP_LOCK_KEY}
+            )
+            await lock_conn.commit()
 
 
 async def _require_migrated(conn: AsyncConnection) -> None:
@@ -244,27 +260,52 @@ async def _require_migrated(conn: AsyncConnection) -> None:
         )
 
 
-async def _create_schema_with_tables(conn: AsyncConnection, schema: str) -> None:
+async def _create_schema_with_tables(engine: AsyncEngine, schema: str) -> None:
     """CREATE SCHEMA + create_all into it, then prove every ORM table landed.
 
     ``create_all(checkfirst=True)`` resolves unqualified names through
     ``pg_table_is_visible()``; with ``public`` on the search_path every table
     is "visible" already and no DDL would be emitted. The ``schema_translate_map``
     makes the existence checks and the DDL name the target schema explicitly.
+    Tables go in dependency-ordered chunks so no transaction holds more than
+    a fraction of the lock table (see module docstring).
     """
-    await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
-    mapped = await conn.execution_options(schema_translate_map={None: schema})
-    await mapped.run_sync(Base.metadata.create_all)
-    created = (
-        await conn.execute(
-            text("SELECT count(*) FROM pg_tables WHERE schemaname = :schema"), {"schema": schema}
-        )
-    ).scalar_one()
+    async with engine.begin() as conn:
+        await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    tables = Base.metadata.sorted_tables
+    for start in range(0, len(tables), _CREATE_CHUNK_SIZE):
+        async with engine.begin() as conn:
+            mapped = await conn.execution_options(schema_translate_map={None: schema})
+            await mapped.run_sync(
+                Base.metadata.create_all, tables=tables[start : start + _CREATE_CHUNK_SIZE]
+            )
+    async with engine.connect() as conn:
+        created = (
+            await conn.execute(
+                text("SELECT count(*) FROM pg_tables WHERE schemaname = :schema"),
+                {"schema": schema},
+            )
+        ).scalar_one()
     expected = len(Base.metadata.tables)
     if created != expected:
         raise RuntimeError(
             f"create_all built {created} of {expected} ORM tables in schema {schema!r}"
         )
+
+
+async def _drop_schema(engine: AsyncEngine, schema: str) -> None:
+    """Drop ``schema`` one table per transaction, child-first, then the schema itself.
+
+    Keeps every transaction's lock footprint tiny so many workers can tear
+    down at once; the final ``DROP SCHEMA ... CASCADE`` only has non-ORM
+    leftovers (sequences, tables a test created) to clean up.
+    """
+    _check_identifier(schema)
+    for table in reversed(Base.metadata.sorted_tables):
+        async with engine.begin() as conn:
+            await conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{table.name}" CASCADE'))
+    async with engine.begin() as conn:
+        await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
 
 
 @pytest.fixture(scope="session")
@@ -284,19 +325,17 @@ async def db_engine(db_schema: str) -> AsyncIterator[AsyncEngine]:
     url = _require_test_dsn()
     engine = build_test_engine(url, db_schema, pool_size=2, max_overflow=0, pool_timeout=30)
     try:
-        async with engine.begin() as conn:
+        async with engine.connect() as conn:
             await _require_migrated(conn)
-            await sweep_orphan_schemas(conn)
-        async with engine.begin() as conn:
-            await _create_schema_with_tables(conn, db_schema)
+        await sweep_orphan_schemas(engine)
+        await _create_schema_with_tables(engine, db_schema)
     except BaseException:
         await engine.dispose()
         raise
     try:
         yield engine
     finally:
-        async with engine.begin() as conn:
-            await conn.execute(text(f'DROP SCHEMA "{db_schema}" CASCADE'))
+        await _drop_schema(engine, db_schema)
         await engine.dispose()
 
 
@@ -347,8 +386,7 @@ async def _fresh_schema_session(url: str) -> AsyncIterator[AsyncSession]:
     schema = _new_schema_name("f")
     engine = build_test_engine(url, schema, poolclass=NullPool)
     try:
-        async with engine.begin() as conn:
-            await _create_schema_with_tables(conn, schema)
+        await _create_schema_with_tables(engine, schema)
         try:
             async with engine.connect() as conn:
                 session = AsyncSession(bind=conn, expire_on_commit=False)
@@ -358,8 +396,7 @@ async def _fresh_schema_session(url: str) -> AsyncIterator[AsyncSession]:
                     await session.close()
                     await conn.rollback()
         finally:
-            async with engine.begin() as conn:
-                await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            await _drop_schema(engine, schema)
     finally:
         await engine.dispose()
 

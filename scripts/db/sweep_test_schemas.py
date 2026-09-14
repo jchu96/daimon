@@ -76,8 +76,7 @@ async def _sweep_legacy(engine: AsyncEngine) -> list[str]:
 async def _main(*, include_legacy: bool) -> None:
     engine = create_async_engine(_test_dsn())
     try:
-        async with engine.begin() as conn:
-            dropped = await sweep_orphan_schemas(conn, limit=1_000_000)
+        dropped = await sweep_orphan_schemas(engine, limit=1_000_000)
         print(f"dropped {len(dropped)} orphaned worker schema(s)")
         for schema in dropped:
             print(f"  {schema}")

@@ -172,13 +172,13 @@ async def test_sweep_orphan_schemas_drops_dead_pid_and_keeps_live_pid(
 
     try:
         dropped: list[str] = []
-        # Another worker's engine setup may hold the sweep lock for a moment.
-        for _ in range(40):
-            async with db_engine.begin() as conn:
-                dropped = await sweep_orphan_schemas(conn, limit=10_000)
+        # Another worker's engine setup may hold the sweep lock while it drops
+        # up to 8 orphans (~1s each), so keep trying for a while.
+        for _ in range(200):
+            dropped = await sweep_orphan_schemas(db_engine, limit=10_000)
             if dead in dropped:
                 break
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
 
         assert dead in dropped, f"schema of a dead pid must be swept, got {dropped!r}"
         assert live not in dropped, "schema of a live pid must survive the sweep"
