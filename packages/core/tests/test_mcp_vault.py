@@ -26,8 +26,6 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 def _make_client(handler: httpx.MockTransport) -> AsyncAnthropic:
     return AsyncAnthropic(

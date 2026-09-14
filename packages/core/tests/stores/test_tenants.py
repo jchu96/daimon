@@ -19,8 +19,6 @@ from daimon.testing.factories import make_tenant
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_get_tenant_returns_tenant_row_with_all_fields(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session, workspace_id="guild-get-fields")

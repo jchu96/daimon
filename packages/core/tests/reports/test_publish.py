@@ -42,8 +42,6 @@ from daimon.testing.ma_models import ma_agent
 from pydantic import HttpUrl, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=UTC)
 _JWT_SECRET = b"jwt-shared-secret-well-over-the-32-byte-minimum"
 _MAX_BUNDLE_BYTES = 25 * 1024 * 1024

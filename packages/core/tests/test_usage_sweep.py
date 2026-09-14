@@ -20,7 +20,6 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
-import pytest
 from anthropic.types.beta.sessions.beta_managed_agents_span_model_request_end_event import (
     BetaManagedAgentsSpanModelRequestEndEvent,
 )
@@ -36,8 +35,6 @@ from daimon.testing.ma import (
 from daimon.testing.ma_models import ma_model_usage, ma_session, ma_session_agent
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 NOW = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
 

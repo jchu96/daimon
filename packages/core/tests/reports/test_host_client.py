@@ -23,8 +23,6 @@ from daimon.core.reports.host_client import (
 )
 from pydantic import HttpUrl, SecretStr
 
-pytestmark = pytest.mark.asyncio
-
 _HOST_URL = HttpUrl("http://report-host:8002")
 _ADMIN_SECRET = SecretStr("supersecret")
 _SLUG = "q3-financials"

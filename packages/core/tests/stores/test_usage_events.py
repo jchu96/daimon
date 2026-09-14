@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import pytest
 import pytest_asyncio
 from daimon.core._models import UsageEvent
 from daimon.core.stores import usage_events
@@ -13,8 +12,6 @@ from daimon.testing.factories import make_tenant
 from daimon.testing.ma_models import ma_model_usage
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-pytestmark = pytest.mark.asyncio
 
 
 @pytest_asyncio.fixture

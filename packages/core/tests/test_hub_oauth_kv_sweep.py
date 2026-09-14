@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
 import structlog
 from daimon.core.hub_oauth_kv_sweep import sweep_expired_hub_oauth_kv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 
 async def _insert(session: AsyncSession, *, key: str, expires_at: datetime | None) -> None:

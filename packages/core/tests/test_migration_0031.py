@@ -11,8 +11,6 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_migration_0031_tenant_id_not_null(db_engine: AsyncEngine) -> None:
     """github_oauth_states.tenant_id is NOT NULL after migration 0031."""

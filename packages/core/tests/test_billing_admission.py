@@ -28,8 +28,6 @@ from daimon.testing.ma_models import ma_model_usage
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 _TEST_BILLING = billing.BillingConfig(
     secret_key=SecretStr("sk_test"),
     webhook_secret=SecretStr("whsec_test"),

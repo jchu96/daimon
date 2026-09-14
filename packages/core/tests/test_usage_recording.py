@@ -31,8 +31,6 @@ from daimon.testing.ma_models import ma_model_usage
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_record_turn_usage_writes_row_from_real_sdk_event(
     db_session: AsyncSession,

@@ -16,7 +16,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import httpx
-import pytest
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.skill_sync.orchestrator import sync_agent_skills
@@ -37,8 +36,6 @@ from daimon.testing.ma import (
     make_fake_ma_handler,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-pytestmark = pytest.mark.asyncio
 
 # ---------------------------------------------------------------------------
 # Helpers

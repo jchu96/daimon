@@ -40,8 +40,6 @@ from daimon.testing.ma import (
 from pydantic import HttpUrl, PostgresDsn, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 _OAUTH_SCOPES = ("repo", "read:user")
 
 

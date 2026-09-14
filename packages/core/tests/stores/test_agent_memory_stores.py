@@ -16,8 +16,6 @@ from daimon.testing.factories import make_tenant
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-pytestmark = pytest.mark.asyncio
-
 
 async def test_get_returns_none_when_unbound(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
