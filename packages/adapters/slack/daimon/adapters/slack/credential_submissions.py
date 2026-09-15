@@ -46,6 +46,7 @@ from daimon.core.continuity.continuation import build_input_continuation
 from daimon.core.continuity.messages import ConfigurationChange, render_env_import_rejected
 from daimon.core.credential_requests import (
     CredentialRequestKind,
+    availability_for_request,
     split_skill_repo_target,
 )
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid, find_attach_mount_collision
@@ -525,7 +526,7 @@ async def run_env_credential_submission(
             target_name=consumed.target_name or "this agent",
             kind="key",
             detail=consumed.target,
-            availability="saved" if consumed.requested_work is None else "next_message",
+            availability=availability_for_request(consumed),
         ),
     )
     if queued:
@@ -778,7 +779,7 @@ async def run_env_file_credential_submission(
         outcome=ConfigurationChange(
             target_name=consumed.target_name or agent_name,
             kind="keys_bulk",
-            availability="saved" if consumed.requested_work is None else "next_message",
+            availability=availability_for_request(consumed),
             count=len(entries),
         ),
     )

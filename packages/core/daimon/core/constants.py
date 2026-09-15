@@ -49,6 +49,9 @@ DEFAULT_AGENT_MODEL: str = "claude-sonnet-5"
 AGENT_SKILL_CAP: int = 20
 AGENT_MCP_CAP: int = 20
 
+# The byte cap on a single key/token value entered through a private form.
+MAX_SECRET_VALUE_BYTES: Final[int] = 4096
+
 # How many times the SDK retries a request before giving up. The SDK's own
 # default is 2, which retries a 429 twice honouring `retry-after` and then
 # raises. That is enough for a burst and not enough for a sustained overage:

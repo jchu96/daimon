@@ -88,9 +88,11 @@ type = "forbidden"
 # drifts from the directory.
 source_modules = [
     "daimon.adapters",
+    "daimon.core.agent_details",
     "daimon.core.agent_guidance",
     "daimon.core.agent_lifecycle",
     "daimon.core.agent_mcp_credentials",
+    "daimon.core.answering_map",
     "daimon.core.artifacts",
     "daimon.core.billing",
     "daimon.core.broker",
@@ -142,6 +144,7 @@ source_modules = [
     "daimon.core.reader_agent",
     "daimon.core.repo_resource",
     "daimon.core.reports",
+    "daimon.core.roster",
     "daimon.core.routing_facts",
     "daimon.core.scheduler",
     "daimon.core.scope",

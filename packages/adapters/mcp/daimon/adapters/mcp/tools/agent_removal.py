@@ -32,11 +32,11 @@ from daimon.adapters.mcp.tools.agents import (
     _build_agent_info,  # pyright: ignore[reportPrivateUsage]
     _ma_tool_to_param,  # pyright: ignore[reportPrivateUsage]
     _reject_system_agent,  # pyright: ignore[reportPrivateUsage]
-    _resolve_custom_skill_titles,  # pyright: ignore[reportPrivateUsage]
 )
 from daimon.adapters.mcp.tools.setup_target import resolve_setup_agent
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
+from daimon.core.defaults.skills import resolve_custom_skill_titles
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.operation_policy import TargetFacts, decide_operation, needs_reachability_read
@@ -175,7 +175,9 @@ async def _remove_skill_impl(
     _reject_system_agent(agent)
     await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=agent_name)
 
-    titles = await _resolve_custom_skill_titles(runtime.client, [agent], tenant_id=auth.tenant_id)
+    titles, _truncated = await resolve_custom_skill_titles(
+        runtime.client, agents=[agent], tenant_id=auth.tenant_id
+    )
     target_id: str | None = None
     for sk in agent.skills:
         if sk.skill_id == skill_id or titles.get(sk.skill_id) == skill_id:

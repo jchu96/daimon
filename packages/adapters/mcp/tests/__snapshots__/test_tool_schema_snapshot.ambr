@@ -1807,9 +1807,9 @@
         API/service keys are not copied; add them with ``request_agent_key``.
         Use ``update_agent`` to edit the copy. Daimon cannot be edited directly.
         
-        The copy answers in no channel until an admin routes it with
-        ``set_agent_default``. Continue configuring it through Daimon with the copy
-        named as the setup target; it cannot already answer mentions by name.
+        Continue configuring it through Daimon with the copy named as the setup
+        target. A returned ``answering`` field says the copy is routed nowhere yet:
+        post it verbatim.
       ''',
       'parameters': dict({
         'additionalProperties': False,

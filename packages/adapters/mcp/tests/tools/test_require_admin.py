@@ -33,6 +33,7 @@ from daimon.core.stores.domain import Role
 from daimon.testing import ma_agent
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from fastmcp.exceptions import ToolError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..harness import seed_tenant
 
@@ -74,16 +75,22 @@ def test_require_admin_passes_when_admin() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _agents_runtime(client: AsyncAnthropic) -> McpRuntime:
+def _agents_runtime(
+    client: AsyncAnthropic,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | MagicMock | None = None,
+) -> McpRuntime:
     return McpRuntime(
-        session_factory=MagicMock(),
+        session_factory=session_factory if session_factory is not None else MagicMock(),
         client=client,  # type: ignore[arg-type]
         settings=MagicMock(),  # type: ignore[arg-type]
         deployment_default=DeploymentDefault(),
     )
 
 
-async def test_create_agent_impl_does_not_raise_admin_gate_for_non_admin() -> None:
+async def test_create_agent_impl_does_not_raise_admin_gate_for_non_admin(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """create_agent is no longer admin-gated — a non-admin caller can create their
     own agent, since a brand-new agent is never reachable (nothing to protect)."""
     tenant_id = uuid.uuid4()
@@ -110,7 +117,9 @@ async def test_create_agent_impl_does_not_raise_admin_gate_for_non_admin() -> No
         is_admin=False,
     )
     spec = AgentSpec(name="demo", model="claude-opus-4-5")
-    result = await _create_agent_impl(_agents_runtime(client), auth, spec)
+    result = await _create_agent_impl(
+        _agents_runtime(client, session_factory=db_session_factory), auth, spec
+    )
     assert isinstance(result, AgentInfo), "non-admin create must succeed and return AgentInfo"
 
 

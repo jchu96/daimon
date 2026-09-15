@@ -38,6 +38,9 @@ import re
 import secrets
 from typing import Final, Literal
 
+from daimon.core.continuity.messages import ChangeAvailability
+from daimon.core.stores.domain import CredentialRequestRow
+
 CUSTOM_ID_PREFIX: Final[str] = "ztc:"
 
 # secrets.token_urlsafe(16) yields a 22-character URL-safe string (~128 bits
@@ -163,3 +166,8 @@ def build_button_label(
         return f"{prefix}{target}"
     truncated = target[: available - 1] + "…"
     return f"{prefix}{truncated}"
+
+
+def availability_for_request(row: CredentialRequestRow) -> ChangeAvailability:
+    """A private-form save is 'saved' when nothing was waiting on it, else 'next_message'."""
+    return "saved" if row.requested_work is None else "next_message"

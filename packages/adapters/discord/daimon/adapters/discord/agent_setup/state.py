@@ -13,8 +13,8 @@ from daimon.core.scope import (
     ChannelConfigRow,
     DeploymentDefault,
     TenantConfigRow,
-    _pick_agent,  # pyright: ignore[reportPrivateUsage]  # same cascade winner as the routing panel
     is_agent_reachable,
+    pick_agent,
 )
 from daimon.core.specs import AgentSpec
 from daimon.core.stores.domain import AgentRepoBindingRow
@@ -278,7 +278,7 @@ class PanelState:
     ) -> PanelState:
         tenant_row, channel_rows = cascade_view if cascade_view is not None else (None, [])
         channel_row = next((row for row in channel_rows if row.channel_id == str(channel_id)), None)
-        responder_name, _ = _pick_agent(
+        responder_name, _ = pick_agent(
             channel_row, tenant_row, deployment_default or DeploymentDefault()
         )
         state = cls(

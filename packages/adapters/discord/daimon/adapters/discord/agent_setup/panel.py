@@ -44,7 +44,8 @@ from daimon.core.observability import capture_exception_with_scope
 from daimon.core.scope import (
     ChannelConfigRow,
     TenantConfigRow,
-    _pick_agent,  # pyright: ignore[reportPrivateUsage]  # canonical cascade winner; adapter renders the result, never re-derives precedence.
+    # canonical cascade winner; adapter renders the result, never re-derives precedence.
+    pick_agent,
 )
 from daimon.core.setup_conversations import get_setup_agent
 from daimon.core.stores.agent_files import list_agent_files
@@ -160,7 +161,7 @@ def _build_vitals_subtext(state: PanelState) -> str:
     # Determine effective default scope for the current channel.
     tenant_row, ch_rows = state.cascade_view
     current_channel = next((c for c in ch_rows if c.channel_id == str(state.channel_id)), None)
-    _winner_name, winner_tier = _pick_agent(current_channel, tenant_row, state.deployment_default)
+    _winner_name, winner_tier = pick_agent(current_channel, tenant_row, state.deployment_default)
     if winner_tier == "channel":
         scope_label = f"default in {_format_channel_label(state)}"
     elif winner_tier == "tenant":
@@ -258,7 +259,7 @@ def _build_body_text(state: PanelState) -> str:
     if not state.is_admin:
         tenant_row, ch_rows = state.cascade_view
         current_channel = next((c for c in ch_rows if c.channel_id == str(state.channel_id)), None)
-        _winner_name, winner_tier = _pick_agent(
+        _winner_name, winner_tier = pick_agent(
             current_channel, tenant_row, state.deployment_default
         )
         channel_label = _format_channel_label(state)

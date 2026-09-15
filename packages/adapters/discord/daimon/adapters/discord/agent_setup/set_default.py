@@ -29,7 +29,8 @@ from daimon.core.scope import (
     ChannelScopeRef,
     TenantConfigRow,
     TenantScopeRef,
-    _pick_agent,  # pyright: ignore[reportPrivateUsage]  # canonical cascade winner; adapter renders the result, never re-derives precedence.
+    # canonical cascade winner; adapter renders the result, never re-derives precedence.
+    pick_agent,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -178,12 +179,12 @@ async def _build_scope_blocks(
         )
 
     # 4. Everywhere-else fallback — always last
-    # Core _pick_agent is the canonical precedence function; adapter NEVER re-derives.
+    # Core pick_agent is the canonical precedence function; adapter NEVER re-derives.
     fallback_agent: str | None = None
     if state.deployment_default.agent_name:
         fallback_agent = state.deployment_default.agent_name
     else:
-        _winner_name, _winner_tier = _pick_agent(
+        _winner_name, _winner_tier = pick_agent(
             current_channel, tenant_row, state.deployment_default
         )
         if _winner_name:
@@ -308,7 +309,7 @@ class SetDefaultView(ExpiringView, discord.ui.LayoutView):
     """C9 V2 cascade panel: airy routing blocks + action select + ChannelSelect.
 
     Write-immediately (no confirm); winner derivation stays in core
-    scope._pick_agent; every send/edit passes AllowedMentions.none() because audit
+    scope.pick_agent; every send/edit passes AllowedMentions.none() because audit
     lines render live <@id> mentions.
     """
 

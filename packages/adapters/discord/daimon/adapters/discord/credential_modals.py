@@ -96,9 +96,6 @@ import httpx
 import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_skill_params import BetaManagedAgentsSkillParams
-from daimon.adapters.discord.agent_setup.credentials import (
-    _MAX_SECRET_VALUE_BYTES,  # pyright: ignore[reportPrivateUsage]  # reusing PasteSecretModal's byte cap rather than inventing a second number
-)
 from daimon.adapters.discord.agent_setup.write import mask_tail
 from daimon.adapters.discord.bot import DaimonBot
 from daimon.adapters.discord.checks import is_guild_admin
@@ -114,13 +111,17 @@ from daimon.adapters.discord.credential_repo_bind import (
 from daimon.adapters.discord.posted_controls import edit_posted_card
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
+from daimon.core.constants import MAX_SECRET_VALUE_BYTES
 from daimon.core.continuity.continuation import build_input_continuation
 from daimon.core.continuity.messages import (
-    ChangeAvailability,
     ConfigurationChange,
     render_env_import_rejected,
 )
-from daimon.core.credential_requests import CredentialRequestOutcome, split_skill_repo_target
+from daimon.core.credential_requests import (
+    CredentialRequestOutcome,
+    availability_for_request,
+    split_skill_repo_target,
+)
 from daimon.core.defaults.ma_index import find_agent_by_derived_uuid, find_attach_mount_collision
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.defaults.report import Action, ResourceOutcome
@@ -213,18 +214,6 @@ def _text_input_of[ModalT: discord.ui.Modal](
     the narrowing is of a fact the caller established one line earlier.
     """
     return cast(discord.ui.TextInput[ModalT], label.component)
-
-
-def _availability(row: CredentialRequestRow) -> ChangeAvailability:
-    """What the card may promise about a value that just landed.
-
-    A request minted with no `requested_work` was a save on its own: nothing
-    is waiting on it, so the card says it is saved and stops there. One
-    minted mid-task owes a turn, and that turn runs off the person's next
-    message in the thread. Neither ever claims `ready_now` — the card is
-    written before the agent has had a turn with the value in hand.
-    """
-    return "saved" if row.requested_work is None else "next_message"
 
 
 def _env_card_text(
@@ -469,9 +458,9 @@ class EnvCredentialModal(discord.ui.Modal):
                 "Key value cannot be empty — try again.", ephemeral=True
             )
             return
-        if len(raw_value.encode()) > _MAX_SECRET_VALUE_BYTES:
+        if len(raw_value.encode()) > MAX_SECRET_VALUE_BYTES:
             await interaction.followup.send(
-                f"Key value is too large. Max {_MAX_SECRET_VALUE_BYTES} bytes.",
+                f"Key value is too large. Max {MAX_SECRET_VALUE_BYTES} bytes.",
                 ephemeral=True,
             )
             return
@@ -572,7 +561,7 @@ class EnvCredentialModal(discord.ui.Modal):
             outcome=ConfigurationChange(
                 target_name=_agent_name(consumed_row),
                 kind="key",
-                availability=_availability(consumed_row),
+                availability=availability_for_request(consumed_row),
                 detail=consumed_row.target,
             ),
         )
@@ -776,7 +765,7 @@ class EnvFileModal(discord.ui.Modal):
             outcome=ConfigurationChange(
                 target_name=agent_name,
                 kind="keys_bulk",
-                availability=_availability(consumed_row),
+                availability=availability_for_request(consumed_row),
                 count=len(entries),
             ),
         )
@@ -1053,7 +1042,7 @@ class SkillRepoModal(discord.ui.Modal):
                 placeholder="github_pat_…",
                 required=True,
                 # Discord rejects the whole form with 50035 above 4000, so this
-                # is a UI character cap and NOT _MAX_SECRET_VALUE_BYTES (4096),
+                # is a UI character cap and NOT MAX_SECRET_VALUE_BYTES (4096),
                 # which is a byte cap enforced on submit. EnvCredentialModal
                 # keeps the two separate for the same reason.
                 max_length=4000,

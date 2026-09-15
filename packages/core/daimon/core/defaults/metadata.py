@@ -26,6 +26,21 @@ MA_METADATA_KEY_WORKSPACE = "daimon_workspace"
 MA_METADATA_VALUE_WORKSPACE_DISPOSABLE = "disposable"
 
 
+def account_id_from_metadata(raw: str | None) -> uuid.UUID | None:
+    """Read the `daimon_account` stamp, treating anything unparseable as absent.
+
+    MA metadata values are free-form strings written by several generations of
+    this codebase; a value that is not a uuid means "this agent has no daimon
+    account attached", which is exactly what an unstamped agent means too.
+    """
+    if raw is None:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
+
+
 def compute_spec_fingerprint(payload: dict[str, Any]) -> str:
     """Stable short digest of a JSON-serializable payload.
 

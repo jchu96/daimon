@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import get_args
 
 from daimon.core.credential_requests import (
@@ -9,12 +11,36 @@ from daimon.core.credential_requests import (
     ENV_FILE_TARGET,
     MAX_BUTTON_LABEL_CHARS,
     CredentialRequestKind,
+    availability_for_request,
     build_button_label,
     build_custom_id,
     build_skill_repo_target,
     mint_request_token,
     split_skill_repo_target,
 )
+from daimon.core.stores.domain import CredentialRequestRow
+
+_NOW = datetime(2024, 1, 1, tzinfo=UTC)
+
+
+def _credential_request_row(*, requested_work: str | None) -> CredentialRequestRow:
+    """A consumed request row, as the store hands it back."""
+    return CredentialRequestRow(
+        token="tok-1",
+        kind="env",
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        account_id=uuid.uuid4(),
+        target="MY_KEY",
+        mcp_server_url=None,
+        requester_platform_user_id="discord-user-1",
+        channel_id="C_FALLBACK",
+        idempotency_key=uuid.uuid4(),
+        requested_work=requested_work,
+        created_at=_NOW,
+        expires_at=_NOW + timedelta(hours=1),
+        used_at=_NOW,
+    )
 
 
 def test_mint_request_token_returns_fresh_string_each_call() -> None:
@@ -162,4 +188,18 @@ def test_build_button_label_covers_every_kind() -> None:
 def test_env_file_label_reads_as_a_file_import() -> None:
     assert build_button_label("env_file", ENV_FILE_TARGET) == "Add keys from .env", (
         "the env_file button must say it imports a whole file, not a single key"
+    )
+
+
+def test_availability_for_request_returns_saved_when_no_requested_work() -> None:
+    row = _credential_request_row(requested_work=None)
+    assert availability_for_request(row) == "saved", (
+        "a request with nothing waiting on it is a plain save"
+    )
+
+
+def test_availability_for_request_returns_next_message_when_requested_work() -> None:
+    row = _credential_request_row(requested_work="finish the churn writeup")
+    assert availability_for_request(row) == "next_message", (
+        "a request minted mid-task owes a turn off the person's next message"
     )
