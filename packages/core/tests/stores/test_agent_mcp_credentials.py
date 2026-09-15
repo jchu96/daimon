@@ -542,3 +542,31 @@ async def test_reused_session_refresh_succeeds_when_the_caller_holds_an_oauth_gr
 
     assert reads, "the refresh reached the mirror and read the vault"
     assert writes == [], f"the refresh must not touch the vault; it tried {writes}"
+
+
+async def test_delete_credential_matches_a_row_stored_with_a_trailing_slash(
+    db_session: AsyncSession,
+) -> None:
+    """The setup panel stored URLs as typed; detach strips the slash before asking."""
+    tenant = await make_tenant(db_session)
+    agent_id = uuid.uuid4()
+    await cred_store.upsert_credential(
+        db_session,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        mcp_server_url="https://example.com/mcp/",
+        encrypted_token=b"x",
+    )
+
+    assert (
+        await cred_store.delete_credential(
+            db_session,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            mcp_server_url="https://example.com/mcp",
+        )
+        is True
+    ), "a slash-only difference must not leave the token row behind"
+    assert (
+        await cred_store.list_credentials(db_session, tenant_id=tenant.id, agent_id=agent_id) == []
+    )

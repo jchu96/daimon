@@ -354,3 +354,36 @@ async def test_mcp_oauth_click_sends_a_private_sign_in_link_instead_of_a_modal(
         spent = await peek_credential_request(session, token=token)
     assert flow is not None and flow.request_token == token
     assert spent is not None and spent.used_at is not None, "the request is spent on the click"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_click_refuses_when_the_deployment_has_no_crypto_keys(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """Same predicate as the route mount: no crypto keys, no link, request kept."""
+    from daimon.core.stores.credential_requests import peek_credential_request
+
+    tenant_id, fernet_key = await _seed_team(db_session)
+    token = await _seed_request(
+        db_session,
+        tenant_id=tenant_id,
+        kind="mcp_oauth",
+        target="notion",
+        mcp_server_url="https://mcp.notion.com/mcp",
+    )
+    await db_session.commit()
+    runtime = _build_runtime(fernet_key, db_session_factory, mcp_configured=True)
+    runtime.settings.mcp.app_root_url = "https://d.example"
+    runtime.turn_deps.fernet = None
+
+    await handle_credential_request_click(runtime, _click_payload(token))
+
+    posts = fake_slack_web_client.mock.requests.get(("POST", _EPHEMERAL_URL), [])
+    assert len(posts) == 1 and "cannot sign you in" in posts[0].kwargs["json"]["text"], (
+        "the person learns the operator must finish setup"
+    )
+    async with db_session_factory() as session:
+        spent = await peek_credential_request(session, token=token)
+    assert spent is not None and spent.used_at is None, "the request survives for a later click"

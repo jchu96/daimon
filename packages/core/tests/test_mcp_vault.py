@@ -1250,4 +1250,92 @@ async def test_add_external_mcp_credential_replaces_the_callers_oauth_grant_at_t
     assert deleted_ids == ["vcrd_grant"], (
         f"only the grant at the target URL goes; got {deleted_ids}"
     )
-    assert len(created_bodies) == 1 and created_bodies[0]["auth"]["token"] == "fresh_token"
+    assert len(created_bodies) == 1 and created_bodies[0]["auth"]["token"] == "fresh_token", (
+        "exactly one fresh static credential is written in the grant's place"
+    )
+
+
+async def test_ensure_agent_mcp_vault_warm_path_counts_a_grant_at_public_url_as_present(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A vault holds one credential per URL: a grant sitting at `public_url` means
+    the slot is taken, and creating the JWT next to it would 409 on every session
+    create with nothing to heal it."""
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    display = f"daimon-mcp:{account_id}:{agent_id}"
+    public_url = "https://mcp.example.com/mcp"
+    writes: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/v1/vaults":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [_vault_obj("vlt_warm", display, "2026-04-01T00:00:00Z")],
+                    "has_more": False,
+                },
+            )
+        if req.method == "GET" and req.url.path == "/v1/vaults/vlt_warm/credentials":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "vcrd_grant",
+                            "type": "credential",
+                            "vault_id": "vlt_warm",
+                            "auth": {"type": "mcp_oauth", "mcp_server_url": public_url + "/"},
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        writes.append(f"{req.method} {req.url.path}")
+        return httpx.Response(409, json={"type": "error", "error": {"message": "exists"}})
+
+    vault_id = await ensure_agent_mcp_vault(
+        _make_client(httpx.MockTransport(handler)),
+        account_id=account_id,
+        agent_id=agent_id,
+        jwt_secret=b"a" * 32,
+        public_url=public_url,
+        now=dt.datetime(2026, 9, 15, tzinfo=dt.UTC),
+        session_factory=db_session_factory,
+    )
+
+    assert vault_id == "vlt_warm"
+    assert writes == [], f"a taken slot is not written to; attempted {writes}"
+
+
+async def test_add_github_copilot_credential_leaves_the_callers_grant_in_place() -> None:
+    """The person signed in to GitHub's MCP themselves: their grant outranks the
+    agent's PAT and the slot is taken, so nothing is deleted or created."""
+    from daimon.core.mcp_vault import GITHUB_COPILOT_MCP_URL, add_github_copilot_credential
+
+    writes: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/v1/vaults/vlt_1/credentials":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "vcrd_grant",
+                            "type": "credential",
+                            "vault_id": "vlt_1",
+                            "auth": {"type": "mcp_oauth", "mcp_server_url": GITHUB_COPILOT_MCP_URL},
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        writes.append(f"{req.method} {req.url.path}")
+        return httpx.Response(409, json={"type": "error", "error": {"message": "exists"}})
+
+    await add_github_copilot_credential(
+        _make_client(httpx.MockTransport(handler)), vault_id="vlt_1", token="ghp_x"
+    )
+
+    assert writes == [], f"the grant is neither replaced nor duplicated; attempted {writes}"

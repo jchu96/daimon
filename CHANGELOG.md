@@ -62,7 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A turn no longer fails with "could not get the agent ready" after someone connects an OAuth-only MCP server: the per-turn vault mirror leaves a URL held by that person's own `mcp_oauth` grant alone instead of trying to create the agent's shared token next to it (a 409 from Managed Agents), tolerates a 409 from a concurrent create, and a pasted token now replaces a grant at the same URL rather than colliding with it.
+- **Connecting an OAuth MCP server no longer breaks every later turn.** After
+  someone signed in to Notion, each turn failed with "could not get the agent
+  ready": the per-turn vault mirror only knew static tokens, so it tried to
+  create the agent's old shared token next to the person's `mcp_oauth` grant
+  and Managed Agents refused (one credential per URL). Every vault writer now
+  treats a URL held by a grant as taken: the mirror, the daimon-mcp bootstrap
+  and the Copilot mount leave it alone, a pasted token replaces it, and a 409
+  from a concurrent create is tolerated. Detaching a server also finds a
+  token row stored with a trailing slash, and the sign-in card refuses the
+  click when the deployment has no crypto keys instead of handing out a dead
+  link.
 
 - **One failing MCP server no longer discards the reply.** When Managed
   Agents cannot reach or authenticate one of an agent's MCP servers it keeps

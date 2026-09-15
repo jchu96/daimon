@@ -95,17 +95,17 @@ async def _ensure_agent_mcp_vault_locked(
     display_name = f"daimon-mcp:{account_id}:{agent_id}"
     oldest = await _find_vault_by_name(client, display_name=display_name)
     if oldest is not None:
-        # Inspect existing static_bearer credentials. Only act on URL mismatch:
-        # no credential matches `public_url` — stale URL from an earlier deploy
-        # (e.g. cloudflare-tunnel → fly URL migration), leaves MA unable to find
-        # a credential for the agent's current mcp_server URL.
-        # MA blocks PATCH (405) and POST-duplicate (409), so the only way to
-        # update a credential is delete + recreate (verified against the live MA API).
+        # Only act on URL mismatch: no credential at `public_url` — stale URL
+        # from an earlier deploy (e.g. cloudflare-tunnel → fly URL migration),
+        # leaves MA unable to find a credential for the agent's current
+        # mcp_server URL. Any auth type at that URL counts: a vault holds one
+        # credential per URL, so creating next to an `mcp_oauth` grant would be
+        # a 409 on every session create with nothing to heal it.
         has_matching_url = False
         async for cred in client.beta.vaults.credentials.list(vault_id=oldest.id):
-            if cred.auth.type != "static_bearer":
+            if isinstance(cred.auth, BetaManagedAgentsEnvironmentVariableAuthResponse):
                 continue
-            if cred.auth.mcp_server_url == public_url:
+            if same_server_url(cred.auth.mcp_server_url, public_url):
                 has_matching_url = True
                 break
         url_mismatch = not has_matching_url
@@ -140,6 +140,16 @@ async def _ensure_agent_mcp_vault_locked(
         },
     )
     return vault.id
+
+
+def same_server_url(left: str, right: str) -> bool:
+    """One vault slot per server: compare without a trailing slash.
+
+    Whether MA itself treats `.../mcp` and `.../mcp/` as one URL is not
+    verified; daimon treats them as one everywhere so its own comparisons
+    agree with each other.
+    """
+    return left.rstrip("/") == right.rstrip("/")
 
 
 async def ensure_agent_mcp_vault(
@@ -214,21 +224,23 @@ async def add_github_copilot_credential(
     If it raises, the local Fernet blob is already the source of truth;
     the operator can retry by re-OAuthing.
 
-    Idempotent on retry: list existing credentials, delete any pointed at the
-    GitHub Copilot URL, then create the new one.
+    Idempotent on retry: list existing credentials, delete any static one
+    pointed at the GitHub Copilot URL, then create the new one. A person's own
+    `mcp_oauth` grant at that URL is left in place and nothing is created:
+    their sign-in outranks the agent's PAT, and the slot is taken anyway.
     """
+    stale: list[str] = []
     async for cred in client.beta.vaults.credentials.list(vault_id=vault_id):
-        # SDK 0.117 widened the auth union with an `environment_variable`
-        # member that has no `mcp_server_url`; narrow to static_bearer first
-        # (these creds are created as static_bearer below), matching the guard
-        # in ensure_agent_mcp_vault.
-        if cred.auth.type != "static_bearer":
+        if isinstance(cred.auth, BetaManagedAgentsEnvironmentVariableAuthResponse):
             continue
-        if cred.auth.mcp_server_url == GITHUB_COPILOT_MCP_URL:
-            await client.beta.vaults.credentials.delete(
-                cred.id,
-                vault_id=vault_id,
-            )
+        if not same_server_url(cred.auth.mcp_server_url, GITHUB_COPILOT_MCP_URL):
+            continue
+        if cred.auth.type == "mcp_oauth":
+            return
+        stale.append(cred.id)
+    # Collect first: deleting while the list paginates can skip an entry.
+    for credential_id in stale:
+        await client.beta.vaults.credentials.delete(credential_id, vault_id=vault_id)
 
     await client.beta.vaults.credentials.create(
         vault_id=vault_id,
@@ -299,7 +311,7 @@ async def add_external_mcp_credential(
             cred.id
             async for cred in client.beta.vaults.credentials.list(vault_id=vault_id)
             if not isinstance(cred.auth, BetaManagedAgentsEnvironmentVariableAuthResponse)
-            and cred.auth.mcp_server_url.rstrip("/") == mcp_server_url.rstrip("/")
+            and same_server_url(cred.auth.mcp_server_url, mcp_server_url)
         ]
         for credential_id in stale:
             await client.beta.vaults.credentials.delete(credential_id, vault_id=vault_id)
