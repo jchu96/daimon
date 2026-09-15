@@ -11,6 +11,7 @@ from daimon.core.errors import DaimonError
 from daimon.core.setup_conversations import (
     CODING_TOOLS_HINT,
     get_setup_responder,
+    has_external_mcp_connection,
     resolve_setup_agents,
     setup_thread_name,
     shared_keys_sentence,
@@ -94,6 +95,36 @@ def test_setup_thread_name_stands_in_for_an_unchosen_target() -> None:
 def test_setup_thread_name_truncates_a_name_discord_would_reject() -> None:
     name = setup_thread_name("x" * 200)
     assert len(name) == 100, "Discord rejects a thread name over 100 characters outright"
+
+
+def test_external_connection_ignores_the_deployments_own_server_whatever_its_name() -> None:
+    """The built-in server is registered under a spec-owned name, so only its
+    URL can tell it apart from a service the person actually connected."""
+    assert not has_external_mcp_connection(
+        ["https://mcp.example.com/mcp"], public_mcp_url="https://mcp.example.com/mcp"
+    ), "an agent carrying only the deployment's own server is connected to nothing external"
+
+
+def test_external_connection_ignores_a_trailing_slash_difference() -> None:
+    assert not has_external_mcp_connection(
+        ["https://mcp.example.com/mcp/"], public_mcp_url="https://mcp.example.com/mcp"
+    ), "one server reached with and without a trailing slash is one server"
+
+
+def test_external_connection_sees_a_server_at_another_url() -> None:
+    assert has_external_mcp_connection(
+        ["https://mcp.example.com/mcp", "https://mcp.linear.app/mcp"],
+        public_mcp_url="https://mcp.example.com/mcp",
+    ), "a server at another URL is an external connection"
+
+
+def test_external_connection_counts_every_server_without_a_public_url() -> None:
+    assert has_external_mcp_connection(["https://mcp.linear.app/mcp"], public_mcp_url=None), (
+        "with no endpoint of its own the deployment has no built-in server to discount"
+    )
+    assert not has_external_mcp_connection([], public_mcp_url=None), (
+        "an agent with no servers is connected to nothing"
+    )
 
 
 def test_shared_keys_sentence_names_the_agent_whose_keys_are_shared() -> None:

@@ -7,12 +7,18 @@ from typing import Any
 
 import aiohttp
 from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.agent_setup.read import public_mcp_url
 from daimon.adapters.slack.mrkdwn import escape_mrkdwn
 from daimon.adapters.slack.runtime import SlackRuntime
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED, MA_METADATA_KEY_NAME
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
-from daimon.core.setup_conversations import build_setup_opener, resolve_setup_agents
+from daimon.core.setup_conversations import (
+    build_setup_opener,
+    has_external_mcp_connection,
+    resolve_setup_agents,
+    setup_thread_name,
+)
 from daimon.core.stores.agent_repo_binding import get_binding as get_repo_binding
 from daimon.core.stores.identity import get_or_create_platform_principal
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
@@ -106,8 +112,10 @@ async def create_setup_conversation(
         opener_mention=f"<@{user_id}>",
         bot_mention=f"<@{bot_user_id}>",
         has_repo=has_repo,
-        has_external_connection=bool(
-            target and any(server.name != "daimon" for server in target.mcp_servers)
+        has_external_connection=target is not None
+        and has_external_mcp_connection(
+            (server.url for server in target.mcp_servers),
+            public_mcp_url=public_mcp_url(runtime),
         ),
         can_customize=can_customize
         and target is not None
@@ -137,7 +145,7 @@ async def create_setup_conversation(
         reply = await client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
             channel=channel_id,
             thread_ts=thread_id,
-            text=f"Reply here in this thread.\n\n{opener}",
+            text=opener,
         )
         opener_ts = str(reply.get("ts") or "")
         if not opener_ts:
@@ -150,12 +158,8 @@ async def create_setup_conversation(
             raise DaimonError(
                 "Slack did not return a link to the setup conversation. Please retry."
             )
-        heading = (
-            f"Set up {escape_mrkdwn(target_name)} with Daimon"
-            if target_name
-            else "Set up an agent with Daimon"
-        )
-        launcher = f"{heading} · opened by <@{user_id}>\nOpen this thread to reply to Daimon."
+        heading = setup_thread_name(escape_mrkdwn(target_name) if target_name else None)
+        launcher = f"{heading}\nOpen this thread to reply to Daimon."
         await client.chat_update(  # pyright: ignore[reportUnknownMemberType]  # SDK kwargs
             channel=channel_id,
             ts=thread_id,

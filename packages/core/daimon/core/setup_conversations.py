@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from typing import Final
 
 from anthropic import APIStatusError, AsyncAnthropic
@@ -14,6 +15,7 @@ from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_TENANT,
 )
 from daimon.core.errors import DaimonError
+from daimon.core.mcp_vault import same_server_url
 
 # Copy for the surfaces that open or describe a setup conversation. It lives
 # here so the Discord panel, the Slack panel and the MCP outcome cannot drift:
@@ -40,6 +42,20 @@ def setup_thread_name(target_name: str | None) -> str:
     ``target_name`` is None before the person has chosen what to set up.
     """
     return f"Set up {target_name or 'an agent'} with Daimon"[:_MAX_SETUP_THREAD_NAME_CHARS]
+
+
+def has_external_mcp_connection(server_urls: Iterable[str], *, public_mcp_url: str | None) -> bool:
+    """Whether the agent connects to an MCP server other than this deployment's.
+
+    Matched on URL, not on server name: the built-in server's name is part of
+    the agent spec and anyone editing the spec can change it, while the
+    deployment's own endpoint is a fact both platforms already hold. With no
+    public URL configured there is no built-in server to discount, so every
+    attached server counts as external.
+    """
+    return any(
+        public_mcp_url is None or not same_server_url(url, public_mcp_url) for url in server_urls
+    )
 
 
 def shared_keys_sentence(agent_name: str) -> str:

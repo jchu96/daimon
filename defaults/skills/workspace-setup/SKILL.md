@@ -150,7 +150,11 @@ it. Give a reachable handoff carrying the target and action, for example:
 channel.’” If no agent answers in the current channel, name the existing
 `/agent-setup` entry rather than telling the person to talk to an unreachable
 agent. Both members and admins can use **💬 Set up with Daimon** in `/agent-setup`,
-including from a selected agent's Details.
+including from a selected agent's Details. A `set_setup_target` refusal means
+this thread is not a setup conversation; it
+never means the agent cannot be configured.
+Configure it by name with `update_agent` or a request tool in the
+conversation you are already in.
 
 An operator-only problem needs the person running the deployment, not a
 workspace admin. Name the blocker and the requested fix without exposing

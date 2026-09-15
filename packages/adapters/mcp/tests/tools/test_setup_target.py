@@ -403,3 +403,55 @@ async def test_setup_target_refuses_in_a_handoff_thread_and_names_who_answers(
     assert binding is not None and binding.configuration_target_ma_agent_id is None, (
         "a handoff thread must not acquire a configuration target"
     )
+
+
+async def test_setup_target_refusal_in_ordinary_chat_keeps_configuration_open(
+    db_session: AsyncSession,
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ordinary thread has no binding at all. The refusal must say only that
+    there is no target to switch — a refusal that reads as 'this agent cannot be
+    configured here' costs the caller the turn and the next one too."""
+    tenant = await make_tenant(db_session)
+    caller = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    target = ma_agent(
+        id="agent_new",
+        name="new",
+        model=ma_model_config("claude-sonnet-5", speed="standard"),
+        metadata={MA_METADATA_KEY_TENANT: str(tenant.id), MA_METADATA_KEY_NAME: "new"},
+    )
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _r, _m: list_response([target.model_dump(mode="json")]))
+    runtime = _runtime(committing_sessionmaker, build_fake_anthropic(router.dispatch))
+    auth = AuthIdentity(
+        account_id=caller.id, tenant_id=tenant.id, role=Role.USER, platform="discord"
+    )
+
+    async with turn_origin(
+        committing_sessionmaker,
+        tenant_id=tenant.id,
+        account_id=caller.id,
+        platform="discord",
+        parent_channel_id="parent",
+        thread_id="ordinary",
+        responder_ma_agent_id="agent_daimon",
+        responder_name="daimon",
+        role=Role.USER,
+    ) as origin:
+        with pytest.raises(ToolError) as refused:
+            await _set_setup_target_impl(
+                runtime, auth, origin_context_id=str(origin.id), agent_id="agent_new"
+            )
+
+    message = str(refused.value)
+    assert "no selected target to switch" in message, (
+        "the refusal must name what is actually missing: a selected target"
+    )
+    assert "update_agent" in message, (
+        "the refusal must hand the caller a tool it can use in this same thread"
+    )
+    assert "does not block" in message, (
+        "the refusal must say configuration is still available, or the model stops trying"
+    )
+    assert "/agent-setup" not in message, "the refusal must name a reachable control, not a path"
