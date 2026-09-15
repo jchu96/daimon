@@ -754,3 +754,50 @@ async def test_callback_mcp_oauth_kind_spends_the_request_and_sends_a_private_si
         spent = await peek_credential_request(session, token=token)
     assert flow is not None and flow.request_token == token, "the link points at a minted flow"
     assert spent is not None and spent.used_at is not None, "the request is spent on the click"
+
+
+async def test_callback_mcp_oauth_kind_refuses_the_click_when_the_deployment_has_no_crypto_keys(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The sign-in routes only mount with crypto keys; without them the click must
+    not spend the request on a link to nowhere."""
+    token = mint_request_token()
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=f"guild-{token[:8]}")
+        row = await create_credential_request(
+            session,
+            token=token,
+            kind="mcp_oauth",
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            account_id=uuid.uuid4(),
+            target="notion",
+            mcp_server_url="https://mcp.notion.com/mcp",
+            requester_platform_user_id=_REQUESTER_ID,
+            channel_id="chan-1",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="daimon",
+            requested_work=None,
+        )
+    runtime = SimpleNamespace(
+        sessionmaker=db_session_factory,
+        settings=SimpleNamespace(
+            mcp=SimpleNamespace(app_root_url="https://d.example", jwt_secret=SecretStr("s" * 32))
+        ),
+        turn_deps=SimpleNamespace(fernet=None),
+    )
+    interaction = _interaction(user_id=_REQUESTER_ID, client=SimpleNamespace(runtime=runtime))
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    await CredentialRequestButton(token=token, label="Connect", request_row=row).callback(
+        interaction
+    )
+
+    text = interaction.followup.send.call_args.args[0]
+    assert "cannot sign you in" in text, "the person learns the operator must finish setup"
+    async with db_session_factory() as session:
+        spent = await peek_credential_request(session, token=token)
+    assert spent is not None and spent.used_at is None, "the request survives for a later click"

@@ -47,7 +47,9 @@ async def start_mcp_oauth_from_click(
     await interaction.response.defer(ephemeral=True, thinking=True)
     mcp = runtime.settings.mcp
     app_root_url = mcp.app_root_url
-    if app_root_url is None or mcp.jwt_secret is None:
+    # A superset of the route mount's predicate (mount needs fernet + app root;
+    # this also needs jwt_secret): never hand out a link the routes cannot serve.
+    if app_root_url is None or mcp.jwt_secret is None or runtime.turn_deps.fernet is None:
         await interaction.followup.send(_UNCONFIGURED, ephemeral=True)
         return
     now = datetime.now(UTC)

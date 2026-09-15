@@ -22,12 +22,13 @@ from daimon.core.mcp_oauth.models import AuthorizationServerMetadata, ProtectedR
 from daimon.core.mcp_oauth.urls import McpUrlError, assert_public_https_url
 from pydantic import BaseModel
 
+_PROTOCOL_VERSION = "2025-06-18"
 _INITIALIZE_BODY = {
     "jsonrpc": "2.0",
     "id": 1,
     "method": "initialize",
     "params": {
-        "protocolVersion": "2025-06-18",
+        "protocolVersion": _PROTOCOL_VERSION,
         "capabilities": {},
         "clientInfo": {"name": "daimon", "version": "0"},
     },
@@ -82,7 +83,10 @@ async def probe_mcp_server(
     and before an OAuth flow to learn where the server's metadata lives.
     """
     assert_public_https_url(mcp_server_url, what="mcp server url")
-    headers = {"Accept": "application/json, text/event-stream"}
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": _PROTOCOL_VERSION,
+    }
     if bearer_token is not None:
         headers["Authorization"] = f"Bearer {bearer_token}"
     response = await http.post(mcp_server_url, json=_INITIALIZE_BODY, headers=headers)

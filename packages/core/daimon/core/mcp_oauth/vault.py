@@ -23,6 +23,7 @@ from anthropic.types.beta.vaults.beta_managed_agents_mcp_oauth_refresh_params im
     TokenEndpointAuth,
 )
 from daimon.core.mcp_oauth.models import ClientRegistration, TokenResponse
+from daimon.core.mcp_vault import same_server_url
 
 # Anthropic wants a bound expiry. A server that omits `expires_in` but hands
 # out a refresh token gets a short lifetime, since Anthropic renews it anyway;
@@ -94,7 +95,7 @@ async def put_mcp_oauth_credential(
         existing.id
         async for existing in anthropic.beta.vaults.credentials.list(vault_id=vault_id)
         if not isinstance(existing.auth, BetaManagedAgentsEnvironmentVariableAuthResponse)
-        and existing.auth.mcp_server_url.rstrip("/") == mcp_server_url.rstrip("/")
+        and same_server_url(existing.auth.mcp_server_url, mcp_server_url)
     ]
     for credential_id in stale:
         await anthropic.beta.vaults.credentials.delete(credential_id, vault_id=vault_id)

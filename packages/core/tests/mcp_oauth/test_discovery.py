@@ -76,6 +76,17 @@ async def test_probe_reads_the_resource_metadata_hint_from_a_401() -> None:
     ), "the advertised metadata URL is extracted"
 
 
+async def test_probe_sends_the_mcp_protocol_version_header() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("mcp-protocol-version"))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    await probe_mcp_server(_client(httpx.MockTransport(handler)), mcp_server_url=_MCP_URL)
+    assert seen == ["2025-06-18"], "the initialize probe declares its protocol version"
+
+
 async def test_probe_sends_the_bearer_token_when_given_one() -> None:
     seen: list[str | None] = []
 

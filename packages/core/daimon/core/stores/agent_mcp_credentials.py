@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 
 from daimon.core._models import AgentMcpCredential
 from daimon.core.stores.domain import AgentMcpCredentialRow
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,16 +72,19 @@ async def delete_credential(
     agent_id: uuid.UUID,
     mcp_server_url: str,
 ) -> bool:
-    """Delete the credential for one server. ``True`` when a row was removed."""
+    """Delete the credential for one server. ``True`` when a row was removed.
+
+    Matches with or without a trailing slash: rows written by the setup panel
+    kept the URL as typed, and detach strips the slash before asking.
+    """
     result = await session.execute(
         select(AgentMcpCredential).where(
             AgentMcpCredential.tenant_id == tenant_id,
             AgentMcpCredential.agent_id == agent_id,
-            AgentMcpCredential.mcp_server_url == mcp_server_url,
+            func.rtrim(AgentMcpCredential.mcp_server_url, "/") == mcp_server_url.rstrip("/"),
         )
     )
-    orm = result.scalar_one_or_none()
-    if orm is None:
-        return False
-    await session.delete(orm)
-    return True
+    rows = result.scalars().all()
+    for orm in rows:
+        await session.delete(orm)
+    return bool(rows)

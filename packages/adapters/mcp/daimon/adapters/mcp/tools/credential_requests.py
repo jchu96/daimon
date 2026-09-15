@@ -44,6 +44,7 @@ from daimon.core.credential_requests import (
     build_skill_repo_target,
     mint_request_token,
 )
+from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.ma_identity import derive_agent_uuid
@@ -487,6 +488,23 @@ async def _request_agent_key_impl(
     )
 
 
+def _reject_reserved_server(runtime: McpRuntime, *, server_name: str, url: str) -> None:
+    """The deployment's own daimon-mcp entry can never be the target of a credential.
+
+    Same gate as `attach_mcp_server`: a grant or token stored at the public URL
+    would take the slot the per-agent JWT needs, and the vault bootstrap
+    would 409 on every session create with nothing to heal it.
+    """
+    public_url = runtime.settings.mcp.public_url
+    rejection = get_reserved_mcp_rejection(
+        server_name=server_name,
+        url=url,
+        public_url=str(public_url) if public_url is not None else None,
+    )
+    if rejection is not None:
+        raise ToolError(rejection)
+
+
 async def _request_mcp_token_impl(
     runtime: McpRuntime,
     auth: AuthIdentity,
@@ -506,6 +524,7 @@ async def _request_mcp_token_impl(
         assert_public_host(url, what="mcp server url")
     except McpUrlError as err:
         raise ToolError(str(err)) from err
+    _reject_reserved_server(runtime, server_name=server_name, url=url)
     # Normalise the trailing slash once, here, before the URL is persisted.
     # The vault stores it as the credential's `auth.mcp_server_url` and
     # mcp_vault's idempotent replace matches on that string exactly, so
@@ -556,6 +575,7 @@ async def _request_mcp_oauth_impl(
         assert_public_host(url, what="mcp server url")
     except McpUrlError as err:
         raise ToolError(str(err)) from err
+    _reject_reserved_server(runtime, server_name=server_name, url=url)
     url = url.rstrip("/")
     origin = await require_turn_origin(runtime, auth, origin_context_id)
     agent_id, ma_agent = await _resolve_agent_uuid(
