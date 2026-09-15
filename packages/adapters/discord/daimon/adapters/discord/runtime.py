@@ -14,6 +14,7 @@ from daimon.core.db import build_engine, build_session_factory
 from daimon.core.defaults.loader import parse_deployment_default
 from daimon.core.github_credentials import build_multifernet
 from daimon.core.ma_resolver import ResolverCache, new_resolver_cache
+from daimon.core.mcp_oauth import McpTokenProbe, probe_bearer_token
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
 from daimon.core.turn.deps import TurnDeps
@@ -30,6 +31,10 @@ class DiscordRuntime:
     deployment_default: DeploymentDefault
     resolver_cache: ResolverCache
     turn_deps: TurnDeps
+    # The MCP token form's live check. None means "do not probe" — the seam
+    # tests use so a form submit never leaves the process; production wires
+    # `daimon.core.mcp_oauth.probe_bearer_token`.
+    mcp_token_probe: McpTokenProbe | None = None
 
 
 def build_turn_deps(
@@ -109,6 +114,7 @@ async def build_runtime(settings: Settings) -> AsyncIterator[DiscordRuntime]:
                 deployment_default=deployment_default,
                 resolver_cache=resolver_cache,
                 turn_deps=turn_deps,
+                mcp_token_probe=probe_bearer_token,
             )
         finally:
             await engine.dispose()

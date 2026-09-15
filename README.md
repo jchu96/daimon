@@ -262,6 +262,22 @@ an env var, and Slack won't redirect to `localhost`.
 [`docs/slack.md`](docs/slack.md) covers the trust model for per-user Slack
 access, which operators should read before enabling it.
 
+## Connect Notion, Linear and other MCP servers
+
+Ask the agent to connect a server and it posts a card only you can open.
+A server that takes a bearer token (Linear, GitHub) gets a private token
+form; the token is checked against the server before it is stored and is
+shared by everyone who talks to that agent. A server that signs people in
+through a browser (Notion, Slack, Atlassian) gets a sign-in link instead:
+daimon registers itself as an OAuth client, you approve in the browser, and
+the grant lands in your own vault, refreshed by Anthropic. Each person
+connects their own account. The sign-in routes live at
+`<DAIMON_MCP__PUBLIC_URL without /mcp>/oauth/mcp/start` and
+`.../oauth/mcp/callback`, so the public URL must be reachable from a browser
+and `DAIMON_CRYPTO__KEYS` must be set. If one connection fails, the agent
+still answers and names the server it could not use under the reply; ask it
+to disconnect the server or connect it again.
+
 ## Layout
 
 - `packages/core/` — `daimon-core` library (MA client, stores, turn pipeline)

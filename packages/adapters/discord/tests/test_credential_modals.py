@@ -2325,3 +2325,59 @@ async def test_env_file_upload_queues_its_continuation_with_the_keys(
     card = _card_text(_card_edits(interaction)[-1])
     assert "1 key saved for tester." in card, "the card counts what landed"
     assert "next message" not in card, "nothing was waiting on the file, so no turn is promised"
+
+
+async def test_mcp_modal_refuses_a_token_the_server_rejects_before_any_write(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A 401/403 from the server at the door: nothing stored, nothing attached,
+    the card refused with the way out named (the case a Notion token hit)."""
+    import dataclasses
+
+    from daimon.core.mcp_oauth import McpProbe
+
+    row = await _seed_mcp_request(
+        db_session_factory, mcp_server_url="https://mcp.notion.com/mcp", with_origin=True
+    )
+    creds_created: list[dict[str, Any]] = []
+    agent_updates: list[dict[str, Any]] = []
+    probed: list[tuple[str, str]] = []
+
+    async def probe(url: str, token: str) -> McpProbe:
+        probed.append((url, token))
+        return McpProbe(status_code=403, resource_metadata_url=None)
+
+    runtime = dataclasses.replace(
+        _runtime(
+            sessionmaker=db_session_factory,
+            anthropic=build_stub_anthropic(
+                _vault_handler(
+                    "vlt_probe",
+                    f"daimon-mcp:{row.account_id}:{row.agent_id}",
+                    creds_created,
+                    tenant_id=str(row.tenant_id),
+                    agent_updates=agent_updates,
+                )
+            ),
+            public_url=HttpUrl("https://mcp.example.com/mcp"),
+            jwt_secret="x" * 32,
+        ),
+        mcp_token_probe=probe,
+    )
+    modal = McpCredentialModal(runtime=runtime, request_row=row)
+    modal.token_input._value = _MCP_TOKEN  # pyright: ignore[reportPrivateUsage]
+
+    interaction = _card_interaction()
+    await modal.on_submit(interaction)
+
+    assert probed == [("https://mcp.notion.com/mcp", _MCP_TOKEN)], "the server is asked first"
+    assert creds_created == [], "a rejected token is never written to a vault"
+    assert agent_updates == [], "and the server is never attached"
+    async with db_session_factory() as session:
+        spent = await peek_credential_request(session, token=row.token)
+    assert spent is not None and spent.outcome == "token_rejected"
+    text = interaction.followup.send.call_args.args[0]
+    assert "did not accept" in text and "connect it with your account" in text, (
+        "the person learns the token was refused and that OAuth is the way out"
+    )

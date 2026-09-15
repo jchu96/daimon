@@ -40,6 +40,7 @@ from daimon.core.turn.render import (
 from daimon.core.turn.run import RunOutcome, run_prepared_turn
 from daimon.core.turn.state import (
     ContentBlock,
+    McpServerFailure,
     Task,
     TextBlock,
     ToolUseBlock,
@@ -82,6 +83,7 @@ __all__ = [
     "run_prepared_turn",
     # state
     "ContentBlock",
+    "McpServerFailure",
     "Task",
     "TextBlock",
     "ToolUseBlock",

@@ -36,6 +36,7 @@ from daimon.adapters.discord.embed import (
 )
 from daimon.adapters.discord.split import split_for_discord_safe
 from daimon.core.pricing import MODEL_PRICING, cost_of, format_cost
+from daimon.core.turn.degraded import render_degraded_notice
 from daimon.core.turn.lifecycle import InterruptSource, ReconnectReason
 from daimon.core.turn.state import (
     ToolUseBlock,
@@ -323,6 +324,13 @@ class DiscordTurnLifecycle:
             has_tool_activity = any(isinstance(block, ToolUseBlock) for block in state.content)
             if has_tool_activity:
                 self._was_answered = True
+                # #79: a tool-only turn has no reply to hang the notice under,
+                # so a dropped server is named on its own line.
+                tool_only_notice = render_degraded_notice(state.mcp_failures)
+                if tool_only_notice is not None:
+                    await self._send_message(
+                        content=tool_only_notice, allowed_mentions=discord.AllowedMentions.none()
+                    )
                 log.info("turn.terminal_success", has_text=False, tool_only=True)
                 return
             await self._edit(self._message_ref, content="Turn cancelled.", embed=None, view=None)
@@ -333,6 +341,11 @@ class DiscordTurnLifecycle:
         if self.answer_prefix is not None:
             response_text = f"{self.answer_prefix}\n\n{response_text}"
             self.answer_prefix_applied = True
+        # #79: a server MA dropped this turn is named under the reply, so a
+        # degraded answer never reads as a complete one.
+        degraded_notice = render_degraded_notice(state.mcp_failures)
+        if degraded_notice is not None:
+            response_text = f"{response_text}\n\n{degraded_notice}"
         chunks = split_for_discord_safe(response_text)
         # Clean replace: first chunk replaces the embed
         await self._edit(

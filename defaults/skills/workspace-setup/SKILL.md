@@ -88,13 +88,17 @@ their snapshots. Selecting a target does not change who answers or routing.
    `request_skill_repo_token`: submission imports and attaches the skills.
    Adding skills from a repo never changes the working repo or its branch;
    say so only if asked.
-4. **MCP servers.** Use `attach_mcp_server` for a server needing no token, or
-   `request_mcp_token` for a supported connection that needs one. Members can
-   use that private form on Daimon or another default agent without an admin
-   handoff or a fork. An API key
+4. **MCP servers.** Use `attach_mcp_server` for a server needing no token,
+   `request_mcp_token` for one that takes a pasted bearer token, or
+   `request_mcp_oauth` for one that signs people in through a browser (Notion,
+   Slack, Atlassian). Members can use either private form on Daimon or another
+   default agent without an admin handoff or a fork. An OAuth connection is
+   per person: the requester signs in with their own account, and another
+   member who wants it asks for their own card. An API key
    for code is not automatically an MCP connection token. Ask “API access for
    code or an MCP connection?” only when the request leaves that choice unclear.
-   A token form does not complete an arbitrary browser OAuth login.
+   A token form does not complete a browser OAuth login; a server that rejects
+   a pasted token is a sign to offer `request_mcp_oauth` instead.
    Successful submission attaches the server to the agent, but does not refresh
    this conversation's toolset. Check actual tool availability before promising
    to use the connection here; a new conversation can load the updated agent.
@@ -134,7 +138,9 @@ those direct edits. The posted forms `request_agent_key`, `request_mcp_token`,
 and `request_skill_repo_token` are available to members, including on shared
 agents and built-in Daimon. They do not inherit the direct-edit admin or fork
 gates: `request_mcp_token` can collect a bearer token and attach its server
-through the private form without an admin handoff. A shared agent's working-repo
+through the private form without an admin handoff, and `request_mcp_oauth`
+does the same through a browser sign-in. `detach_mcp_server` undoes either: an
+admin can disconnect a server from any agent, built-in Daimon included. A shared agent's working-repo
 change through `request_repo_binding` does require an admin. Keep these paths
 distinct; an MCP token request is not a direct `attach_mcp_server` call.
 

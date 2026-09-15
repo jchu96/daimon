@@ -122,6 +122,8 @@ source_modules = [
     "daimon.core.mcp_attach",
     "daimon.core.mcp_auth",
     "daimon.core.mcp_credential_sweep",
+    "daimon.core.mcp_oauth",
+    "daimon.core.mcp_token_check",
     "daimon.core.mcp_vault",
     "daimon.core.mcp_vault_janitor",
     "daimon.core.media",

@@ -47,6 +47,7 @@ from daimon.core.stores.domain import CredentialRequestRow
 from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, list_response
+from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -690,3 +691,66 @@ async def test_wrong_requester_click_does_not_edit() -> None:
     assert interaction.response.send_message.call_args.args[0] == WRONG_REQUESTER_MESSAGE, (
         "the wrong clicker is told whose request this is, and changes nothing"
     )
+
+
+# --- callback (mcp_oauth kind): a private sign-in link, no modal ------------------
+
+
+async def test_callback_mcp_oauth_kind_spends_the_request_and_sends_a_private_sign_in_link(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The OAuth card's click opens no modal: the request is spent atomically,
+    a flow row is minted and only the requester gets the start link."""
+    from daimon.core.stores import mcp_oauth_flows as flows_store
+    from daimon.testing.crypto import make_fernet
+
+    token = mint_request_token()
+    async with db_session_factory() as session, session.begin():
+        tenant = await make_tenant(session, platform="discord", workspace_id=f"guild-{token[:8]}")
+        row = await create_credential_request(
+            session,
+            token=token,
+            kind="mcp_oauth",
+            tenant_id=tenant.id,
+            agent_id=uuid.uuid4(),
+            account_id=uuid.uuid4(),
+            target="notion",
+            mcp_server_url="https://mcp.notion.com/mcp",
+            requester_platform_user_id=_REQUESTER_ID,
+            channel_id="chan-1",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="daimon",
+            requested_work=None,
+        )
+    runtime = SimpleNamespace(
+        sessionmaker=db_session_factory,
+        settings=SimpleNamespace(
+            mcp=SimpleNamespace(app_root_url="https://d.example", jwt_secret=SecretStr("s" * 32))
+        ),
+        turn_deps=SimpleNamespace(fernet=make_fernet()),
+    )
+    bot = SimpleNamespace(runtime=runtime)
+    interaction = _interaction(user_id=_REQUESTER_ID, client=bot)
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    item = CredentialRequestButton(token=token, label="Connect", request_row=row)
+
+    await item.callback(interaction)
+
+    interaction.response.send_modal.assert_not_awaited()
+    interaction.followup.send.assert_awaited_once()
+    kwargs = interaction.followup.send.call_args.kwargs
+    assert kwargs["ephemeral"] is True, "the link is for the requester alone"
+    view = kwargs["view"]
+    button = next(c for c in view.children if isinstance(c, discord.ui.Button))
+    assert button.url is not None and button.url.startswith(
+        "https://d.example/oauth/mcp/start?state="
+    )
+    state = button.url.rsplit("state=", 1)[1]
+    async with db_session_factory() as session:
+        flow = await flows_store.get_flow(session, state=state)
+        spent = await peek_credential_request(session, token=token)
+    assert flow is not None and flow.request_token == token, "the link points at a minted flow"
+    assert spent is not None and spent.used_at is not None, "the request is spent on the click"

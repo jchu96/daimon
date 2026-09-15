@@ -1390,3 +1390,68 @@ async def test_success_paths_send_no_ephemeral_receipt(
     assert [row.requested_work for row in pending] == [_WORK], (
         "a connected server resumes the work that was waiting on it"
     )
+
+
+async def test_mcp_submission_refuses_a_token_the_server_rejects_before_any_write(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """Same door check as Discord: a 401/403 from the server stores nothing."""
+    import dataclasses
+
+    from daimon.core.mcp_oauth import McpProbe
+
+    tenant_id, fernet_key = await _seed_team(db_session)
+    live_agent = ma_agent(id="agent_credentials", name="specialist", tenant_id=tenant_id)
+    agent_id = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=live_agent.id)
+    account_id = derive_guild_account_uuid(tenant_id=tenant_id)
+    token = await _seed_request(
+        db_session,
+        tenant_id=tenant_id,
+        kind="mcp",
+        target="notion",
+        mcp_server_url="https://mcp.notion.com/mcp",
+        agent_id=agent_id,
+        posted_message_id=_MESSAGE_TS,
+        origin_thread_id=_ORIGIN_THREAD,
+        target_ma_agent_id=live_agent.id,
+    )
+    await db_session.commit()
+    ma_calls: list[str] = []
+    counting = _mcp_handler(live_agent, account_id=account_id, agent_id=agent_id)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        ma_calls.append(f"{req.method} {req.url.path}")
+        return counting(req)
+
+    async def probe(url: str, value: str) -> McpProbe:
+        return McpProbe(status_code=401, resource_metadata_url=None)
+
+    runtime = dataclasses.replace(
+        _build_runtime(
+            fernet_key, db_session_factory, anthropic_handler=handler, mcp_configured=True
+        ),
+        mcp_token_probe=probe,
+    )
+    runtime.turn_deps.fernet = build_multifernet((fernet_key,))
+    await run_mcp_credential_submission(
+        runtime,
+        team_id=_TEAM_ID,
+        user_id=_USER_ID,
+        channel_id=_CHANNEL_ID,
+        message_ts=_MESSAGE_TS,
+        token=token,
+        value="ntn_rejected",
+        dispatch_continuations=_noop_dispatch,
+    )
+
+    assert not any(c.startswith("POST") for c in ma_calls), "nothing is written to MA"
+    async with db_session_factory() as session:
+        request_row = await peek_credential_request(session, token=token)
+    assert request_row is not None and request_row.outcome == "token_rejected"
+    card = _chat_updates(fake_slack_web_client)[-1]
+    assert "did not accept that token" in card["text"], "the card says the token was refused"
+    assert any(
+        "connect it with your account" in t for t in _ephemeral_texts(fake_slack_web_client)
+    ), "the person is pointed at the OAuth path"

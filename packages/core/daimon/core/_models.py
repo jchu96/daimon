@@ -1050,7 +1050,7 @@ class CredentialRequest(Base):
     __tablename__ = "credential_requests"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('env', 'env_file', 'mcp', 'repo', 'skill_repo')",
+            "kind IN ('env', 'env_file', 'mcp', 'mcp_oauth', 'repo', 'skill_repo')",
             name="ck_credential_requests_kind",
         ),
         UniqueConstraint("idempotency_key", name="uq_credential_requests_idempotency_key"),
@@ -1087,6 +1087,51 @@ class CredentialRequest(Base):
     # the vocabulary is pinned by `CredentialRequestOutcome` in
     # `daimon.core.credential_requests`.
     outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class McpOAuthFlow(Base):
+    """One in-flight MCP OAuth authorization, keyed by its `state`.
+
+    Minted when the requester clicks an `mcp_oauth` card: the row holds the
+    PKCE verifier the callback needs and, once `/oauth/mcp/start` has run
+    discovery and dynamic client registration, the client Anthropic will
+    refresh with. Person-scoped like `credential_requests`; it cascades from
+    its request row, so the platform-user erasure that deletes the request
+    takes the flow with it, and `tenant_id` cascades on tenant teardown.
+    `client_secret_encrypted` is Fernet ciphertext and only ever set for a
+    server that offers no public-client registration.
+    """
+
+    __tablename__ = "mcp_oauth_flows"
+
+    state: Mapped[str] = mapped_column(Text, primary_key=True)
+    request_token: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("credential_requests.token", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    server_name: Mapped[str] = mapped_column(Text, nullable=False)
+    mcp_server_url: Mapped[str] = mapped_column(Text, nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    code_verifier: Mapped[str] = mapped_column(Text, nullable=False)
+    client_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_endpoint_auth_method: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorization_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resource: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scope: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

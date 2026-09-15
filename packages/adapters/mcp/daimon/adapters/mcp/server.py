@@ -32,6 +32,7 @@ from daimon.adapters.mcp.middleware.mcp_identity import (
     production_subject_resolver,
     production_tenant_resolver,
 )
+from daimon.adapters.mcp.oauth_mcp import build_oauth_mcp_routes
 from daimon.adapters.mcp.oauth_slack import build_oauth_slack_routes
 from daimon.adapters.mcp.runtime import McpRuntime
 from daimon.adapters.mcp.search_transform import AgentChatAwareBM25SearchTransform
@@ -403,6 +404,19 @@ def create_mcp_app(
             )
     else:
         log.info("slack oauth disabled", reason="no slack settings or crypto keys")
+
+    # Per-person MCP OAuth: needs the crypto keys (a confidential client's
+    # secret is stored encrypted) and the public URL the callback hangs off.
+    if fernet is not None and effective_settings.mcp.app_root_url is not None:
+        mcp_oauth_start, mcp_oauth_callback = build_oauth_mcp_routes(
+            runtime=runtime,
+            fernet=fernet,
+            http_client_factory=lambda: httpx.AsyncClient(timeout=20.0, follow_redirects=False),
+        )
+        app.add_route("/oauth/mcp/start", mcp_oauth_start, methods=["GET"])
+        app.add_route("/oauth/mcp/callback", mcp_oauth_callback, methods=["GET"])
+    else:
+        log.info("mcp oauth disabled", reason="no crypto keys or public url")
 
     mount_hub_apps(
         app,

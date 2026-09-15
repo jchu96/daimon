@@ -137,6 +137,7 @@ from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.github_visibility import pat_can_access_repo
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.mcp_attach import attach_mcp_server_to_agent
+from daimon.core.mcp_token_check import is_token_rejected, rejected_token_message
 from daimon.core.mcp_vault import add_external_mcp_credential
 from daimon.core.operation_policy import (
     PolicyOutcome,
@@ -342,6 +343,17 @@ async def _refuse_for_unavailable_target(
     await edit_posted_card(
         interaction.client, row=row, state="refused", refusal="target_unavailable"
     )
+
+
+async def _refuse_for_rejected_token(
+    runtime: DiscordRuntime, interaction: discord.Interaction, row: CredentialRequestRow
+) -> None:
+    """Close a SPENT request whose token the server refused before any write."""
+    async with runtime.sessionmaker.begin() as session:
+        await credential_requests.set_credential_request_outcome(
+            session, token=row.token, outcome="token_rejected"
+        )
+    await edit_posted_card(interaction.client, row=row, state="refused", refusal="token_rejected")
 
 
 async def _dispatch_origin_thread(
@@ -849,6 +861,16 @@ class McpCredentialModal(discord.ui.Modal):
             mcp_server_url=mcp_server_url,
             token_masked=mask_tail(token_value),
         )
+        # Ask the server first. A token it rejects would otherwise be stored,
+        # mirrored into every caller's vault and attached, and every turn from
+        # then on would carry a failed MCP init (#79). A server that cannot be
+        # reached is not a verdict: the save proceeds and MA reports later.
+        if await is_token_rejected(
+            self._runtime.mcp_token_probe, mcp_server_url=mcp_server_url, token=token_value
+        ):
+            await _refuse_for_rejected_token(self._runtime, interaction, consumed_row)
+            await interaction.followup.send(rejected_token_message(mcp_server_url), ephemeral=True)
+            return
         try:
             # Agent-scoped copy first: the server is attached to the AGENT, so
             # every caller's session needs this credential mirrored in at

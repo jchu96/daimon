@@ -65,6 +65,7 @@ from daimon.core.errors import TurnError
 from daimon.core.ma import replay_events, send_interrupt_and_wait, terminal_stop_reason
 from daimon.core.turn.approvals import build_confirmation_events, pending_confirmation_ids
 from daimon.core.turn.ceiling import ceiling_error, remaining_s
+from daimon.core.turn.degraded import degraded_failure_message
 from daimon.core.turn.lifecycle import ReconnectReason, TurnLifecycle
 from daimon.core.turn.posture import (
     AutoApprove,
@@ -969,6 +970,30 @@ async def _finalize_success_or_error(
         err = TurnError(kind="requires_action", message=message)
         final_state = dataclasses.replace(final_state, error=err)
         state_cell[0] = final_state
+    if final_state.error is None:
+        # #79: an MCP failure the reducer kept out of `error` degrades a turn
+        # that still answered. A turn that answered with nothing is dead
+        # (MA's `exhausted` means exactly that), so name the server here
+        # instead of surfacing a blank success. A `retrying` error that was
+        # never settled is surfaced when nothing was produced, or when MA's
+        # own stop reason says the retries ran out behind a partial answer.
+        retries_exhausted = (
+            final_state.stop_reason is not None
+            and final_state.stop_reason.type == "retries_exhausted"
+        )
+        if not final_state.content and final_state.mcp_failures:
+            err = TurnError(
+                kind="upstream",
+                message=degraded_failure_message(final_state.mcp_failures),
+                cause=final_state.mcp_failures[-1],
+            )
+            final_state = dataclasses.replace(final_state, error=err)
+            state_cell[0] = final_state
+        elif final_state.retrying_error is not None and (
+            not final_state.content or retries_exhausted
+        ):
+            final_state = dataclasses.replace(final_state, error=final_state.retrying_error)
+            state_cell[0] = final_state
     await render_once(final_state)  # guarded final render (§6)
     if final_state.error is not None:
         log.warning(

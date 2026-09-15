@@ -1120,3 +1120,56 @@ class TestUnpromptedTurn:
 
         assert len(sends) == 1, "a mention still gets its thinking embed immediately"
         assert "silent" not in sends[0], "mention turns notify as they always have"
+
+
+class TestDegradedTurnNotice:
+    async def test_terminal_success_names_the_failed_mcp_server_under_the_reply(self) -> None:
+        """#79: a reply produced after an MCP failure is delivered, with the
+        dropped server named under it instead of a blank failure embed."""
+        from daimon.core.turn.state import McpServerFailure
+
+        lc, _sends, edits = _make_lifecycle()
+        await lc.on_sse_event(_thinking_event())
+        state = TurnState(
+            content=[TextBlock(kind="text", text="Here is the board.")],
+            mcp_failures=(
+                McpServerFailure(
+                    server_name="notion",
+                    error_type="mcp_authentication_failed_error",
+                    message="access forbidden",
+                    retry_status="exhausted",
+                ),
+            ),
+        )
+        await lc.on_terminal_success(state)
+
+        content = edits[-1][1]["content"]
+        assert content.startswith("Here is the board."), "the reply itself comes first"
+        assert "`notion`" in content, "the dropped server is named under the reply"
+        assert lc.was_answered, "a degraded turn still counts as answered"
+
+    async def test_tool_only_turn_posts_the_notice_on_its_own(self) -> None:
+        """No reply to hang the notice under: it goes out as its own message."""
+        from daimon.core.turn.state import McpServerFailure
+
+        lc, sends, _edits = _make_lifecycle()
+        await lc.on_sse_event(_thinking_event())
+        state = TurnState(
+            content=[
+                ToolUseBlock(
+                    kind="tool_use", id="tu_1", type="agent.tool_use", name="bash", input={}
+                )
+            ],
+            mcp_failures=(
+                McpServerFailure(
+                    server_name="notion",
+                    error_type="mcp_authentication_failed_error",
+                    message="access forbidden",
+                    retry_status="exhausted",
+                ),
+            ),
+        )
+        await lc.on_terminal_success(state)
+
+        notices = [s for s in sends if "`notion`" in str(s.get("content", ""))]
+        assert len(notices) == 1, "the dropped server is named once, on its own line"

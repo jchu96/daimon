@@ -77,6 +77,7 @@ from daimon.adapters.discord.credential_modals import (
     RepoBindModal,
     SkillRepoModal,
 )
+from daimon.adapters.discord.credential_oauth import start_mcp_oauth_from_click
 from daimon.adapters.discord.credential_origin import is_credential_interaction_valid
 from daimon.adapters.discord.credential_repo_bind import (
     refuse_if_shared_and_not_admin_for_request,
@@ -290,6 +291,10 @@ class CredentialRequestButton(
                 await interaction.response.send_modal(
                     EnvFileModal(runtime=bot.runtime, request_row=request_row)
                 )
+            elif request_row.kind == "mcp_oauth":
+                # No modal: the value is a browser sign-in. The requester gets
+                # a private link and the mcp process finishes the rest.
+                await start_mcp_oauth_from_click(interaction, runtime=bot.runtime, row=request_row)
             elif request_row.kind == "skill_repo":
                 # Explicit branch, not a fall-through: the `else` below is the
                 # MCP modal, so a kind added without a branch here silently

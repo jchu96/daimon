@@ -69,7 +69,7 @@ CardState = Literal[
 ]
 #: `env_file` is a bulk upload of one .env file; the other four match the
 #: single-value request kinds in `daimon.core.credential_requests`.
-CardKind = Literal["env", "env_file", "mcp", "repo", "skill_repo"]
+CardKind = Literal["env", "env_file", "mcp", "mcp_oauth", "repo", "skill_repo"]
 RefusalReason = Literal[
     "admin_required",
     "replacement_admin_required",
@@ -79,6 +79,12 @@ RefusalReason = Literal[
     #: the server it named. Deliberately not an error string: the person who
     #: filled in the form did nothing wrong, and asking again is the way out.
     "target_unavailable",
+    #: The server answered the token with 401/403 before anything was stored.
+    #: The way out is a different credential — or, for a server that signs
+    #: people in through a browser, the OAuth card.
+    "token_rejected",
+    #: The person cancelled at the OAuth provider; nothing was connected.
+    "sign_in_declined",
 ]
 
 #: `requested` footer, with the two placeholders each renderer fills from
@@ -107,6 +113,7 @@ _BUTTON_LABEL: Final[dict[CardKind, str]] = {
     "env": "🔐 Enter it privately",
     "env_file": "🔐 Upload it privately",
     "mcp": "🔐 Enter the token privately",
+    "mcp_oauth": "🔗 Connect my account",
     "repo": "🔐 Use my GitHub token",
     "skill_repo": "🔐 Use my GitHub token",
 }
@@ -247,6 +254,16 @@ def _requested_content(
                 f"Anyone who talks to {agent_name} can use this connection.",
             ),
         )
+    if kind == "mcp_oauth":
+        if mcp_server_url is None:
+            raise ValueError("kind='mcp_oauth' requires mcp_server_url")
+        return (
+            f"🔌 Connect {agent_name} to {target} with your account",
+            (
+                f"{mcp_server_url} signs you in through your browser.",
+                "Only you can use your connection; others connect their own.",
+            ),
+        )
     if branch is None:
         raise ValueError(f"kind={kind!r} requires branch")
     branch_line = f"Branch `{branch}`."
@@ -290,7 +307,7 @@ def _expired_fact(
         phrase = f"add {target} to {agent_name}"
     elif kind == "env_file":
         phrase = f"add keys to {agent_name} from a file"
-    elif kind == "mcp":
+    elif kind in ("mcp", "mcp_oauth"):
         phrase = f"connect {agent_name} to {target}"
     elif kind == "repo":
         phrase = f"give {agent_name} access to {repo_display}"
@@ -351,6 +368,19 @@ def _refusal_content(
         return (
             f"🛡️ Nothing was saved for {agent_name}.",
             f"{agent_name} is not available right now. Ask {responder_name} again.",
+        )
+    if refusal == "sign_in_declined":
+        return (
+            f"🛡️ Nothing was connected for {agent_name}.",
+            f"Sign-in was cancelled. Ask {responder_name} to connect {target} again "
+            "whenever you want to.",
+        )
+    if refusal == "token_rejected":
+        return (
+            f"🛡️ {target} did not accept that token for {agent_name}.",
+            "Nothing was saved.",
+            f"If {target} signs people in through a browser, ask {responder_name} to "
+            "connect it with your account instead.",
         )
     if not refusal_lines:
         raise ValueError("refusal='env_file_invalid' requires refusal_lines")

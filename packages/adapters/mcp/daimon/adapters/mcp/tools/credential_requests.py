@@ -47,6 +47,7 @@ from daimon.core.credential_requests import (
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.mcp_oauth.urls import McpUrlError, assert_public_host
 from daimon.core.operation_policy import (
     TargetFacts,
     decide_operation,
@@ -501,6 +502,10 @@ async def _request_mcp_token_impl(
     requester = _require_requestable_platform(auth)
     if urlparse(url).scheme not in ("http", "https"):
         raise ToolError("mcp server url must be http or https")
+    try:
+        assert_public_host(url, what="mcp server url")
+    except McpUrlError as err:
+        raise ToolError(str(err)) from err
     # Normalise the trailing slash once, here, before the URL is persisted.
     # The vault stores it as the credential's `auth.mcp_server_url` and
     # mcp_vault's idempotent replace matches on that string exactly, so
@@ -523,6 +528,50 @@ async def _request_mcp_token_impl(
         requester_platform_user_id=requester,
         agent_name=agent_name,
         purpose=f"connecting the MCP server '{server_name}'",
+        channel_id=channel_id,
+        origin=origin,
+        requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, server_name)),
+    )
+
+
+async def _request_mcp_oauth_impl(
+    runtime: McpRuntime,
+    auth: AuthIdentity,
+    *,
+    agent_name: str,
+    server_name: str,
+    url: str,
+    channel_id: str,
+    pending_task: str | None = None,
+    origin_context_id: str | None = None,
+    expected_ma_agent_id: str | None = None,
+) -> RequestCredentialResult:
+    requester = _require_requestable_platform(auth)
+    # OAuth only ever happens over TLS: the code and the tokens travel in the
+    # browser and the callback, and no authorization server accepts a plain
+    # http redirect target.
+    if urlparse(url).scheme != "https":
+        raise ToolError("an OAuth MCP server url must be https")
+    try:
+        assert_public_host(url, what="mcp server url")
+    except McpUrlError as err:
+        raise ToolError(str(err)) from err
+    url = url.rstrip("/")
+    origin = await require_turn_origin(runtime, auth, origin_context_id)
+    agent_id, ma_agent = await _resolve_agent_uuid(
+        runtime, auth, agent_name, expected_ma_agent_id, origin
+    )
+    return await _mint_and_post(
+        runtime,
+        auth,
+        kind="mcp_oauth",
+        target=server_name,
+        mcp_server_url=url,
+        agent_id=agent_id,
+        ma_agent=ma_agent,
+        requester_platform_user_id=requester,
+        agent_name=agent_name,
+        purpose=f"connecting the MCP server '{server_name}' with your account",
         channel_id=channel_id,
         origin=origin,
         requested_work=_bounded_pending_task(pending_task, echoes=(agent_name, server_name)),
@@ -697,8 +746,10 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         expected_ma_agent_id: str,
         pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
     ) -> RequestCredentialResult:
-        """Connect an agent such as research-bot to Linear, Notion or GitHub through
-        an MCP endpoint with a bearer token, not browser OAuth.
+        """Connect an agent such as research-bot to Linear or GitHub through an MCP
+        endpoint with a bearer token, not browser OAuth. For a server that only
+        signs people in through a browser (Notion, Slack, Atlassian) use
+        ``request_mcp_oauth`` instead; such servers reject a pasted key.
         Match supported authentication; an API key is not automatically an MCP token.
 
         Use ``attach_mcp_server`` for public servers without tokens. Never accept
@@ -712,6 +763,53 @@ def register_credential_request_tools(mcp: FastMCP, runtime: McpRuntime) -> None
         connection. Pass the waiting task as `pending_task` so it resumes after the
         value is saved."""
         return await _request_mcp_token_impl(
+            runtime,
+            await _auth(ctx),
+            agent_name=agent_name,
+            server_name=server_name,
+            url=url,
+            channel_id=channel_id,
+            pending_task=pending_task,
+            origin_context_id=origin_context_id,
+            expected_ma_agent_id=expected_ma_agent_id,
+        )
+
+    @mcp.tool(tags={"discord", "slack"})  # pyright: ignore[reportArgumentType]
+    async def request_mcp_oauth(  # pyright: ignore[reportUnusedFunction]
+        ctx: Context,
+        agent_name: str,
+        server_name: Annotated[
+            str, Field(description="Connection name; reusing a name replaces that server entry.")
+        ],
+        url: Annotated[
+            str,
+            Field(
+                description="MCP endpoint URL that signs people in through OAuth, e.g. https://mcp.notion.com/mcp."
+            ),
+        ],
+        channel_id: Annotated[
+            str,
+            Field(description="Compatibility field; origin controls the posting destination."),
+        ],
+        origin_context_id: str,
+        expected_ma_agent_id: str,
+        pending_task: Annotated[str | None, Field(description=_PENDING_TASK_DESCRIPTION)] = None,
+    ) -> RequestCredentialResult:
+        """Connect an agent to an MCP server that signs people in through the browser,
+        such as Notion, Slack or Atlassian. Each person connects their own account:
+        the grant is theirs alone, and other members connect separately when asked.
+
+        Use ``request_mcp_token`` for servers that take a pasted bearer token and
+        ``attach_mcp_server`` for public servers. Members can use this on shared
+        agents and built-in Daimon; the admin and fork gates for direct spec edits
+        do not apply.
+
+        Posts a requester-only card; its button opens a private sign-in link that
+        expires in ten minutes. Finishing sign-in stores the grant for that person
+        and attaches the server to the agent, not this session's toolset. Check
+        tool availability before promising use here. Pass the waiting task as
+        `pending_task` so it resumes after the connection is made."""
+        return await _request_mcp_oauth_impl(
             runtime,
             await _auth(ctx),
             agent_name=agent_name,

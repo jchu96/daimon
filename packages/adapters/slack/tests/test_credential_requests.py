@@ -310,3 +310,47 @@ async def test_wrong_requester_click_never_edits_the_card(
     assert ("POST", _CHAT_UPDATE_URL) not in fake_slack_web_client.mock.requests, (
         "a bystander's click must not be able to change what the requester's card says"
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_click_sends_a_private_sign_in_link_instead_of_a_modal(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    fake_slack_web_client: Any,
+) -> None:
+    """Same contract as Discord: the request is spent, a flow is minted, and the
+    start link rides an ephemeral only the requester sees."""
+    from daimon.core.github_credentials import build_multifernet
+    from daimon.core.stores import mcp_oauth_flows as flows_store
+    from daimon.core.stores.credential_requests import peek_credential_request
+
+    tenant_id, fernet_key = await _seed_team(db_session)
+    token = await _seed_request(
+        db_session,
+        tenant_id=tenant_id,
+        kind="mcp_oauth",
+        target="notion",
+        mcp_server_url="https://mcp.notion.com/mcp",
+    )
+    await db_session.commit()
+    runtime = _build_runtime(fernet_key, db_session_factory, mcp_configured=True)
+    runtime.settings.mcp.app_root_url = "https://d.example"
+    runtime.turn_deps.fernet = build_multifernet((fernet_key,))
+
+    await handle_credential_request_click(runtime, _click_payload(token))
+
+    opens = fake_slack_web_client.mock.requests.get(("POST", _VIEWS_OPEN_URL), [])
+    assert opens == [], "an OAuth request never opens a modal"
+    posts = fake_slack_web_client.mock.requests.get(("POST", _EPHEMERAL_URL), [])
+    assert len(posts) == 1, "the requester gets exactly one ephemeral"
+    payload = posts[0].kwargs["json"]
+    button = payload["blocks"][1]["elements"][0]
+    assert button["url"].startswith("https://d.example/oauth/mcp/start?state="), (
+        "the ephemeral carries the start link as a url button"
+    )
+    state = button["url"].rsplit("state=", 1)[1]
+    async with db_session_factory() as session:
+        flow = await flows_store.get_flow(session, state=state)
+        spent = await peek_credential_request(session, token=token)
+    assert flow is not None and flow.request_token == token
+    assert spent is not None and spent.used_at is not None, "the request is spent on the click"

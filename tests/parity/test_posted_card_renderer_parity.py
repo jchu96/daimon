@@ -37,6 +37,7 @@ _KIND_ARGS: dict[CardKind, dict[str, Any]] = {
     "env": {"target": "TOGGL_TOKEN"},
     "env_file": {"target": ".env"},
     "mcp": {"target": "linear", "mcp_server_url": "https://mcp.linear.app/sse"},
+    "mcp_oauth": {"target": "notion", "mcp_server_url": "https://mcp.notion.com/mcp"},
     "repo": {
         "target": "https://github.com/acme/pipeline",
         "repo": "acme/pipeline",
