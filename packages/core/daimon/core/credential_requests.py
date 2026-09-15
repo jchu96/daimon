@@ -56,9 +56,16 @@ CredentialRequestKind = Literal["env", "env_file", "mcp", "mcp_oauth", "repo", "
 # key was removed). "write_failed" — the write itself raised.
 # "replaced_by_newer" — nobody clicked it: the same person asked again in the
 # same thread for the same agent, and the newer form retired this one so the
-# thread never holds two live buttons for one intent.
+# thread never holds two live buttons for one intent. "token_rejected" — the
+# server refused the pasted token before anything was written. "declined" —
+# the person cancelled an OAuth sign-in at the provider.
 CredentialRequestOutcome = Literal[
-    "applied", "stale_replacement", "write_failed", "replaced_by_newer"
+    "applied",
+    "stale_replacement",
+    "write_failed",
+    "replaced_by_newer",
+    "token_rejected",
+    "declined",
 ]
 
 # `target` for kind='env_file'. The column is NOT NULL and a whole-file import

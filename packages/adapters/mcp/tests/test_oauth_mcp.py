@@ -18,19 +18,23 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from daimon.adapters.mcp.oauth_mcp import build_oauth_mcp_routes
 from daimon.adapters.mcp.runtime import McpRuntime
+from daimon.adapters.mcp.tools.discord._credential_button import (
+    edit_card_state,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.core.config import (
     AnthropicSettings,
     DatabaseSettings,
     McpSettings,
     Settings,
 )
+from daimon.core.continuity.messages import ConfigurationChange
 from daimon.core.credential_requests import mint_request_token
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.mcp_oauth import begin_mcp_oauth_flow
 from daimon.core.scope import DeploymentDefault
 from daimon.core.stores import credential_requests as requests_store
 from daimon.core.stores import mcp_oauth_flows as flows_store
-from daimon.core.stores.domain import McpOAuthFlowRow
+from daimon.core.stores.domain import CredentialRequestRow, McpOAuthFlowRow
 from daimon.testing import ma_agent
 from daimon.testing.crypto import make_fernet
 from daimon.testing.factories import make_account, make_tenant
@@ -92,7 +96,7 @@ def _notion(token_forms: list[dict[str, list[str]]]) -> httpx.MockTransport:
 
 
 def _fake_ma(
-    tenant_id: uuid.UUID, *, account_id: uuid.UUID, agent_id: uuid.UUID
+    tenant_id: uuid.UUID, *, account_id: uuid.UUID, agent_id: uuid.UUID, agent_present: bool = True
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
     created: list[dict[str, Any]] = []
     updates: list[dict[str, Any]] = []
@@ -164,8 +168,11 @@ def _fake_ma(
         )
 
     router.add("POST", rf"/v1/vaults/{vault_id}/credentials", on_create)
-    router.add_agent_list(agent)
-    router.add_agent(agent)
+    if agent_present:
+        router.add_agent_list(agent)
+        router.add_agent(agent)
+    else:
+        router.add_agent_list()
 
     def on_update(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
         updates.append(json_body(req))
@@ -323,3 +330,71 @@ async def test_callback_with_a_provider_error_declines_without_touching_ma(
     assert created == [] and updates == [], "a declined sign-in stores and attaches nothing"
     body = json.dumps({"created": created})
     assert "mcp_oauth" not in body
+    async with db_session_factory() as session:
+        request = await requests_store.peek_credential_request(session, token=flow.request_token)
+    assert request is not None and request.outcome == "declined", "the card does not stay pending"
+
+
+async def test_callback_for_a_deleted_agent_stores_the_grant_but_says_nothing_was_attached(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    flow, tenant_id = await _seed_flow(db_session)
+    await db_session.commit()
+    anthropic, created, updates = _fake_ma(
+        tenant_id, account_id=flow.account_id, agent_id=flow.agent_id, agent_present=False
+    )
+    app = _app(db_session_factory, anthropic=anthropic, transport=_notion([]))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.get(f"/oauth/mcp/start?state={flow.state}")
+        r = await client.get(f"/oauth/mcp/callback?code=code123&state={flow.state}")
+
+    assert r.status_code == 200 and "agent is gone" in r.text, r.text
+    assert "Connected notion" not in r.text, "no success page for a server nothing uses"
+    assert len(created) == 1 and updates == [], "the grant is kept; there is no agent to attach"
+    async with db_session_factory() as session:
+        request = await requests_store.peek_credential_request(session, token=flow.request_token)
+    assert request is not None and request.outcome == "write_failed"
+
+
+async def test_editing_the_card_without_a_discord_bot_token_does_not_raise(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The grant is stored before the card is edited; a deployment whose mcp
+    process has no Discord token must not turn that into a failed callback."""
+    runtime = McpRuntime(
+        session_factory=db_session_factory,
+        client=build_fake_anthropic(MARouter().dispatch),
+        settings=_settings(),
+        deployment_default=DeploymentDefault(),
+        fernet=make_fernet(),
+    )
+    assert runtime.settings.discord is None
+    row = CredentialRequestRow(
+        token="crq_x",
+        kind="mcp_oauth",
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        account_id=uuid.uuid4(),
+        target="notion",
+        mcp_server_url=_MCP_URL,
+        requester_platform_user_id="1",
+        channel_id="2",
+        platform="discord",
+        origin_thread_id="2",
+        posted_message_id="3",
+        idempotency_key=uuid.uuid4(),
+        created_at=_NOW,
+        expires_at=_NOW + timedelta(minutes=30),
+        used_at=_NOW,
+    )
+    await edit_card_state(
+        runtime,
+        row=row,
+        state="applied",
+        outcome=ConfigurationChange(
+            target_name="daimon", kind="mcp", availability="next_message", detail="notion"
+        ),
+    )

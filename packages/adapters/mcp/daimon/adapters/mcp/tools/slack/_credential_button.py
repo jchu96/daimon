@@ -45,6 +45,7 @@ from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.posted_controls import (
     CardKind,
     CardState,
+    RefusalReason,
     build_card_blocks,
     build_posted_card,
     card_notification_text,
@@ -133,6 +134,7 @@ async def edit_card_state_for_tenant(
     row: CredentialRequestRow,
     state: CardState,
     outcome: ConfigurationChange | None = None,
+    refusal: RefusalReason | None = None,
 ) -> None:
     """Edit one card into `state` with no caller identity at hand. Never raises.
 
@@ -156,6 +158,7 @@ async def edit_card_state_for_tenant(
         token=row.token,
         mcp_server_url=row.mcp_server_url,
         outcome=outcome,
+        refusal=refusal,
     )
     try:
         client = await slack_web_client(runtime, team_id=tenant.external_id)

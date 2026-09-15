@@ -42,7 +42,9 @@ log = structlog.get_logger(__name__)
 Handler = Callable[[Request], Awaitable[Response]]
 HttpClientFactory = Callable[[], httpx.AsyncClient]
 
-_ErrorKind = Literal["expired", "unconfigured", "discovery_failed", "exchange_failed", "declined"]
+_ErrorKind = Literal[
+    "expired", "unconfigured", "discovery_failed", "exchange_failed", "declined", "agent_gone"
+]
 _ERROR_COPY: dict[_ErrorKind, tuple[str, str, int]] = {
     "expired": (
         "This sign-in link has expired",
@@ -68,6 +70,12 @@ _ERROR_COPY: dict[_ErrorKind, tuple[str, str, int]] = {
     "declined": (
         "Sign-in was cancelled",
         "Nothing was connected. Ask the agent again whenever you want to connect it.",
+        200,
+    ),
+    "agent_gone": (
+        "Signed in, but the agent is gone",
+        "Your connection is stored, but the agent it was for no longer exists, so nothing "
+        "was attached. Ask again from an agent that still answers.",
         200,
     ),
 }
@@ -137,6 +145,12 @@ def build_oauth_mcp_routes(
     async def callback_handler(request: Request) -> Response:
         state = request.query_params.get("state", "")
         code = request.query_params.get("code", "")
+        # Configuration is checked before the flow is spent: an unconfigured
+        # deployment must not burn the person's one chance to finish.
+        public_url = settings.mcp.public_url
+        jwt_secret = settings.mcp.jwt_secret
+        if public_url is None or jwt_secret is None:
+            return _error_page("unconfigured")
         moment = now()
         async with runtime.session_factory() as session, session.begin():
             flow = (
@@ -144,18 +158,16 @@ def build_oauth_mcp_routes(
             )
         if flow is None:
             return _error_page("expired")
+        request_row = await _load_request(flow)
         if request.query_params.get("error") or not code:
             log.info(
                 "mcp_oauth.authorization_declined",
                 mcp_server_url=flow.mcp_server_url,
                 error=request.query_params.get("error", "")[:80],
             )
+            if request_row is not None:
+                await _settle(request_row, outcome="declined", state="refused")
             return _error_page("declined")
-        public_url = settings.mcp.public_url
-        jwt_secret = settings.mcp.jwt_secret
-        if public_url is None or jwt_secret is None:
-            return _error_page("unconfigured")
-        request_row = await _load_request(flow)
         try:
             async with http_client_factory() as http:
                 completion = await complete_mcp_oauth_flow(
@@ -184,34 +196,44 @@ def build_oauth_mcp_routes(
             mcp_server_url=flow.mcp_server_url,
             attached=completion.ma_agent_id is not None,
         )
+        if completion.ma_agent_id is None:
+            if request_row is not None:
+                await _settle(request_row, outcome="write_failed", state="partial")
+            return _error_page("agent_gone")
         if request_row is not None:
-            await _settle(
-                request_row,
-                outcome="applied" if completion.ma_agent_id is not None else "write_failed",
-                state="applied" if completion.ma_agent_id is not None else "partial",
-            )
+            await _settle(request_row, outcome="applied", state="applied")
         agent_name = request_row.target_name if request_row is not None else None
         return _success_page(server_name=flow.server_name, agent_name=agent_name or "The agent")
 
     async def _settle(
         row: CredentialRequestRow,
         *,
-        outcome: Literal["applied", "write_failed"],
-        state: Literal["applied", "partial"],
+        outcome: Literal["applied", "write_failed", "declined"],
+        state: Literal["applied", "partial", "refused"],
     ) -> None:
+        """Record the outcome and put the card in its final state. Never raises."""
         async with runtime.session_factory() as session, session.begin():
             await requests_store.set_credential_request_outcome(
                 session, token=row.token, outcome=outcome
             )
-        change = ConfigurationChange(
-            target_name=row.target_name or "the agent",
-            kind="mcp",
-            availability="next_message" if state == "applied" else "preparation_failed",
-            detail=row.target,
-        )
-        if row.platform == "slack":
-            await edit_slack_card_state(runtime, row=row, state=state, outcome=change)
+        change: ConfigurationChange | None = None
+        refusal: Literal["sign_in_declined"] | None = None
+        if state == "refused":
+            refusal = "sign_in_declined"
         else:
-            await edit_discord_card_state(runtime, row=row, state=state, outcome=change)
+            change = ConfigurationChange(
+                target_name=row.target_name or "the agent",
+                kind="mcp",
+                availability="next_message" if state == "applied" else "preparation_failed",
+                detail=row.target,
+            )
+        if row.platform == "slack":
+            await edit_slack_card_state(
+                runtime, row=row, state=state, outcome=change, refusal=refusal
+            )
+        else:
+            await edit_discord_card_state(
+                runtime, row=row, state=state, outcome=change, refusal=refusal
+            )
 
     return start_handler, callback_handler

@@ -83,6 +83,8 @@ RefusalReason = Literal[
     #: The way out is a different credential — or, for a server that signs
     #: people in through a browser, the OAuth card.
     "token_rejected",
+    #: The person cancelled at the OAuth provider; nothing was connected.
+    "sign_in_declined",
 ]
 
 #: `requested` footer, with the two placeholders each renderer fills from
@@ -366,6 +368,12 @@ def _refusal_content(
         return (
             f"🛡️ Nothing was saved for {agent_name}.",
             f"{agent_name} is not available right now. Ask {responder_name} again.",
+        )
+    if refusal == "sign_in_declined":
+        return (
+            f"🛡️ Nothing was connected for {agent_name}.",
+            f"Sign-in was cancelled. Ask {responder_name} to connect {target} again "
+            "whenever you want to.",
         )
     if refusal == "token_rejected":
         return (
