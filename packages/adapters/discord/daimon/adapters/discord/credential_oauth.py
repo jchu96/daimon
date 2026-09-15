@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
+from daimon.adapters.discord.posted_controls import edit_posted_card
 from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.mcp_oauth import INVITE_BUTTON_LABEL, begin_mcp_oauth_flow, invite_copy, start_url
 from daimon.core.posted_controls import NO_LONGER_VALID_MESSAGE
@@ -25,8 +26,8 @@ import discord
 _log = structlog.get_logger()
 
 _UNCONFIGURED = (
-    "This deployment cannot sign you in yet. Ask the operator to set the public URL "
-    "and crypto keys, then ask again. Nothing was saved."
+    "This deployment cannot sign you in yet. Ask the operator to finish the daimon-mcp "
+    "setup, then ask again. Nothing was saved."
 )
 
 
@@ -44,8 +45,9 @@ async def start_mcp_oauth_from_click(
 ) -> None:
     """Answer the click with the requester's private sign-in link."""
     await interaction.response.defer(ephemeral=True, thinking=True)
-    app_root_url = runtime.settings.mcp.app_root_url
-    if app_root_url is None or runtime.turn_deps.fernet is None:
+    mcp = runtime.settings.mcp
+    app_root_url = mcp.app_root_url
+    if app_root_url is None or mcp.jwt_secret is None:
         await interaction.followup.send(_UNCONFIGURED, ephemeral=True)
         return
     now = datetime.now(UTC)
@@ -62,6 +64,10 @@ async def start_mcp_oauth_from_click(
     if consumed is None or flow is None:
         await interaction.followup.send(NO_LONGER_VALID_MESSAGE, ephemeral=True)
         return
+    # The row is spent: the card must stop offering a button that can only
+    # answer "already used" from here on, the same moment every other kind
+    # flips to received.
+    await edit_posted_card(interaction.client, row=consumed, state="received")
     _log.info(
         "credential_button.mcp_oauth.started",
         mcp_server_url=consumed.mcp_server_url,

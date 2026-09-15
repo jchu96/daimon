@@ -47,6 +47,7 @@ from daimon.core.stores.domain import CredentialRequestRow
 from daimon.testing import ma_agent
 from daimon.testing.factories import make_account, make_tenant
 from daimon.testing.ma import build_fake_anthropic, list_response
+from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -725,7 +726,9 @@ async def test_callback_mcp_oauth_kind_spends_the_request_and_sends_a_private_si
         )
     runtime = SimpleNamespace(
         sessionmaker=db_session_factory,
-        settings=SimpleNamespace(mcp=SimpleNamespace(app_root_url="https://d.example")),
+        settings=SimpleNamespace(
+            mcp=SimpleNamespace(app_root_url="https://d.example", jwt_secret=SecretStr("s" * 32))
+        ),
         turn_deps=SimpleNamespace(fernet=make_fernet()),
     )
     bot = SimpleNamespace(runtime=runtime)

@@ -1449,7 +1449,7 @@ async def test_mcp_submission_refuses_a_token_the_server_rejects_before_any_writ
     assert not any(c.startswith("POST") for c in ma_calls), "nothing is written to MA"
     async with db_session_factory() as session:
         request_row = await peek_credential_request(session, token=token)
-    assert request_row is not None and request_row.outcome == "write_failed"
+    assert request_row is not None and request_row.outcome == "token_rejected"
     card = _chat_updates(fake_slack_web_client)[-1]
     assert "did not accept that token" in card["text"], "the card says the token was refused"
     assert any(

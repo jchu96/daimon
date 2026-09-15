@@ -2376,7 +2376,7 @@ async def test_mcp_modal_refuses_a_token_the_server_rejects_before_any_write(
     assert agent_updates == [], "and the server is never attached"
     async with db_session_factory() as session:
         spent = await peek_credential_request(session, token=row.token)
-    assert spent is not None and spent.outcome == "write_failed"
+    assert spent is not None and spent.outcome == "token_rejected"
     text = interaction.followup.send.call_args.args[0]
     assert "did not accept" in text and "connect it with your account" in text, (
         "the person learns the token was refused and that OAuth is the way out"

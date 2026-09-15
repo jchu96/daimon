@@ -810,7 +810,7 @@ async def _refuse_for_rejected_token(
     """Close a spent request whose token the server refused before any write."""
     async with runtime.sessionmaker() as session, session.begin():
         await credential_requests_store.set_credential_request_outcome(
-            session, token=token, outcome="write_failed"
+            session, token=token, outcome="token_rejected"
         )
     await edit_posted_card(client, row=row, state="refused", refusal="token_rejected")
 

@@ -80,8 +80,8 @@ _WRONG_WORKSPACE = (
 
 
 _UNCONFIGURED_OAUTH = (
-    "This deployment cannot sign you in yet. Ask the operator to set the public URL "
-    "and crypto keys, then ask again. Nothing was saved."
+    "This deployment cannot sign you in yet. Ask the operator to finish the daimon-mcp "
+    "setup, then ask again. Nothing was saved."
 )
 
 
@@ -100,8 +100,9 @@ async def start_mcp_oauth_from_click(
     is edited by the mcp process once sign-in completes.
     """
     thread_ts = row.origin_thread_id
-    app_root_url = runtime.settings.mcp.app_root_url
-    if app_root_url is None or runtime.turn_deps.fernet is None:
+    mcp = runtime.settings.mcp
+    app_root_url = mcp.app_root_url
+    if app_root_url is None or mcp.jwt_secret is None:
         await post_ephemeral(
             client,
             channel_id=channel_id,
@@ -131,6 +132,8 @@ async def start_mcp_oauth_from_click(
             thread_ts=thread_ts,
         )
         return
+    # Same as Discord: the spent row's card stops offering a live button.
+    await edit_posted_card(client, row=consumed, state="received")
     text = invite_copy(server_name=consumed.target, agent_name=consumed.target_name or "the agent")
     await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
         channel=channel_id,
