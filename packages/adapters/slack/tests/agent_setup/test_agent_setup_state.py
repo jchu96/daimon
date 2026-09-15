@@ -6,11 +6,18 @@ and the rename-forbidden reducer shape.
 No I/O, no DB, no mocks — pure unit assertions.
 """
 
+import json
+
+import pytest
 from daimon.adapters.slack.agent_setup.state import (
+    PanelMetadata,
     apply_agent_modal,
+    decode_panel_metadata,
     decode_private_metadata,
+    encode_panel_metadata,
     encode_private_metadata,
 )
+from daimon.adapters.slack.modal_limits import MAX_PRIVATE_METADATA_CHARS
 
 # ---------------------------------------------------------------------------
 # encode/decode round-trip — L1
@@ -182,3 +189,129 @@ def test_apply_agent_modal_returns_only_provided_fields() -> None:
     result = apply_agent_modal(model_id="claude-3-5-haiku-20241022", system_prompt=None)
     assert "model" in result, "apply_agent_modal should include model when provided"
     assert "system" not in result, "apply_agent_modal should omit system when system_prompt is None"
+
+
+# ---------------------------------------------------------------------------
+# PanelMetadata — the read-only panel's private_metadata
+# ---------------------------------------------------------------------------
+
+
+def test_panel_metadata_round_trips_every_field() -> None:
+    meta = PanelMetadata(
+        team_id="T01ABC123",
+        channel_id="C01XYZ456",
+        view="details",
+        page=3,
+        agent_name="research-bot",
+        root_view_id="V0123456789",
+        expanded=frozenset({"keys", "skills"}),
+    )
+    decoded = decode_panel_metadata(encode_panel_metadata(meta))
+    assert decoded == meta, "a fully populated panel metadata must survive the round trip"
+
+
+def test_panel_metadata_omits_defaults_from_the_encoded_payload() -> None:
+    meta = PanelMetadata(team_id="T01ABC123", channel_id="C01XYZ456", view="agents")
+    encoded = encode_panel_metadata(meta)
+    assert json.loads(encoded) == {"t": "T01ABC123", "c": "C01XYZ456", "v": "agents"}, (
+        "a field still at its default costs no characters of the 3,000-character budget"
+    )
+    assert decode_panel_metadata(encoded) == meta, "the omitted fields come back as their defaults"
+
+
+def test_panel_metadata_carries_no_tenant_or_agent_id() -> None:
+    encoded = encode_panel_metadata(
+        PanelMetadata(
+            team_id="T01ABC123",
+            channel_id="C01XYZ456",
+            view="details",
+            agent_name="research-bot",
+        )
+    )
+    assert "tenant" not in encoded, "the tenant id is always re-derived server-side"
+    assert "ma_agent_id" not in encoded, "an MA id is never taken from a client payload"
+
+
+def test_panel_metadata_stays_well_inside_slacks_metadata_budget() -> None:
+    encoded = encode_panel_metadata(
+        PanelMetadata(
+            team_id="T" * 32,
+            channel_id="C" * 32,
+            view="details",
+            page=99,
+            agent_name="n" * 64,
+            root_view_id="V" * 32,
+            expanded=frozenset({"keys", "skills"}),
+        )
+    )
+    assert len(encoded) < MAX_PRIVATE_METADATA_CHARS, (
+        "a worst-case panel payload must still fit Slack's private_metadata cap"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "not json at all",
+        "[]",
+        '{"c":"C1","v":"agents"}',
+        '{"t":"T1","v":"agents"}',
+        '{"t":"T1","c":"C1"}',
+        '{"t":"T1","c":"C1","v":"nope"}',
+        '{"t":"T1","c":"C1","v":"agents","p":-1}',
+        '{"t":"T1","c":"C1","v":"agents","p":"two"}',
+        '{"t":"T1","c":"C1","v":"agents","a":7}',
+        '{"t":1,"c":"C1","v":"agents"}',
+        '{"t":"T1","c":"C1","v":"agents","x":"keys"}',
+    ],
+)
+def test_decode_panel_metadata_when_malformed_returns_none(raw: str) -> None:
+    assert decode_panel_metadata(raw) is None, (
+        f"a payload the panel cannot trust must decode to None, not a half-read view ({raw!r})"
+    )
+
+
+def test_decode_panel_metadata_drops_unrecognised_expansions() -> None:
+    decoded = decode_panel_metadata('{"t":"T1","c":"C1","v":"details","x":["keys","mystery"]}')
+    assert decoded is not None, "a recognisable payload with one odd expansion still decodes"
+    assert decoded.expanded == frozenset({"keys"}), (
+        "an expansion this build does not know about is ignored, not carried through"
+    )
+
+
+def test_with_page_moves_the_page_and_clamps_below_zero() -> None:
+    meta = PanelMetadata(team_id="T1", channel_id="C1", view="agents", page=2)
+    assert meta.with_page(5).page == 5, "with_page moves to the requested page"
+    assert meta.with_page(-3).page == 0, "a page before the first clamps to the first"
+    assert meta.page == 2, "with_page returns a new metadata rather than mutating"
+
+
+def test_with_view_keeps_page() -> None:
+    meta = PanelMetadata(team_id="T1", channel_id="C1", view="agents", page=4, root_view_id="V1")
+    moved = meta.with_view("new_agent", root_view_id="V1")
+    assert moved.view == "new_agent", "with_view switches screens"
+    assert moved.root_view_id == "V1", "the root view id is carried when the caller passes it"
+    assert moved.page == 4, (
+        "the page travels so the root roster can be refreshed where the reader left it"
+    )
+    assert meta.view == "agents", "with_view returns a new metadata rather than mutating"
+
+
+def test_with_view_when_page_given_starts_the_new_screen_there() -> None:
+    meta = PanelMetadata(team_id="T1", channel_id="C1", view="agents", page=4)
+    moved = meta.with_view("details", agent_name="research-bot", page=0)
+    assert moved.agent_name == "research-bot", "the target agent travels with the view"
+    assert moved.page == 0, "a screen that pages over its own list says so explicitly"
+    assert meta.page == 4, "the view the reader came from is untouched, so Back restores it"
+    assert meta.with_view("routing", page=-2).page == 0, "a page before the first clamps"
+
+
+def test_toggled_opens_a_collapsed_list_and_closes_an_open_one() -> None:
+    meta = PanelMetadata(team_id="T1", channel_id="C1", view="details")
+    opened = meta.toggled("keys")
+    assert opened.expanded == frozenset({"keys"}), "toggling a collapsed list opens it"
+    assert opened.toggled("keys").expanded == frozenset(), "toggling it again closes it"
+    both = opened.toggled("skills")
+    assert both.expanded == frozenset({"keys", "skills"}), "expansions are independent"
+    assert meta.expanded == frozenset(), "toggled returns a new metadata rather than mutating"

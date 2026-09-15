@@ -46,9 +46,25 @@ from typing import Any, Literal
 
 import anthropic
 import structlog
+from daimon.adapters.slack.admin import resolve_is_admin
 from daimon.adapters.slack.agent_setup import gate
-from daimon.adapters.slack.agent_setup.state import decode_private_metadata
-from daimon.adapters.slack.agent_setup.views import build_new_agent_created_blocks
+from daimon.adapters.slack.agent_setup.actions import load_agents_view
+from daimon.adapters.slack.agent_setup.panel_views import (
+    build_creating_view,
+    build_details_view,
+    build_new_agent_form,
+)
+from daimon.adapters.slack.agent_setup.read import (
+    coding_tools_available,
+    load_panel_details,
+    load_panel_roster,
+    resolve_attributions,
+)
+from daimon.adapters.slack.agent_setup.state import (
+    PanelMetadata,
+    decode_panel_metadata,
+    decode_private_metadata,
+)
 from daimon.adapters.slack.agent_setup.write import (
     call_reconcile_for_panel,
     create_blank_agent,
@@ -60,7 +76,7 @@ from daimon.adapters.slack.agent_setup.write import (
     store_inline_pat,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core.constants import DEFAULT_AGENT_MODEL, MAX_SECRET_VALUE_BYTES, MODEL_DISPLAY_NAMES
+from daimon.core.constants import DEFAULT_AGENT_MODEL, MAX_SECRET_VALUE_BYTES
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
@@ -68,6 +84,7 @@ from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.errors import DaimonError, StoreError
 from daimon.core.github_visibility import is_public_repo, pat_can_access_repo
 from daimon.core.ma_identity import derive_agent_uuid, derive_tenant_uuid
+from daimon.core.models_catalog import list_model_choices
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.specs import AgentSpec, build_authoring_params
 from daimon.core.stores.agent_files import put_agent_file
@@ -118,6 +135,9 @@ class SubmitDecision:
     parent_section:   L2 section to return to after a successful form submission.
     extra:            Form-specific fields needed by the background run, keyed by name.
                       NEVER includes raw secret values — only key names or booleans.
+    panel_meta:       Decoded panel metadata for a form pushed from the read-only
+                      panel (new agent today). None for every legacy editor form,
+                      which carries the old dict-shaped metadata instead.
     """
 
     response_payload: dict[str, Any]
@@ -127,6 +147,7 @@ class SubmitDecision:
     agent_name: str | None
     parent_section: str | None
     extra: dict[str, Any]
+    panel_meta: PanelMetadata | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -218,50 +239,89 @@ def _success_decision(
 def evaluate_new_agent_submission(payload: dict[str, Any]) -> SubmitDecision:
     """Pure: validate the new-agent form submission.
 
-    Checks name format (regex) and model syntax pre-ack. Returns:
-      - proceed=False + response_action=errors on format failure
-      - proceed=True + response_action=clear on success (name-collision
-        check is deferred to run_* to stay within the 3s budget; run_*
-        reports via ephemeral on collision)
+    Checks name format and model membership pre-ack, then acks with
+    ``response_action: update`` so the form becomes the "creating…" view and
+    the person stays inside the panel while the create runs. The
+    name-collision check is deferred to ``run_new_agent_submission``, which
+    restores this form with a banner when it fires — it needs an MA read and
+    the ack budget is three seconds.
 
     No I/O.
     """
-    meta = _get_meta(payload)
+    view = _get_view(payload)
+    meta = decode_panel_metadata(str(view.get("private_metadata") or ""))
     values = _get_values(payload)
 
     name = _get_value(values, "new_agent__name", "new_agent__name")
-    # Task 4E: a real static_select over the model catalog, not free text —
-    # read the selected option's value rather than a plain_text_input value.
-    # A stale client (an already-open form re-submitted after a catalog
-    # change) can still send an id outside the allow-list, so this stays
-    # validated exactly like the old free-text field was.
+    # A real static_select over the model catalog, not free text — read the
+    # selected option's value. A stale client (an already-open form submitted
+    # after a catalog change) can still send an id outside the allow-list, so
+    # this stays validated exactly like the old free-text field was.
     model = _get_selected_option_value(values, "new_agent__model", "new_agent__model")
-    system = _get_value(values, "new_agent__prompt", "new_agent__prompt")
+    purpose = _get_value(values, "new_agent__prompt", "new_agent__prompt")
+
+    if meta is None:
+        # A form from before this panel shipped, or metadata Slack truncated:
+        # there is no view to update and no root to refresh, so say so instead
+        # of creating an agent nobody can be shown.
+        return _new_agent_error(
+            payload,
+            meta=None,
+            block_id="new_agent__name",
+            text="This form is out of date. Close it and run /agent-setup again.",
+        )
 
     if not _AGENT_NAME_RE.match(name):
-        return _error_decision(
-            "new_agent__name",
-            "Name must be 1–64 characters: letters, digits, hyphens, underscores.",
+        return _new_agent_error(
+            payload,
             meta=meta,
-            payload=payload,
+            block_id="new_agent__name",
+            text="Name must be 1–64 characters: letters, digits, hyphens, underscores.",
         )
 
     if not model or model not in _allowed_model_ids():
-        return _error_decision(
-            "new_agent__model",
-            f'Unknown model "{model}". Choose one from the list.',
+        return _new_agent_error(
+            payload,
             meta=meta,
-            payload=payload,
+            block_id="new_agent__model",
+            text=f'Unknown model "{model}". Choose one from the list.',
         )
 
-    return _success_decision(
-        meta=meta,
-        payload=payload,
-        extra={
-            "name": name,
-            "model": model,
-            "system": system or None,
+    return SubmitDecision(
+        response_payload={
+            "response_action": "update",
+            "view": build_creating_view(
+                agent_name=name,
+                meta=meta.with_view("creating", agent_name=name),
+            ),
         },
+        proceed=True,
+        team_id=meta.team_id,
+        user_id=_get_user_id(payload),
+        agent_name=name,
+        parent_section=None,
+        extra={"name": name, "purpose": purpose or None, "model": model},
+        panel_meta=meta,
+    )
+
+
+def _new_agent_error(
+    payload: dict[str, Any],
+    *,
+    meta: PanelMetadata | None,
+    block_id: str,
+    text: str,
+) -> SubmitDecision:
+    """A field error on the new-agent form: the form stays open, nothing runs."""
+    return SubmitDecision(
+        response_payload={"response_action": "errors", "errors": {block_id: text}},
+        proceed=False,
+        team_id=meta.team_id if meta is not None else "",
+        user_id=_get_user_id(payload),
+        agent_name=None,
+        parent_section=None,
+        extra={},
+        panel_meta=meta,
     )
 
 
@@ -599,55 +659,118 @@ async def run_new_agent_submission(
     user_id: str,
     channel_id: str,
     view_id: str,
-    extra: dict[str, Any],
+    meta: PanelMetadata,
+    name: str,
+    purpose: str | None,
+    model: str,
 ) -> None:
-    """Post-ack: create a blank agent then refresh the L1 modal.
+    """Post-ack: create the agent, then show its Details in the same view.
 
-    Creation is open to every workspace member: a new or forked agent has no
-    propagation row and no config tier pointing at it, so there is nothing
-    an admin has approved to protect. Name-collision guard lives in
-    create_blank_agent (fast indexed MA read).
+    Creation is open to every workspace member: a new agent has no propagation
+    row and no config tier pointing at it, so there is nothing an admin has
+    approved to protect, and no turn is admitted or billed. The name-collision
+    guard lives in ``create_blank_agent`` (one indexed MA read); when it fires
+    the form comes back carrying what was typed and the reason, rather than an
+    ephemeral beside a modal that has already closed.
+
+    On success the view the form became shows Details for the new agent —
+    which says, honestly, that it does not answer anywhere yet — and the root
+    Agents view behind it is refreshed so the new row is there on the way back.
     """
     try:
         tenant_id = derive_tenant_uuid(platform="slack", workspace_id=team_id)
         account_id = derive_guild_account_uuid(tenant_id=tenant_id)
 
-        outcome = await create_blank_agent(
-            runtime,
-            tenant_id=tenant_id,
-            name=str(extra.get("name") or ""),
-            system=str(extra["system"]) if extra.get("system") else None,
-            model=str(extra.get("model") or DEFAULT_AGENT_MODEL),
-            account_id=account_id,
-        )
+        try:
+            outcome = await create_blank_agent(
+                runtime,
+                tenant_id=tenant_id,
+                name=name,
+                system=purpose,
+                model=model or DEFAULT_AGENT_MODEL,
+                account_id=account_id,
+            )
+            if outcome.anthropic_id is None:
+                raise DaimonError(
+                    "Agent creation did not return an identity. Reopen setup and retry."
+                )
+        except (DaimonError, anthropic.APIError, SQLAlchemyError) as exc:
+            log.error("slack.agent_setup.new_agent_failed", team_id=team_id, exc_info=exc)
+            _capture(exc)
+            await web_client.views_update(  # pyright: ignore[reportUnknownMemberType]
+                view_id=view_id,
+                view=build_new_agent_form(
+                    meta=meta.with_view("new_agent", root_view_id=meta.root_view_id),
+                    model_choices=list_model_choices(default=DEFAULT_AGENT_MODEL),
+                    initial_name=name,
+                    initial_purpose=purpose,
+                    initial_model=model,
+                    error=str(exc),
+                ),
+            )
+            return
 
-        if outcome.anthropic_id is None:
-            raise DaimonError("Agent creation did not return an identity. Reopen setup and retry.")
-        log.info(
-            "slack.agent_setup.new_agent.created",
-            team_id=team_id,
-            agent_name=extra.get("name"),
-        )
-        created_model = str(extra.get("model") or DEFAULT_AGENT_MODEL)
-        agent_name = str(extra.get("name") or "")
-        await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-            channel=channel_id,
-            user=user_id,
-            text=f":white_check_mark: Created agent `{agent_name}`.",
-            blocks=build_new_agent_created_blocks(
-                agent_name=agent_name,
-                model_display_name=MODEL_DISPLAY_NAMES.get(created_model, created_model),
-                target_ma_agent_id=outcome.anthropic_id,
-            ),
-        )
+        log.info("slack.agent_setup.new_agent.created", team_id=team_id, agent_name=name)
+
+        is_admin = await resolve_is_admin(web_client, user_id=user_id)
+        async with runtime.sessionmaker() as session:
+            roster = await load_panel_roster(
+                session,
+                runtime.anthropic,
+                tenant_id=tenant_id,
+                channel_id=channel_id or None,
+                thread_id=None,
+                default=runtime.deployment_default,
+            )
+            details = await load_panel_details(
+                session,
+                runtime.anthropic,
+                runtime,
+                tenant_id=tenant_id,
+                roster=roster,
+                agent_name=name,
+                channel_id=channel_id,
+                thread_id=None,
+                is_admin=is_admin,
+            )
+            attributions = await resolve_attributions(
+                session,
+                tenant_id=tenant_id,
+                account_ids=[
+                    row.created_by_account_id for row in roster.rows if row.created_by_account_id
+                ],
+            )
+
+        if details is not None:
+            await web_client.views_update(  # pyright: ignore[reportUnknownMemberType]
+                view_id=view_id,
+                view=build_details_view(
+                    details,
+                    meta=meta.with_view("details", agent_name=name),
+                    is_admin=is_admin,
+                    coding_tools_available=coding_tools_available(runtime),
+                    channel_id=channel_id,
+                    attribution=attributions.get(details.created_by_account_id)
+                    if details.created_by_account_id
+                    else None,
+                ),
+            )
+
+        if meta.root_view_id:
+            # The root is a separate view in Slack's stack: it keeps the page
+            # the reader left, now with the new agent in it.
+            await web_client.views_update(  # pyright: ignore[reportUnknownMemberType]
+                view_id=meta.root_view_id,
+                view=await load_agents_view(
+                    runtime,
+                    tenant_id=tenant_id,
+                    meta=meta.with_view("agents").with_page(meta.page),
+                    is_admin=is_admin,
+                ),
+            )
     except (DaimonError, anthropic.APIError, SlackApiError, SQLAlchemyError) as exc:
-        log.error("slack.agent_setup.new_agent_failed", team_id=team_id, exc_info=exc)
+        log.error("slack.agent_setup.new_agent_render_failed", team_id=team_id, exc_info=exc)
         _capture(exc)
-        await web_client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
-            channel=channel_id,
-            user=user_id,
-            text=f":x: Failed to create agent: {type(exc).__name__}",
-        )
 
 
 async def run_fork_agent_submission(

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 from anthropic import AsyncAnthropic
+from daimon.adapters.slack.agent_setup.state import PanelMetadata, encode_panel_metadata
 from daimon.adapters.slack.app import SlackApp
 from daimon.adapters.slack.runtime import SlackRuntime
 from pydantic import SecretStr
@@ -126,11 +127,13 @@ def _make_new_agent_view_submission_payload(*, name: str) -> dict[str, Any]:
         "view": {
             "callback_id": "agent_setup__new_agent",
             "id": "V_TEST",
-            "private_metadata": json.dumps(
-                {
-                    "team_id": "T_TEST",
-                    "channel_id": "C_TEST",
-                }
+            "private_metadata": encode_panel_metadata(
+                PanelMetadata(
+                    team_id="T_TEST",
+                    channel_id="C_TEST",
+                    view="new_agent",
+                    root_view_id="V_ROOT",
+                )
             ),
             "state": {
                 "values": {
@@ -198,11 +201,11 @@ async def test_on_request_new_agent_view_submission_when_invalid_name_acks_error
     )
 
 
-async def test_on_request_new_agent_view_submission_when_valid_name_acks_clear_and_spawns_run() -> (
+async def test_on_request_new_agent_view_submission_when_valid_name_acks_update_and_spawns_run() -> (
     None
 ):
     """view_submission agent_setup__new_agent with valid name:
-    - ack carries response_action=clear (modal dismissed)
+    - ack carries response_action=update (the form becomes the creating view)
     - background run is spawned after the ack (I/O after ack, STURN-01)
     """
     fake_client = _FakeSocketClient()
@@ -241,9 +244,10 @@ async def test_on_request_new_agent_view_submission_when_valid_name_acks_clear_a
         "view_submission must ack first — ack before spawning the background run (STURN-01)"
     )
     ack_payload: dict[str, Any] = fake_client.sent_responses[0].payload or {}  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
-    assert ack_payload.get("response_action") == "clear", (
-        "valid name must ack with response_action=clear (modal dismissed)"
+    assert ack_payload.get("response_action") == "update", (
+        "valid name must ack by replacing the form with the creating view"
     )
+    assert ack_payload.get("view"), "the update ack must carry the view to show"
     assert "run_new_agent" in run_calls, (
         "run_new_agent_submission must be spawned when proceed=True (validation passed)"
     )
@@ -293,6 +297,13 @@ async def test_on_request_new_agent_view_submission_sources_channel_id_from_priv
     assert captured_kwargs.get("channel_id") == "C_TEST", (
         "channel_id must be sourced from private_metadata (C_TEST), not the empty "
         f"top-level payload channel, got {captured_kwargs.get('channel_id')!r}"
+    )
+    meta = captured_kwargs.get("meta")
+    assert meta is not None and meta.root_view_id == "V_ROOT", (
+        "the decoded panel metadata must reach the run so it can refresh the root view"
+    )
+    assert captured_kwargs.get("name") == "my-valid-agent", (
+        "the validated name is passed explicitly, not buried in an untyped bag"
     )
 
 

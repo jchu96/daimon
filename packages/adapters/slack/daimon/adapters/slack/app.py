@@ -29,7 +29,7 @@ from daimon.adapters.slack.agent_setup.actions import (
     handle_agent_setup_action,
     handle_agent_setup_command,
 )
-from daimon.adapters.slack.agent_setup.state import decode_private_metadata
+from daimon.adapters.slack.agent_setup.state import PanelMetadata, decode_private_metadata
 from daimon.adapters.slack.agent_setup.submit import (
     evaluate_add_mcp_submission,
     evaluate_add_skill_submission,
@@ -523,7 +523,15 @@ class SlackApp:
                     _as_meta = decode_private_metadata(
                         str(_as_view_info.get("private_metadata") or "")
                     )
-                    _as_channel_id: str = str(_as_meta.get("channel_id") or "")
+                    # The panel's own forms carry typed metadata; the legacy
+                    # editors carry the dict above. Either way the invoking
+                    # channel comes from the view, not the payload.
+                    _as_panel_meta = _as_decision.panel_meta
+                    _as_channel_id: str = str(
+                        (_as_panel_meta.channel_id if _as_panel_meta is not None else "")
+                        or _as_meta.get("channel_id")
+                        or ""
+                    )
                     _as_agent_name: str = _as_decision.agent_name or ""
                     _as_parent_section: str = _as_decision.parent_section or ""
                     _as_extra: dict[str, Any] = _as_decision.extra
@@ -539,11 +547,14 @@ class SlackApp:
                         _s: str = _as_parent_section,
                         _e: dict[str, Any] = _as_extra,
                         _cb: str = _as_cb_id,
+                        _pm: PanelMetadata | None = _as_panel_meta,
                     ) -> None:
                         wc = await resolve_web_client(self.runtime, team_id=_t)
                         if wc is None:
                             return
                         if _cb == "agent_setup__new_agent":
+                            if _pm is None:
+                                return
                             await run_new_agent_submission(
                                 self.runtime,
                                 wc,
@@ -551,7 +562,10 @@ class SlackApp:
                                 user_id=_u,
                                 channel_id=_c,
                                 view_id=_v,
-                                extra=_e,
+                                meta=_pm,
+                                name=str(_e.get("name") or ""),
+                                purpose=str(_e["purpose"]) if _e.get("purpose") else None,
+                                model=str(_e.get("model") or ""),
                             )
                         elif _cb == "agent_setup__fork_agent":
                             await run_fork_agent_submission(
@@ -1366,7 +1380,8 @@ class SlackApp:
             hints: list[str] = []
             if "agent" in err.missing:
                 hints.append(
-                    "Ask a workspace admin to choose who answers here with `/agent-setup`."
+                    "Ask a workspace admin to tell Daimon which agent should answer here "
+                    "(/agent-setup shows who answers where)."
                 )
             if "environment" in err.missing:
                 hints.append("Ask the operator to configure an environment for this channel.")
@@ -1390,7 +1405,7 @@ class SlackApp:
                 thread_ts=thread_id,
                 text=(
                     "The configured agent or environment no longer exists. "
-                    "Ask a workspace admin to choose an existing agent with `/agent-setup`, "
+                    "Ask a workspace admin to ask Daimon for an existing agent, "
                     "or ask the operator to restore the environment."
                 ),
             )

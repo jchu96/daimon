@@ -366,7 +366,7 @@ def _success_html(
     body = f"""
 <h1>installed in {safe}</h1>
 <p>next: @mention <code>@{safe_name}</code> in a channel you have invited it to,
-or run <code>/agent-setup</code> to choose who answers where.</p>
+or run <code>/agent-setup</code> to see who answers where and set up an agent with Daimon.</p>
 <p>you get {credit} of credit on us.</p>
 <p class="dim">you can close this tab and head back to Slack.</p>
 """
