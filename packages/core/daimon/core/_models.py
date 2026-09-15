@@ -1129,6 +1129,7 @@ class McpOAuthFlow(Base):
     client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_endpoint_auth_method: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorization_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
     resource: Mapped[str | None] = mapped_column(Text, nullable=True)
     scope: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

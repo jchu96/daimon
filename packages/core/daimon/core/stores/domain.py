@@ -583,6 +583,7 @@ class McpOAuthFlowRow(BaseModel):
     client_secret_encrypted: str | None
     token_endpoint_auth_method: str | None
     token_endpoint: str | None
+    authorization_endpoint: str | None
     resource: str | None
     scope: str | None
     created_at: datetime

@@ -53,6 +53,7 @@ def upgrade() -> None:
         sa.Column("client_secret_encrypted", sa.Text(), nullable=True),
         sa.Column("token_endpoint_auth_method", sa.Text(), nullable=True),
         sa.Column("token_endpoint", sa.Text(), nullable=True),
+        sa.Column("authorization_endpoint", sa.Text(), nullable=True),
         sa.Column("resource", sa.Text(), nullable=True),
         sa.Column("scope", sa.Text(), nullable=True),
         sa.Column(

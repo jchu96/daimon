@@ -75,6 +75,7 @@ async def _flow(
             client_secret_encrypted=None,
             token_endpoint_auth_method="none",
             token_endpoint="https://mcp.notion.com/token",
+            authorization_endpoint="https://mcp.notion.com/authorize",
             resource="https://mcp.notion.com",
             scope="default",
         )

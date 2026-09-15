@@ -72,11 +72,37 @@ async def test_save_flow_client_records_the_registered_client(db_session: AsyncS
         client_secret_encrypted=None,
         token_endpoint_auth_method="none",
         token_endpoint="https://mcp.notion.com/token",
+        authorization_endpoint="https://mcp.notion.com/authorize",
         resource="https://mcp.notion.com",
         scope="default",
     )
     assert updated is not None and updated.client_id == "cid"
     assert updated.token_endpoint == "https://mcp.notion.com/token"
+    assert updated.authorization_endpoint == "https://mcp.notion.com/authorize"
+
+
+async def test_save_flow_client_keeps_the_first_registration(db_session: AsyncSession) -> None:
+    flow = await _seed(db_session)
+
+    async def save(client_id: str) -> McpOAuthFlowRow | None:
+        return await store.save_flow_client(
+            db_session,
+            state=flow.state,
+            client_id=client_id,
+            client_secret_encrypted=None,
+            token_endpoint_auth_method="none",
+            token_endpoint="https://mcp.notion.com/token",
+            authorization_endpoint="https://mcp.notion.com/authorize",
+            resource=None,
+            scope=None,
+        )
+
+    first = await save("first")
+    second = await save("second")
+    assert first is not None and first.client_id == "first"
+    assert second is None, "a second open of the link must not replace the registered client"
+    fetched = await store.get_flow(db_session, state=flow.state)
+    assert fetched is not None and fetched.client_id == "first"
 
 
 async def test_consume_flow_is_single_use(db_session: AsyncSession) -> None:

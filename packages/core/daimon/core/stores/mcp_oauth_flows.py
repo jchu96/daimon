@@ -63,18 +63,29 @@ async def save_flow_client(
     client_secret_encrypted: str | None,
     token_endpoint_auth_method: str,
     token_endpoint: str,
+    authorization_endpoint: str,
     resource: str | None,
     scope: str | None,
 ) -> McpOAuthFlowRow | None:
-    """Record the discovered endpoints and registered client on an unspent row."""
+    """Record the discovered endpoints and registered client on an unspent row.
+
+    Only a row with no client yet takes the write: a second open of the same
+    link must reuse the client the first open registered, or the code the
+    provider issues to one client would be exchanged as the other.
+    """
     stmt = (
         update(McpOAuthFlow)
-        .where(McpOAuthFlow.state == state, McpOAuthFlow.used_at.is_(None))
+        .where(
+            McpOAuthFlow.state == state,
+            McpOAuthFlow.used_at.is_(None),
+            McpOAuthFlow.client_id.is_(None),
+        )
         .values(
             client_id=client_id,
             client_secret_encrypted=client_secret_encrypted,
             token_endpoint_auth_method=token_endpoint_auth_method,
             token_endpoint=token_endpoint,
+            authorization_endpoint=authorization_endpoint,
             resource=resource,
             scope=scope,
         )

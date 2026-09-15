@@ -21,6 +21,7 @@ from cryptography.fernet import MultiFernet
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.mcp_oauth.discovery import discover_authorization_server, probe_mcp_server
 from daimon.core.mcp_oauth.flow import build_authorization_url, generate_pkce, register_client
+from daimon.core.mcp_oauth.models import AuthorizationServerMetadata
 from daimon.core.stores import mcp_oauth_flows as flows_store
 from daimon.core.stores.domain import CredentialRequestRow, McpOAuthFlowRow
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -91,6 +92,29 @@ class PreparedAuthorization:
     authorize_url: str
 
 
+def _reuse_registered(flow: McpOAuthFlowRow) -> PreparedAuthorization:
+    """The authorize URL for a flow whose client is already on the row."""
+    assert flow.client_id is not None and flow.token_endpoint is not None
+    assert flow.authorization_endpoint is not None
+    metadata = AuthorizationServerMetadata(
+        issuer=flow.authorization_endpoint,
+        authorization_endpoint=flow.authorization_endpoint,
+        token_endpoint=flow.token_endpoint,
+    )
+    return PreparedAuthorization(
+        flow=flow,
+        authorize_url=build_authorization_url(
+            metadata,
+            client_id=flow.client_id,
+            redirect_uri=flow.redirect_uri,
+            state=flow.state,
+            code_challenge=generate_pkce(verifier=flow.code_verifier).code_challenge,
+            scope=flow.scope,
+            resource=flow.resource,
+        ),
+    )
+
+
 async def prepare_authorization(
     session: AsyncSession,
     http: httpx.AsyncClient,
@@ -100,9 +124,13 @@ async def prepare_authorization(
 ) -> PreparedAuthorization | None:
     """Discover the server's authorization server, register a client, build the URL.
 
-    Returns None when the flow was spent between the read and this write (a
-    second open of the same link); the caller shows the expired page.
+    A link opened twice reuses the client the first open registered, so the
+    code the provider issues is always exchanged as the client that asked for
+    it. Returns None when the flow was spent in between; the caller shows the
+    expired page.
     """
+    if flow.client_id is not None:
+        return _reuse_registered(flow)
     probe = await probe_mcp_server(http, mcp_server_url=flow.mcp_server_url)
     discovery = await discover_authorization_server(
         http,
@@ -127,11 +155,17 @@ async def prepare_authorization(
         ),
         token_endpoint_auth_method=client.token_endpoint_auth_method,
         token_endpoint=metadata.token_endpoint,
+        authorization_endpoint=metadata.authorization_endpoint,
         resource=resource,
         scope=scope,
     )
     if saved is None:
-        return None
+        # Lost a race with a concurrent open of the same link, or the flow was
+        # spent: re-read and reuse whatever landed first.
+        current = await flows_store.get_flow(session, state=flow.state)
+        if current is None or current.used_at is not None or current.client_id is None:
+            return None
+        return _reuse_registered(current)
     authorize_url = build_authorization_url(
         metadata,
         client_id=client.client_id,
