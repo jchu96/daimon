@@ -369,6 +369,16 @@ class SlackTurnLifecycle:
                 # cancelled." — matches the Discord parity reference.
                 if any(isinstance(block, ToolUseBlock) for block in state.content):
                     await self._flush_terminal()
+                    # #79: no reply to hang the notice under on a tool-only
+                    # turn, so a dropped server is named on its own line.
+                    tool_only_notice = render_degraded_notice(state.mcp_failures)
+                    if tool_only_notice is not None:
+                        await self._client.chat_postMessage(  # pyright: ignore[reportUnknownMemberType]
+                            channel=self._channel,
+                            thread_ts=self._thread_ts,
+                            blocks=[{"type": "markdown", "text": tool_only_notice}],
+                            text=tool_only_notice,
+                        )
                 else:
                     await self._flush_cancelled()
                 self.final_ts = self._status_ts

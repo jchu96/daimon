@@ -324,6 +324,13 @@ class DiscordTurnLifecycle:
             has_tool_activity = any(isinstance(block, ToolUseBlock) for block in state.content)
             if has_tool_activity:
                 self._was_answered = True
+                # #79: a tool-only turn has no reply to hang the notice under,
+                # so a dropped server is named on its own line.
+                tool_only_notice = render_degraded_notice(state.mcp_failures)
+                if tool_only_notice is not None:
+                    await self._send_message(
+                        content=tool_only_notice, allowed_mentions=discord.AllowedMentions.none()
+                    )
                 log.info("turn.terminal_success", has_text=False, tool_only=True)
                 return
             await self._edit(self._message_ref, content="Turn cancelled.", embed=None, view=None)

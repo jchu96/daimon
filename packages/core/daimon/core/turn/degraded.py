@@ -24,7 +24,8 @@ def render_degraded_notice(failures: Sequence[McpServerFailure]) -> str | None:
     if not failures:
         return None
     lines = [
-        f"⚠️ `{f.server_name}` was unavailable this turn: it {_REASON[f.error_type]}."
+        f"⚠️ `{f.server_name}` was unavailable this turn: it {_REASON[f.error_type]}. "
+        "Ask to reconnect it, or to disconnect it."
         for f in failures
     ]
     return "\n".join(lines)
