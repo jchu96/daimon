@@ -50,12 +50,15 @@ from daimon.core.credential_requests import (
     CredentialRequestKind,
 )
 from daimon.core.ma_identity import derive_tenant_uuid
+from daimon.core.mcp_oauth import INVITE_BUTTON_LABEL, begin_mcp_oauth_flow, invite_copy, start_url
 from daimon.core.posted_controls import (
     ALREADY_USED_MESSAGE,
     NO_LONGER_VALID_MESSAGE,
     WRONG_REQUESTER_MESSAGE,
 )
 from daimon.core.stores import credential_requests as credential_requests_store
+from daimon.core.stores.domain import CredentialRequestRow
+from slack_sdk.web.async_client import AsyncWebClient
 
 __all__ = [
     "CRED_CALLBACK_PREFIX",
@@ -74,6 +77,81 @@ __all__ = [
 _WRONG_WORKSPACE = (
     "This request isn't for this workspace — ask again from the workspace it was posted in."
 )
+
+
+_UNCONFIGURED_OAUTH = (
+    "This deployment cannot sign you in yet. Ask the operator to set the public URL "
+    "and crypto keys, then ask again. Nothing was saved."
+)
+
+
+async def start_mcp_oauth_from_click(
+    runtime: SlackRuntime,
+    client: AsyncWebClient,
+    *,
+    row: CredentialRequestRow,
+    channel_id: str,
+    user_id: str,
+) -> None:
+    """Answer an `mcp_oauth` click with the requester's private sign-in link.
+
+    The request row is spent atomically (a second click gets "already used")
+    and the link rides an ephemeral only the requester sees; the card itself
+    is edited by the mcp process once sign-in completes.
+    """
+    thread_ts = row.origin_thread_id
+    app_root_url = runtime.settings.mcp.app_root_url
+    if app_root_url is None or runtime.turn_deps.fernet is None:
+        await post_ephemeral(
+            client,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=_UNCONFIGURED_OAUTH,
+            thread_ts=thread_ts,
+        )
+        return
+    now = datetime.now(UTC)
+    async with runtime.sessionmaker() as session, session.begin():
+        consumed = await credential_requests_store.consume_credential_request(
+            session, token=row.token, now=now
+        )
+        flow = (
+            await begin_mcp_oauth_flow(
+                session, request=consumed, app_root_url=app_root_url, now=now
+            )
+            if consumed is not None
+            else None
+        )
+    if consumed is None or flow is None:
+        await post_ephemeral(
+            client,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=NO_LONGER_VALID_MESSAGE,
+            thread_ts=thread_ts,
+        )
+        return
+    text = invite_copy(server_name=consumed.target, agent_name=consumed.target_name or "the agent")
+    await client.chat_postEphemeral(  # pyright: ignore[reportUnknownMemberType]
+        channel=channel_id,
+        user=user_id,
+        thread_ts=thread_ts,
+        text=text,
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": INVITE_BUTTON_LABEL},
+                        "url": start_url(app_root_url, state=flow.state),
+                        "action_id": "mcp_oauth_open",
+                    }
+                ],
+            },
+        ],
+    )
 
 
 async def handle_credential_request_click(runtime: SlackRuntime, payload: dict[str, Any]) -> None:
@@ -146,6 +224,14 @@ async def handle_credential_request_click(runtime: SlackRuntime, payload: dict[s
             # expiry branch edits — a wrong-requester click must not be able
             # to change what the requester's own card says.
             await edit_posted_card(client, row=row, state="expired")
+        return
+
+    if row.kind == "mcp_oauth":
+        # No modal: the value is a browser sign-in. The requester gets a
+        # private link and the mcp process finishes the rest.
+        await start_mcp_oauth_from_click(
+            runtime, client, row=row, channel_id=channel_id, user_id=user_id
+        )
         return
 
     if row.kind == "repo" and await refuse_if_shared_and_not_admin_for_request(

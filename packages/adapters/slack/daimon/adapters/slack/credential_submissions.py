@@ -64,6 +64,7 @@ from daimon.core.github_visibility import is_public_repo, pat_can_access_repo
 from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_tenant_uuid
 from daimon.core.mcp_attach import attach_mcp_server_to_agent
+from daimon.core.mcp_token_check import is_token_rejected, rejected_token_message
 from daimon.core.mcp_vault import add_external_mcp_credential
 from daimon.core.operation_policy import TargetFacts, decide_operation, needs_reachability_read
 from daimon.core.posted_controls import (
@@ -803,6 +804,17 @@ async def _refuse_for_unavailable_target(
     await edit_posted_card(client, row=row, state="refused", refusal="target_unavailable")
 
 
+async def _refuse_for_rejected_token(
+    runtime: SlackRuntime, client: AsyncWebClient, *, row: CredentialRequestRow, token: str
+) -> None:
+    """Close a spent request whose token the server refused before any write."""
+    async with runtime.sessionmaker() as session, session.begin():
+        await credential_requests_store.set_credential_request_outcome(
+            session, token=token, outcome="write_failed"
+        )
+    await edit_posted_card(client, row=row, state="refused", refusal="token_rejected")
+
+
 async def run_mcp_credential_submission(
     runtime: SlackRuntime,
     *,
@@ -887,6 +899,18 @@ async def run_mcp_credential_submission(
         mcp_server_url=mcp_server_url,
         token_masked=mask_tail(value),
     )
+    # Ask the server first, as on Discord: a rejected token must not be
+    # stored, mirrored and attached only to fail every later turn (#79).
+    if await is_token_rejected(runtime.mcp_token_probe, mcp_server_url=mcp_server_url, token=value):
+        await _refuse_for_rejected_token(runtime, client, row=consumed, token=token)
+        await post_ephemeral(
+            client,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+            user_id=user_id,
+            text=rejected_token_message(mcp_server_url),
+        )
+        return
     try:
         # Agent-scoped copy first: the server is attached to the AGENT, so
         # every caller's session needs this credential mirrored in at create
