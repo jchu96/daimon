@@ -84,9 +84,10 @@ async def _detach_mcp_server_impl(
     # to the seeded agent for any member, and the defaults reconciler unions
     # whatever foreign servers MA holds, so detaching one can never drift the
     # seed. Gating removal harder than the attach it undoes is what left a
-    # rejected Notion token stuck on the built-in agent with no way off. An
-    # admin may always detach; a member may detach from an agent nobody has
-    # scoped.
+    # rejected Notion token stuck on the built-in agent with no way off, even
+    # for an admin. Now an admin may always detach, and a member may detach
+    # from an agent nobody has scoped; a member's own attach to a shared agent
+    # still needs an admin to undo, because the removal reaches everyone.
     is_daimon_managed = agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
     reachable = False
     if needs_reachability_read(
