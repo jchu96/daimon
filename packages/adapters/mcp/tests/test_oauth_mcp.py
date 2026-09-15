@@ -108,7 +108,12 @@ def _notion(
 
 
 def _fake_ma(
-    tenant_id: uuid.UUID, *, account_id: uuid.UUID, agent_id: uuid.UUID, agent_present: bool = True
+    tenant_id: uuid.UUID,
+    *,
+    account_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    agent_present: bool = True,
+    vault_write_status: int = 200,
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
     created: list[dict[str, Any]] = []
     updates: list[dict[str, Any]] = []
@@ -163,6 +168,8 @@ def _fake_ma(
     )
 
     def on_create(req: httpx.Request, _m: re.Match[str]) -> httpx.Response:
+        if vault_write_status != 200:
+            return httpx.Response(vault_write_status, json={"error": {"type": "api_error"}})
         created.append(json_body(req))
         return httpx.Response(
             200,
@@ -455,6 +462,30 @@ async def test_callback_with_an_unusable_token_body_settles_the_card_instead_of_
 
     assert r.status_code == 502 and "did not complete" in r.text, r.text
     assert created == [], "nothing is stored without an access token"
+    async with db_session_factory() as session:
+        request = await requests_store.peek_credential_request(session, token=flow.request_token)
+    assert request is not None and request.outcome == "write_failed", "the card is not left pending"
+
+
+async def test_callback_settles_the_card_when_managed_agents_refuses_the_vault_write(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """An MA blip after the exchange is the exchange_failed page, not a traceback."""
+    flow, tenant_id = await _seed_flow(db_session)
+    await db_session.commit()
+    anthropic, created, updates = _fake_ma(
+        tenant_id, account_id=flow.account_id, agent_id=flow.agent_id, vault_write_status=503
+    )
+    app = _app(db_session_factory, anthropic=anthropic, transport=_notion([]))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.get(f"/oauth/mcp/start?state={flow.state}")
+        r = await client.get(f"/oauth/mcp/callback?code=code123&state={flow.state}")
+
+    assert r.status_code == 502 and "did not complete" in r.text, r.text
+    assert created == [] and updates == [], "nothing was stored or attached"
     async with db_session_factory() as session:
         request = await requests_store.peek_credential_request(session, token=flow.request_token)
     assert request is not None and request.outcome == "write_failed", "the card is not left pending"

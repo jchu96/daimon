@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Literal
 
+import anthropic
 import httpx
 import structlog
 from cryptography.fernet import MultiFernet
@@ -127,7 +128,7 @@ def build_oauth_mcp_routes(
                 session.begin(),
             ):
                 prepared = await prepare_authorization(session, http, flow=flow, fernet=fernet)
-        except (DaimonError, httpx.HTTPError) as err:
+        except (DaimonError, httpx.HTTPError, anthropic.AnthropicError) as err:
             # Boundary: the browser needs an answer and the diagnostic belongs
             # in the operator log, not the page.
             log.warning(
@@ -181,7 +182,7 @@ def build_oauth_mcp_routes(
                     now=moment,
                     session_factory=runtime.session_factory,
                 )
-        except (DaimonError, httpx.HTTPError) as err:
+        except (DaimonError, httpx.HTTPError, anthropic.AnthropicError) as err:
             log.warning(
                 "mcp_oauth.callback_failed",
                 mcp_server_url=flow.mcp_server_url,
