@@ -47,7 +47,9 @@ def test_build_mcp_oauth_auth_omits_refresh_without_a_refresh_token() -> None:
         now=_NOW,
     )
     assert "refresh" not in auth, "no refresh token means Anthropic cannot renew"
-    assert auth.get("expires_at") == _NOW + dt.timedelta(hours=1), "a bounded default lifetime"
+    assert auth.get("expires_at") == _NOW + dt.timedelta(days=365), (
+        "nothing can renew it, so it must not lapse after an hour"
+    )
 
 
 def test_build_mcp_oauth_auth_passes_the_client_secret_for_a_confidential_client() -> None:

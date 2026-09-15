@@ -21,10 +21,12 @@ from anthropic.types.beta.vaults.beta_managed_agents_mcp_oauth_refresh_params im
 )
 from daimon.core.mcp_oauth.models import ClientRegistration, TokenResponse
 
-# Anthropic wants a bound expiry; a server that omits `expires_in` usually
-# means a long-lived token, and one hour is the conservative reading when a
-# refresh token exists to renew it.
-_DEFAULT_ACCESS_TOKEN_LIFETIME = dt.timedelta(hours=1)
+# Anthropic wants a bound expiry. A server that omits `expires_in` but hands
+# out a refresh token gets a short lifetime, since Anthropic renews it anyway;
+# one that omits both issued a long-lived token, and a short guess would make
+# MA retire a working credential after an hour with no way to renew it.
+_REFRESHABLE_DEFAULT_LIFETIME = dt.timedelta(hours=1)
+_UNREFRESHABLE_DEFAULT_LIFETIME = dt.timedelta(days=365)
 
 
 def _token_endpoint_auth(client: ClientRegistration) -> TokenEndpointAuth:
@@ -45,11 +47,12 @@ def build_mcp_oauth_auth(
     now: dt.datetime,
 ) -> BetaManagedAgentsMCPOAuthCreateParams:
     """Pure: the `auth` body for `vaults.credentials.create`."""
-    lifetime = (
-        dt.timedelta(seconds=tokens.expires_in)
-        if tokens.expires_in is not None
-        else _DEFAULT_ACCESS_TOKEN_LIFETIME
-    )
+    if tokens.expires_in is not None:
+        lifetime = dt.timedelta(seconds=tokens.expires_in)
+    elif tokens.refresh_token is not None:
+        lifetime = _REFRESHABLE_DEFAULT_LIFETIME
+    else:
+        lifetime = _UNREFRESHABLE_DEFAULT_LIFETIME
     auth: BetaManagedAgentsMCPOAuthCreateParams = {
         "type": "mcp_oauth",
         "mcp_server_url": mcp_server_url,
