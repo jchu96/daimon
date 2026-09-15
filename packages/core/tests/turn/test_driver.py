@@ -21,6 +21,7 @@ from .conftest import (
     make_agent_message,
     make_end_turn,
     make_requires_action,
+    make_retries_exhausted,
     make_status_idle,
     make_status_terminated,
 )
@@ -990,3 +991,33 @@ async def test_retrying_error_that_never_settles_and_produces_nothing_is_a_failu
 
     assert final.error is not None and "overloaded" in final.error.message
     assert len(lc.terminal_failures) == 1, "an empty turn after a retrying error is a failure"
+
+
+async def test_retrying_error_behind_a_partial_answer_fails_when_ma_says_retries_exhausted() -> (
+    None
+):
+    """A partial paragraph, a `retrying` error, then idle with MA's own
+    `retries_exhausted`: the truncated text must not pass as a finished answer."""
+    fa = FakeAnthropic()
+    fa.beta.sessions.events.stream_scripts = [
+        [
+            YieldEvent(make_agent_message(event_id="m_1", text="Here is the first half")),
+            YieldEvent(_retrying_overloaded_event("e_1")),
+            YieldEvent(make_status_idle(event_id="s_1", stop_reason=make_retries_exhausted())),
+        ]
+    ]
+    lc = RecordingLifecycle()
+
+    final = await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="hi",
+        lifecycle=lc,
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+    )
+
+    assert final.error is not None and "overloaded" in final.error.message
+    assert len(lc.terminal_failures) == 1, "retries ran out behind the partial text"

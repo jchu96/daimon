@@ -970,13 +970,18 @@ async def _finalize_success_or_error(
         err = TurnError(kind="requires_action", message=message)
         final_state = dataclasses.replace(final_state, error=err)
         state_cell[0] = final_state
-    if final_state.error is None and not final_state.content:
+    if final_state.error is None:
         # #79: an MCP failure the reducer kept out of `error` degrades a turn
         # that still answered. A turn that answered with nothing is dead
         # (MA's `exhausted` means exactly that), so name the server here
         # instead of surfacing a blank success. A `retrying` error that was
-        # never settled and produced nothing is surfaced the same way.
-        if final_state.mcp_failures:
+        # never settled is surfaced when nothing was produced, or when MA's
+        # own stop reason says the retries ran out behind a partial answer.
+        retries_exhausted = (
+            final_state.stop_reason is not None
+            and final_state.stop_reason.type == "retries_exhausted"
+        )
+        if not final_state.content and final_state.mcp_failures:
             err = TurnError(
                 kind="upstream",
                 message=degraded_failure_message(final_state.mcp_failures),
@@ -984,7 +989,9 @@ async def _finalize_success_or_error(
             )
             final_state = dataclasses.replace(final_state, error=err)
             state_cell[0] = final_state
-        elif final_state.retrying_error is not None:
+        elif final_state.retrying_error is not None and (
+            not final_state.content or retries_exhausted
+        ):
             final_state = dataclasses.replace(final_state, error=final_state.retrying_error)
             state_cell[0] = final_state
     await render_once(final_state)  # guarded final render (§6)
