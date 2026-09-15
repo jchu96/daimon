@@ -47,6 +47,7 @@ from daimon.core.credential_requests import (
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.mcp_oauth.urls import McpUrlError, assert_public_host
 from daimon.core.operation_policy import (
     TargetFacts,
     decide_operation,
@@ -501,6 +502,10 @@ async def _request_mcp_token_impl(
     requester = _require_requestable_platform(auth)
     if urlparse(url).scheme not in ("http", "https"):
         raise ToolError("mcp server url must be http or https")
+    try:
+        assert_public_host(url, what="mcp server url")
+    except McpUrlError as err:
+        raise ToolError(str(err)) from err
     # Normalise the trailing slash once, here, before the URL is persisted.
     # The vault stores it as the credential's `auth.mcp_server_url` and
     # mcp_vault's idempotent replace matches on that string exactly, so
@@ -547,6 +552,10 @@ async def _request_mcp_oauth_impl(
     # http redirect target.
     if urlparse(url).scheme != "https":
         raise ToolError("an OAuth MCP server url must be https")
+    try:
+        assert_public_host(url, what="mcp server url")
+    except McpUrlError as err:
+        raise ToolError(str(err)) from err
     url = url.rstrip("/")
     origin = await require_turn_origin(runtime, auth, origin_context_id)
     agent_id, ma_agent = await _resolve_agent_uuid(

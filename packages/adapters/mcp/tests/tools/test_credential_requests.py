@@ -555,6 +555,37 @@ async def test_request_mcp_oauth_creates_an_oauth_row_and_posts_the_connect_card
     )
 
 
+async def test_request_mcp_oauth_refuses_a_private_address() -> None:
+    runtime = _runtime(MagicMock())
+    with pytest.raises(ToolError, match="non-public address"):
+        await _request_mcp_oauth_impl(
+            runtime,
+            _auth_identity(),
+            agent_name="daimon",
+            server_name="metadata",
+            url="https://169.254.169.254/computeMetadata/v1/",
+            channel_id="222",
+        )
+
+
+async def test_request_mcp_token_refuses_a_private_address(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    """The token form probes the URL from inside the deployment: no internal hosts."""
+    runtime = _runtime(committing_sessionmaker)
+    with pytest.raises(ToolError, match="non-public address"):
+        await _request_mcp_token_impl(
+            runtime,
+            _auth_identity(),
+            agent_name="daimon",
+            server_name="redis",
+            url="http://10.0.0.5:6379/",
+            channel_id="222",
+        )
+    assert await _row_count(db_session) == 0
+
+
 async def test_request_mcp_oauth_refuses_a_plain_http_server() -> None:
     runtime = _runtime(MagicMock())
     with pytest.raises(ToolError, match="https"):

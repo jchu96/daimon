@@ -11,6 +11,7 @@ from daimon.core.mcp_oauth.discovery import (
     probe_mcp_server,
     protected_resource_urls,
 )
+from daimon.core.mcp_oauth.urls import McpUrlError
 
 _MCP_URL = "https://mcp.notion.com/mcp"
 _PRM = {
@@ -128,3 +129,66 @@ async def test_discover_raises_naming_the_urls_tried_when_nothing_answers() -> N
         await discover_authorization_server(
             _client(httpx.MockTransport(handler)), mcp_server_url=_MCP_URL
         )
+
+
+async def test_discover_reports_a_malformed_metadata_document_as_discovery_failure() -> None:
+    """A SPA catch-all answering 200 text/html is not a crash."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.well-known/oauth-protected-resource":
+            return httpx.Response(200, text="<!doctype html><title>app</title>")
+        return httpx.Response(404)
+
+    with pytest.raises(McpOAuthDiscoveryError, match="not a valid ProtectedResourceMetadata"):
+        await discover_authorization_server(
+            _client(httpx.MockTransport(handler)), mcp_server_url=_MCP_URL
+        )
+
+
+async def test_discover_skips_an_issuer_that_is_not_a_public_https_host() -> None:
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        if request.url.path == "/.well-known/oauth-protected-resource":
+            return httpx.Response(
+                200,
+                json={**_PRM, "authorization_servers": ["http://10.0.0.5", "https://[::1]"]},
+            )
+        return httpx.Response(404)
+
+    with pytest.raises(McpOAuthDiscoveryError, match="not a public https issuer"):
+        await discover_authorization_server(
+            _client(httpx.MockTransport(handler)), mcp_server_url=_MCP_URL
+        )
+    assert all("10.0.0.5" not in url and "::1" not in url for url in fetched), (
+        "a hostile resource document must not steer a fetch into the network"
+    )
+
+
+async def test_discover_refuses_metadata_whose_endpoints_are_not_public_https() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/.well-known/oauth-authorization-server":
+            return httpx.Response(
+                200, json={**_AS, "authorization_endpoint": "http://mcp.notion.com/authorize"}
+            )
+        return httpx.Response(404)
+
+    with pytest.raises(McpUrlError, match="authorization_endpoint"):
+        await discover_authorization_server(
+            _client(httpx.MockTransport(handler)), mcp_server_url=_MCP_URL
+        )
+
+
+async def test_probe_refuses_to_contact_a_private_address() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200)
+
+    with pytest.raises(McpUrlError):
+        await probe_mcp_server(
+            _client(httpx.MockTransport(handler)), mcp_server_url="https://10.0.0.5:6379/"
+        )
+    assert calls == [], "the request is refused before it leaves"

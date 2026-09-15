@@ -11,6 +11,7 @@ from __future__ import annotations
 import httpx
 import structlog
 from daimon.core.mcp_oauth.discovery import McpTokenProbe
+from daimon.core.mcp_oauth.urls import McpUrlError
 
 log = structlog.get_logger(__name__)
 
@@ -22,8 +23,9 @@ async def is_token_rejected(
         return False
     try:
         result = await probe(mcp_server_url, token)
-    except httpx.HTTPError as err:
-        # Boundary by design: see the module docstring.
+    except (httpx.HTTPError, McpUrlError) as err:
+        # Boundary by design: see the module docstring. A URL the probe will
+        # not contact (http, private address) is left to MA, as before.
         log.warning(
             "mcp_token_check.probe_failed",
             mcp_server_url=mcp_server_url,

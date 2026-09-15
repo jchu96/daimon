@@ -48,6 +48,7 @@ from daimon.core.mcp_oauth.models import (
     ProtectedResourceMetadata,
     TokenResponse,
 )
+from daimon.core.mcp_oauth.urls import McpUrlError, assert_public_host, assert_public_https_url
 from daimon.core.mcp_oauth.vault import put_mcp_oauth_credential
 
 __all__ = [
@@ -59,11 +60,14 @@ __all__ = [
     "McpOAuthIncompleteFlowError",
     "McpProbe",
     "McpTokenProbe",
+    "McpUrlError",
     "OAuthDiscovery",
     "Pkce",
     "PreparedAuthorization",
     "ProtectedResourceMetadata",
     "TokenResponse",
+    "assert_public_host",
+    "assert_public_https_url",
     "begin_mcp_oauth_flow",
     "build_authorization_url",
     "callback_url",
