@@ -28,7 +28,7 @@ log = structlog.get_logger()
 # Slack mrkdwn: *bold* instead of **bold**; -# (Discord small text) replaced by plain text.
 _BODY = """\
 *Agent management*
-/agent-setup — Manage this workspace's agents
+/agent-setup — See who answers here, each agent's details, and set up with Daimon
 
 *Routines*
 /routines — Show scheduled routines for this workspace

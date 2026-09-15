@@ -32,6 +32,7 @@ import structlog
 from anthropic.types.beta import BetaManagedAgentsAgent
 from anthropic.types.beta.beta_managed_agents_skill_params import BetaManagedAgentsSkillParams
 from daimon.adapters.slack.admin import resolve_is_admin
+from daimon.adapters.slack.agent_policy import AGENT_GONE_MESSAGE, refuse_unless_allowed
 from daimon.adapters.slack.agent_setup.write import (
     load_agent_inline_pat,
     mask_tail,
@@ -108,17 +109,6 @@ ContinuationTrigger = Callable[[], Awaitable[None]]
 # matching `render_env_import_rejected`'s own line budget.
 _COLLISION_LINES_SHOWN: Final[int] = 3
 
-# Matches the panel gate's `_SHARED_AGENT_MESSAGE` in spirit; the request row
-# carries a derived agent uuid rather than a roster entry, so the gate below
-# re-derives the panel's decision from primitives, as Discord's
-# `credential_repo_bind` does.
-_SHARED_AGENT_MESSAGE = (
-    ":lock: Changing this shared agent's working repo needs a workspace admin. "
-    "Ask an admin to request the working-repo change for this agent in this conversation."
-)
-
-_AGENT_GONE_MESSAGE = "That agent no longer exists — ask again and a fresh request will be posted."
-
 
 async def post_ephemeral(
     client: AsyncWebClient,
@@ -145,66 +135,26 @@ async def refuse_if_shared_and_not_admin_for_request(
 ) -> bool:
     """Click/submit-time re-check for the chat-initiated repo-bind write.
 
-    Re-derives the panel gate's (`agent_setup.gate.refuse_if_shared_and_not_admin`)
-    decision from primitives — a request row carries a derived agent uuid, not
-    the roster name the panel gate expects. The branch ORDER mirrors both the
-    panel gate and Discord's `credential_repo_bind` twin exactly:
-
-    1. A live workspace admin -> allow, before any MA or DB read — what keeps
-       an admin able to bind a repo to the workspace's built-in agent.
-    2. The row's derived uuid resolving to no live MA agent -> refuse, fail
-       closed (archived or deleted since the mint).
-    3. A defaults-managed agent -> refuse; every member shares it.
-    4. Otherwise read reachability fresh and refuse when the agent currently
-       resolves for the workspace or some channel.
+    A thin wrapper over the shared gate in `daimon.adapters.slack.agent_policy`,
+    which owns the order this used to spell out: a live workspace admin is
+    allowed before any MA or DB read (what keeps an admin able to bind a repo
+    to the workspace's built-in agent); a derived uuid that no longer resolves
+    to a live MA agent fails closed; then `decide_operation` settles the rest
+    of the attachment family, reading reachability only when the outcome turns
+    on it.
 
     Returns True when the caller must return immediately (refused).
     """
-    if await resolve_is_admin(client, user_id=user_id):
-        return False
-    agent = await find_agent_by_derived_uuid(
-        runtime.anthropic, tenant_id=tenant_id, agent_id=agent_id
+    return await refuse_unless_allowed(
+        runtime,
+        client,
+        operation="repo_bind",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        channel_id=channel_id,
+        user_id=user_id,
+        thread_ts=thread_ts,
     )
-    if agent is None:
-        log.warning(
-            "credential_request.agent_gone",
-            tenant_id=str(tenant_id),
-            agent_id=str(agent_id),
-        )
-        await post_ephemeral(
-            client,
-            thread_ts=thread_ts,
-            channel_id=channel_id,
-            user_id=user_id,
-            text=_AGENT_GONE_MESSAGE,
-        )
-        return True
-    if agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true":
-        await post_ephemeral(
-            client,
-            thread_ts=thread_ts,
-            channel_id=channel_id,
-            user_id=user_id,
-            text=_SHARED_AGENT_MESSAGE,
-        )
-        return True
-    async with runtime.sessionmaker() as session:
-        reachable = await is_agent_reachable_in_tenant(
-            session,
-            tenant_id=tenant_id,
-            agent_name=str(agent.metadata.get(MA_METADATA_KEY_NAME) or agent.name),
-            default=runtime.deployment_default,
-        )
-    if reachable:
-        await post_ephemeral(
-            client,
-            thread_ts=thread_ts,
-            channel_id=channel_id,
-            user_id=user_id,
-            text=_SHARED_AGENT_MESSAGE,
-        )
-        return True
-    return False
 
 
 async def _mark_button_consumed(client: AsyncWebClient, *, row: CredentialRequestRow) -> None:
@@ -381,7 +331,7 @@ async def _validate_submission(
             channel_id=row.parent_channel_id or channel_id,
             thread_ts=row.origin_thread_id,
             user_id=user_id,
-            text=_AGENT_GONE_MESSAGE,
+            text=AGENT_GONE_MESSAGE,
         )
         return None
     return row

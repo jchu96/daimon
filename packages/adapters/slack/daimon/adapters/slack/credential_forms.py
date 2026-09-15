@@ -20,6 +20,7 @@ import dataclasses
 import json
 from typing import Any, Final, cast
 
+from daimon.adapters.slack.modal_limits import MAX_TITLE_CHARS
 from daimon.core.constants import MAX_SECRET_VALUE_BYTES
 from daimon.core.credential_requests import (
     CredentialRequestKind,
@@ -52,10 +53,6 @@ CRED_CALLBACK_PREFIX: Final[str] = "credential_request__"
 
 _VALUE_BLOCK = "credential__value"
 _FILE_BLOCK = "credential__file"
-
-# Slack's documented `view.title` limit. A title over it is rejected outright,
-# so every title below is built to fit rather than trusted to.
-_MAX_TITLE_CHARS: Final[int] = 24
 
 #: The two kinds whose `target` packs `repo_url@branch#path`.
 _REPO_KINDS: Final[frozenset[str]] = frozenset({"repo", "skill_repo"})
@@ -134,10 +131,10 @@ def _modal_title(kind: CredentialRequestKind, target: str) -> str:
     """
     name = target.strip()
     if kind == "env" and name:
-        return name[:_MAX_TITLE_CHARS]
+        return name[:MAX_TITLE_CHARS]
     if kind == "mcp" and name:
         suffix = " token"
-        return f"{name[: _MAX_TITLE_CHARS - len(suffix)]}{suffix}"
+        return f"{name[: MAX_TITLE_CHARS - len(suffix)]}{suffix}"
     return _TITLE_FALLBACK[kind]
 
 

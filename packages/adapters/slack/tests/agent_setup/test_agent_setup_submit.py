@@ -34,6 +34,11 @@ import structlog.testing
 import yarl
 from cryptography.fernet import Fernet
 from daimon.adapters.slack.agent_setup import submit as submit_mod
+from daimon.adapters.slack.agent_setup.state import (
+    PanelMetadata,
+    decode_panel_metadata,
+    encode_panel_metadata,
+)
 from daimon.adapters.slack.agent_setup.submit import (
     _SECRET_CAP,
     SubmitDecision,
@@ -67,6 +72,9 @@ _TEAM_ID = "T_TEST"
 _USER_ID = "U_TEST"
 _CHANNEL_ID = "C_TEST"
 _AGENT_NAME = "my-agent"
+
+_ROOT_VIEW_ID = "V_PANEL_ROOT"
+_FORM_VIEW_ID = "V_NEW_AGENT_FORM"
 
 _USERS_INFO_PATTERN = re.compile(r"https://slack\.com/api/users\.info.*")
 
@@ -219,6 +227,36 @@ def _select_value(block_id: str, action_id: str, value: str) -> dict[str, Any]:
     }
 
 
+def _panel_meta(**overrides: Any) -> PanelMetadata:
+    """The metadata the New agent form carries when the panel pushes it."""
+    base: dict[str, Any] = {
+        "team_id": _TEAM_ID,
+        "channel_id": _CHANNEL_ID,
+        "view": "new_agent",
+        "root_view_id": _ROOT_VIEW_ID,
+    }
+    base.update(overrides)
+    return PanelMetadata(**base)
+
+
+def _panel_payload(
+    *,
+    values: dict[str, Any],
+    meta: PanelMetadata | None = None,
+    user_id: str = _USER_ID,
+) -> dict[str, Any]:
+    """A view_submission from the panel's own New agent form."""
+    return {
+        "user": {"id": user_id},
+        "view": {
+            "callback_id": "agent_setup__new_agent",
+            "id": _FORM_VIEW_ID,
+            "private_metadata": encode_panel_metadata(meta if meta is not None else _panel_meta()),
+            "state": {"values": values},
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pure evaluator tests — evaluate_new_agent_submission
 # ---------------------------------------------------------------------------
@@ -228,7 +266,7 @@ def test_evaluate_new_agent_submission_when_name_invalid_returns_errors_keyed_ne
     None
 ):
     values = _input_value("new_agent__name", "new_agent__name", "bad name!")  # spaces + bang
-    payload = _payload(callback_id="agent_setup__new_agent", values=values)
+    payload = _panel_payload(values=values)
 
     decision = evaluate_new_agent_submission(payload)
 
@@ -243,18 +281,25 @@ def test_evaluate_new_agent_submission_when_name_invalid_returns_errors_keyed_ne
     )
 
 
-def test_evaluate_new_agent_submission_when_name_valid_returns_clear_and_proceed() -> None:
+def test_evaluate_new_agent_returns_update_to_creating_view() -> None:
     values = {
         **_input_value("new_agent__name", "new_agent__name", "my-agent"),
         **_select_value("new_agent__model", "new_agent__model", "claude-sonnet-5"),
     }
-    payload = _payload(callback_id="agent_setup__new_agent", values=values)
+    payload = _panel_payload(values=values)
 
     decision = evaluate_new_agent_submission(payload)
 
     assert decision.proceed is True, "valid name should proceed"
-    assert decision.response_payload.get("response_action") == "clear", (
-        "successful new-agent submit should clear (pop to L1)"
+    assert decision.response_payload.get("response_action") == "update", (
+        "the form becomes the creating view rather than closing the panel"
+    )
+    acked_meta = decode_panel_metadata(decision.response_payload["view"]["private_metadata"])
+    assert acked_meta is not None and acked_meta.view == "creating", (
+        "the acked view says what is happening and keeps the panel's state"
+    )
+    assert decision.panel_meta is not None and decision.panel_meta.root_view_id == _ROOT_VIEW_ID, (
+        "the background run needs the root view id to refresh the list behind the form"
     )
     assert decision.extra.get("name") == "my-agent", "name should be carried to extra"
     assert decision.extra.get("model") == "claude-sonnet-5", (
@@ -270,7 +315,7 @@ def test_evaluate_new_agent_submission_when_model_invalid_returns_errors_keyed_n
         **_input_value("new_agent__name", "new_agent__name", "valid-name"),
         **_select_value("new_agent__model", "new_agent__model", "gpt-4-turbo"),
     }
-    payload = _payload(callback_id="agent_setup__new_agent", values=values)
+    payload = _panel_payload(values=values)
 
     decision = evaluate_new_agent_submission(payload)
 
@@ -287,7 +332,7 @@ def test_evaluate_new_agent_submission_when_model_missing_returns_errors_keyed_n
     """The model select always carries an initial_option in production, but the
     evaluator must not silently fall back to a default if a value is somehow absent."""
     values = _input_value("new_agent__name", "new_agent__name", "valid-name")
-    payload = _payload(callback_id="agent_setup__new_agent", values=values)
+    payload = _panel_payload(values=values)
 
     decision = evaluate_new_agent_submission(payload)
 
@@ -638,14 +683,25 @@ def _ephemeral_blocks(client_fake: Any) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 
+def _views(client_fake: Any, method: str) -> list[dict[str, Any]]:
+    key = ("POST", yarl.URL(f"https://slack.com/api/{method}"))
+    return [dict(call.kwargs["json"]) for call in client_fake.mock.requests.get(key, [])]
+
+
 @pytest.mark.asyncio
-async def test_run_new_agent_submission_when_non_admin_creates_agent_with_no_refusal(
+async def test_run_new_agent_when_created_updates_same_view_to_details_and_refreshes_root_page(
     fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Creation is open to every workspace member — no admin re-check remains."""
+    """Creation lands on the new agent's Details, with the list behind it fresh.
+
+    Two updates and no ephemeral: the view the form became shows what was
+    created, and the root view is re-rendered so the new row is there when the
+    person goes back. Creation stays open to every member — the conftest
+    users.info default is a non-admin and nothing here refuses it.
+    """
     client_fake: Any = fake_slack_web_client
-    # conftest default users.info is non-admin; no override needed.
-    runtime = _build_runtime_no_db()
+    runtime = _build_runtime_with_db(db_session_factory, fernet_key=Fernet.generate_key().decode())
 
     await run_new_agent_submission(
         runtime,
@@ -653,84 +709,138 @@ async def test_run_new_agent_submission_when_non_admin_creates_agent_with_no_ref
         team_id=_TEAM_ID,
         user_id=_USER_ID,
         channel_id=_CHANNEL_ID,
-        view_id="V_SUBMIT_TEST",
-        extra={"name": "member-created-agent", "model": "claude-sonnet-4-6", "system": None},
+        view_id=_FORM_VIEW_ID,
+        meta=_panel_meta(),
+        name="churn-explorer",
+        purpose="Explain churn",
+        model="claude-sonnet-4-6",
     )
 
-    texts = _ephemeral_texts(client_fake)
-    assert any(":white_check_mark:" in t for t in texts), (
-        "a non-admin's new-agent submission must succeed"
+    updates = _views(client_fake, "views.update")
+    assert [call["view_id"] for call in updates] == [_FORM_VIEW_ID, _ROOT_VIEW_ID], (
+        "the form's own view becomes Details, then the root list is refreshed"
     )
-    assert not any("permission" in t for t in texts), (
-        "creation must not post a permission-refusal ephemeral"
+    details_meta = decode_panel_metadata(updates[0]["view"]["private_metadata"])
+    assert details_meta is not None, "the Details view carries typed panel metadata"
+    assert (details_meta.view, details_meta.agent_name) == ("details", "churn-explorer"), (
+        "the created agent is the one shown"
     )
-
-
-@pytest.mark.asyncio
-async def test_run_new_agent_submission_success_view_shows_detail_and_setup_button(
-    fake_slack_web_client: Any,
-) -> None:
-    """The post-create confirmation must read as the new agent's Details: model
-    display name, the not-answering fact, and Set up with Daimon targeting it."""
-    client_fake: Any = fake_slack_web_client
-    runtime = _build_runtime_no_db()
-
-    await run_new_agent_submission(
-        runtime,
-        client_fake.client,
-        team_id=_TEAM_ID,
-        user_id=_USER_ID,
-        channel_id=_CHANNEL_ID,
-        view_id="V_SUBMIT_TEST",
-        extra={"name": "churn-explorer", "model": "claude-sonnet-4-6", "system": None},
-    )
-
-    blocks = _ephemeral_blocks(client_fake)
-    assert blocks, "run_new_agent_submission must post an ephemeral with blocks"
-    serialized = json.dumps(blocks[-1])
-    assert "Sonnet" in serialized, "the model's familiar display name must be shown"
-    assert "Not answering in any channel yet" in serialized, (
-        "a just-created agent has no routing yet and must say so, like Details does"
-    )
-    setup_actions = next(b for b in blocks[-1] if b.get("type") == "actions")
-    assert setup_actions["elements"][0]["value"], (
-        "the setup button must carry the newly created agent's MA id as its target"
+    assert not _ephemeral_texts(client_fake), (
+        "the outcome is the view itself; no success ephemeral beside it"
     )
 
 
 @pytest.mark.asyncio
-async def test_run_new_agent_submission_when_duplicate_name_still_refused(
+async def test_run_new_agent_when_member_details_carries_admin_routing_sentence(
     fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A name collision is still refused by create_blank_agent's own guard,
-    independent of the now-removed admin check."""
+    """A new agent answers nowhere, and a member is told who can change that.
+
+    "Created" must not read as "available by mention", and the next step for a
+    member is asking an admin rather than a control they do not have.
+    """
     client_fake: Any = fake_slack_web_client
-    runtime = _build_runtime_no_db()
+    runtime = _build_runtime_with_db(db_session_factory, fernet_key=Fernet.generate_key().decode())
 
-    extra = {"name": "collide-agent", "model": "claude-sonnet-4-6", "system": None}
     await run_new_agent_submission(
         runtime,
         client_fake.client,
         team_id=_TEAM_ID,
         user_id=_USER_ID,
         channel_id=_CHANNEL_ID,
-        view_id="V1",
-        extra=extra,
+        view_id=_FORM_VIEW_ID,
+        meta=_panel_meta(),
+        name="unrouted-agent",
+        purpose=None,
+        model="claude-sonnet-4-6",
     )
+
+    details = json.dumps(_views(client_fake, "views.update")[0]["view"])
+    assert "Not answering in any channel yet" in details, (
+        "a just-created agent says it is not reachable yet"
+    )
+    assert "An admin can" in details, "a member is given the admin handoff, not a control"
+
+
+@pytest.mark.asyncio
+async def test_run_new_agent_when_name_collides_restores_form_with_inputs_and_banner(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A collision brings the form back with what was typed and why it failed.
+
+    The form is the only place the person can fix the name, and re-typing a
+    purpose they already wrote is the kind of loss this panel exists to avoid.
+    """
+    client_fake: Any = fake_slack_web_client
+    runtime = _build_runtime_with_db(db_session_factory, fernet_key=Fernet.generate_key().decode())
+
+    common: dict[str, Any] = {
+        "team_id": _TEAM_ID,
+        "user_id": _USER_ID,
+        "channel_id": _CHANNEL_ID,
+        "meta": _panel_meta(),
+        "name": "collide-agent",
+        "purpose": "Explain churn",
+        "model": "claude-sonnet-4-6",
+    }
+    await run_new_agent_submission(runtime, client_fake.client, view_id="V1", **common)
+    before = len(_views(client_fake, "views.update"))
+    await run_new_agent_submission(runtime, client_fake.client, view_id="V2", **common)
+
+    restored = _views(client_fake, "views.update")[before:]
+    assert len(restored) == 1, "a refused create re-renders the form and nothing else"
+    assert restored[0]["view_id"] == "V2", "the form comes back where it was submitted from"
+    rendered = json.dumps(restored[0]["view"])
+    assert "already has an agent named" in rendered, "the banner says why it failed"
+    assert "Explain churn" in rendered, "what was typed comes back with the form"
+    restored_meta = decode_panel_metadata(restored[0]["view"]["private_metadata"])
+    assert restored_meta is not None and restored_meta.root_view_id == _ROOT_VIEW_ID, (
+        "the restored form still knows the root view for a later retry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_new_agent_never_consults_admission(
+    fake_slack_web_client: Any,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Creating and inspecting stay available when billed turns cannot be.
+
+    Nothing in this path opens a session, so nothing about the workspace's
+    balance can stop someone creating an agent and reading its Details.
+    """
+    client_fake: Any = fake_slack_web_client
+    paths: list[str] = []
+    base = make_fake_ma_handler()
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        paths.append(f"{request.method} {request.url.path}")
+        return base(request)
+
+    runtime = _build_runtime_with_db(
+        db_session_factory,
+        fernet_key=Fernet.generate_key().decode(),
+        anthropic_handler=recording_handler,
+    )
+
     await run_new_agent_submission(
         runtime,
         client_fake.client,
         team_id=_TEAM_ID,
         user_id=_USER_ID,
         channel_id=_CHANNEL_ID,
-        view_id="V2",
-        extra=extra,
+        view_id=_FORM_VIEW_ID,
+        meta=_panel_meta(),
+        name="unbilled-agent",
+        purpose=None,
+        model="claude-sonnet-4-6",
     )
 
-    texts = _ephemeral_texts(client_fake)
-    assert any(":white_check_mark:" in t for t in texts), "the first create should succeed"
-    assert any("Failed to create agent" in t for t in texts), (
-        "the second, colliding create must still be refused by the collision guard"
+    assert paths, "the create really did reach the Managed Agents API"
+    assert not any("/v1/sessions" in path for path in paths), (
+        "creation opens no session, so nothing is admitted or billed"
     )
 
 
@@ -752,7 +862,10 @@ async def test_run_fork_agent_submission_when_non_admin_forks_agent_with_no_refu
         user_id=_USER_ID,
         channel_id=_CHANNEL_ID,
         view_id="V1",
-        extra={"name": _AGENT_NAME, "model": "claude-sonnet-4-6", "system": None},
+        meta=_panel_meta(),
+        name=_AGENT_NAME,
+        purpose=None,
+        model="claude-sonnet-4-6",
     )
     await run_fork_agent_submission(
         runtime,
@@ -1396,56 +1509,6 @@ async def test_run_add_mcp_submission_when_admin_and_reachable_proceeds(
     texts = _ephemeral_texts(client_fake)
     assert any(":white_check_mark:" in t for t in texts), (
         "add-mcp must succeed for an admin regardless of reachability"
-    )
-
-
-# ---------------------------------------------------------------------------
-# CR-02 regression: success ephemerals and NO views_update on cleared view
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_run_new_agent_submission_when_admin_and_write_succeeds_posts_success_ephemeral_and_no_views_update(
-    fake_slack_web_client: Any,
-) -> None:
-    """Admin create succeeds → :white_check_mark: ephemeral posted; views_update NOT called.
-
-    CR-02 fix: _refresh_l1 was removed; views_update on the cleared L3 view_id
-    would return not_found and produce a spurious :x: failure. The fix posts a
-    :white_check_mark: chat_postEphemeral instead.
-    """
-    client_fake: Any = fake_slack_web_client
-    _override_users_info_admin(client_fake.mock)
-
-    runtime = _build_runtime_no_db()
-
-    await run_new_agent_submission(
-        runtime,
-        client_fake.client,
-        team_id=_TEAM_ID,
-        user_id=_USER_ID,
-        channel_id=_CHANNEL_ID,
-        view_id="V_SUBMIT_TEST",
-        extra={"name": "fresh-agent", "model": "claude-sonnet-4-6", "system": None},
-    )
-
-    ephemeral_key = ("POST", yarl.URL("https://slack.com/api/chat.postEphemeral"))
-    views_update_key = ("POST", yarl.URL("https://slack.com/api/views.update"))
-
-    assert ephemeral_key in client_fake.mock.requests, (
-        "successful create should post a chat_postEphemeral"
-    )
-    ephemeral_calls: list[Any] = client_fake.mock.requests[ephemeral_key]
-    assert len(ephemeral_calls) == 1, "exactly one ephemeral should be posted"
-
-    # The Slack SDK sends chat.postEphemeral as JSON (kwargs["json"]).
-    ephemeral_text: str = ephemeral_calls[0].kwargs["json"]["text"]
-    assert ":white_check_mark:" in ephemeral_text, (
-        "success ephemeral text must contain :white_check_mark:"
-    )
-
-    assert views_update_key not in client_fake.mock.requests, (
-        "run_new_agent_submission must NOT call views_update on the cleared L3 view (CR-02)"
     )
 
 
