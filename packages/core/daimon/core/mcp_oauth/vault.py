@@ -12,6 +12,9 @@ from __future__ import annotations
 import datetime as dt
 
 from anthropic import AsyncAnthropic
+from anthropic.types.beta.vaults.beta_managed_agents_environment_variable_auth_response import (
+    BetaManagedAgentsEnvironmentVariableAuthResponse,
+)
 from anthropic.types.beta.vaults.beta_managed_agents_mcp_oauth_create_params import (
     BetaManagedAgentsMCPOAuthCreateParams,
 )
@@ -86,10 +89,15 @@ async def put_mcp_oauth_credential(
     now: dt.datetime,
 ) -> str:
     """Replace whatever credential the vault holds for the URL; return the new id."""
-    async for existing in anthropic.beta.vaults.credentials.list(vault_id=vault_id):
-        existing_url = getattr(existing.auth, "mcp_server_url", None)
-        if existing_url is not None and existing_url.rstrip("/") == mcp_server_url.rstrip("/"):
-            await anthropic.beta.vaults.credentials.delete(existing.id, vault_id=vault_id)
+    # Collect first: deleting while the list paginates can skip an entry.
+    stale = [
+        existing.id
+        async for existing in anthropic.beta.vaults.credentials.list(vault_id=vault_id)
+        if not isinstance(existing.auth, BetaManagedAgentsEnvironmentVariableAuthResponse)
+        and existing.auth.mcp_server_url.rstrip("/") == mcp_server_url.rstrip("/")
+    ]
+    for credential_id in stale:
+        await anthropic.beta.vaults.credentials.delete(credential_id, vault_id=vault_id)
     created = await anthropic.beta.vaults.credentials.create(
         vault_id=vault_id,
         auth=build_mcp_oauth_auth(
