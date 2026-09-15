@@ -211,29 +211,41 @@ def build_oauth_mcp_routes(
         outcome: Literal["applied", "write_failed", "declined"],
         state: Literal["applied", "partial", "refused"],
     ) -> None:
-        """Record the outcome and put the card in its final state. Never raises."""
-        async with runtime.session_factory() as session, session.begin():
-            await requests_store.set_credential_request_outcome(
-                session, token=row.token, outcome=outcome
-            )
-        change: ConfigurationChange | None = None
-        refusal: Literal["sign_in_declined"] | None = None
-        if state == "refused":
-            refusal = "sign_in_declined"
-        else:
-            change = ConfigurationChange(
-                target_name=row.target_name or "the agent",
-                kind="mcp",
-                availability="next_message" if state == "applied" else "preparation_failed",
-                detail=row.target,
-            )
-        if row.platform == "slack":
-            await edit_slack_card_state(
-                runtime, row=row, state=state, outcome=change, refusal=refusal
-            )
-        else:
-            await edit_discord_card_state(
-                runtime, row=row, state=state, outcome=change, refusal=refusal
+        """Record the outcome and put the card in its final state. Never raises.
+
+        The grant is already stored by the time this runs; a bookkeeping or
+        card failure must not turn a finished sign-in into a 500 page.
+        """
+        try:
+            async with runtime.session_factory() as session, session.begin():
+                await requests_store.set_credential_request_outcome(
+                    session, token=row.token, outcome=outcome
+                )
+            change: ConfigurationChange | None = None
+            refusal: Literal["sign_in_declined"] | None = None
+            if state == "refused":
+                refusal = "sign_in_declined"
+            else:
+                change = ConfigurationChange(
+                    target_name=row.target_name or "the agent",
+                    kind="mcp",
+                    availability="next_message" if state == "applied" else "preparation_failed",
+                    detail=row.target,
+                )
+            if row.platform == "slack":
+                await edit_slack_card_state(
+                    runtime, row=row, state=state, outcome=change, refusal=refusal
+                )
+            else:
+                await edit_discord_card_state(
+                    runtime, row=row, state=state, outcome=change, refusal=refusal
+                )
+        except Exception as err:
+            log.warning(
+                "mcp_oauth.settle_failed",
+                err_type=type(err).__name__,
+                outcome=outcome,
+                error=str(err)[:200],
             )
 
     return start_handler, callback_handler

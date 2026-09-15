@@ -177,7 +177,7 @@ async def edit_card_state(
                 int(row.posted_message_id)
             )
             await message.edit(view=view, allowed_mentions=discord.AllowedMentions.none())
-    except (ToolError, ValueError, discord.HTTPException) as err:
+    except (ToolError, ValueError, discord.DiscordException) as err:
         _log.warning(
             "posted_card.edit_failed", err_type=type(err).__name__, kind=row.kind, state=state
         )
