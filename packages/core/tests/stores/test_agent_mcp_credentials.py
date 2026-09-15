@@ -567,6 +567,6 @@ async def test_delete_credential_matches_a_row_stored_with_a_trailing_slash(
         )
         is True
     ), "a slash-only difference must not leave the token row behind"
-    assert (
-        await cred_store.list_credentials(db_session, tenant_id=tenant.id, agent_id=agent_id) == []
-    )
+    assert not await cred_store.list_credentials(
+        db_session, tenant_id=tenant.id, agent_id=agent_id
+    ), "no token row is left for the mirror to keep pushing"
