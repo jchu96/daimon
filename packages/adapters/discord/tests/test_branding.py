@@ -169,14 +169,14 @@ class TestWelcomeEmbedOnceReadyField:
         embed = _build_welcome_embed("daimon")
         field = embed.fields[0]
         assert field.value == (
-            "Mention `@daimon` anywhere to chat, or run `/agent-setup` to manage your agents."
+            "Mention `@daimon` anywhere to chat, or run `/agent-setup` to see who answers here."
         ), "unset bot_display_name must render byte-identical welcome copy"
 
     def test_set_name_changes_text(self) -> None:
         embed = _build_welcome_embed("daimon-staging")
         field = embed.fields[0]
         assert field.value == (
-            "Mention `@daimon-staging` anywhere to chat, or run `/agent-setup` to manage your agents."
+            "Mention `@daimon-staging` anywhere to chat, or run `/agent-setup` to see who answers here."
         )
 
 

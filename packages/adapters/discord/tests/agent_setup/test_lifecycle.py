@@ -10,15 +10,9 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import httpx
 import pytest
-from daimon.adapters.discord.agent_setup import write as write_mod
-from daimon.adapters.discord.agent_setup.panel import (
-    AgentSetupView,
-    ForkAgentModal,
-    NewAgentModal,
-)
+from daimon.adapters.discord.agent_setup.panel import AgentSetupView, ForkAgentModal
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core.defaults.report import Action, ResourceOutcome
 from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.scope import DeploymentDefault
@@ -82,101 +76,6 @@ def _runtime(
         deployment_default=DeploymentDefault(),
         resolver_cache=new_resolver_cache(),
         turn_deps=MagicMock(),  # pyright: ignore[reportArgumentType]  # never runs a turn
-    )
-
-
-@pytest.mark.asyncio
-async def test_new_agent_calls_reconcile_with_blank_spec_and_account_id(
-    monkeypatch: pytest.MonkeyPatch,
-    tenant_id: uuid.UUID,
-    account_id: uuid.UUID,
-) -> None:
-    """SC-2: NewAgentModal stamps the guild account, not the personal account."""
-    captured: dict[str, Any] = {}
-
-    # DISTINCT guild account so regression (using personal account) fails loudly.
-    guild_account = uuid.UUID("00000000-0000-0000-0000-000000004444")
-    assert guild_account != account_id, (
-        "test setup: guild account must differ from personal account"
-    )
-
-    async def spy_reconcile(
-        client: Any,
-        spec: AgentSpec,
-        *,
-        tenant_id: uuid.UUID,
-        dry_run: bool,
-        account_id: uuid.UUID | None = None,
-        public_url: str | None = None,
-        managed: bool = True,
-    ) -> ResourceOutcome:
-        captured["spec"] = spec
-        captured["account_id"] = account_id
-        captured["managed"] = managed
-        return ResourceOutcome(
-            kind="agent", name=spec.name, action=Action.CREATED, anthropic_id="ag_new"
-        )
-
-    monkeypatch.setattr(write_mod, "reconcile_agent", spy_reconcile)
-
-    # No agents on MA initially — list returns []
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/skills":
-            return httpx.Response(200, json={"data": [], "next_page": None})
-        if request.method == "GET" and request.url.path == "/v1/agents":
-            return httpx.Response(200, json={"data": [], "next_page": None})
-        if request.method == "GET" and request.url.path == "/v1/agents/ag_new":
-            agent = ma_agent(
-                id="ag_new",
-                name="research-bot",
-                metadata={"daimon_tenant": str(tenant_id)},
-                system="be helpful",
-            )
-            return httpx.Response(200, json=agent.model_dump(mode="json"))
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
-
-    runtime = _runtime(build_stub_anthropic(handler), tenant_id)
-    state = PanelState.initial(
-        roster=[],
-        account_id=account_id,
-        platform_principal_id=uuid.uuid4(),
-        guild_account_id=guild_account,
-    )
-
-    modal = NewAgentModal(state, runtime=runtime, allowed_user_id=42)
-    # Simulate the user typing into / selecting the Label-wrapped components.
-    name_field = modal.name_label.component
-    assert isinstance(name_field, discord.ui.TextInput)
-    name_field._value = "research-bot"  # pyright: ignore[reportPrivateUsage]  # TextInput private value
-    prompt_field = modal.prompt_label.component
-    assert isinstance(prompt_field, discord.ui.TextInput)
-    prompt_field._value = "be helpful"  # pyright: ignore[reportPrivateUsage]
-    model_field = modal.model_label.component
-    assert isinstance(model_field, discord.ui.Select)
-    model_field._values = ["claude-sonnet-4-6"]  # pyright: ignore[reportPrivateUsage]  # Select private value
-
-    interaction = MagicMock()
-    interaction.user.id = 42
-    interaction.response.defer = AsyncMock()
-    interaction.edit_original_response = AsyncMock()
-
-    await modal.on_submit(interaction)
-
-    assert state.selected is not None and state.selected.ma_agent_id == "ag_new", (
-        "new-agent success must retain the created identity even before the roster lists it"
-    )
-    assert "spec" in captured, "new-agent submit must invoke reconcile_agent"
-    assert captured["spec"].name == "research-bot", "spec name must come from modal input"
-    assert captured["account_id"] == guild_account, (
-        "SC-2: new-agent submit must stamp the guild account (guild_account_id), "
-        "not the personal account_id — the panel passes state.guild_account_id"
-    )
-    assert captured["account_id"] != account_id, (
-        "SC-2: personal account must not be used as the ownership stamp"
-    )
-    assert captured["managed"] is False, (
-        "new-agent submit creates a guild-owned agent — managed=True would make it "
-        "sweep-eligible, archived on the next deploy's defaults apply"
     )
 
 

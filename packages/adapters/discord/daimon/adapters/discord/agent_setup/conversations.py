@@ -14,8 +14,14 @@ from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.defaults.metadata import MA_METADATA_KEY_MANAGED
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.setup_conversations import build_setup_opener, resolve_setup_agents
+from daimon.core.roster import RosterAgent
+from daimon.core.setup_conversations import (
+    build_setup_opener,
+    resolve_setup_agents,
+    setup_thread_name,
+)
 from daimon.core.stores.agent_repo_binding import get_binding
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from daimon.core.stores.thread_agent_bindings import create_binding, update_lifecycle
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -24,10 +30,36 @@ import discord
 _log = structlog.get_logger()
 
 
+def _legacy_target(state: PanelState) -> RosterAgent | None:
+    """The editor panel's selection, in the shape the read-only panel passes.
+
+    The editor holds its own `RosterEntry`; it calls this function without a
+    target and gets the same behaviour it had before the parameter existed.
+    Goes away with the editor.
+    """
+    entry = state.selected
+    if entry is None:
+        return None
+    return RosterAgent(
+        name=entry.name,
+        ma_agent_id=entry.ma_agent_id,
+        model_id=entry.model,
+        is_built_in=entry.is_system,
+    )
+
+
 async def open_setup_conversation(
-    interaction: discord.Interaction, *, runtime: DiscordRuntime, state: PanelState
+    interaction: discord.Interaction,
+    *,
+    runtime: DiscordRuntime,
+    state: PanelState,
+    target: RosterAgent | None = None,
 ) -> None:
     """Validate identities, persist routing, then present a ready conversation.
+
+    `target` is what the conversation will be about — the caller names it rather
+    than the conversation inferring it, because the screen the person clicked
+    from is the only thing that knows which agent they were reading about.
 
     The caller defers before entering. Opening this thread never creates an MA
     session or runs a turn; the opener is deterministic platform content.
@@ -47,57 +79,63 @@ async def open_setup_conversation(
     thread: discord.Thread | None = None
     try:
         tenant_id = await resolve_tenant_for_panel(runtime, interaction)
-        selected = state.selected
+        selected = target if target is not None else _legacy_target(state)
         if selected is not None and not selected.ma_agent_id:
             raise DaimonError("That agent is not ready. Reopen `/agent-setup` and try again.")
-        responder, target = await resolve_setup_agents(
+        responder, ma_target = await resolve_setup_agents(
             runtime.anthropic,
             tenant_id=tenant_id,
             target_ma_agent_id=selected.ma_agent_id if selected else None,
         )
+        target_name = selected.name if ma_target is not None and selected is not None else None
         has_repo = False
-        if target is not None:
+        is_reachable = False
+        if ma_target is not None and target_name is not None:
             async with runtime.sessionmaker() as session:
                 has_repo = (
                     await get_binding(
                         session,
                         tenant_id=tenant_id,
-                        agent_id=derive_agent_uuid(tenant_id=tenant_id, ma_agent_id=str(target.id)),
+                        agent_id=derive_agent_uuid(
+                            tenant_id=tenant_id, ma_agent_id=str(ma_target.id)
+                        ),
                     )
                     is not None
                 )
-        target_name = selected.name if target is not None and selected else None
+                # Read reachability live rather than off the panel's snapshot:
+                # the opener offers to change the agent's instructions, and a
+                # default set in another channel since the panel opened changes
+                # who is allowed to accept that offer.
+                is_reachable = await is_agent_reachable_in_tenant(
+                    session,
+                    tenant_id=tenant_id,
+                    agent_name=target_name,
+                    default=runtime.deployment_default,
+                )
+        caller_is_admin = isinstance(interaction.user, discord.Member) and is_member_guild_admin(
+            interaction.user,
+            guild_owner_id=interaction.guild.owner_id if interaction.guild else None,
+        )
         opener = build_setup_opener(
             target_name=target_name,
             opener_mention=interaction.user.mention,
             bot_mention=interaction.client.user.mention,
             has_repo=has_repo,
             has_external_connection=bool(
-                target
+                ma_target
                 and any(
                     server.url.rstrip("/") != (state.default_mcp_url or "").rstrip("/")
-                    for server in target.mcp_servers
+                    for server in ma_target.mcp_servers
                 )
             ),
             can_customize=bool(
-                target
-                and target.metadata.get(MA_METADATA_KEY_MANAGED) != "true"
-                and (
-                    (
-                        isinstance(interaction.user, discord.Member)
-                        and is_member_guild_admin(
-                            interaction.user,
-                            guild_owner_id=interaction.guild.owner_id
-                            if interaction.guild
-                            else None,
-                        )
-                    )
-                    or not state.is_selected_reachable()
-                )
+                ma_target
+                and ma_target.metadata.get(MA_METADATA_KEY_MANAGED) != "true"
+                and (caller_is_admin or not is_reachable)
             ),
         )
         thread = await channel.create_thread(
-            name=f"Set up {target_name or 'an agent'} with Daimon"[:100],
+            name=setup_thread_name(target_name),
             type=discord.ChannelType.public_thread,
             auto_archive_duration=10080,
             reason="Member opened an agent setup conversation",
@@ -112,7 +150,7 @@ async def open_setup_conversation(
                     thread_id=str(thread.id),
                     responder_ma_agent_id=str(responder.id),
                     responder_name="Daimon",
-                    configuration_target_ma_agent_id=str(target.id) if target else None,
+                    configuration_target_ma_agent_id=str(ma_target.id) if ma_target else None,
                     configuration_target_name=target_name,
                     creator_account_id=state.account_id,
                 )

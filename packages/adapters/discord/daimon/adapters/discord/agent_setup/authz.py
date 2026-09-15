@@ -68,8 +68,8 @@ _REACHABLE_AGENT_MESSAGE = (
 _SHARED_AGENT_MESSAGE = (
     "This agent is shared — it either ships with the deployment or is the "
     "current default for this channel or the server — so changing its repo or "
-    "keys needs Manage Server. Ask a server admin to make this change in `/agent-setup`, "
-    "or fork it to make an editable copy; the fork starts with no keys of its own."
+    "keys needs Manage Server. Ask a server admin to make this change with Daimon, "
+    "or ask Daimon to fork it to make an editable copy; the fork starts with no keys of its own."
 )
 
 

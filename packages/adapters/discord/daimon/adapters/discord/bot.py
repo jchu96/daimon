@@ -223,7 +223,7 @@ def _build_welcome_embed(bot_display_name: str) -> discord.Embed:
         name="Once ready",
         value=(
             f"Mention `@{bot_display_name}` anywhere to chat, or run `/agent-setup` "
-            "to manage your agents."
+            "to see who answers here."
         ),
         inline=False,
     )
@@ -1683,8 +1683,8 @@ class DaimonBot(commands.Bot):
             hints: list[str] = []
             if "agent" in err.missing:
                 hints.append(
-                    "An admin can choose who answers in this channel or the whole server "
-                    "by opening `/agent-setup`."
+                    "An admin can tell Daimon: make an agent answer in this channel or the "
+                    "whole server. Run `/agent-setup` to see who answers where."
                 )
             if "environment" in err.missing:
                 hints.append(
@@ -1707,7 +1707,7 @@ class DaimonBot(commands.Bot):
             target = thread or message.channel
             await target.send(
                 "The configured agent or environment no longer exists. "
-                "An admin can choose an existing agent in `/agent-setup`; the environment is "
+                "An admin can ask Daimon to pick an existing agent; the environment is "
                 "operator-only via the CLI (`daimon config set environment_name=...`)."
             )
             return

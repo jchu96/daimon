@@ -199,7 +199,7 @@ async def test_defaults_managed_target_member_refuses_with_shared_agent_message(
     assert _sent_message(interaction) == _SHARED_AGENT_MESSAGE
     assert "working repo" in _sent_message(interaction)
     assert "Manage Server" in _sent_message(interaction)
-    assert "`/agent-setup`" in _sent_message(interaction)
+    assert "with Daimon" in _sent_message(interaction)
     assert "keys" not in _sent_message(interaction)
     assert "fork" not in _sent_message(interaction)
 

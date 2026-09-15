@@ -117,3 +117,84 @@ def test_initial_selection_without_a_responder_keeps_setup_target_unset() -> Non
     assert state.selected is None, (
         "setup must ask which agent instead of silently picking the first roster entry"
     )
+
+
+def test_select_agent_keeps_legacy_selection_in_sync() -> None:
+    """The read-only panel's selection must be visible to the editor panel.
+
+    Both panels live in the tree at once; a target chosen on one and read off
+    the other would send setup at the wrong agent.
+    """
+    from daimon.adapters.discord.agent_setup.state import RosterEntry
+    from daimon.core.roster import RosterAgent
+
+    entries = [
+        RosterEntry(
+            name=name,
+            model="claude-sonnet-4-6",
+            spec=AgentSpec(name=name, model="claude-sonnet-4-6"),
+            ma_agent_id=f"ag_{name}",
+        )
+        for name in ("first", "specialist")
+    ]
+    state = PanelState(roster=entries, selected=entries[0], account_id=uuid.uuid4())
+    chosen = RosterAgent(
+        name="specialist",
+        ma_agent_id="ag_specialist",
+        model_id="claude-sonnet-4-6",
+        is_built_in=False,
+    )
+
+    state.select_agent(chosen)
+
+    assert state.selected_agent is chosen, "the new panel points at the chosen agent"
+    assert state.selected is entries[1], "and the editor panel's selection follows it by name"
+
+
+def test_select_agent_without_a_legacy_entry_leaves_the_editor_selection_alone() -> None:
+    from daimon.core.roster import RosterAgent
+
+    state = PanelState(roster=[], selected=None, account_id=uuid.uuid4())
+    chosen = RosterAgent(
+        name="only-on-the-new-panel",
+        ma_agent_id="ag_new",
+        model_id="claude-sonnet-4-6",
+        is_built_in=False,
+    )
+
+    state.select_agent(chosen)
+
+    assert state.selected_agent is chosen, "the read-only panel always records its own selection"
+    assert state.selected is None, "there is no editor entry to point at, and none is invented"
+
+
+def test_roster_page_of_clamps_stale_page() -> None:
+    """A page number that outlived its rows shows the last page, not an error."""
+    from daimon.core.roster import RosterAgent
+
+    agents = tuple(
+        RosterAgent(
+            name=f"agent-{index}",
+            ma_agent_id=f"ag_{index}",
+            model_id="claude-sonnet-4-6",
+            is_built_in=False,
+        )
+        for index in range(3)
+    )
+    state = PanelState(
+        roster=[],
+        selected=None,
+        account_id=uuid.uuid4(),
+        roster_agents=agents,
+        roster_page=7,
+    )
+
+    page = state.roster_page_of(2)
+
+    assert page.page == 1, "a page past the end clamps to the last page that exists"
+    assert [agent.name for agent in page.items] == ["agent-2"], (
+        "the clamped page carries the rows that are actually there"
+    )
+    assert page.has_next is False and page.has_previous is True, (
+        "the pager must know it is at the end"
+    )
