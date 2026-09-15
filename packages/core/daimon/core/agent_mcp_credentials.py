@@ -31,12 +31,16 @@ import datetime as dt
 import uuid
 from dataclasses import dataclass
 
+import anthropic
+import structlog
 from anthropic import AsyncAnthropic
 from cryptography.fernet import MultiFernet
 from daimon.core.github_credentials import decrypt_token, encrypt_token
 from daimon.core.mcp_vault import ensure_agent_mcp_vault
 from daimon.core.stores import agent_mcp_credentials as cred_store
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+log = structlog.get_logger(__name__)
 
 # Stamped on every credential this module writes, so a later turn can tell
 # whether a vault's credential carries the token currently in the DB. The value
@@ -127,37 +131,58 @@ async def mirror_credentials_into_vault(
     Note: ``mcp_vault.py`` still documents PATCH as 405-blocked. That was true
     when it was written and is not any more.
 
+    A URL the vault already holds as an ``mcp_oauth`` grant is left alone: that
+    is this person's own sign-in, which outranks the agent's shared token, and
+    a vault holds one credential per URL, so creating there is a 409 that
+    failed every turn after the first Notion connect (staging, 2026-09-15).
+
     Deliberately NOT degrade-not-block: unlike the Copilot and memory mounts,
     a missing credential here means MA hard-fails the whole turn at MCP init.
     Swallowing an error would only convert this clear failure into that
     confusing one, so ``anthropic.APIError`` propagates (the loud-failure
-    precedent is ``resolve_clone_token``).
+    precedent is ``resolve_clone_token``). The one exception is a 409 on
+    create: the credential exists, whether a concurrent turn or an auth type
+    this code does not know wrote it, and MA can use it as it is.
     """
     if not credentials:
         return
     # url -> (credential_id, stamped version or None)
     existing_by_url: dict[str, tuple[str, str | None]] = {}
+    held_by_grant: set[str] = set()
     async for existing in client.beta.vaults.credentials.list(vault_id=vault_id):
+        if existing.auth.type == "mcp_oauth":
+            held_by_grant.add(_url_key(existing.auth.mcp_server_url))
+            continue
         if existing.auth.type != "static_bearer":
             continue
         metadata = existing.metadata or {}
-        existing_by_url[existing.auth.mcp_server_url] = (
+        existing_by_url[_url_key(existing.auth.mcp_server_url)] = (
             existing.id,
             metadata.get(METADATA_VERSION_KEY),
         )
 
     for cred in credentials:
-        found = existing_by_url.get(cred.mcp_server_url)
+        key = _url_key(cred.mcp_server_url)
+        if key in held_by_grant:
+            continue
+        found = existing_by_url.get(key)
         if found is None:
-            await client.beta.vaults.credentials.create(
-                vault_id=vault_id,
-                auth={
-                    "type": "static_bearer",
-                    "mcp_server_url": cred.mcp_server_url,
-                    "token": cred.token,
-                },
-                metadata={METADATA_VERSION_KEY: cred.version},
-            )
+            try:
+                await client.beta.vaults.credentials.create(
+                    vault_id=vault_id,
+                    auth={
+                        "type": "static_bearer",
+                        "mcp_server_url": cred.mcp_server_url,
+                        "token": cred.token,
+                    },
+                    metadata={METADATA_VERSION_KEY: cred.version},
+                )
+            except anthropic.ConflictError:
+                log.info(
+                    "mcp_credentials.mirror_raced",
+                    vault_id=vault_id,
+                    mcp_server_url=cred.mcp_server_url,
+                )
             continue
         credential_id, stamped_version = found
         if stamped_version == cred.version:
@@ -169,6 +194,11 @@ async def mirror_credentials_into_vault(
             auth={"type": "static_bearer", "token": cred.token},
             metadata={METADATA_VERSION_KEY: cred.version},
         )
+
+
+def _url_key(url: str) -> str:
+    """One vault slot per server: `.../mcp` and `.../mcp/` are the same slot."""
+    return url.rstrip("/")
 
 
 async def sync_agent_mcp_credentials(

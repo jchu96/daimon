@@ -62,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A turn no longer fails with "could not get the agent ready" after someone connects an OAuth-only MCP server: the per-turn vault mirror leaves a URL held by that person's own `mcp_oauth` grant alone instead of trying to create the agent's shared token next to it (a 409 from Managed Agents), tolerates a 409 from a concurrent create, and a pasted token now replaces a grant at the same URL rather than colliding with it.
+
 - **One failing MCP server no longer discards the reply.** When Managed
   Agents cannot reach or authenticate one of an agent's MCP servers it keeps
   the session running without it; daimon treated that error as fatal and

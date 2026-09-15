@@ -208,8 +208,12 @@ def _vault_handler(
     created: list[dict[str, Any]],
     updated: list[tuple[str, dict[str, Any]]],
     deleted: list[str],
+    conflict: bool = False,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Serves one vault's credential endpoints, recording every mutation."""
+    """Serves one vault's credential endpoints, recording every mutation.
+
+    `conflict=True` answers every create with MA's 409 for a URL already held.
+    """
 
     def _handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.endswith("/credentials"):
@@ -217,6 +221,17 @@ def _vault_handler(
         if request.method == "POST" and request.url.path.endswith("/credentials"):
             body = json.loads(request.content)
             created.append(body)
+            if conflict:
+                return httpx.Response(
+                    409,
+                    json={
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "A credential already exists for this MCP server URL.",
+                        },
+                    },
+                )
             return httpx.Response(
                 200,
                 json={
@@ -375,4 +390,56 @@ async def test_mirror_makes_no_call_when_the_stamp_is_already_current() -> None:
 
     assert created == [] and updated == [] and deleted == [], (
         "a matching stamp means the vault is already current"
+    )
+
+
+async def test_mirror_leaves_a_url_held_by_the_callers_own_oauth_grant_alone() -> None:
+    """Staging, 2026-09-15: after one person connected Notion by OAuth, every turn
+    failed with 409 because the mirror only saw static_bearer credentials and
+    tried to create the agent's shared token next to their grant."""
+    created: list[dict[str, Any]] = []
+    updated: list[tuple[str, dict[str, Any]]] = []
+    deleted: list[str] = []
+    client = build_fake_anthropic(
+        _vault_handler(
+            creds=[
+                {
+                    "id": "vcrd_grant",
+                    "type": "credential",
+                    "vault_id": "vlt_1",
+                    "auth": {"type": "mcp_oauth", "mcp_server_url": _URL + "/"},
+                    "metadata": None,
+                }
+            ],
+            created=created,
+            updated=updated,
+            deleted=deleted,
+        )
+    )
+
+    await mirror_credentials_into_vault(
+        client, vault_id="vlt_1", credentials=_stored(token="tok_shared", version="v9")
+    )
+
+    assert created == [] and updated == [] and deleted == [], (
+        "the person's own sign-in outranks the shared token; nothing is written or removed"
+    )
+
+
+async def test_mirror_tolerates_a_409_from_a_concurrent_create() -> None:
+    """Two turns for the same caller can both find the slot empty; the loser's
+    409 means the credential exists, which is what the mirror wanted."""
+    created: list[dict[str, Any]] = []
+    client = build_fake_anthropic(
+        _vault_handler(creds=[], created=created, updated=[], deleted=[], conflict=True)
+    )
+
+    await mirror_credentials_into_vault(
+        client, vault_id="vlt_1", credentials=_stored(token="tok_1", version="v1")
+    )
+
+    # The SDK retries a 409 on its own before raising ConflictError, so the
+    # fake sees more than one identical create; what matters is no exception.
+    assert created and all(body == created[0] for body in created), (
+        "the create was attempted and its 409 was not a failure"
     )

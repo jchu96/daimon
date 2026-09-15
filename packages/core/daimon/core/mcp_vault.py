@@ -22,6 +22,9 @@ import uuid
 
 from anthropic import AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsVault
+from anthropic.types.beta.vaults.beta_managed_agents_environment_variable_auth_response import (
+    BetaManagedAgentsEnvironmentVariableAuthResponse,
+)
 from daimon.core.mcp_auth import mint_jwt
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -256,10 +259,13 @@ async def add_external_mcp_credential(
     Bootstraps the per-agent vault (creates it + mints the daimon-mcp JWT) when
     it does not yet exist — no longer raises on missing vault.
 
-    Idempotent on retry: deletes any existing ``static_bearer`` credential
-    whose ``auth.mcp_server_url`` matches ``mcp_server_url``, then creates the
-    new one. Mirrors ``add_github_copilot_credential`` but accepts the URL as
-    a parameter (per-user MCP servers each have distinct URLs).
+    Idempotent on retry: deletes any existing credential at ``mcp_server_url``,
+    a ``static_bearer`` or this person's own ``mcp_oauth`` grant, then creates
+    the new one. A vault holds one credential per URL, so leaving the grant in
+    place would make the create a 409; the person who pastes a token for a
+    server they had signed in to is choosing the token. Mirrors
+    ``add_github_copilot_credential`` but accepts the URL as a parameter
+    (per-user MCP servers each have distinct URLs).
 
     The entire list-then-create body (including the bootstrap branch) runs
     inside the same blocking Postgres advisory-transaction lock as
@@ -288,11 +294,15 @@ async def add_external_mcp_credential(
                 now=now,
             )
 
-        async for cred in client.beta.vaults.credentials.list(vault_id=vault_id):
-            if cred.auth.type != "static_bearer":
-                continue
-            if cred.auth.mcp_server_url == mcp_server_url:
-                await client.beta.vaults.credentials.delete(cred.id, vault_id=vault_id)
+        # Collect first: deleting while the list paginates can skip an entry.
+        stale = [
+            cred.id
+            async for cred in client.beta.vaults.credentials.list(vault_id=vault_id)
+            if not isinstance(cred.auth, BetaManagedAgentsEnvironmentVariableAuthResponse)
+            and cred.auth.mcp_server_url.rstrip("/") == mcp_server_url.rstrip("/")
+        ]
+        for credential_id in stale:
+            await client.beta.vaults.credentials.delete(credential_id, vault_id=vault_id)
 
         await client.beta.vaults.credentials.create(
             vault_id=vault_id,

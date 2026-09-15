@@ -1199,3 +1199,55 @@ async def test_ensure_agent_mcp_vault_concurrent_calls_create_exactly_one_vault(
     assert vault_id_a == vault_id_b == "vlt_race", (
         "both concurrent callers must resolve to the same (single) created vault"
     )
+
+
+async def test_add_external_mcp_credential_replaces_the_callers_oauth_grant_at_that_url(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A pasted token for a server the person had signed in to replaces the
+    grant: one credential per URL, and the create would otherwise be a 409."""
+    account_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    display = f"daimon-mcp:{account_id}:{agent_id}"
+    target_url = "https://mcp.notion.com/mcp"
+
+    deleted_ids: list[str] = []
+    created_bodies: list[dict[str, Any]] = []
+    handler = _stateful_vault_handler(
+        initial_vaults=[_vault_obj("vlt_acct", display, "2026-04-01T00:00:00Z")],
+        per_vault_creds={
+            "vlt_acct": [
+                {
+                    "id": "vcrd_grant",
+                    "type": "credential",
+                    "vault_id": "vlt_acct",
+                    "auth": {"type": "mcp_oauth", "mcp_server_url": target_url + "/"},
+                },
+                {
+                    "id": "vcrd_other",
+                    "type": "credential",
+                    "vault_id": "vlt_acct",
+                    "auth": {"type": "mcp_oauth", "mcp_server_url": "https://mcp.linear.app/mcp"},
+                },
+            ]
+        },
+        created_bodies=created_bodies,
+        deleted_ids=deleted_ids,
+    )
+
+    await add_external_mcp_credential(
+        _make_client(httpx.MockTransport(handler)),
+        account_id=account_id,
+        agent_id=agent_id,
+        jwt_secret=b"x" * 32,
+        public_url="https://mcp.example.com/mcp",
+        now=dt.datetime(2026, 9, 15, tzinfo=dt.UTC),
+        mcp_server_url=target_url,
+        token="fresh_token",
+        session_factory=db_session_factory,
+    )
+
+    assert deleted_ids == ["vcrd_grant"], (
+        f"only the grant at the target URL goes; got {deleted_ids}"
+    )
+    assert len(created_bodies) == 1 and created_bodies[0]["auth"]["token"] == "fresh_token"
