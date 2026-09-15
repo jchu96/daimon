@@ -71,7 +71,7 @@ log = structlog.get_logger()
 
 _SHARED_AGENT_MESSAGE: Final[str] = (
     "Changing this shared agent's working repo needs a server admin (Manage Server). "
-    "Ask a server admin to set the working repo in `/agent-setup`."
+    "Ask a server admin to give it access to the repo with Daimon."
 )
 
 

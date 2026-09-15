@@ -75,6 +75,12 @@ _RENDER_SITE_MODULE_NAMES = [
     "daimon.adapters.discord.agent_setup.modals",
     "daimon.adapters.discord.agent_setup.modals_mcp",
     "daimon.adapters.discord.commands.agent_setup",
+    "daimon.adapters.discord.agent_setup.roster_view",
+    "daimon.adapters.discord.agent_setup.details_view",
+    "daimon.adapters.discord.agent_setup.routing_view",
+    "daimon.adapters.discord.agent_setup.new_agent",
+    "daimon.adapters.discord.agent_setup.navigation",
+    "daimon.adapters.discord.agent_setup.hydrate",
 ]
 
 

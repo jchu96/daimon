@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
     BetaManagedAgentsURLMCPServerParams,
 )
+from daimon.core.agent_details import AgentDetails
+from daimon.core.answering_map import AnsweringMap
+from daimon.core.roster import Page, RosterAgent, paginate
 from daimon.core.scope import (
     ChannelConfigRow,
     DeploymentDefault,
@@ -31,6 +34,20 @@ class RosterEntry:
     # before reconcile); used to derive the per-agent uuid for credential reads.
     ma_agent_id: str = ""
     is_system: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class ThreadContext:
+    """Why the thread the panel was opened in has a responder of its own.
+
+    A setup thread and a handoff thread both take the mention away from the
+    parent channel's agent, but they say different things to the reader, so the
+    kind survives as far as the render instead of being flattened to a boolean.
+    """
+
+    kind: Literal["setup", "handoff"]
+    responder_name: str | None
+    target_name: str | None
 
 
 @dataclasses.dataclass
@@ -86,6 +103,29 @@ class PanelState:
     # stale generation is off screen and must not rewrite the message.
     render_seq: int = 0
     recent_setup_conversations: list[str] = dataclasses.field(default_factory=list[str])
+    # ---- Read-only setup panel (roster / details / routing) -----------------
+    # The tenant's agents as `daimon.core.roster` ordered them: whichever agent
+    # answers where the panel was opened first, then case-insensitive name.
+    roster_agents: tuple[RosterAgent, ...] = ()
+    # The agent that answers where the panel was opened, or None when nothing
+    # resolves there. Setup targets this one from the roster view.
+    answering: RosterAgent | None = None
+    # The agent Details and setup act on. Distinct from `answering`: opening
+    # Details on another agent moves this and leaves `answering` alone.
+    selected_agent: RosterAgent | None = None
+    # ma_agent_id -> platform mention, only for creators that resolve to a
+    # Discord principal. An agent with no entry renders no attribution line.
+    attributions: dict[str, str] = dataclasses.field(default_factory=dict[str, str])
+    roster_page: int = 0
+    routing_page: int = 0
+    keys_expanded: bool = False
+    details: AgentDetails | None = None
+    answering_map: AnsweringMap | None = None
+    thread_context: ThreadContext | None = None
+    # The thread the panel was opened in, when it was opened in one. `channel_id`
+    # holds the PARENT channel in that case, so both are needed to resolve who
+    # answers for the caller exactly as a mention would.
+    thread_id: str | None = None
 
     def add_skill_repo_pending(self, url: str) -> None:
         """Mark a skill repo as in-flight; idempotent."""
@@ -212,6 +252,28 @@ class PanelState:
                 self.roster[idx] = self.selected
                 break
         return removed_name
+
+    def roster_page_of(self, page_size: int) -> Page[RosterAgent]:
+        """The current window onto `roster_agents`, clamped into range.
+
+        `roster_page` can outlive the rows it indexed — an agent archived in
+        chat between two clicks shortens the roster — so the page number is
+        clamped rather than trusted.
+        """
+        return paginate(self.roster_agents, page=self.roster_page, page_size=page_size)
+
+    def select_agent(self, agent: RosterAgent) -> None:
+        """Point Details and setup at `agent`, keeping the legacy selection in step.
+
+        The editor panel still reads `selected`; while both panels exist in the
+        tree, a selection made on the new one has to be visible to the old one
+        or the two disagree about what setup would target.
+        """
+        self.selected_agent = agent
+        for entry in self.roster:
+            if entry.name == agent.name:
+                self.selected = entry
+                return
 
     def select(self, name: str) -> None:
         for entry in self.roster:

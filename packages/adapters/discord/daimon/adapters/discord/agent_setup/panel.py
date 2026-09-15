@@ -23,23 +23,19 @@ from daimon.adapters.discord.agent_setup.expiry import ExpiringView
 from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.agent_setup.tenant import resolve_tenant_for_panel as _resolve_tenant
 from daimon.adapters.discord.agent_setup.write import (
-    _build_roster_entry,  # pyright: ignore[reportPrivateUsage]  # hydrate an exact newly created identity
-    create_blank_agent,
     delete_agent,
     fork_agent,
     load_selected_github_login,
     load_tenant_roster,
-    validate_model_id,
 )
 from daimon.adapters.discord.checks import refuse_if_not_admin
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
-from daimon.core.constants import DEFAULT_AGENT_MODEL, MODEL_DISPLAY_NAMES
+from daimon.core.constants import MODEL_DISPLAY_NAMES
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.errors import DaimonError
 from daimon.core.ma_identity import derive_agent_uuid
-from daimon.core.models_catalog import list_model_choices
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.scope import (
     ChannelConfigRow,
@@ -47,7 +43,6 @@ from daimon.core.scope import (
     # canonical cascade winner; adapter renders the result, never re-derives precedence.
     pick_agent,
 )
-from daimon.core.setup_conversations import get_setup_agent
 from daimon.core.stores.agent_files import list_agent_files
 from daimon.core.stores.agent_repo_binding import get_binding
 from daimon.core.stores.domain import AgentRepoBindingRow
@@ -132,7 +127,6 @@ __all__ = [
     "BackButton",
     "_McpRemoveSelect",
     "_SkillRemoveSelect",
-    "NewAgentModal",
     "ForkAgentModal",
 ]
 
@@ -671,6 +665,10 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
         return self.state.selected.name if self.state.selected else None
 
     async def _on_new(self, interaction: discord.Interaction) -> None:
+        # Lazy import: new_agent.py returns to the new Details screen, which
+        # reaches the roster screen, so a top-level import here would be circular.
+        from daimon.adapters.discord.agent_setup.new_agent import NewAgentModal
+
         log.info("agent_setup.new_btn.click")
         await interaction.response.send_modal(
             NewAgentModal(self.state, runtime=self.runtime, allowed_user_id=self.allowed_user_id)
@@ -679,7 +677,7 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
     async def _on_connect_via_mcp(self, interaction: discord.Interaction) -> None:
         # Lazy import: mcp_access imports from state/tenant only, but keep the
         # panel's import surface minimal and avoid any cycle through agent_setup.
-        from daimon.adapters.discord.agent_setup.mcp_access import send_connect_via_mcp
+        from daimon.adapters.discord.agent_setup.mcp_access import send_coding_tools_access
 
         log.info("agent_setup.connect_mcp_btn.click", agent_name=self._selected_name())
         # state.is_admin is a snapshot from panel-open, and every interaction
@@ -690,7 +688,7 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
         # Fork / Edit) that is deliberately open to everyone.
         if await refuse_if_not_admin(interaction):  # pyright: ignore[reportArgumentType]  # discord.Interaction vs Interaction[commands.Bot]; refuse_if_not_admin only reads user/guild/response
             return
-        await send_connect_via_mcp(
+        await send_coding_tools_access(
             interaction,
             runtime=self.runtime,
             state=self.state,
@@ -774,148 +772,6 @@ class AgentSetupView(ExpiringView, discord.ui.LayoutView):
             runtime=self.runtime,
             allowed_user_id=self.allowed_user_id,
         )
-
-
-class NewAgentModal(discord.ui.Modal, title="New agent"):
-    """Three-field modal: name, system prompt, model. Reconciles + re-renders."""
-
-    def __init__(
-        self,
-        state: PanelState,
-        *,
-        runtime: DiscordRuntime,
-        allowed_user_id: int,
-    ) -> None:
-        super().__init__()
-        self.state = state
-        self.runtime = runtime
-        self.allowed_user_id = allowed_user_id
-        # Each TextInput's own `label=` is redundant with the wrapping Label's
-        # `text=` (Discord's modern Label-wrapped modal fields), but is kept
-        # so `scripts/lint_discord_modals.py`'s unconditional missing-label
-        # rule passes; discord.py's constructor writes it straight into the
-        # underlying component dataclass rather than through the deprecated
-        # `TextInput.label` property, so it costs nothing at runtime.
-        self.name_label: discord.ui.Label[NewAgentModal] = discord.ui.Label(
-            text="Name",
-            description="lowercase, dashes ok",
-            component=discord.ui.TextInput(
-                label="Name", placeholder="churn-explorer", max_length=64
-            ),
-        )
-        self.prompt_label: discord.ui.Label[NewAgentModal] = discord.ui.Label(
-            text="What should it help with?",
-            description="one or two sentences",
-            component=discord.ui.TextInput(
-                label="What should it help with?",
-                style=discord.TextStyle.paragraph,
-                max_length=2000,
-                required=False,
-            ),
-        )
-        self.model_label: discord.ui.Label[NewAgentModal] = discord.ui.Label(
-            text="Model",
-            component=discord.ui.Select(
-                options=[
-                    discord.SelectOption(
-                        label=choice.label,
-                        value=choice.id,
-                        description=choice.description,
-                        default=choice.is_default,
-                    )
-                    for choice in list_model_choices(default=DEFAULT_AGENT_MODEL)
-                ],
-                min_values=1,
-                max_values=1,
-            ),
-        )
-        self.add_item(self.name_label)
-        self.add_item(self.prompt_label)
-        self.add_item(self.model_label)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        name_field = self.name_label.component
-        assert isinstance(name_field, discord.ui.TextInput), "name field is a TextInput"
-        prompt_field = self.prompt_label.component
-        assert isinstance(prompt_field, discord.ui.TextInput), "prompt field is a TextInput"
-        model_field = self.model_label.component
-        assert isinstance(model_field, discord.ui.Select), "model field is a Select"
-        new_name = str(name_field.value).strip()
-        model_value = model_field.values[0]
-        system_value = str(prompt_field.value).strip() or None
-        log.info(
-            "agent_setup.new.submit",
-            new_name=new_name,
-            model=model_value,
-            has_system=system_value is not None,
-        )
-        error = validate_model_id(model_value)
-        if error is not None:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
-        await interaction.response.defer()
-        tenant_id: uuid.UUID | None = None
-        try:
-            tenant_id = await _resolve_tenant(self.runtime, interaction)
-            created = await create_blank_agent(
-                self.runtime,
-                tenant_id=tenant_id,
-                name=new_name,
-                system=system_value,
-                model=model_value,
-                account_id=self.state.guild_account_id,  # SC-2: stamp guild account
-            )
-            if created.anthropic_id is None:
-                raise DaimonError(
-                    "Could not confirm the new agent. "
-                    "Reopen `/agent-setup` to check before retrying."
-                )
-            roster = await load_tenant_roster(
-                self.runtime.anthropic,
-                tenant_id=tenant_id,
-            )
-            selected = next(
-                (entry for entry in roster if entry.ma_agent_id == created.anthropic_id), None
-            )
-            if selected is None:
-                created_agent = await get_setup_agent(
-                    self.runtime.anthropic, tenant_id=tenant_id, ma_agent_id=created.anthropic_id
-                )
-                selected = _build_roster_entry(created_agent, custom_skill_titles={})
-                roster.append(selected)
-            self.state.roster = roster
-            self.state.selected = selected
-            self.state.hydrate_repo_binding(None)
-            self.state.secret_count = 0
-            self.state.github_login = None
-            thumbnail_url = _get_thumbnail_url(interaction)
-            await interaction.edit_original_response(
-                view=AgentSetupView(
-                    self.state,
-                    runtime=self.runtime,
-                    allowed_user_id=self.allowed_user_id,
-                    thumbnail_url=thumbnail_url,
-                ).bind_render_interaction(interaction, panel=self.state),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except Exception as err:
-            rid = generate_request_id()
-            log.exception(
-                "agent_setup.new.failed",
-                new_name=new_name,
-                model=model_value,
-                err_type=type(err).__name__,
-                request_id=rid,
-            )
-            _capture_panel_exception(
-                err, tenant_id=tenant_id, guild_id=interaction.guild_id, rid=rid
-            )
-            await interaction.followup.send(
-                render_error(err, request_id=rid),
-                ephemeral=True,
-            )
-            return
-        log.info("agent_setup.new.created", new_name=new_name, model=model_value)
 
 
 class ForkAgentModal(discord.ui.Modal, title="Fork agent"):
