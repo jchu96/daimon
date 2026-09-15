@@ -36,7 +36,7 @@ import structlog
 from anthropic import AsyncAnthropic
 from cryptography.fernet import MultiFernet
 from daimon.core.github_credentials import decrypt_token, encrypt_token
-from daimon.core.mcp_vault import ensure_agent_mcp_vault, same_server_url
+from daimon.core.mcp_vault import ensure_agent_mcp_vault
 from daimon.core.stores import agent_mcp_credentials as cred_store
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -76,8 +76,9 @@ async def save_agent_mcp_credential(
             session,
             tenant_id=tenant_id,
             agent_id=agent_id,
-            # Stored without a trailing slash so detach (which strips it) finds it.
-            mcp_server_url=mcp_server_url.rstrip("/"),
+            # Stored verbatim so it matches the URL attached to the agent spec;
+            # detach compares slash-insensitively (delete_credential rtrims).
+            mcp_server_url=mcp_server_url,
             encrypted_token=encrypt_token(fernet, plaintext_token),
         )
 
@@ -198,8 +199,7 @@ async def mirror_credentials_into_vault(
 
 
 def _url_key(url: str) -> str:
-    """Dict key form of `same_server_url`."""
-    assert same_server_url(url, url.rstrip("/"))
+    """Dict key: the slash-insensitive form `same_server_url` compares on."""
     return url.rstrip("/")
 
 

@@ -72,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a concurrent create is tolerated. Detaching a server also finds a
   token row stored with a trailing slash, and the sign-in card refuses the
   click when the deployment has no crypto keys instead of handing out a dead
-  link.
+  link. Asking to connect the deployment's own `daimon-mcp` name or URL is
+  refused, as attaching it already was.
 
 - **One failing MCP server no longer discards the reply.** When Managed
   Agents cannot reach or authenticate one of an agent's MCP servers it keeps

@@ -102,7 +102,7 @@ async def start_mcp_oauth_from_click(
     thread_ts = row.origin_thread_id
     mcp = runtime.settings.mcp
     app_root_url = mcp.app_root_url
-    # Same predicate as the route mount in the mcp process.
+    # A superset of the route mount's predicate: never hand out a dead link.
     if app_root_url is None or mcp.jwt_secret is None or runtime.turn_deps.fernet is None:
         await post_ephemeral(
             client,
