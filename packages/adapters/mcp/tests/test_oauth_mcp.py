@@ -64,8 +64,14 @@ def _settings() -> Settings:
     )
 
 
-def _notion(token_forms: list[dict[str, list[str]]]) -> httpx.MockTransport:
+def _notion(
+    token_forms: list[dict[str, list[str]]],
+    *,
+    registrations: list[str] | None = None,
+    token_body: dict[str, str] | None = None,
+) -> httpx.MockTransport:
     """The authorization server: discovery, registration and the token endpoint."""
+    registered = registrations if registrations is not None else []
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -84,12 +90,18 @@ def _notion(token_forms: list[dict[str, list[str]]]) -> httpx.MockTransport:
         if path == "/.well-known/oauth-authorization-server":
             return httpx.Response(200, json=_AS)
         if req.method == "POST" and path == "/register":
+            registered.append(f"cid{len(registered) + 1}")
             return httpx.Response(
-                201, json={"client_id": "cid", "token_endpoint_auth_method": "none"}
+                201, json={"client_id": registered[-1], "token_endpoint_auth_method": "none"}
             )
         if req.method == "POST" and path == "/token":
             token_forms.append(parse_qs(req.content.decode()))
-            return httpx.Response(200, json={"access_token": "at", "refresh_token": "rt"})
+            body = (
+                token_body
+                if token_body is not None
+                else {"access_token": "at", "refresh_token": "rt"}
+            )
+            return httpx.Response(200, json=body)
         return httpx.Response(404)
 
     return httpx.MockTransport(handler)
@@ -257,11 +269,11 @@ async def test_start_registers_a_client_and_redirects_to_the_authorization_serve
     location = urlparse(r.headers["location"])
     assert location.path == "/authorize" and location.netloc == "mcp.notion.com"
     query = parse_qs(location.query)
-    assert query["client_id"] == ["cid"] and query["state"] == [flow.state]
+    assert query["client_id"] == ["cid1"] and query["state"] == [flow.state]
     assert query["redirect_uri"] == [f"{_ROOT}/oauth/mcp/callback"]
     async with db_session_factory() as session:
         saved = await flows_store.get_flow(session, state=flow.state)
-    assert saved is not None and saved.client_id == "cid", "the registered client is on the row"
+    assert saved is not None and saved.client_id == "cid1", "the registered client is on the row"
 
 
 async def test_start_answers_an_unknown_or_spent_state_with_the_expired_page(
@@ -371,7 +383,7 @@ async def test_editing_the_card_without_a_discord_bot_token_does_not_raise(
         deployment_default=DeploymentDefault(),
         fernet=make_fernet(),
     )
-    assert runtime.settings.discord is None
+    assert runtime.settings.discord is None, "the mcp process here has no Discord token"
     row = CredentialRequestRow(
         token="crq_x",
         kind="mcp_oauth",
@@ -398,3 +410,51 @@ async def test_editing_the_card_without_a_discord_bot_token_does_not_raise(
             target_name="daimon", kind="mcp", availability="next_message", detail="notion"
         ),
     )
+
+
+async def test_opening_the_start_link_twice_registers_one_client(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """The code the provider issues must be exchanged as the client that asked for it."""
+    flow, tenant_id = await _seed_flow(db_session)
+    await db_session.commit()
+    anthropic, _c, _u = _fake_ma(tenant_id, account_id=flow.account_id, agent_id=flow.agent_id)
+    registrations: list[str] = []
+    app = _app(
+        db_session_factory, anthropic=anthropic, transport=_notion([], registrations=registrations)
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.get(f"/oauth/mcp/start?state={flow.state}")
+        second = await client.get(f"/oauth/mcp/start?state={flow.state}")
+
+    assert registrations == ["cid1"], "the second open registers nothing new"
+    ids = [parse_qs(urlparse(r.headers["location"]).query)["client_id"] for r in (first, second)]
+    assert ids == [["cid1"], ["cid1"]], "both redirects carry the same client"
+
+
+async def test_callback_with_an_unusable_token_body_settles_the_card_instead_of_crashing(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    flow, tenant_id = await _seed_flow(db_session)
+    await db_session.commit()
+    anthropic, created, _u = _fake_ma(tenant_id, account_id=flow.account_id, agent_id=flow.agent_id)
+    app = _app(
+        db_session_factory,
+        anthropic=anthropic,
+        transport=_notion([], token_body={"token_type": "bearer"}),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.get(f"/oauth/mcp/start?state={flow.state}")
+        r = await client.get(f"/oauth/mcp/callback?code=code123&state={flow.state}")
+
+    assert r.status_code == 502 and "did not complete" in r.text, r.text
+    assert created == [], "nothing is stored without an access token"
+    async with db_session_factory() as session:
+        request = await requests_store.peek_credential_request(session, token=flow.request_token)
+    assert request is not None and request.outcome == "write_failed", "the card is not left pending"

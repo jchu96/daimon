@@ -36,7 +36,7 @@ def test_generate_pkce_derives_the_s256_challenge_from_the_verifier() -> None:
 
 def test_build_authorization_url_carries_pkce_state_and_resource() -> None:
     url = build_authorization_url(
-        _AS,
+        _AS.authorization_endpoint,
         client_id="cid",
         redirect_uri="https://d.example/oauth/mcp/callback",
         state="st",
@@ -140,3 +140,21 @@ async def test_exchange_raises_with_the_server_body_on_refusal() -> None:
             redirect_uri="https://d.example/cb",
             resource=None,
         )
+
+
+async def test_exchange_wraps_an_unusable_token_body_without_repeating_it() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"token_type": "bearer", "secret_thing": "s3cr3t"})
+
+    with pytest.raises(McpOAuthFlowError, match="unusable body") as excinfo:
+        await exchange_authorization_code(
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            token_endpoint=_AS.token_endpoint,
+            code="c",
+            code_verifier="v",
+            client=ClientRegistration(client_id="cid"),
+            redirect_uri="https://d.example/cb",
+            resource=None,
+        )
+    assert "s3cr3t" not in str(excinfo.value), "a token response body never reaches a log line"
+    assert excinfo.value.__cause__ is not None, "the parse error stays attached as the cause"

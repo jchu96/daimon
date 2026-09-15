@@ -47,7 +47,7 @@ def generate_pkce(*, verifier: str | None = None) -> Pkce:
 
 
 def build_authorization_url(
-    metadata: AuthorizationServerMetadata,
+    authorization_endpoint: str,
     *,
     client_id: str,
     redirect_uri: str,
@@ -73,8 +73,8 @@ def build_authorization_url(
         query["scope"] = scope
     if resource:
         query["resource"] = resource
-    separator = "&" if "?" in metadata.authorization_endpoint else "?"
-    return f"{metadata.authorization_endpoint}{separator}{urlencode(query)}"
+    separator = "&" if "?" in authorization_endpoint else "?"
+    return f"{authorization_endpoint}{separator}{urlencode(query)}"
 
 
 def pick_token_endpoint_auth_method(
@@ -117,7 +117,14 @@ async def register_client(
             f"client registration at {metadata.registration_endpoint} failed: "
             f"{response.status_code} {response.text[:300]}"
         )
-    return ClientRegistration.model_validate(response.json())
+    try:
+        return ClientRegistration.model_validate(response.json())
+    except ValueError as err:
+        # The body stays out of the message: registration echoes what we sent
+        # plus the server's own fields, none of which belong in a log line.
+        raise McpOAuthFlowError(
+            f"client registration at {metadata.registration_endpoint} returned an unusable body"
+        ) from err
 
 
 async def exchange_authorization_code(
@@ -153,4 +160,10 @@ async def exchange_authorization_code(
             f"token exchange at {token_endpoint} failed: "
             f"{response.status_code} {response.text[:300]}"
         )
-    return TokenResponse.model_validate(response.json())
+    try:
+        return TokenResponse.model_validate(response.json())
+    except ValueError as err:
+        # Never include the body: a token response is a secret.
+        raise McpOAuthFlowError(
+            f"token exchange at {token_endpoint} returned an unusable body"
+        ) from err

@@ -21,7 +21,6 @@ from cryptography.fernet import MultiFernet
 from daimon.core.github_credentials import encrypt_token
 from daimon.core.mcp_oauth.discovery import discover_authorization_server, probe_mcp_server
 from daimon.core.mcp_oauth.flow import build_authorization_url, generate_pkce, register_client
-from daimon.core.mcp_oauth.models import AuthorizationServerMetadata
 from daimon.core.stores import mcp_oauth_flows as flows_store
 from daimon.core.stores.domain import CredentialRequestRow, McpOAuthFlowRow
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,17 +93,11 @@ class PreparedAuthorization:
 
 def _reuse_registered(flow: McpOAuthFlowRow) -> PreparedAuthorization:
     """The authorize URL for a flow whose client is already on the row."""
-    assert flow.client_id is not None and flow.token_endpoint is not None
-    assert flow.authorization_endpoint is not None
-    metadata = AuthorizationServerMetadata(
-        issuer=flow.authorization_endpoint,
-        authorization_endpoint=flow.authorization_endpoint,
-        token_endpoint=flow.token_endpoint,
-    )
+    assert flow.client_id is not None and flow.authorization_endpoint is not None
     return PreparedAuthorization(
         flow=flow,
         authorize_url=build_authorization_url(
-            metadata,
+            flow.authorization_endpoint,
             client_id=flow.client_id,
             redirect_uri=flow.redirect_uri,
             state=flow.state,
@@ -167,7 +160,7 @@ async def prepare_authorization(
             return None
         return _reuse_registered(current)
     authorize_url = build_authorization_url(
-        metadata,
+        metadata.authorization_endpoint,
         client_id=client.client_id,
         redirect_uri=flow.redirect_uri,
         state=flow.state,
