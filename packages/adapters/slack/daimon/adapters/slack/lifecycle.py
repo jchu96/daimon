@@ -55,6 +55,7 @@ from daimon.adapters.slack.mrkdwn import escape_mrkdwn_preserving_mentions
 from daimon.adapters.slack.split import split_for_slack_safe
 from daimon.core.observability import capture_exception_with_scope
 from daimon.core.pricing import MODEL_PRICING, cost_of, format_cost
+from daimon.core.turn.degraded import render_degraded_notice
 from daimon.core.turn.lifecycle import InterruptSource, ReconnectReason
 from daimon.core.turn.state import ToolUseBlock, TurnState, extract_final_response
 from slack_sdk.errors import SlackApiError
@@ -377,6 +378,11 @@ class SlackTurnLifecycle:
             if self.answer_prefix is not None:
                 final_text = f"{self.answer_prefix}\n\n{final_text}"
                 self.answer_prefix_applied = True
+            # #79: same trailer as Discord — a dropped server is named under
+            # the reply rather than swallowing the reply.
+            degraded_notice = render_degraded_notice(state.mcp_failures)
+            if degraded_notice is not None:
+                final_text = f"{final_text}\n\n{degraded_notice}"
             chunks = split_for_slack_safe(escape_mrkdwn_preserving_mentions(final_text))
             first_chunk = chunks[0]
             # First chunk + the cost/usage footer replace the status message

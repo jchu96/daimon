@@ -1141,3 +1141,31 @@ async def test_tool_only_turn_gets_no_feedback_buttons(fake_slack_web_client: An
     assert "feedback_vote:up" not in _action_ids(_last_update_blocks(fake_slack_web_client)), (
         "tool-only turn has no answer to vote on"
     )
+
+
+async def test_terminal_success_names_the_failed_mcp_server_under_the_reply(
+    fake_slack_web_client: Any,
+) -> None:
+    """#79: the reply is posted with the dropped server named under it."""
+    from daimon.core.turn.state import McpServerFailure
+
+    lc, *_ = _make_lifecycle(fake_slack_web_client)
+    await lc.post_initial()
+    await lc.on_sse_event(_thinking_event())
+
+    state = TurnState(
+        content=[TextBlock(kind="text", text="Here is the board.")],
+        mcp_failures=(
+            McpServerFailure(
+                server_name="notion",
+                error_type="mcp_authentication_failed_error",
+                message="access forbidden",
+                retry_status="exhausted",
+            ),
+        ),
+    )
+    await lc.on_terminal_success(state)
+
+    blocks = _last_update_blocks(fake_slack_web_client)
+    assert blocks[0]["text"].startswith("Here is the board."), "the reply itself comes first"
+    assert "notion" in blocks[0]["text"], "the dropped server is named under the reply"
