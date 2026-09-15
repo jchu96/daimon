@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Connect Notion and other OAuth-only MCP servers with your own account.**
+  Ask the agent to connect a server that signs people in through a browser
+  and the new `request_mcp_oauth` tool posts a card whose button hands the
+  requester a private sign-in link. daimon registers itself with the server,
+  runs the PKCE authorization-code flow on `/oauth/mcp/start` and
+  `/oauth/mcp/callback`, stores the grant as an `mcp_oauth` credential in
+  that person's per-agent vault (Anthropic refreshes it) and attaches the
+  server to the agent. Grants are per person: each member connects their
+  own account and nobody inherits another's. Needs `DAIMON_MCP__PUBLIC_URL`
+  and `DAIMON_CRYPTO__KEYS`. Migration `0020_mcp_oauth_flows`.
+
 - **daimon can change its own name and picture on Discord.** Ask it to
   rename itself or use an attached image as its profile picture and the new
   `set_display_identity` MCP tool edits the bot's nickname and per-server
@@ -48,6 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP tool lets the agent retitle a thread on request: anyone who can post in
   a thread daimon opened may rename it, other threads need Manage Threads.
   Slack threads have no title, so both are Discord-only.
+
+### Fixed
+
+- **One failing MCP server no longer discards the reply.** When Managed
+  Agents cannot reach or authenticate one of an agent's MCP servers it keeps
+  the session running without it; daimon treated that error as fatal and
+  threw away the answer that followed, so a rejected Notion token turned
+  every turn into a blank failure (#79). The turn now succeeds with a line
+  under the reply naming the unavailable server, and only a turn that
+  produced nothing fails, naming the server in its error. The MCP token form
+  probes the server first and refuses a token it rejects, pointing at the
+  OAuth path; `detach_mcp_server` lets an admin disconnect a server from
+  built-in Daimon and forgets the shared token stored for it.
 
 ### Removed
 
