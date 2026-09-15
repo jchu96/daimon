@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import uuid
 from collections.abc import Callable
@@ -15,12 +16,13 @@ from daimon.core.agent_mcp_credentials import (
     mirror_credentials_into_vault,
     resolve_agent_mcp_credentials,
     save_agent_mcp_credential,
+    sync_agent_mcp_credentials,
 )
 from daimon.core.github_credentials import build_multifernet
 from daimon.core.stores import agent_mcp_credentials as cred_store
 from daimon.core.stores.domain import AgentMcpCredentialRow
-from daimon.testing.factories import make_tenant
-from daimon.testing.ma import build_fake_anthropic
+from daimon.testing.factories import make_account, make_tenant
+from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -443,3 +445,100 @@ async def test_mirror_tolerates_a_409_from_a_concurrent_create() -> None:
     assert created and all(body == created[0] for body in created), (
         "the create was attempted and its 409 was not a failure"
     )
+
+
+async def test_reused_session_refresh_succeeds_when_the_caller_holds_an_oauth_grant(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """The staging failure end to end: the agent keeps its shared static token
+    row, the caller's vault holds an `mcp_oauth` grant at that URL, and the
+    per-turn refresh (`RemirrorVaultCredentials` -> `sync_agent_mcp_credentials`)
+    must complete without writing anything."""
+    tenant = await make_tenant(db_session)
+    account = await make_account(db_session, tenant=tenant)
+    await db_session.commit()
+    agent_id = uuid.uuid4()
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+    notion = "https://mcp.notion.com/mcp"
+    public_url = "https://mcp.example.com/mcp"
+    await save_agent_mcp_credential(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        mcp_server_url=notion,
+        plaintext_token="ntn_rejected_long_ago",
+    )
+
+    writes: list[str] = []
+    router = MARouter()
+    router.add(
+        "GET",
+        r"/v1/vaults",
+        lambda _r, _m: list_response(
+            [
+                {
+                    "id": "vlt_me",
+                    "type": "vault",
+                    "display_name": f"daimon-mcp:{account.id}:{agent_id}",
+                    "metadata": None,
+                    "archived_at": None,
+                    "created_at": "2026-09-01T00:00:00Z",
+                }
+            ]
+        ),
+    )
+    reads: list[str] = []
+
+    def list_creds(_r: httpx.Request, _m: Any) -> httpx.Response:
+        reads.append("list")
+        return list_response(
+            [
+                {
+                    "id": "vcrd_jwt",
+                    "type": "vault_credential",
+                    "vault_id": "vlt_me",
+                    "auth": {"type": "static_bearer", "mcp_server_url": public_url},
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "updated_at": "2026-09-01T00:00:00Z",
+                    "archived_at": None,
+                    "display_name": None,
+                    "metadata": None,
+                },
+                {
+                    "id": "vcrd_grant",
+                    "type": "vault_credential",
+                    "vault_id": "vlt_me",
+                    "auth": {"type": "mcp_oauth", "mcp_server_url": notion},
+                    "created_at": "2026-09-15T14:04:00Z",
+                    "updated_at": "2026-09-15T14:04:00Z",
+                    "archived_at": None,
+                    "display_name": None,
+                    "metadata": None,
+                },
+            ]
+        )
+
+    router.add("GET", r"/v1/vaults/vlt_me/credentials", list_creds)
+
+    def refuse(req: httpx.Request, _m: Any) -> httpx.Response:
+        writes.append(f"{req.method} {req.url.path}")
+        return httpx.Response(409, json={"type": "error", "error": {"message": "exists"}})
+
+    router.add("POST", r"/v1/vaults/vlt_me/credentials.*", refuse)
+    router.add("DELETE", r"/v1/vaults/vlt_me/credentials/.*", refuse)
+
+    await sync_agent_mcp_credentials(
+        build_fake_anthropic(router.dispatch),
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        account_id=account.id,
+        jwt_secret=b"x" * 32,
+        public_url=public_url,
+        now=dt.datetime(2026, 9, 15, 14, 5, tzinfo=dt.UTC),
+    )
+
+    assert reads, "the refresh reached the mirror and read the vault"
+    assert writes == [], f"the refresh must not touch the vault; it tried {writes}"
