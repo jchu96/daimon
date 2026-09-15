@@ -114,6 +114,8 @@ class TurnState:
     usage_totals: UsageTotals = field(default_factory=UsageTotals)
     mcp_failures: tuple[McpServerFailure, ...] = ()
     """Servers that failed this turn, newest status per server name."""
+    retrying_error: TurnError | None = None
+    """The last `retrying` error MA reported; only surfaces if nothing follows."""
 
 
 def extract_final_response(content: list[ContentBlock]) -> str:

@@ -943,3 +943,50 @@ async def test_mcp_failure_with_no_output_finalizes_as_failure_naming_the_server
     assert "'notion'" in final.error.message, "the failure must name the MCP server"
     assert "access forbidden" in final.error.message, "MA's detail must survive"
     assert len(lc.terminal_failures) == 1, "an empty turn after MCP failure is a failure"
+
+
+def _retrying_overloaded_event(event_id: str):  # SDK union member, inlined per guideline:testing
+    from anthropic.types.beta.sessions.beta_managed_agents_model_overloaded_error import (
+        BetaManagedAgentsModelOverloadedError,
+    )
+    from anthropic.types.beta.sessions.beta_managed_agents_retry_status_retrying import (
+        BetaManagedAgentsRetryStatusRetrying,
+    )
+
+    from .conftest import make_session_error
+
+    return make_session_error(
+        event_id=event_id,
+        error=BetaManagedAgentsModelOverloadedError(
+            type="model_overloaded_error",
+            message="overloaded",
+            retry_status=BetaManagedAgentsRetryStatusRetrying(type="retrying"),
+        ),
+    )
+
+
+async def test_retrying_error_that_never_settles_and_produces_nothing_is_a_failure() -> None:
+    """MA said `retrying`, then went idle without a settled copy or any
+    output. The kept-aside error is surfaced instead of a blank success."""
+    fa = FakeAnthropic()
+    fa.beta.sessions.events.stream_scripts = [
+        [
+            YieldEvent(_retrying_overloaded_event("e_1")),
+            YieldEvent(make_status_idle(event_id="s_1", stop_reason=make_end_turn())),
+        ]
+    ]
+    lc = RecordingLifecycle()
+
+    final = await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="hi",
+        lifecycle=lc,
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+    )
+
+    assert final.error is not None and "overloaded" in final.error.message
+    assert len(lc.terminal_failures) == 1, "an empty turn after a retrying error is a failure"

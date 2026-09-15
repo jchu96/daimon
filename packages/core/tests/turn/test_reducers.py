@@ -584,6 +584,7 @@ def test_apply_ignores_retrying_model_error_until_it_settles() -> None:
     )
     state = apply(TurnState(), make_session_error(event_id="e_1", error=retrying))
     assert state.error is None, "a retrying error must not fail the turn early"
+    assert state.retrying_error is not None, "kept aside so an empty turn can still name it"
     assert "e_1" in state.seen_event_ids, "the event is still folded for dedup"
     settled = apply(state, make_session_error(event_id="e_2", error=make_overloaded_error()))
     assert settled.error is not None, "the settled copy fails the turn"

@@ -259,7 +259,11 @@ def _apply_session_error(
         kept = tuple(f for f in state.mcp_failures if f.server_name != failure.server_name)
         return dataclasses.replace(state, mcp_failures=(*kept, failure), seen_event_ids=seen)
     if retry_status == "retrying":
-        return dataclasses.replace(state, seen_event_ids=seen)
+        # Kept aside, not dropped: should the stream end with no settled
+        # copy and no output, the finalizer surfaces it rather than a blank.
+        return dataclasses.replace(
+            state, retrying_error=_to_turn_error(sdk_error), seen_event_ids=seen
+        )
     return dataclasses.replace(state, error=_to_turn_error(sdk_error), seen_event_ids=seen)
 
 
