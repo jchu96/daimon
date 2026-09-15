@@ -127,7 +127,11 @@ async def _set_setup_target_impl(
         )
         if binding is None or binding.deleted:
             raise ToolError(
-                "This is not an active setup conversation. Open Set up with Daimon first."
+                "This thread is not a setup conversation, so there is no selected "
+                "target to switch. That does not block configuring the agent: name "
+                "it and use update_agent or a request tool directly. A setup "
+                "conversation is opened from the Set up with Daimon button in the "
+                "setup panel. Nothing was changed."
             )
         if binding.kind == "handoff":
             raise ToolError(

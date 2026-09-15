@@ -17,6 +17,7 @@ from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.roster import RosterAgent
 from daimon.core.setup_conversations import (
     build_setup_opener,
+    has_external_mcp_connection,
     resolve_setup_agents,
     setup_thread_name,
 )
@@ -121,12 +122,10 @@ async def open_setup_conversation(
             opener_mention=interaction.user.mention,
             bot_mention=interaction.client.user.mention,
             has_repo=has_repo,
-            has_external_connection=bool(
-                ma_target
-                and any(
-                    server.url.rstrip("/") != (state.default_mcp_url or "").rstrip("/")
-                    for server in ma_target.mcp_servers
-                )
+            has_external_connection=ma_target is not None
+            and has_external_mcp_connection(
+                (server.url for server in ma_target.mcp_servers),
+                public_mcp_url=state.default_mcp_url,
             ),
             can_customize=bool(
                 ma_target

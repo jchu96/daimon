@@ -233,3 +233,37 @@ def test_reply_shape_forbids_describing_a_form_that_was_not_posted() -> None:
         assert "if posting failed, say" in section, (
             f"{label} must tell the model to say what failed when posting fails"
         )
+
+
+def test_guidance_says_to_post_the_answering_and_applies_sentences_word_for_word() -> None:
+    """D25-QA-01/S25-01/S25-02: three chat creations paraphrased the routing
+    sentence the tool returned, and one of the paraphrases invented a
+    channel-specific routing step no tool had supplied."""
+    system = _daimon_system()
+    assert "`answering` or `applies`" in system, (
+        "daimon.yaml must name both tool-result sentences the reply carries unchanged"
+    )
+    assert "word for word" in system, (
+        "daimon.yaml must tell the model to post those sentences word for word, "
+        "not to paraphrase them"
+    )
+    assert "no routing step the tool did not give" in system, (
+        "daimon.yaml must forbid adding a routing step the tool result did not supply"
+    )
+
+
+def test_workspace_setup_says_a_setup_target_refusal_does_not_block_configuration() -> None:
+    """D25-QA-02: one `set_setup_target` refusal in ordinary chat convinced the
+    model it could not configure the named agent at all, and the belief carried
+    into the next turn."""
+    body = _workspace_setup_body()
+    section = _section(body, "## Permissions and refusals", "An operator-only problem")
+    assert "`set_setup_target` refusal" in section, (
+        "workspace-setup must say what a set_setup_target refusal actually means"
+    )
+    assert "never means the agent cannot be configured" in section, (
+        "workspace-setup must say the refusal does not block configuration"
+    )
+    assert "Configure it by name" in section, (
+        "workspace-setup must name the way through: configure the agent by name"
+    )

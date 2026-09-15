@@ -835,6 +835,9 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
 
         Do not pass a ``skills`` field here. To add skills, either sync a repo via
         ``skill_repos`` or use ``sync_skills`` after the agent is created.
+
+        A returned ``answering`` field says the new agent is routed nowhere yet:
+        post it verbatim.
         """
         spec = _build_create_spec(
             name=name,
