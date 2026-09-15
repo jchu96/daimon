@@ -37,6 +37,12 @@ from anthropic.types.beta.sessions.beta_managed_agents_agent_tool_result_event i
 from anthropic.types.beta.sessions.beta_managed_agents_agent_tool_use_event import (
     BetaManagedAgentsAgentToolUseEvent,
 )
+from anthropic.types.beta.sessions.beta_managed_agents_mcp_authentication_failed_error import (
+    BetaManagedAgentsMCPAuthenticationFailedError,
+)
+from anthropic.types.beta.sessions.beta_managed_agents_mcp_connection_failed_error import (
+    BetaManagedAgentsMCPConnectionFailedError,
+)
 from anthropic.types.beta.sessions.beta_managed_agents_session_error_event import (
     BetaManagedAgentsSessionErrorEvent,
 )
@@ -58,6 +64,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_user_custom_tool_result_e
 from daimon.core.errors import TurnError
 from daimon.core.turn.state import (
     ContentBlock,
+    McpServerFailure,
     TextBlock,
     ToolUseBlock,
     TurnState,
@@ -98,9 +105,7 @@ def apply(state: TurnState, event: SessionEvent) -> TurnState:
             return dataclasses.replace(state, stop_reason=event.stop_reason, seen_event_ids=seen)
         case "session.error":
             assert isinstance(event, BetaManagedAgentsSessionErrorEvent)
-            return dataclasses.replace(
-                state, error=_to_turn_error(event.error), seen_event_ids=seen
-            )
+            return _apply_session_error(state, event.error, seen)
         case "session.status_terminated":
             assert isinstance(event, BetaManagedAgentsSessionStatusTerminatedEvent)
             return dataclasses.replace(
@@ -218,6 +223,44 @@ def _apply_tool_result(
         *state.content[match_index + 1 :],
     ]
     return dataclasses.replace(state, content=new_content, seen_event_ids=seen)
+
+
+_MCP_FAILURE_TYPES = ("mcp_connection_failed_error", "mcp_authentication_failed_error")
+
+
+def _apply_session_error(
+    state: TurnState, sdk_error: SessionError, seen: frozenset[str]
+) -> TurnState:
+    """Fold one `session.error` by what MA says the client should do next.
+
+    Every variant carries `retry_status`. `retrying` means MA will fire the
+    same error again as `exhausted` or `terminal` once its budget runs out, so
+    an early copy must not brand the turn failed while the model is still
+    working. An MCP connection or authentication failure that is not
+    `terminal` is the case from #79: MA drops that server and keeps the
+    session running, the model answers with the rest of its tools, and the
+    session idles cleanly — so it lands in `mcp_failures`, newest status per
+    server, and never in `error`. Everything else is the turn's error, as
+    before.
+    """
+    retry_status = sdk_error.retry_status.type
+    if sdk_error.type in _MCP_FAILURE_TYPES and retry_status != "terminal":
+        assert isinstance(
+            sdk_error,
+            BetaManagedAgentsMCPAuthenticationFailedError
+            | BetaManagedAgentsMCPConnectionFailedError,
+        )
+        failure = McpServerFailure(
+            server_name=sdk_error.mcp_server_name,
+            error_type=sdk_error.type,
+            message=sdk_error.message,
+            retry_status=retry_status,
+        )
+        kept = tuple(f for f in state.mcp_failures if f.server_name != failure.server_name)
+        return dataclasses.replace(state, mcp_failures=(*kept, failure), seen_event_ids=seen)
+    if retry_status == "retrying":
+        return dataclasses.replace(state, seen_event_ids=seen)
+    return dataclasses.replace(state, error=_to_turn_error(sdk_error), seen_event_ids=seen)
 
 
 def _to_turn_error(sdk_error: SessionError) -> TurnError:

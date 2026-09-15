@@ -858,3 +858,88 @@ async def test_run_turn_sends_only_the_user_message_when_system_blocks_are_empty
     assert [event["type"] for event in sent] == ["user.message"], (
         "no system.message when no blocks were supplied"
     )
+
+
+# --- #79: an MCP server failing mid-turn degrades the turn, never discards the reply ---
+
+
+def _mcp_failure_event(event_id: str):  # SDK union member, inlined per guideline:testing
+    from anthropic.types.beta.sessions.beta_managed_agents_mcp_authentication_failed_error import (
+        BetaManagedAgentsMCPAuthenticationFailedError,
+    )
+    from anthropic.types.beta.sessions.beta_managed_agents_retry_status_exhausted import (
+        BetaManagedAgentsRetryStatusExhausted,
+    )
+
+    from .conftest import make_session_error
+
+    return make_session_error(
+        event_id=event_id,
+        error=BetaManagedAgentsMCPAuthenticationFailedError(
+            type="mcp_authentication_failed_error",
+            mcp_server_name="notion",
+            message="MCP server 'notion' initialize failed: access forbidden",
+            retry_status=BetaManagedAgentsRetryStatusExhausted(type="exhausted"),
+        ),
+    )
+
+
+async def test_mcp_failure_then_reply_finalizes_as_success_carrying_the_failure() -> None:
+    """The observed #79 sequence: MCP error at turn start, model answers with
+    its other tools, clean idle. The reply must reach the lifecycle's success
+    hook with the failed server named on the state."""
+    fa = FakeAnthropic()
+    fa.beta.sessions.events.stream_scripts = [
+        [
+            YieldEvent(_mcp_failure_event("e_1")),
+            YieldEvent(make_agent_message(event_id="m_1", text="done without notion")),
+            YieldEvent(make_status_idle(event_id="s_1", stop_reason=make_end_turn())),
+        ]
+    ]
+    lc = RecordingLifecycle()
+
+    final = await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="hi",
+        lifecycle=lc,
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+    )
+
+    assert final.error is None, "a reply produced after an MCP failure is not a failed turn"
+    assert len(lc.terminal_success) == 1, "the reply must reach on_terminal_success"
+    assert lc.terminal_failures == [], "on_terminal_failure must not fire"
+    assert [f.server_name for f in final.mcp_failures] == ["notion"]
+
+
+async def test_mcp_failure_with_no_output_finalizes_as_failure_naming_the_server() -> None:
+    """MA's `exhausted` means this turn is dead. With nothing produced the
+    turn is a failure, and the error names the server instead of a bare
+    upstream message."""
+    fa = FakeAnthropic()
+    fa.beta.sessions.events.stream_scripts = [
+        [
+            YieldEvent(_mcp_failure_event("e_1")),
+            YieldEvent(make_status_idle(event_id="s_1", stop_reason=make_end_turn())),
+        ]
+    ]
+    lc = RecordingLifecycle()
+
+    final = await run_turn(
+        anthropic=_cast(fa),
+        session_id="sess_1",
+        user_message="hi",
+        lifecycle=lc,
+        cancel=asyncio.Event(),
+        render_interval_s=0.001,
+        now=_now,
+        billing=_EXEMPT,
+    )
+
+    assert final.error is not None and final.error.kind == "upstream"
+    assert "'notion'" in final.error.message, "the failure must name the MCP server"
+    assert "access forbidden" in final.error.message, "MA's detail must survive"
+    assert len(lc.terminal_failures) == 1, "an empty turn after MCP failure is a failure"
