@@ -11,6 +11,7 @@ already is one is refused up front.
 from __future__ import annotations
 
 import ipaddress
+import socket
 from urllib.parse import urlparse
 
 from daimon.core.errors import DaimonError
@@ -25,20 +26,30 @@ class McpUrlError(DaimonError):
 def assert_public_host(url: str, *, what: str = "url") -> str:
     """Refuse a URL with no host, embedded credentials, a local name or a non-public address."""
     parsed = urlparse(url)
-    host = parsed.hostname
+    host = (parsed.hostname or "").rstrip(".")
     if not host:
         raise McpUrlError(f"{what} must name a host: {url}")
     if parsed.username is not None or parsed.password is not None:
         raise McpUrlError(f"{what} must not carry credentials: {url}")
     if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
         raise McpUrlError(f"{what} points at a local name: {url}")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return url
-    if not address.is_global:
+    address = _literal_address(host)
+    if address is not None and not address.is_global:
         raise McpUrlError(f"{what} points at a non-public address: {url}")
     return url
+
+
+def _literal_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address a literal host denotes, including `127.1`, decimal and hex IPv4 forms."""
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:
+        # inet_aton accepts every shorthand the resolver would: no DNS involved.
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host)))
+    except OSError:
+        return None
 
 
 def assert_public_https_url(url: str, *, what: str = "url") -> str:

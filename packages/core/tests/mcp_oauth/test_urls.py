@@ -19,6 +19,11 @@ from daimon.core.mcp_oauth.urls import McpUrlError, assert_public_host, assert_p
         "https://printer.local/mcp",
         "https://user:pw@mcp.notion.com/mcp",
         "https:///mcp",
+        "https://2130706433/",
+        "https://0x7f000001/",
+        "https://127.1/",
+        "https://localhost./",
+        "https://db.internal./",
     ],
 )
 def test_non_public_or_credentialed_urls_are_refused(url: str) -> None:
