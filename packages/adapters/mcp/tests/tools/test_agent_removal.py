@@ -81,14 +81,18 @@ def _spec_agent_router(
     mcp_servers: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     skills: list[dict[str, Any]] | None = None,
+    managed: bool = False,
 ) -> tuple[dict[str, Any], list[str], AsyncAnthropic]:
     """MARouter + fake client for one agent; captures the PATCH body and a
-    request log (method+path) so tests can assert zero requests were issued."""
+    request log (method+path) so tests can assert zero requests were issued.
+    `managed` stamps the reconciler's provenance marker, i.e. a seeded agent."""
     captured: dict[str, Any] = {}
     request_log: list[str] = []
     metadata = {"daimon_tenant": str(tenant_id), "daimon_name": agent_name}
     if account_id is not None:
         metadata["daimon_account"] = str(account_id)
+    if managed:
+        metadata["daimon_managed"] = "true"
 
     def _agent_payload() -> dict[str, Any]:
         return ma_agent(
@@ -145,8 +149,10 @@ async def _make_tenant_with_default_agent(
 # ---------------------------------------------------------------------------
 
 
-async def test_detach_mcp_server_impl_removes_server_and_matching_toolset() -> None:
-    tenant_id = uuid.uuid4()
+async def test_detach_mcp_server_impl_removes_server_and_matching_toolset(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
     account_id = uuid.uuid4()
     captured, _log, client = _spec_agent_router(
         tenant_id=tenant_id,
@@ -170,7 +176,10 @@ async def test_detach_mcp_server_impl_removes_server_and_matching_toolset() -> N
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     result = await _detach_mcp_server_impl(
-        _runtime(client), auth, agent_name="demo", server_name="ctx7"
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="demo",
+        server_name="ctx7",
     )
 
     assert isinstance(result, AgentInfo)
@@ -217,22 +226,100 @@ async def test_detach_mcp_server_impl_rejects_reserved_server_before_any_request
     assert request_log == [], "the reserved-name guard must fire before any agent lookup"
 
 
-async def test_detach_mcp_server_impl_rejects_system_agent_no_daimon_account() -> None:
-    tenant_id = uuid.uuid4()
-    _captured, _log, client = _spec_agent_router(
+async def test_detach_mcp_server_impl_lets_an_admin_detach_from_the_seeded_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The token form attaches to built-in Daimon for any member, so the undo
+    must reach it too: an admin can disconnect a server from the seeded agent
+    (the case a rejected Notion token left stuck)."""
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="daimon")
+    captured, _log, client = _spec_agent_router(
         tenant_id=tenant_id,
         account_id=None,
         agent_name="daimon",
-        mcp_servers=[{"name": "ctx7", "type": "url", "url": "https://ctx7.example/mcp"}],
+        mcp_servers=[{"name": "notion", "type": "url", "url": "https://mcp.notion.com/mcp"}],
+        managed=True,
     )
 
     auth = AuthIdentity(
         account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
     )
-    with pytest.raises(ToolError, match="system agent"):
+    await _detach_mcp_server_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="daimon",
+        server_name="notion",
+    )
+    assert captured.get("mcp_servers") == [], "an admin's detach reaches the seeded agent"
+
+
+async def test_detach_mcp_server_impl_refuses_non_admin_on_the_seeded_agent(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    _captured, request_log, client = _spec_agent_router(
+        tenant_id=tenant_id,
+        account_id=None,
+        agent_name="daimon",
+        mcp_servers=[{"name": "notion", "type": "url", "url": "https://mcp.notion.com/mcp"}],
+        managed=True,
+    )
+
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+    with pytest.raises(ToolError, match="needs a workspace or server admin"):
         await _detach_mcp_server_impl(
-            _runtime(client), auth, agent_name="daimon", server_name="ctx7"
+            _runtime(client, session_factory=db_session_factory),
+            auth,
+            agent_name="daimon",
+            server_name="notion",
         )
+    assert "POST /v1/agents/{id}" not in request_log, "a refused detach issues no update"
+
+
+async def test_detach_mcp_server_impl_forgets_the_shared_token_for_that_url(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A re-attach at the same URL must not silently reuse a token that was
+    just rejected, so the agent-scoped credential row goes with the server."""
+    from cryptography.fernet import Fernet, MultiFernet
+    from daimon.core.agent_mcp_credentials import (
+        resolve_agent_mcp_credentials,
+        save_agent_mcp_credential,
+    )
+
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    account_id = uuid.uuid4()
+    _captured, _log, client = _spec_agent_router(
+        tenant_id=tenant_id,
+        account_id=account_id,
+        agent_name="demo",
+        mcp_servers=[{"name": "notion", "type": "url", "url": "https://mcp.notion.com/mcp/"}],
+    )
+    fernet = MultiFernet([Fernet(Fernet.generate_key())])
+    agent_id = derive_agent_uuid(tenant_id=tenant_id, ma_agent_id="ag_removal")
+    await save_agent_mcp_credential(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        mcp_server_url="https://mcp.notion.com/mcp",
+        plaintext_token="ntn_rejected",
+    )
+
+    auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
+    await _detach_mcp_server_impl(
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="demo",
+        server_name="notion",
+    )
+
+    remaining = await resolve_agent_mcp_credentials(
+        sessionmaker=db_session_factory, fernet=fernet, tenant_id=tenant_id, agent_id=agent_id
+    )
+    assert remaining == (), "the stored token for the detached URL must be gone"
 
 
 async def test_detach_mcp_server_impl_rejects_non_admin_when_agent_reachable(
@@ -248,7 +335,7 @@ async def test_detach_mcp_server_impl_rejects_non_admin_when_agent_reachable(
     )
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.USER, is_admin=False)
-    with pytest.raises(ToolError, match="admin must change"):
+    with pytest.raises(ToolError, match="needs a workspace or server admin"):
         await _detach_mcp_server_impl(
             _runtime(client, session_factory=db_session_factory),
             auth,
@@ -279,8 +366,10 @@ async def test_detach_mcp_server_impl_allows_non_admin_when_agent_unreachable(
     assert captured.get("mcp_servers") == [], "an unreachable agent's detach is not gated"
 
 
-async def test_detach_mcp_server_impl_retries_once_on_version_conflict() -> None:
-    tenant_id = uuid.uuid4()
+async def test_detach_mcp_server_impl_retries_once_on_version_conflict(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
     account_id = uuid.uuid4()
     metadata = {
         "daimon_tenant": str(tenant_id),
@@ -332,7 +421,10 @@ async def test_detach_mcp_server_impl_retries_once_on_version_conflict() -> None
 
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
     result = await _detach_mcp_server_impl(
-        _runtime(client), auth, agent_name="demo", server_name="ctx7"
+        _runtime(client, session_factory=db_session_factory),
+        auth,
+        agent_name="demo",
+        server_name="ctx7",
     )
     assert isinstance(result, AgentInfo)
     assert len(update_calls) == 2, "must retry exactly once after a version conflict"

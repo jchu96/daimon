@@ -41,6 +41,9 @@ from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.operation_policy import TargetFacts, decide_operation, needs_reachability_read
 from daimon.core.stores.agent_files import delete_agent_file, list_agent_files
+from daimon.core.stores.agent_mcp_credentials import (
+    delete_credential as delete_agent_mcp_credential,
+)
 from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -76,11 +79,41 @@ async def _detach_mcp_server_impl(
     agent = await resolve_setup_agent(
         runtime, auth, name=agent_name, expected_ma_agent_id=expected_ma_agent_id
     )
-    _reject_system_agent(agent)
-    await reachability.require_admin_for_reachable_agent(runtime, auth, agent_name=agent_name)
+    # `mcp_remove` sits in `decide_operation`'s attachment family, not the spec
+    # family `_reject_system_agent` enforces: the token form attaches a server
+    # to the seeded agent for any member, and the defaults reconciler unions
+    # whatever foreign servers MA holds, so detaching one can never drift the
+    # seed. Gating removal harder than the attach it undoes is what left a
+    # rejected Notion token stuck on the built-in agent with no way off. An
+    # admin may always detach; a member may detach from an agent nobody has
+    # scoped.
+    is_daimon_managed = agent.metadata.get(MA_METADATA_KEY_MANAGED) == "true"
+    reachable = False
+    if needs_reachability_read(
+        "mcp_remove", is_admin=auth.is_admin, is_daimon_managed=is_daimon_managed
+    ):
+        async with runtime.session_factory() as session:
+            reachable = await is_agent_reachable_in_tenant(
+                session,
+                tenant_id=auth.tenant_id,
+                agent_name=agent_name,
+                default=runtime.deployment_default,
+            )
+    outcome = decide_operation(
+        "mcp_remove",
+        is_admin=auth.is_admin,
+        target=TargetFacts(is_daimon_managed=is_daimon_managed, is_reachable_in_tenant=reachable),
+    )
+    if outcome != "allow":
+        raise ToolError(
+            f"Disconnecting '{server_name}' from '{agent_name}' needs a workspace or server "
+            "admin, and the caller is not one. Tell them an admin can ask Daimon: disconnect "
+            f"{server_name} from {agent_name}. Nothing was changed. Do not retry."
+        )
 
     existing = list(agent.mcp_servers or [])
-    if not any(s.name == server_name for s in existing):
+    target_server = next((s for s in existing if s.name == server_name), None)
+    if target_server is None:
         attached = ", ".join(s.name for s in existing) or "none"
         raise ToolError(
             f"'{server_name}' is not attached to '{agent_name}'. Currently attached: {attached}"
@@ -113,6 +146,17 @@ async def _detach_mcp_server_impl(
         updated = await update_agent_with_version_retry(runtime.client, agent.id, _apply)
     except anthropic.ConflictError as exc:
         raise ToolError("the agent was modified concurrently — please retry the operation") from exc
+    # The shared token the form stored for this URL is mirrored into every
+    # caller's vault at session create; without this delete a re-attach at
+    # the same URL would silently reuse the token that was just rejected.
+    agent_id: uuid.UUID = derive_agent_uuid(tenant_id=auth.tenant_id, ma_agent_id=str(agent.id))
+    async with runtime.session_factory.begin() as session:
+        await delete_agent_mcp_credential(
+            session,
+            tenant_id=auth.tenant_id,
+            agent_id=agent_id,
+            mcp_server_url=target_server.url.rstrip("/"),
+        )
     return await _build_agent_info(runtime.client, updated, tenant_id=auth.tenant_id)
 
 
@@ -260,13 +304,17 @@ def register_agent_removal_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         ],
         expected_ma_agent_id: str | None = None,
     ) -> AgentInfo:
-        """Disconnect an MCP server such as Linear from an agent. Detach the named
-        connection and its tools while preserving other servers and skills; the
-        change reaches the agent on its next message, not the one running now.
+        """Disconnect an MCP server such as Linear or Notion from an agent. Detach
+        the named connection and its tools while preserving other servers and
+        skills, and forget the shared token stored for it; the change reaches the
+        agent on its next message, not the one running now.
 
-        ``attach_mcp_server`` adds public endpoints; ``request_mcp_token`` enrolls
-        authenticated connections. The built-in daimon server cannot be removed.
-        Changing a channel or workspace default needs admin."""
+        ``attach_mcp_server`` adds public endpoints; ``request_mcp_token`` and
+        ``request_mcp_oauth`` enroll authenticated connections. The built-in
+        daimon server cannot be removed. Use this when a connection keeps
+        failing: a server admin can disconnect from any agent, built-in Daimon
+        included; a member can disconnect from an agent that is not a channel or
+        workspace default."""
         return await _detach_mcp_server_impl(
             runtime,
             await _auth(ctx),
