@@ -39,11 +39,31 @@ from aioresponses import aioresponses as AioResponsesMock
 from cryptography.fernet import Fernet
 from daimon.adapters.mcp.auth.resolver import AuthIdentity
 from daimon.adapters.mcp.runtime import McpRuntime
+from daimon.adapters.mcp.tools.agents import (
+    _archive_agent_impl,  # pyright: ignore[reportPrivateUsage]
+    _fork_agent_impl,  # pyright: ignore[reportPrivateUsage]
+)
 from daimon.adapters.mcp.tools.credential_requests import (
     _request_agent_key_impl,  # pyright: ignore[reportPrivateUsage]
     _request_mcp_token_impl,  # pyright: ignore[reportPrivateUsage]
 )
-from daimon.adapters.slack.agent_setup import write as slack_write
+from daimon.adapters.slack.agent_setup.actions import (
+    handle_agent_setup_action,
+    handle_agent_setup_command,
+)
+from daimon.adapters.slack.agent_setup.panel_views import (
+    ACTION_DETAILS,
+    ACTION_EXPAND_KEYS,
+    ACTION_NEW,
+    ACTION_PAGE_NEXT,
+    ACTION_PAGE_PREV,
+    ACTION_ROUTING,
+    CALLBACK_NEW_AGENT,
+)
+from daimon.adapters.slack.agent_setup.submit import (
+    evaluate_new_agent_submission,
+    run_new_agent_submission,
+)
 from daimon.adapters.slack.app import SlackApp
 from daimon.adapters.slack.credential_requests import (
     CRED_CALLBACK_PREFIX,
@@ -53,6 +73,7 @@ from daimon.adapters.slack.credential_requests import (
     run_env_file_credential_submission,
     run_mcp_credential_submission,
 )
+from daimon.adapters.slack.interactions import resolve_web_client
 from daimon.adapters.slack.runtime import SlackRuntime, build_turn_deps
 from daimon.core.config import (
     AnthropicSettings,
@@ -79,7 +100,8 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .cards import CapturedCard, read_slack_card
-from .protocol import parity_account_id
+from .protocol import PanelAction, parity_account_id
+from .views import CapturedView, read_slack_view
 
 _SLACK_API_BASE = "https://slack.com/api"
 _POST_JSON_METHODS: tuple[str, ...] = (
@@ -173,6 +195,37 @@ _DOWNLOAD_URL = "https://files.slack.com/parity/.env"
 _MCP_PUBLIC_URL = "https://mcp.example.com/mcp"
 _MCP_JWT_SECRET = "x" * 32
 
+#: The install the agent-lifecycle tools act as. The fork and archive
+#: scenarios name a tenant directly rather than opening a panel, so the
+#: workspace and the caller are fixed here and only the tenant varies.
+_LIFECYCLE_WORKSPACE_ID = "T_PARITY_LIFECYCLE"
+_LIFECYCLE_USER_ID = "U_PARITY_LIFECYCLE"
+
+_VIEWS_UPDATE_URL = f"{_SLACK_API_BASE}/views.update"
+_VIEWS_PUSH_URL = f"{_SLACK_API_BASE}/views.push"
+
+#: The root view id Slack hands back when the slash command opens the panel,
+#: and the hash every click sends with it.
+_ROOT_VIEW_ID = "V_PARITY_ROOT"
+_PANEL_VIEW_HASH = "H_PARITY_PANEL"
+
+#: The neutral names both drivers rewrite their own ids to, so the routing
+#: sentences the two platforms render can be compared verbatim.
+_ALIAS_CHANNEL = "here"
+_ALIAS_USER = "you"
+
+#: Which Slack action id each `PanelAction` is. "back" has none: Slack pops
+#: the view stack itself, so the reader returns to the root with no click the
+#: panel ever hears about.
+_PANEL_ACTION_IDS: dict[str, str] = {
+    "details": ACTION_DETAILS,
+    "who_answers_where": ACTION_ROUTING,
+    "next_page": ACTION_PAGE_NEXT,
+    "prev_page": ACTION_PAGE_PREV,
+    "new_agent": ACTION_NEW,
+    "expand_keys": ACTION_EXPAND_KEYS,
+}
+
 
 def _register_credential_defaults(mock: AioResponsesMock, *, channel_id: str) -> None:
     """Canned responses for every Slack call the card lifecycle makes.
@@ -240,6 +293,18 @@ class SlackDriver:
     #: One workspace key for the driver's whole life, so the bot token seeded
     #: by the first call is still decryptable by the last.
     _fernet_key: str = field(default_factory=lambda: Fernet.generate_key().decode())
+    #: Every setup-panel screen this driver drew, oldest first.
+    _views: list[CapturedView] = field(default_factory=list[CapturedView])
+    #: The last view body Slack was sent for each view id in the modal stack.
+    _panel_bodies: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
+    #: Which view of that stack is on screen.
+    _panel_view_id: str = _ROOT_VIEW_ID
+    #: Serial for the ids Slack would mint for pushed views.
+    _panel_push_seq: int = 0
+    #: What `users.info` answers about the caller for the panel's lifetime.
+    _panel_is_admin: bool = False
+    #: Platform ids rewritten to neutral names when a screen is read.
+    _panel_aliases: dict[str, str] = field(default_factory=dict[str, str])
 
     def _make_runtime(
         self,
@@ -349,6 +414,42 @@ class SlackDriver:
     def expected_blocked_text(self, kind: Literal["balance", "cap"]) -> str:
         return _BALANCE_BLOCKED_TEXT if kind == "balance" else _CAP_BLOCKED_TEXT
 
+    def _agent_tool_context(
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        *,
+        tenant_id: uuid.UUID,
+    ) -> tuple[McpRuntime, AuthIdentity]:
+        """The runtime and identity the agent lifecycle tools run under.
+
+        Fork and archive are chat operations: the panel dropped both, so the
+        only implementation either platform has left is the MCP tool, and the
+        driver reaches it exactly as a turn would -- with this platform's own
+        `AuthIdentity` and nothing else changed.
+        """
+        anthropic = build_fake_anthropic(router.dispatch)
+        runtime = McpRuntime(
+            session_factory=sessionmaker,
+            client=anthropic,
+            settings=Settings(
+                database=DatabaseSettings(url="postgresql+asyncpg://parity/parity"),  # pyright: ignore[reportArgumentType]  # pydantic coerces the DSN string
+                anthropic=AnthropicSettings(api_key=SecretStr("parity")),
+            ),
+            deployment_default=DeploymentDefault(),
+            fernet=build_multifernet((self._fernet_key,)),
+        )
+        auth = AuthIdentity(
+            account_id=parity_account_id(tenant_id, _LIFECYCLE_USER_ID),
+            tenant_id=tenant_id,
+            role=Role.ADMIN,
+            platform="slack",
+            external_id=_LIFECYCLE_WORKSPACE_ID,
+            platform_user_id=_LIFECYCLE_USER_ID,
+            is_admin=True,
+        )
+        return runtime, auth
+
     async def delete_agent(
         self,
         *,
@@ -357,10 +458,13 @@ class SlackDriver:
         tenant_id: uuid.UUID,
         name: str,
     ) -> None:
-        runtime = self._make_runtime(
-            sessionmaker, router, fernet_key=Fernet.generate_key().decode()
+        runtime, auth = self._agent_tool_context(sessionmaker, router, tenant_id=tenant_id)
+        await _archive_agent_impl(
+            runtime,
+            auth,
+            name=name,
+            expected_ma_agent_id=await _pin_agent(runtime, tenant_id=tenant_id, name=name),
         )
-        await slack_write.delete_agent(runtime, tenant_id=tenant_id, name=name)
 
     async def fork_agent(
         self,
@@ -372,15 +476,14 @@ class SlackDriver:
         new_name: str,
         account_id: uuid.UUID,
     ) -> None:
-        runtime = self._make_runtime(
-            sessionmaker, router, fernet_key=Fernet.generate_key().decode()
-        )
-        await slack_write.fork_agent(
+        del account_id  # the tool stamps the install's own account, not a caller's
+        runtime, auth = self._agent_tool_context(sessionmaker, router, tenant_id=tenant_id)
+        await _fork_agent_impl(
             runtime,
-            tenant_id=tenant_id,
+            auth,
             source_name=source_name,
             new_name=new_name,
-            account_id=account_id,
+            expected_ma_agent_id=await _pin_agent(runtime, tenant_id=tenant_id, name=source_name),
         )
 
     async def purge_account(
@@ -693,6 +796,330 @@ class SlackDriver:
 
     def captured_card_states(self) -> list[str]:
         return [card.state for card in self._cards]
+
+    # -- setup panel --------------------------------------------------------
+    #
+    # Slack's panel is a modal stack: the slash command opens the root, a
+    # navigation click pushes a second view on top of it, and paging and the
+    # Details expansions update whichever view was clicked. The driver keeps
+    # that stack — each view's id and the body Slack was last sent for it — so
+    # a click can carry the `private_metadata` the panel actually wrote, and so
+    # "back" can hand back the root exactly as it stands.
+
+    def _panel_runtime(
+        self, sessionmaker: async_sessionmaker[AsyncSession], router: MARouter
+    ) -> SlackRuntime:
+        """The runtime the panel's reads and renders run against.
+
+        Deliberately not `_make_runtime`: the panel reads the two GitHub facts
+        and the two coding-tool settings off `Settings`, and a MagicMock's
+        truthy attribute would claim a fallback PAT and a configured App this
+        deployment does not have.
+        """
+        settings = MagicMock()
+        settings.crypto.keys = (SecretStr(self._fernet_key),)
+        settings.slack = SlackSettings(
+            signing_secret=SecretStr("parity-signing-secret"),
+            app_token=SecretStr("xapp-parity-test"),
+            max_concurrent_turns_per_tenant=100,
+        )
+        settings.mcp.public_url = _MCP_PUBLIC_URL
+        settings.mcp.jwt_secret = SecretStr(_MCP_JWT_SECRET)
+        settings.mcp.app_root_url = None
+        settings.github.fallback_pat = None
+        settings.github.app_id = None
+        settings.github.app_private_key = None
+        settings.github.oauth_scopes = ()
+        settings.defaults_root = MagicMock()
+        settings.billing.markup = Decimal("1.0")
+        anthropic = build_fake_anthropic(router.dispatch)
+        deployment_default = DeploymentDefault()
+        resolver_cache = new_resolver_cache()
+        return SlackRuntime(
+            settings=settings,
+            anthropic=anthropic,
+            sessionmaker=sessionmaker,
+            billing_config=None,
+            http_client=MagicMock(spec=httpx.AsyncClient),
+            resolver_cache=resolver_cache,
+            turn_deps=build_turn_deps(
+                settings,
+                anthropic,
+                sessionmaker,
+                deployment_default=deployment_default,
+                resolver_cache=resolver_cache,
+                billing_config=None,
+            ),
+            deployment_default=deployment_default,
+        )
+
+    def _register_panel_defaults(
+        self, mock: AioResponsesMock, *, channel_id: str, is_admin: bool
+    ) -> None:
+        """Every Slack call the panel makes, answered the way the scenario set it.
+
+        `users.info` is the only source of the caller's role — the panel
+        re-reads it on every click rather than trusting the rendered view — so
+        `is_admin` is faked here and never handed to the handler.
+        """
+        mock.get(  # pyright: ignore[reportUnknownMemberType]  # aioresponses has no type stubs
+            _USERS_INFO_PATTERN,
+            payload={
+                "ok": True,
+                "user": {
+                    "is_admin": is_admin,
+                    "is_owner": False,
+                    "is_primary_owner": False,
+                    "is_restricted": False,
+                    "is_ultra_restricted": False,
+                },
+            },
+            repeat=True,
+        )
+        mock.get(  # pyright: ignore[reportUnknownMemberType]
+            _CONVERSATIONS_INFO_PATTERN,
+            payload={
+                "ok": True,
+                "channel": {
+                    "id": channel_id,
+                    "is_private": False,
+                    "is_im": False,
+                    "is_mpim": False,
+                },
+            },
+            repeat=True,
+        )
+        for url in (_VIEWS_OPEN_URL, _VIEWS_UPDATE_URL, _VIEWS_PUSH_URL):
+            mock.post(  # pyright: ignore[reportUnknownMemberType]
+                url,
+                payload={"ok": True, "view": {"id": _ROOT_VIEW_ID, "hash": _PANEL_VIEW_HASH}},
+                repeat=True,
+            )
+        for url in (_CHAT_POST_MESSAGE_URL, _CHAT_UPDATE_URL, _CHAT_EPHEMERAL_URL):
+            mock.post(  # pyright: ignore[reportUnknownMemberType]
+                url,
+                payload={"ok": True, "ts": _POSTED_MESSAGE_TS, "channel": channel_id},
+                repeat=True,
+            )
+
+    def _remember_view(self, view_id: str, view: dict[str, Any]) -> None:
+        if not view:
+            return
+        self._panel_bodies[view_id] = view
+        self._views.append(read_slack_view(view, aliases=self._panel_aliases))
+
+    def _absorb_views(self, mock: AioResponsesMock) -> None:
+        """Fold every view Slack was sent during one call into the stack.
+
+        Opens land on the root, pushes take a new id and become the view on
+        screen, and an update rewrites whichever view it names.
+        """
+        for body in _bodies_for(mock, _VIEWS_OPEN_URL):
+            self._remember_view(_ROOT_VIEW_ID, cast(dict[str, Any], body.get("view") or {}))
+            self._panel_view_id = _ROOT_VIEW_ID
+        for body in _bodies_for(mock, _VIEWS_PUSH_URL):
+            self._panel_push_seq += 1
+            view_id = f"V_PARITY_PUSH_{self._panel_push_seq}"
+            self._remember_view(view_id, cast(dict[str, Any], body.get("view") or {}))
+            self._panel_view_id = view_id
+        for body in _bodies_for(mock, _VIEWS_UPDATE_URL):
+            view_id = str(body.get("view_id") or self._panel_view_id)
+            self._remember_view(view_id, cast(dict[str, Any], body.get("view") or {}))
+
+    def _current_view(self) -> CapturedView:
+        body = self._panel_bodies.get(self._panel_view_id)
+        if body is None:
+            raise AssertionError("the panel drew nothing on the view that was clicked")
+        return read_slack_view(body, aliases=self._panel_aliases)
+
+    async def open_setup_panel(
+        self,
+        *,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        tenant_id: uuid.UUID,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+        is_admin: bool,
+    ) -> CapturedView:
+        del tenant_id  # the handler derives it from the team id, as production does
+        await self._seed_bot_token(sessionmaker, workspace_id)
+        self._panel_is_admin = is_admin
+        self._panel_aliases = {channel_id: _ALIAS_CHANNEL, user_id: _ALIAS_USER}
+        runtime = self._panel_runtime(sessionmaker, router)
+        with AioResponsesMock() as mock:
+            self._register_panel_defaults(mock, channel_id=channel_id, is_admin=is_admin)
+            await handle_agent_setup_command(
+                runtime,
+                {
+                    "team_id": workspace_id,
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                    "trigger_id": _TRIGGER_ID,
+                },
+            )
+            self._absorb_views(mock)
+        return self._current_view()
+
+    def _panel_action_payload(
+        self,
+        *,
+        action_id: str,
+        value: str | None,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        view = self._panel_bodies.get(self._panel_view_id)
+        if view is None:
+            raise AssertionError("open_setup_panel must run before a click")
+        action: dict[str, Any] = {"action_id": action_id}
+        if value is not None:
+            action["value"] = value
+        return {
+            "type": "block_actions",
+            "team": {"id": workspace_id},
+            "user": {"id": user_id},
+            "channel": {"id": channel_id},
+            "trigger_id": _TRIGGER_ID,
+            "response_url": "https://hooks.slack.test/actions/response",
+            "actions": [action],
+            "view": {
+                "id": self._panel_view_id,
+                "hash": _PANEL_VIEW_HASH,
+                "private_metadata": view.get("private_metadata") or "",
+            },
+        }
+
+    async def click_panel_action(
+        self,
+        *,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        tenant_id: uuid.UUID,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+        action: PanelAction,
+        agent_name: str | None = None,
+    ) -> CapturedView:
+        del tenant_id
+        if action == "back":
+            # Slack pops its own stack; the reader lands back on the root view
+            # exactly as the panel last drew it, with no round trip.
+            self._panel_view_id = _ROOT_VIEW_ID
+            restored = self._current_view()
+            self._views.append(restored)
+            return restored
+        if action == "details" and agent_name is None:
+            raise ValueError("action='details' needs the agent whose row was clicked")
+        action_id = _PANEL_ACTION_IDS[action]
+        payload = self._panel_action_payload(
+            action_id=action_id,
+            value=agent_name if action == "details" else None,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            user_id=user_id,
+        )
+        runtime = self._panel_runtime(sessionmaker, router)
+        with AioResponsesMock() as mock:
+            self._register_panel_defaults(
+                mock, channel_id=channel_id, is_admin=self._panel_is_admin
+            )
+            await handle_agent_setup_action(runtime, payload)
+            self._absorb_views(mock)
+        return self._current_view()
+
+    async def submit_new_agent(
+        self,
+        *,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        tenant_id: uuid.UUID,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+        name: str,
+        purpose: str | None,
+        model: str,
+    ) -> CapturedView:
+        del tenant_id
+        form = self._panel_bodies.get(self._panel_view_id)
+        if form is None:
+            raise AssertionError("click_panel_action(action='new_agent') must run first")
+        payload: dict[str, Any] = {
+            "type": "view_submission",
+            "team": {"id": workspace_id},
+            "user": {"id": user_id},
+            "view": {
+                "id": self._panel_view_id,
+                "callback_id": CALLBACK_NEW_AGENT,
+                "private_metadata": form.get("private_metadata") or "",
+                "state": {
+                    "values": {
+                        "new_agent__name": {
+                            "new_agent__name": {"type": "plain_text_input", "value": name}
+                        },
+                        "new_agent__prompt": {
+                            "new_agent__prompt": {
+                                "type": "plain_text_input",
+                                "value": purpose or "",
+                            }
+                        },
+                        "new_agent__model": {
+                            "new_agent__model": {
+                                "type": "static_select",
+                                "selected_option": {"value": model},
+                            }
+                        },
+                    }
+                },
+            },
+        }
+        decision = evaluate_new_agent_submission(payload)
+        if not decision.proceed or decision.panel_meta is None:
+            raise AssertionError(f"the form refused the submission: {decision.response_payload}")
+        runtime = self._panel_runtime(sessionmaker, router)
+        with AioResponsesMock() as mock:
+            self._register_panel_defaults(
+                mock, channel_id=channel_id, is_admin=self._panel_is_admin
+            )
+            client = await resolve_web_client(runtime, team_id=workspace_id)
+            if client is None:
+                raise AssertionError("no bot token for the panel's workspace")
+            await run_new_agent_submission(
+                runtime,
+                client,
+                team_id=workspace_id,
+                user_id=user_id,
+                channel_id=channel_id,
+                view_id=self._panel_view_id,
+                meta=decision.panel_meta,
+                name=name,
+                purpose=purpose,
+                model=model,
+            )
+            self._absorb_views(mock)
+        return self._current_view()
+
+    def captured_views(self) -> list[CapturedView]:
+        return list(self._views)
+
+
+async def _pin_agent(runtime: McpRuntime, *, tenant_id: uuid.UUID, name: str) -> str:
+    """The MA id the tool must be handed to act on `name`.
+
+    `resolve_setup_agent` refuses a platform call that names an agent without
+    pinning its identity, which is the whole point of the guard: a namesake
+    recreated since the caller last looked must not be adopted silently. A
+    real turn passes the id off the roster it just listed; this does the same
+    read.
+    """
+    agents = await find_agents_by_daimon_tag(runtime.client, tenant_id=tenant_id, name=name)
+    if not agents:
+        raise AssertionError(f"the router serves no agent named {name!r}")
+    return agents[0].id
 
 
 async def _no_dispatch() -> None:

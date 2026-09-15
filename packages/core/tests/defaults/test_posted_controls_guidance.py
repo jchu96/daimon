@@ -200,6 +200,29 @@ def test_reply_shape_keeps_tool_names_out_of_the_reply() -> None:
         )
 
 
+def test_guidance_drops_editor_era_and_duplicate_routing_phrases() -> None:
+    """Setup-orientation repetition audit (PR 4).
+
+    The read-only panel's New agent form lands on Details — there is no
+    separate success screen to name — and a newly created or forked agent's
+    routing state is relayed from the tool's own ``answering`` field rather
+    than restated in independently worded prose.
+    """
+    combined = _daimon_system() + "\n" + _workspace_setup_body()
+    for phrase in ("new-agent success control", "Creation alone does not route mentions"):
+        assert phrase not in combined, f"guidance still contains the removed phrase {phrase!r}"
+
+
+def test_daimon_system_skips_orientation_after_the_setup_opener() -> None:
+    """The setup thread's opener already gives identity and next steps; the
+    general unconfigured-workspace orientation must not repeat it."""
+    system = _daimon_system()
+    assert "setup opener already introduced you" in system, (
+        "daimon.yaml must tell the model to skip the general orientation when "
+        "the setup conversation opener already covered it"
+    )
+
+
 def test_reply_shape_forbids_describing_a_form_that_was_not_posted() -> None:
     """D24-QA-06: the agent told the person about a key-request form it never posted."""
     for label, section in _reply_shape_sections():

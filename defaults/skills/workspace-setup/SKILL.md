@@ -119,8 +119,8 @@ and `delete_skill` are admin-only.
 When creating an agent and no model was requested, use the built-in Daimon's
 model, read through `get_agent`, as the fallback and state that choice.
 Confirm the new name and model, carry its returned identity into subsequent
-setup, and say whether it answers anywhere. Creation alone does not route
-mentions to the new agent.
+setup, and post the returned `answering` field verbatim — it already says
+whether the new agent is routed anywhere and what to do next.
 
 ## Permissions and refusals
 
@@ -150,7 +150,7 @@ it. Give a reachable handoff carrying the target and action, for example:
 channel.’” If no agent answers in the current channel, name the existing
 `/agent-setup` entry rather than telling the person to talk to an unreachable
 agent. Both members and admins can use **💬 Set up with Daimon** in `/agent-setup`,
-including from a selected agent's Details or the new-agent success control.
+including from a selected agent's Details.
 
 An operator-only problem needs the person running the deployment, not a
 workspace admin. Name the blocker and the requested fix without exposing

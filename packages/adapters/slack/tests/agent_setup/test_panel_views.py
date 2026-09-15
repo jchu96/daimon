@@ -469,6 +469,27 @@ def test_details_view_when_unrouted_shows_note(is_admin: bool) -> None:
     expected_lead = "Tell Daimon:" if is_admin else "An admin can tell Daimon:"
     assert expected_lead in rendered, "the next step is phrased in the reader's own voice"
     assert f"<#{_CHANNEL_ID}>" in rendered, "the request names the channel as a live mention"
+    assert rendered.count(UNROUTED_LINE) == 1, (
+        "the fact is stated once, in the body — the header says nothing about routing"
+    )
+
+
+def test_details_view_orders_sections_model_repo_keys_skills_then_mcp() -> None:
+    """Details reads top to bottom the way it does on the other platform."""
+    view = build_details_view(
+        _details(files=[_agent_file("TOGGL_TOKEN")], binding=_binding()),
+        meta=_meta(),
+        is_admin=True,
+        coding_tools_available=True,
+        channel_id=_CHANNEL_ID,
+        attribution=None,
+    )
+    rendered = _joined(view)
+    headings = ["*Model*", "*Working repo*", "*Keys*", "*Skills*", "*MCP servers*"]
+    positions = [rendered.index(heading) for heading in headings]
+    assert positions == sorted(positions), (
+        f"Details must read {' → '.join(headings)}, not {rendered}"
+    )
 
 
 def test_details_view_never_renders_key_values() -> None:

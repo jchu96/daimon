@@ -44,7 +44,11 @@ from daimon.core.routing_facts import (
     build_routing_request,
 )
 from daimon.core.scope import AnsweringPlace, ConfigTier
-from daimon.core.setup_conversations import EMPTY_ROSTER_COPY, shared_keys_sentence
+from daimon.core.setup_conversations import (
+    CODING_TOOLS_HINT,
+    EMPTY_ROSTER_COPY,
+    shared_keys_sentence,
+)
 
 __all__ = [
     "ACTION_CODING_TOOLS",
@@ -149,10 +153,6 @@ NEW_AGENT_LABEL: Final = "➕ New agent"
 ROUTING_LABEL: Final = "📍 Who answers where"
 CODING_TOOLS_LABEL: Final = "🧰 Use from your coding tools"
 
-CODING_TOOLS_NOTE: Final = (
-    "Use from your coding tools: get a token with the button below, then run the "
-    "claude mcp add command it gives you."
-)
 CODING_TOOLS_UNAVAILABLE_NOTE: Final = "Coding-tool access is not configured for this deployment."
 
 _TIER_PHRASES: Final[dict[ConfigTier, str]] = {
@@ -395,17 +395,17 @@ def build_details_view(
                     "type": "mrkdwn",
                     "text": _clip(f"*Model*\n{escape_mrkdwn(details.model_display_name)}"),
                 },
-                {"type": "mrkdwn", "text": _clip(_skills_text(details))},
             ],
         }
     )
-    blocks.extend(_keys_blocks(details, meta=meta))
     blocks.extend(_repo_blocks(details))
+    blocks.extend(_keys_blocks(details, meta=meta))
+    blocks.append(_section(_skills_text(details)))
     blocks.append(_section(_mcp_servers_text(details)))
     if details.unrouted_note is not None:
         blocks.append(_section(escape_mrkdwn_preserving_mentions(details.unrouted_note)))
     blocks.append(
-        _context(CODING_TOOLS_NOTE if coding_tools_available else CODING_TOOLS_UNAVAILABLE_NOTE)
+        _context(CODING_TOOLS_HINT if coding_tools_available else CODING_TOOLS_UNAVAILABLE_NOTE)
     )
     blocks.append({"type": "divider"})
     elements = _setup_elements(details.ma_agent_id)
@@ -432,11 +432,17 @@ def build_details_view(
 
 
 def _details_header(details: AgentDetails, *, attribution: str | None) -> list[str]:
+    """Attribution, and where the agent answers when it answers anywhere.
+
+    An unrouted agent says nothing here: `details.unrouted_note` states that in
+    the body, and a header line would make the reader read it twice.
+    """
     parts: list[str] = []
     if attribution is not None:
         parts.append(f"made by {attribution}")
     labels = _place_labels(details.answers_in)
-    parts.append(f"answers in {', '.join(labels)}" if labels else UNROUTED_LINE)
+    if labels:
+        parts.append(f"answers in {', '.join(labels)}")
     return parts
 
 
