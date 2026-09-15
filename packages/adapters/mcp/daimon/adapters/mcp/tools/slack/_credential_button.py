@@ -36,6 +36,7 @@ from daimon.adapters.mcp.tools.slack._client import (
     slack_web_client,
 )
 from daimon.adapters.mcp.tools.slack._visibility import check_channel_access
+from daimon.core.continuity.messages import ConfigurationChange
 from daimon.core.credential_requests import (
     CredentialRequestKind,
     split_skill_repo_target,
@@ -43,11 +44,13 @@ from daimon.core.credential_requests import (
 from daimon.core.github_repo_auth import normalize_owner_repo
 from daimon.core.posted_controls import (
     CardKind,
+    CardState,
     build_card_blocks,
     build_posted_card,
     card_notification_text,
 )
 from daimon.core.stores.domain import CredentialRequestRow
+from daimon.core.stores.tenants import get_tenant
 from fastmcp.exceptions import ToolError
 from slack_sdk.errors import SlackApiError
 
@@ -122,6 +125,48 @@ async def _post_slack_credential_button_impl(  # pyright: ignore[reportUnusedFun
         code = str(err.response.get("error", "slack_api_error"))  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # slack_sdk response is dict-like
         raise ToolError(f"posting to the channel failed ({code})") from err
     return str(sent.get("ts") or "")  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+
+
+async def edit_card_state_for_tenant(
+    runtime: McpRuntime,
+    *,
+    row: CredentialRequestRow,
+    state: CardState,
+    outcome: ConfigurationChange | None = None,
+) -> None:
+    """Edit one card into `state` with no caller identity at hand. Never raises.
+
+    The OAuth callback has a row and a tenant, not an `AuthIdentity`; a Slack
+    tenant's `external_id` is its team id, which is all the web client needs.
+    """
+    if row.posted_message_id is None:
+        return
+    async with runtime.session_factory() as session:
+        tenant = await get_tenant(session, row.tenant_id)
+    if tenant is None or tenant.platform != "slack":
+        return
+    card = build_posted_card(
+        kind=cast("CardKind", row.kind),
+        state=state,
+        agent_name=row.target_name or "the agent",
+        responder_name=row.responder_name or "Daimon",
+        target=row.target,
+        requester_platform_user_id=row.requester_platform_user_id,
+        expires_at=row.expires_at,
+        token=row.token,
+        mcp_server_url=row.mcp_server_url,
+        outcome=outcome,
+    )
+    try:
+        client = await slack_web_client(runtime, team_id=tenant.external_id)
+        await client.chat_update(  # pyright: ignore[reportUnknownMemberType]
+            channel=row.parent_channel_id or row.channel_id,
+            ts=row.posted_message_id,
+            text=card_notification_text(card),
+            blocks=build_card_blocks(card),
+        )
+    except (SlackApiError, ToolError) as err:
+        _log.warning("posted_card.edit_failed", kind=row.kind, state=state, error=str(err)[:200])
 
 
 async def edit_card_replaced(

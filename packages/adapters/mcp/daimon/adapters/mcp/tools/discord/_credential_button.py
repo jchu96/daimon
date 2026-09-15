@@ -43,12 +43,13 @@ from daimon.adapters.mcp.tools.discord._visibility import (
     _check_send_permission,  # pyright: ignore[reportPrivateUsage]
     _ensure_thread_parent_cached,  # pyright: ignore[reportPrivateUsage]
 )
+from daimon.core.continuity.messages import ConfigurationChange
 from daimon.core.credential_requests import (
     CredentialRequestKind,
     split_skill_repo_target,
 )
 from daimon.core.github_repo_auth import normalize_owner_repo
-from daimon.core.posted_controls import CardKind, build_posted_card
+from daimon.core.posted_controls import CardKind, CardState, build_posted_card
 from daimon.core.stores.domain import CredentialRequestRow
 from fastmcp.exceptions import ToolError
 
@@ -135,6 +136,47 @@ async def _post_credential_button_impl(  # pyright: ignore[reportUnusedFunction]
             ),
         )
         return str(sent.id)
+
+
+async def edit_card_state(
+    runtime: McpRuntime,
+    *,
+    row: CredentialRequestRow,
+    state: CardState,
+    outcome: ConfigurationChange | None = None,
+) -> None:
+    """Edit one card into `state` from the mcp process. Never raises.
+
+    The OAuth callback lands here rather than in the bot process, so the
+    card's final state has to be written from this side. Same feedback-only
+    contract as `edit_card_replaced`: the durable outcome is already recorded
+    when this runs.
+    """
+    if row.origin_thread_id is None or row.posted_message_id is None:
+        return
+    card = build_posted_card(
+        kind=cast("CardKind", row.kind),
+        state=state,
+        agent_name=row.target_name or "the agent",
+        responder_name=row.responder_name or "Daimon",
+        target=row.target,
+        requester_platform_user_id=row.requester_platform_user_id,
+        expires_at=row.expires_at,
+        token=row.token,
+        mcp_server_url=row.mcp_server_url,
+        outcome=outcome,
+    )
+    view = build_card_view(card)
+    async with rest_client(_require_bot_token(runtime)) as c:
+        message = c.get_partial_messageable(int(row.origin_thread_id)).get_partial_message(
+            int(row.posted_message_id)
+        )
+        try:
+            await message.edit(view=view, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as err:
+            _log.warning(
+                "posted_card.edit_failed", err_type=type(err).__name__, kind=row.kind, state=state
+            )
 
 
 async def edit_card_replaced(runtime: McpRuntime, *, row: CredentialRequestRow) -> None:

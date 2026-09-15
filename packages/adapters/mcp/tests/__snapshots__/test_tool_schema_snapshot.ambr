@@ -1667,13 +1667,17 @@
     }),
     'detach_mcp_server': dict({
       'description': '''
-        Disconnect an MCP server such as Linear from an agent. Detach the named
-        connection and its tools while preserving other servers and skills; the
-        change reaches the agent on its next message, not the one running now.
+        Disconnect an MCP server such as Linear or Notion from an agent. Detach
+        the named connection and its tools while preserving other servers and
+        skills, and forget the shared token stored for it; the change reaches the
+        agent on its next message, not the one running now.
         
-        ``attach_mcp_server`` adds public endpoints; ``request_mcp_token`` enrolls
-        authenticated connections. The built-in daimon server cannot be removed.
-        Changing a channel or workspace default needs admin.
+        ``attach_mcp_server`` adds public endpoints; ``request_mcp_token`` and
+        ``request_mcp_oauth`` enroll authenticated connections. The built-in
+        daimon server cannot be removed. Use this when a connection keeps
+        failing: a server admin can disconnect from any agent, built-in Daimon
+        included; a member can disconnect from an agent that is not a channel or
+        workspace default.
       ''',
       'parameters': dict({
         'additionalProperties': False,
@@ -3084,10 +3088,77 @@
         'type': 'object',
       }),
     }),
+    'request_mcp_oauth': dict({
+      'description': '''
+        Connect an agent to an MCP server that signs people in through the browser,
+        such as Notion, Slack or Atlassian. Each person connects their own account:
+        the grant is theirs alone, and other members connect separately when asked.
+        
+        Use ``request_mcp_token`` for servers that take a pasted bearer token and
+        ``attach_mcp_server`` for public servers. Members can use this on shared
+        agents and built-in Daimon; the admin and fork gates for direct spec edits
+        do not apply.
+        
+        Posts a requester-only card; its button opens a private sign-in link that
+        expires in ten minutes. Finishing sign-in stores the grant for that person
+        and attaches the server to the agent, not this session's toolset. Check
+        tool availability before promising use here. Pass the waiting task as
+        `pending_task` so it resumes after the connection is made.
+      ''',
+      'parameters': dict({
+        'additionalProperties': False,
+        'properties': dict({
+          'agent_name': dict({
+            'type': 'string',
+          }),
+          'channel_id': dict({
+            'description': 'Compatibility field; origin controls the posting destination.',
+            'type': 'string',
+          }),
+          'expected_ma_agent_id': dict({
+            'type': 'string',
+          }),
+          'origin_context_id': dict({
+            'type': 'string',
+          }),
+          'pending_task': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': "The work that should run once the value is saved, in the person's words — a script, a file, a question. Omit it when they only asked to save or replace the key; the request itself is never a task.",
+          }),
+          'server_name': dict({
+            'description': 'Connection name; reusing a name replaces that server entry.',
+            'type': 'string',
+          }),
+          'url': dict({
+            'description': 'MCP endpoint URL that signs people in through OAuth, e.g. https://mcp.notion.com/mcp.',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'agent_name',
+          'server_name',
+          'url',
+          'channel_id',
+          'origin_context_id',
+          'expected_ma_agent_id',
+        ]),
+        'type': 'object',
+      }),
+    }),
     'request_mcp_token': dict({
       'description': '''
-        Connect an agent such as research-bot to Linear, Notion or GitHub through
-        an MCP endpoint with a bearer token, not browser OAuth.
+        Connect an agent such as research-bot to Linear or GitHub through an MCP
+        endpoint with a bearer token, not browser OAuth. For a server that only
+        signs people in through a browser (Notion, Slack, Atlassian) use
+        ``request_mcp_oauth`` instead; such servers reject a pasted key.
         Match supported authentication; an API key is not automatically an MCP token.
         
         Use ``attach_mcp_server`` for public servers without tokens. Never accept

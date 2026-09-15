@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -72,6 +73,9 @@ _request_agent_key_impl = (
 )
 _request_mcp_token_impl = (
     _credential_requests_mod._request_mcp_token_impl  # pyright: ignore[reportPrivateUsage]
+)
+_request_mcp_oauth_impl = (
+    _credential_requests_mod._request_mcp_oauth_impl  # pyright: ignore[reportPrivateUsage]
 )
 _request_repo_binding_impl = (
     _credential_requests_mod._request_repo_binding_impl  # pyright: ignore[reportPrivateUsage]
@@ -496,6 +500,72 @@ async def test_request_mcp_token_creates_row_and_posts_button(
     assert row is not None, "the minted token must resolve to the created row"
     assert row.kind == "mcp"
     assert row.mcp_server_url == "https://mcp.linear.app/sse", "mcp rows must carry the server url"
+
+
+async def test_request_mcp_oauth_creates_an_oauth_row_and_posts_the_connect_card(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    client = _ma_client_with_agents(
+        [_ma_agent(agent_id="ag_mcp", name="daimon", tenant_id=tenant.id)]
+    )
+    runtime = _runtime(committing_sessionmaker, client=client)
+    auth = _auth_identity(tenant_id=tenant.id)
+    await make_account(db_session, tenant=tenant, id=auth.account_id)
+    await db_session.commit()
+    async with committing_sessionmaker.begin() as session:
+        origin = await create_origin(
+            session,
+            tenant_id=tenant.id,
+            account_id=auth.account_id,
+            platform="discord",
+            parent_channel_id="1111",
+            thread_id="222",
+            responder_ma_agent_id="ag_daimon",
+            responder_name="Daimon",
+            configuration_target_ma_agent_id=None,
+            configuration_target_name=None,
+            role=auth.role,
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            now=datetime.now(UTC),
+        )
+    posted: dict[str, Any] = {}
+    _patch_successful_post(monkeypatch, message_id="9303", posted=posted)
+
+    result = await _request_mcp_oauth_impl(
+        runtime,
+        auth,
+        origin_context_id=str(origin.id),
+        expected_ma_agent_id="ag_mcp",
+        agent_name="daimon",
+        server_name="notion",
+        url="https://mcp.notion.com/mcp/",
+        channel_id="222",
+    )
+
+    assert result.kind == "mcp_oauth" and result.target == "notion"
+    row = await peek_credential_request(db_session, token=_token_from_posted(posted))
+    assert row is not None and row.kind == "mcp_oauth"
+    assert row.mcp_server_url == "https://mcp.notion.com/mcp", "the url is stored without its slash"
+    assert "Connect my account" in json.dumps(posted, default=str), (
+        "the card offers a sign-in, not a token form"
+    )
+
+
+async def test_request_mcp_oauth_refuses_a_plain_http_server() -> None:
+    runtime = _runtime(MagicMock())
+    with pytest.raises(ToolError, match="https"):
+        await _request_mcp_oauth_impl(
+            runtime,
+            _auth_identity(),
+            agent_name="daimon",
+            server_name="notion",
+            url="http://mcp.notion.com/mcp",
+            channel_id="222",
+        )
 
 
 # ---------------------------------------------------------------------------
