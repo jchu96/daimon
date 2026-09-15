@@ -30,7 +30,7 @@ _INITIALIZE_BODY = {
         "clientInfo": {"name": "daimon", "version": "0"},
     },
 }
-_RESOURCE_METADATA_RE = re.compile(r'resource_metadata="([^"]+)"')
+_RESOURCE_METADATA_RE = re.compile(r'resource_metadata="([^"]+)"', re.IGNORECASE)
 
 
 class McpOAuthDiscoveryError(DaimonError):
@@ -91,9 +91,20 @@ async def probe_mcp_server(
 
 
 def protected_resource_urls(mcp_server_url: str, advertised: str | None) -> list[str]:
+    """The metadata documents to try, in spec order.
+
+    The URL a 401 advertises is honoured only on the MCP server's own host
+    over https: RFC 9728 derives the document from the resource itself, and
+    fetching an arbitrary advertised URL from inside the deployment would be a
+    blind request to wherever a hostile server pointed.
+    """
     parsed = urlparse(mcp_server_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    urls = [advertised] if advertised else []
+    urls: list[str] = []
+    if advertised:
+        hinted = urlparse(advertised)
+        if hinted.scheme == "https" and hinted.netloc == parsed.netloc:
+            urls.append(advertised)
     if parsed.path and parsed.path != "/":
         urls.append(urljoin(base, f"/.well-known/oauth-protected-resource{parsed.path}"))
     urls.append(urljoin(base, "/.well-known/oauth-protected-resource"))

@@ -41,6 +41,14 @@ def test_protected_resource_urls_put_the_advertised_url_first_then_path_then_roo
     ], "WWW-Authenticate wins, then the path-aware document, then the root one"
 
 
+def test_protected_resource_urls_ignore_an_advertised_url_off_the_servers_host() -> None:
+    """A hostile 401 must not steer the deployment into fetching an arbitrary URL."""
+    for advertised in ("https://evil.example/.well-known/x", "http://mcp.notion.com/.well-known/x"):
+        urls = protected_resource_urls(_MCP_URL, advertised)
+        assert advertised not in urls, advertised
+        assert urls[0] == "https://mcp.notion.com/.well-known/oauth-protected-resource/mcp"
+
+
 def test_authorization_server_urls_are_path_aware_for_an_issuer_with_a_path() -> None:
     urls = authorization_server_urls("https://auth.example.com/tenant")
     assert urls[0] == "https://auth.example.com/.well-known/oauth-authorization-server/tenant"
