@@ -69,7 +69,7 @@ CardState = Literal[
 ]
 #: `env_file` is a bulk upload of one .env file; the other four match the
 #: single-value request kinds in `daimon.core.credential_requests`.
-CardKind = Literal["env", "env_file", "mcp", "repo", "skill_repo"]
+CardKind = Literal["env", "env_file", "mcp", "mcp_oauth", "repo", "skill_repo"]
 RefusalReason = Literal[
     "admin_required",
     "replacement_admin_required",
@@ -107,6 +107,7 @@ _BUTTON_LABEL: Final[dict[CardKind, str]] = {
     "env": "🔐 Enter it privately",
     "env_file": "🔐 Upload it privately",
     "mcp": "🔐 Enter the token privately",
+    "mcp_oauth": "🔗 Connect my account",
     "repo": "🔐 Use my GitHub token",
     "skill_repo": "🔐 Use my GitHub token",
 }
@@ -247,6 +248,16 @@ def _requested_content(
                 f"Anyone who talks to {agent_name} can use this connection.",
             ),
         )
+    if kind == "mcp_oauth":
+        if mcp_server_url is None:
+            raise ValueError("kind='mcp_oauth' requires mcp_server_url")
+        return (
+            f"🔌 Connect {agent_name} to {target} with your account",
+            (
+                f"{mcp_server_url} signs you in through your browser.",
+                "Only you can use your connection; others connect their own.",
+            ),
+        )
     if branch is None:
         raise ValueError(f"kind={kind!r} requires branch")
     branch_line = f"Branch `{branch}`."
@@ -290,7 +301,7 @@ def _expired_fact(
         phrase = f"add {target} to {agent_name}"
     elif kind == "env_file":
         phrase = f"add keys to {agent_name} from a file"
-    elif kind == "mcp":
+    elif kind in ("mcp", "mcp_oauth"):
         phrase = f"connect {agent_name} to {target}"
     elif kind == "repo":
         phrase = f"give {agent_name} access to {repo_display}"

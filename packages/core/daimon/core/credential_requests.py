@@ -26,7 +26,9 @@ environment variable's key name, for `env_file` it is the fixed
 `ENV_FILE_TARGET` sentinel (a whole-file import names no single key, and the
 column is NOT NULL), for `mcp` it is the MCP server name, and for `repo` and
 `skill_repo` it is the repo URL, optionally packed with a branch and path by
-`build_skill_repo_target`.
+`build_skill_repo_target`. `mcp_oauth` carries the MCP server name like
+`mcp`, but its click starts a per-person browser authorization instead of
+opening a token form.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ TOKEN_BYTES: Final[int] = 16
 CUSTOM_ID_TEMPLATE: Final[str] = r"ztc:(?P<token>[A-Za-z0-9_-]{16,64})"
 CUSTOM_ID_PATTERN: Final[re.Pattern[str]] = re.compile(CUSTOM_ID_TEMPLATE)
 
-CredentialRequestKind = Literal["env", "env_file", "mcp", "repo", "skill_repo"]
+CredentialRequestKind = Literal["env", "env_file", "mcp", "mcp_oauth", "repo", "skill_repo"]
 
 # How a request actually ended, recorded on the row once it is spent.
 # "applied" — the write landed. "stale_replacement" — the compare-and-set
@@ -89,6 +91,7 @@ _KIND_LABEL_PREFIX: Final[dict[CredentialRequestKind, str]] = {
     "env": "Add key: ",
     "env_file": "Add keys from ",
     "mcp": "Add MCP token: ",
+    "mcp_oauth": "Connect your account: ",
     "repo": "Set working repo: ",
     "skill_repo": "Import skills from: ",
 }

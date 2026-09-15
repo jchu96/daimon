@@ -33,7 +33,7 @@ EXPIRES = datetime(2026, 9, 14, 17, 30, tzinfo=UTC)
 TOKEN = "vJ8xQ2mZ1pKd7nRb3sTyLw"
 MCP_URL = "https://mcp.linear.app/sse"
 
-KINDS: tuple[CardKind, ...] = ("env", "env_file", "mcp", "repo", "skill_repo")
+KINDS: tuple[CardKind, ...] = ("env", "env_file", "mcp", "mcp_oauth", "repo", "skill_repo")
 STATES: tuple[CardState, ...] = (
     "requested",
     "received",
@@ -49,6 +49,7 @@ TARGETS: dict[CardKind, str] = {
     "env": "TOGGL_TOKEN",
     "env_file": ".env",
     "mcp": "Linear",
+    "mcp_oauth": "Notion",
     "repo": "acme/analytics",
     "skill_repo": "acme/skills",
 }
@@ -64,6 +65,9 @@ OUTCOMES: dict[CardKind, ConfigurationChange] = {
     ),
     "mcp": ConfigurationChange(
         target_name=AGENT, kind="mcp", availability="next_message", detail="Linear"
+    ),
+    "mcp_oauth": ConfigurationChange(
+        target_name=AGENT, kind="mcp", availability="next_message", detail="Notion"
     ),
     "repo": ConfigurationChange(
         target_name=AGENT,
@@ -297,6 +301,7 @@ def test_expired_card_says_what_to_ask_for_again(kind: CardKind) -> None:
         ("env", f"Ask {RESPONDER} to add TOGGL_TOKEN to {AGENT} again."),
         ("env_file", f"Ask {RESPONDER} to add keys to {AGENT} from a file again."),
         ("mcp", f"Ask {RESPONDER} to connect {AGENT} to Linear again."),
+        ("mcp_oauth", f"Ask {RESPONDER} to connect {AGENT} to Notion again."),
         ("repo", f"Ask {RESPONDER} to give {AGENT} access to acme/analytics again."),
         ("skill_repo", f"Ask {RESPONDER} to add skills to {AGENT} from acme/skills again."),
     ],

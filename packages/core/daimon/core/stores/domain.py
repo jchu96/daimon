@@ -565,6 +565,31 @@ class CredentialRequestRow(BaseModel):
     used_at: datetime | None
 
 
+class McpOAuthFlowRow(BaseModel):
+    """Pydantic row for McpOAuthFlow — one in-flight MCP OAuth authorization."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    state: str
+    request_token: str
+    tenant_id: uuid.UUID
+    account_id: uuid.UUID
+    agent_id: uuid.UUID
+    server_name: str
+    mcp_server_url: str
+    redirect_uri: str
+    code_verifier: str
+    client_id: str | None
+    client_secret_encrypted: str | None
+    token_endpoint_auth_method: str | None
+    token_endpoint: str | None
+    resource: str | None
+    scope: str | None
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None
+
+
 class MessageFeedbackRow(BaseModel):
     """Pydantic row for MessageFeedback — one thumbs-up/down reaction vote.
 
