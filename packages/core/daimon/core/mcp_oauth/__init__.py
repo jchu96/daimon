@@ -12,6 +12,11 @@ HTTP calls and `vault` are the shell, with the `httpx.AsyncClient` and the
 Anthropic client injected.
 """
 
+from daimon.core.mcp_oauth.complete import (
+    McpOAuthCompletion,
+    McpOAuthIncompleteFlowError,
+    complete_mcp_oauth_flow,
+)
 from daimon.core.mcp_oauth.discovery import (
     McpProbe,
     OAuthDiscovery,
@@ -25,6 +30,14 @@ from daimon.core.mcp_oauth.flow import (
     generate_pkce,
     register_client,
 )
+from daimon.core.mcp_oauth.handshake import (
+    FLOW_TTL,
+    PreparedAuthorization,
+    begin_mcp_oauth_flow,
+    callback_url,
+    prepare_authorization,
+    start_url,
+)
 from daimon.core.mcp_oauth.models import (
     AuthorizationServerMetadata,
     ClientRegistration,
@@ -34,18 +47,27 @@ from daimon.core.mcp_oauth.models import (
 from daimon.core.mcp_oauth.vault import put_mcp_oauth_credential
 
 __all__ = [
+    "FLOW_TTL",
     "AuthorizationServerMetadata",
     "ClientRegistration",
+    "McpOAuthCompletion",
+    "McpOAuthIncompleteFlowError",
     "McpProbe",
     "OAuthDiscovery",
     "Pkce",
+    "PreparedAuthorization",
     "ProtectedResourceMetadata",
     "TokenResponse",
+    "begin_mcp_oauth_flow",
     "build_authorization_url",
+    "callback_url",
+    "complete_mcp_oauth_flow",
     "discover_authorization_server",
     "exchange_authorization_code",
     "generate_pkce",
+    "prepare_authorization",
     "probe_mcp_server",
     "put_mcp_oauth_credential",
     "register_client",
+    "start_url",
 ]
