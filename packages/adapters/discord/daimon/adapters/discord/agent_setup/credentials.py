@@ -30,6 +30,7 @@ from daimon.adapters.discord.agent_setup.state import PanelState, RosterEntry
 from daimon.adapters.discord.errors import generate_request_id, render_error
 from daimon.adapters.discord.layout import hairline, header
 from daimon.adapters.discord.runtime import DiscordRuntime
+from daimon.core.constants import MAX_SECRET_VALUE_BYTES
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.stores.agent_files import (
     delete_agent_file,
@@ -42,7 +43,6 @@ import discord
 _log = structlog.get_logger()
 
 _SECRET_CAP = 20
-_MAX_SECRET_VALUE_BYTES = 4096
 _POSIX_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -181,9 +181,9 @@ class PasteSecretModal(discord.ui.Modal, title="Add keys"):
                     ephemeral=True,
                 )
                 return
-            if len(value.encode()) > _MAX_SECRET_VALUE_BYTES:
+            if len(value.encode()) > MAX_SECRET_VALUE_BYTES:
                 await interaction.followup.send(
-                    f"Key value for `{key}` is too large. Max {_MAX_SECRET_VALUE_BYTES} bytes.",
+                    f"Key value for `{key}` is too large. Max {MAX_SECRET_VALUE_BYTES} bytes.",
                     ephemeral=True,
                 )
                 return

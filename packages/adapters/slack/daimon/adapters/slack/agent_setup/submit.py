@@ -34,7 +34,7 @@ Threat register:
   write layer only; they never appear in response_action payloads, error
   strings, block_ids, action_ids, or log lines.
 - Blank PAT/token = keep stored token; never overwrites.
-- _SECRET_CAP + _MAX_SECRET_VALUE_BYTES enforced pre-ack.
+- _SECRET_CAP + MAX_SECRET_VALUE_BYTES enforced pre-ack.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ from daimon.adapters.slack.agent_setup.write import (
     store_inline_pat,
 )
 from daimon.adapters.slack.runtime import SlackRuntime
-from daimon.core.constants import DEFAULT_AGENT_MODEL, MODEL_DISPLAY_NAMES
+from daimon.core.constants import DEFAULT_AGENT_MODEL, MAX_SECRET_VALUE_BYTES, MODEL_DISPLAY_NAMES
 from daimon.core.continuity.messages import ConfigurationChange, render_change_confirmation
 from daimon.core.defaults.ma_index import find_agent_by_daimon_tag
 from daimon.core.defaults.mcp_merge import get_reserved_mcp_rejection
@@ -92,7 +92,6 @@ log = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 _SECRET_CAP = 20
-_MAX_SECRET_VALUE_BYTES = 4096
 _POSIX_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Agent name format: 1-64 chars, letters/digits/hyphens/underscores
@@ -478,7 +477,7 @@ def evaluate_paste_secrets_submission(payload: dict[str, Any]) -> SubmitDecision
     Parses KEY=VALUE lines from paste_secrets__content. Validates:
     - Key names against _POSIX_KEY_RE
     - Total count against _SECRET_CAP (20)
-    - Each value's byte length against _MAX_SECRET_VALUE_BYTES (4096)
+    - Each value's byte length against MAX_SECRET_VALUE_BYTES (4096)
 
     CRITICAL: the validated values are carried to run_* for the
     write ONLY via the extra dict. They MUST NOT appear in:
@@ -527,11 +526,11 @@ def evaluate_paste_secrets_submission(payload: dict[str, Any]) -> SubmitDecision
             continue
 
         # Byte-size cap per value (T-83-17)
-        if len(value.encode()) > _MAX_SECRET_VALUE_BYTES:
+        if len(value.encode()) > MAX_SECRET_VALUE_BYTES:
             return _error_decision(
                 "paste_secrets__content",
                 # CRITICAL: only the KEY name appears; value length is safe.
-                f"Value for key {key!r} exceeds the {_MAX_SECRET_VALUE_BYTES}-byte limit.",
+                f"Value for key {key!r} exceeds the {MAX_SECRET_VALUE_BYTES}-byte limit.",
                 meta=meta,
                 payload=payload,
             )

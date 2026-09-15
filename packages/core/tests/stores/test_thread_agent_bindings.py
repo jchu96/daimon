@@ -15,6 +15,7 @@ from daimon.core.stores.thread_agent_bindings import (
     create_binding,
     get_binding,
     list_active_bindings,
+    list_active_setup_bindings_for_tenant,
     update_channel_lifecycle,
     update_lifecycle,
     upsert_responder_binding,
@@ -414,4 +415,125 @@ async def test_upsert_responder_binding_is_scoped_to_one_tenant_and_location(
     )
     assert neighbour is not None and neighbour.responder_ma_agent_id == "agent_other", (
         "another workspace's identically-named thread is untouched"
+    )
+
+
+async def test_tenant_wide_listing_omits_handoffs_and_closed_conversations(
+    db_session: AsyncSession,
+) -> None:
+    """Only live setup conversations count, across every channel in the install."""
+    tenant = await make_tenant(db_session)
+    for thread_id, kind in (
+        ("live-a", "setup"),
+        ("live-b", "setup"),
+        ("handed-over", "handoff"),
+        ("archived", "setup"),
+        ("locked", "setup"),
+        ("deleted", "setup"),
+    ):
+        await create_binding(
+            db_session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id=f"channel-{thread_id}",
+            thread_id=thread_id,
+            responder_ma_agent_id="agent_daimon",
+            responder_name="daimon",
+            kind=kind,
+        )
+    for thread_id, field in (
+        ("archived", "archived"),
+        ("locked", "locked"),
+        ("deleted", "deleted"),
+    ):
+        await update_lifecycle(
+            db_session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id=f"channel-{thread_id}",
+            thread_id=thread_id,
+            **{field: True},
+        )
+
+    rows, truncated = await list_active_setup_bindings_for_tenant(
+        db_session, tenant_id=tenant.id, platform="discord"
+    )
+
+    assert sorted(row.thread_id for row in rows) == ["live-a", "live-b"], (
+        "handed-over threads and archived/locked/deleted conversations must all be omitted"
+    )
+    assert not truncated, "two rows under the default limit is not a truncated listing"
+
+
+async def test_tenant_wide_listing_reports_truncation_past_the_limit(
+    db_session: AsyncSession,
+) -> None:
+    """The caller learns more conversations exist without a second query."""
+    tenant = await make_tenant(db_session)
+    for index in range(4):
+        await create_binding(
+            db_session,
+            tenant_id=tenant.id,
+            platform="discord",
+            parent_channel_id="channel",
+            thread_id=f"setup-{index}",
+            responder_ma_agent_id="agent_daimon",
+            responder_name="daimon",
+        )
+
+    rows, truncated = await list_active_setup_bindings_for_tenant(
+        db_session, tenant_id=tenant.id, platform="discord", limit=3
+    )
+
+    assert len(rows) == 3, "the listing must stop at the requested limit, not the probe row"
+    assert truncated, "a fourth live conversation must be reported as truncated"
+
+    all_rows, all_truncated = await list_active_setup_bindings_for_tenant(
+        db_session, tenant_id=tenant.id, platform="discord", limit=4
+    )
+    assert len(all_rows) == 4 and not all_truncated, (
+        "a limit that covers every live conversation must not report truncation"
+    )
+
+
+async def test_tenant_wide_listing_isolates_one_tenant_and_one_platform(
+    db_session: AsyncSession,
+) -> None:
+    """A tenant-wide read still stops at the install boundary."""
+    tenant = await make_tenant(db_session, workspace_id="guild-1")
+    other = await make_tenant(db_session, workspace_id="guild-2")
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="ours",
+        responder_ma_agent_id="agent_daimon",
+        responder_name="daimon",
+    )
+    await create_binding(
+        db_session,
+        tenant_id=tenant.id,
+        platform="slack",
+        parent_channel_id="channel",
+        thread_id="other-platform",
+        responder_ma_agent_id="agent_daimon",
+        responder_name="daimon",
+    )
+    await create_binding(
+        db_session,
+        tenant_id=other.id,
+        platform="discord",
+        parent_channel_id="channel",
+        thread_id="other-tenant",
+        responder_ma_agent_id="agent_daimon",
+        responder_name="daimon",
+    )
+
+    rows, _truncated = await list_active_setup_bindings_for_tenant(
+        db_session, tenant_id=tenant.id, platform="discord"
+    )
+
+    assert [row.thread_id for row in rows] == ["ours"], (
+        "another tenant's and another platform's conversations must not leak into the listing"
     )

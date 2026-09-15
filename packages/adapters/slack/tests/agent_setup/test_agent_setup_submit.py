@@ -427,9 +427,9 @@ def test_evaluate_paste_secrets_when_count_exceeds_cap_returns_cap_error() -> No
 
 
 def test_evaluate_paste_secrets_when_value_oversized_returns_byte_cap_error() -> None:
-    from daimon.adapters.slack.agent_setup.submit import _MAX_SECRET_VALUE_BYTES
+    from daimon.core.constants import MAX_SECRET_VALUE_BYTES
 
-    oversized_value = "x" * (_MAX_SECRET_VALUE_BYTES + 1)
+    oversized_value = "x" * (MAX_SECRET_VALUE_BYTES + 1)
     content = f"MY_KEY={oversized_value}"
     values = _input_value("paste_secrets__content", "paste_secrets__content", content)
     payload = _payload(callback_id="agent_setup__paste_secrets", values=values)

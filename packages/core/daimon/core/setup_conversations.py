@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Final
 
 from anthropic import APIStatusError, AsyncAnthropic
 from anthropic.types.beta import BetaManagedAgentsAgent
@@ -13,6 +14,35 @@ from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_TENANT,
 )
 from daimon.core.errors import DaimonError
+
+# Copy for the surfaces that open or describe a setup conversation. It lives
+# here so the Discord panel, the Slack panel and the MCP outcome cannot drift:
+# an agent named on one platform and the same agent named on the other must
+# read identically.
+SETUP_ACTION_LABEL: Final = "💬 Set up with Daimon"
+EMPTY_ROSTER_COPY: Final = "No agent answers here yet. Ask Daimon to help set one up."
+
+# Discord rejects a thread name longer than 100 characters outright, so the
+# name is truncated rather than left to fail at thread creation.
+_MAX_SETUP_THREAD_NAME_CHARS: Final = 100
+
+
+def setup_thread_name(target_name: str | None) -> str:
+    """Name the thread a setup conversation opens in.
+
+    ``target_name`` is None before the person has chosen what to set up.
+    """
+    return f"Set up {target_name or 'an agent'} with Daimon"[:_MAX_SETUP_THREAD_NAME_CHARS]
+
+
+def shared_keys_sentence(agent_name: str) -> str:
+    """Say who a stored key reaches: everyone who talks to the agent, not its owner.
+
+    Keys are attached to the agent, not to the person who supplied them, and
+    people reliably assume the opposite — so every surface that lists an
+    agent's keys says this next to the list.
+    """
+    return f"Anyone who talks to {agent_name} can use these."
 
 
 async def get_setup_agent(

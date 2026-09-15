@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any, Final, cast
 
 import anthropic
@@ -39,7 +39,6 @@ from daimon.core.continuity.messages import ConfigurationChange, render_change_c
 from daimon.core.defaults.ma_index import (
     find_agents_by_daimon_tag,
     list_agents_by_tenant,
-    list_skills_lenient,
 )
 from daimon.core.defaults.mcp_merge import (
     get_reserved_mcp_rejection,
@@ -51,11 +50,10 @@ from daimon.core.defaults.metadata import (
     MA_METADATA_KEY_ISOLATED,
     MA_METADATA_KEY_MANAGED,
     build_metadata,
-    strip_tenant_prefix,
 )
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.defaults.reconcile_agents import reconcile_agent
-from daimon.core.defaults.skills import resolve_skill_names
+from daimon.core.defaults.skills import resolve_custom_skill_titles, resolve_skill_names
 from daimon.core.defaults.spec_merge import merge_mcp_servers_with_ma, merge_skills_with_ma
 from daimon.core.errors import DaimonError, DefaultsError
 from daimon.core.github_app_auth import build_app_jwt, get_installation_id_for_repo
@@ -64,12 +62,14 @@ from daimon.core.ma import update_agent_with_version_retry
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.mcp_attach import attach_mcp_server_to_agent
 from daimon.core.memory_resource import archive_memory_store_for_agent
+from daimon.core.routing_facts import build_unrouted_note
 from daimon.core.skill_sync import SyncRepoFailure, sync_agent_skills, sync_report_failures
 from daimon.core.specs import (
     AgentSpec,
     SkillRepo,
     merge_default_agent_toolset,
 )
+from daimon.core.stores.scoped_config_read import is_agent_reachable_in_tenant
 from daimon.core.stores.scoped_config_write import clear_agent_references
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -106,6 +106,10 @@ class AgentInfo(BaseModel):
     """Set only by ``update_agent`` when it changed ``model`` and/or ``system``:
     person-facing confirmation that the change reaches this conversation on
     its next message, not the one running now."""
+    answering: str | None = None
+    """Set only by ``create_agent`` and ``fork_agent``, and only when nothing
+    routes to the new agent yet: post it verbatim, so the person learns the
+    agent exists but answers nowhere and what to say to change that."""
 
     @classmethod
     def from_ma(
@@ -136,35 +140,6 @@ class AgentInfo(BaseModel):
         )
 
 
-async def _resolve_custom_skill_titles(
-    client: AsyncAnthropic,
-    agents: Sequence[BetaManagedAgentsAgent],
-    *,
-    tenant_id: uuid.UUID,
-) -> dict[str, str]:
-    """MA skill id → bare display name for own-namespace custom skills referenced by ``agents``.
-
-    Agent responses carry opaque custom skill ids (``skill_...``); the
-    human-readable display titles only live on the skills list. One LIST call,
-    skipped entirely when no agent references a custom skill.
-
-    Only skills whose display_title strips to a non-None bare name for the caller's
-    tenant_id are included — foreign-tenant and legacy titles are excluded from the
-    map, so downstream display falls back to the skill_id (the existing map-miss path).
-    """
-    if not any(sk.type == "custom" for agent in agents for sk in agent.skills):
-        return {}
-    rows, _truncated = await list_skills_lenient(client)
-    result: dict[str, str] = {}
-    for sk in rows:
-        if sk.display_title is None:
-            continue
-        bare = strip_tenant_prefix(tenant_id=tenant_id, display_title=sk.display_title)
-        if bare is not None:
-            result[sk.id] = bare
-    return result
-
-
 async def _build_agent_info(
     client: AsyncAnthropic,
     agent: BetaManagedAgentsAgent,
@@ -173,8 +148,37 @@ async def _build_agent_info(
     sync_warnings: list[SyncRepoFailure] | None = None,
 ) -> AgentInfo:
     """Map an MA agent to ``AgentInfo`` with custom skill names resolved."""
-    skill_titles = await _resolve_custom_skill_titles(client, [agent], tenant_id=tenant_id)
+    skill_titles, _truncated = await resolve_custom_skill_titles(
+        client, agents=[agent], tenant_id=tenant_id
+    )
     return AgentInfo.from_ma(agent, sync_warnings=sync_warnings, skill_titles=skill_titles)
+
+
+async def _with_answering_note(
+    runtime: McpRuntime, auth: AuthIdentity, info: AgentInfo
+) -> AgentInfo:
+    """Attach the routing handoff when nothing in the tenant routes to ``info``.
+
+    A freshly created or forked agent exists but answers nowhere, and the
+    person who asked for it reliably expects to be able to talk to it by name.
+    One config-cascade read decides; a reachable agent gets no note.
+    """
+    async with runtime.session_factory() as session:
+        reachable = await is_agent_reachable_in_tenant(
+            session,
+            tenant_id=auth.tenant_id,
+            agent_name=info.name,
+            default=runtime.deployment_default,
+        )
+    if reachable:
+        return info
+    return info.model_copy(
+        update={
+            "answering": build_unrouted_note(
+                agent_name=info.name, channel_label=None, is_admin=auth.is_admin
+            )
+        }
+    )
 
 
 _CREATE_FIELDS: Final = frozenset(
@@ -308,8 +312,8 @@ async def _list_agents_impl(
 ) -> list[AgentInfo]:
     del page
     rows = await list_agents_by_tenant(runtime.client, tenant_id=auth.tenant_id)
-    skill_titles = await _resolve_custom_skill_titles(
-        runtime.client, rows, tenant_id=auth.tenant_id
+    skill_titles, _truncated = await resolve_custom_skill_titles(
+        runtime.client, agents=rows, tenant_id=auth.tenant_id
     )
     return [AgentInfo.from_ma(a, skill_titles=skill_titles) for a in rows]
 
@@ -473,9 +477,10 @@ async def _create_agent_impl(
                     ),
                 )
             warnings = sync_report_failures(report) or None
-    return await _build_agent_info(
+    info = await _build_agent_info(
         runtime.client, ma_agent, tenant_id=auth.tenant_id, sync_warnings=warnings
     )
+    return await _with_answering_note(runtime, auth, info)
 
 
 async def _update_agent_impl(
@@ -740,7 +745,8 @@ async def _fork_agent_impl(
     except DaimonError as exc:
         raise ToolError(str(exc)) from exc
 
-    return await _build_agent_info(runtime.client, new_ma, tenant_id=auth.tenant_id)
+    info = await _build_agent_info(runtime.client, new_ma, tenant_id=auth.tenant_id)
+    return await _with_answering_note(runtime, auth, info)
 
 
 async def _archive_agent_impl(
@@ -919,9 +925,9 @@ def register_agent_tools(mcp: FastMCP, runtime: McpRuntime) -> None:
         API/service keys are not copied; add them with ``request_agent_key``.
         Use ``update_agent`` to edit the copy. Daimon cannot be edited directly.
 
-        The copy answers in no channel until an admin routes it with
-        ``set_agent_default``. Continue configuring it through Daimon with the copy
-        named as the setup target; it cannot already answer mentions by name."""
+        Continue configuring it through Daimon with the copy named as the setup
+        target. A returned ``answering`` field says the copy is routed nowhere yet:
+        post it verbatim."""
         return await _fork_agent_impl(
             runtime,
             await _auth(ctx),

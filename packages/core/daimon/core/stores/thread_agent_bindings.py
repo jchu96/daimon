@@ -120,6 +120,47 @@ async def list_active_bindings(
     return [ThreadAgentBindingRow.model_validate(binding) for binding in bindings]
 
 
+async def list_active_setup_bindings_for_tenant(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    platform: str,
+    limit: int = 10,
+) -> tuple[list[ThreadAgentBindingRow], bool]:
+    """Live setup conversations anywhere in one tenant, newest first.
+
+    The tenant-wide sibling of `list_active_bindings`: same filters minus the
+    channel, because a reader asking where setup is happening is asking about
+    the whole install, not one channel. Setup only, for the reason
+    `list_active_bindings` gives.
+
+    Reads one row past `limit` so the second element of the return can say
+    whether more live conversations exist without a second COUNT query; the
+    extra row is dropped from the list.
+    """
+    bindings = (
+        (
+            await session.execute(
+                select(ThreadAgentBinding)
+                .where(
+                    ThreadAgentBinding.tenant_id == tenant_id,
+                    ThreadAgentBinding.platform == platform,
+                    ThreadAgentBinding.kind == "setup",
+                    ThreadAgentBinding.archived.is_(False),
+                    ThreadAgentBinding.locked.is_(False),
+                    ThreadAgentBinding.deleted.is_(False),
+                )
+                .order_by(ThreadAgentBinding.updated_at.desc(), ThreadAgentBinding.id)
+                .limit(limit + 1)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    rows = [ThreadAgentBindingRow.model_validate(binding) for binding in bindings[:limit]]
+    return rows, len(bindings) > limit
+
+
 async def update_target(
     session: AsyncSession,
     *,

@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 from daimon.core.errors import DaimonError
-from daimon.core.setup_conversations import get_setup_responder, resolve_setup_agents
+from daimon.core.setup_conversations import (
+    get_setup_responder,
+    resolve_setup_agents,
+    setup_thread_name,
+    shared_keys_sentence,
+)
 from daimon.testing.ma import MARouter, build_fake_anthropic, list_response
 from daimon.testing.ma_models import ma_agent
 
@@ -71,3 +76,26 @@ async def test_missing_bound_responder_is_explicit_and_does_not_reconcile() -> N
     )
     with pytest.raises(DaimonError, match="Daimon responder is missing"):
         await get_setup_responder(client, tenant_id=uuid.uuid4(), ma_agent_id="ag_deleted")
+
+
+def test_setup_thread_name_names_the_target_when_one_is_chosen() -> None:
+    assert setup_thread_name("writer") == "Set up writer with Daimon", (
+        "the thread name says which agent is being set up"
+    )
+
+
+def test_setup_thread_name_stands_in_for_an_unchosen_target() -> None:
+    assert setup_thread_name(None) == "Set up an agent with Daimon", (
+        "a conversation opened before a target is chosen still needs a readable name"
+    )
+
+
+def test_setup_thread_name_truncates_a_name_discord_would_reject() -> None:
+    name = setup_thread_name("x" * 200)
+    assert len(name) == 100, "Discord rejects a thread name over 100 characters outright"
+
+
+def test_shared_keys_sentence_names_the_agent_whose_keys_are_shared() -> None:
+    assert shared_keys_sentence("writer") == "Anyone who talks to writer can use these.", (
+        "the sentence must say the keys follow the agent, not the person who added them"
+    )

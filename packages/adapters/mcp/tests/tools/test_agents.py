@@ -40,6 +40,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_ISOLATED
 from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.github_credentials import build_multifernet, get_pat, upsert_credential_encrypted
 from daimon.core.ma_identity import derive_agent_uuid
+from daimon.core.routing_facts import UNROUTED_LINE
 from daimon.core.scope import ChannelScopeRef, DeploymentDefault, TenantScopeRef
 from daimon.core.specs import AgentSpec, SkillRef, SkillRepo
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
@@ -370,7 +371,9 @@ async def test_get_agent_impl_raises_tool_error_not_found() -> None:
         await _get_agent_impl(_runtime(client), auth, "nope")
 
 
-async def test_create_agent_impl_calls_ma_create() -> None:
+async def test_create_agent_impl_calls_ma_create(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
 
@@ -395,7 +398,9 @@ async def test_create_agent_impl_calls_ma_create() -> None:
 
     spec = AgentSpec(name="demo", model="claude-opus-4-5")
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
-    result = await _create_agent_impl(_runtime(client), auth, spec)
+    result = await _create_agent_impl(
+        _runtime(client, session_factory=db_session_factory), auth, spec
+    )
     assert result.name == "demo", "should return the created agent name"
     assert result.id == "ag_new", "should store the MA-assigned id"
     assert len(created) == 1, "should call MA create exactly once"
@@ -407,7 +412,9 @@ async def test_create_agent_impl_calls_ma_create() -> None:
     )
 
 
-async def test_create_agent_impl_adds_base_toolset_when_caller_passes_only_mcp_toolset() -> None:
+async def test_create_agent_impl_adds_base_toolset_when_caller_passes_only_mcp_toolset(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """Regression: passing mcp_servers forces a matching mcp_toolset into tools,
     which used to skip the base-toolset default entirely — the created agent then
     400s at session create once skills are attached (skills require read)."""
@@ -440,7 +447,7 @@ async def test_create_agent_impl_adds_base_toolset_when_caller_passes_only_mcp_t
         }
     )
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
-    await _create_agent_impl(_runtime(client), auth, spec)
+    await _create_agent_impl(_runtime(client, session_factory=db_session_factory), auth, spec)
 
     assert len(created) == 1, "should call MA create exactly once"
     tool_types = [t.get("type") for t in created[0].get("tools", [])]
@@ -1300,7 +1307,9 @@ async def test_archive_agent_clears_scope_rows_even_when_the_memory_store_archiv
         )
 
 
-async def test_create_agent_impl_stamps_daimon_account_when_called() -> None:
+async def test_create_agent_impl_stamps_daimon_account_when_called(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     tenant_id = uuid.uuid4()
     account_id = uuid.uuid4()
     guild_account = derive_guild_account_uuid(tenant_id)
@@ -1327,7 +1336,7 @@ async def test_create_agent_impl_stamps_daimon_account_when_called() -> None:
 
     spec = AgentSpec(name="demo", model="claude-opus-4-5")
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
-    await _create_agent_impl(_runtime(client), auth, spec)
+    await _create_agent_impl(_runtime(client, session_factory=db_session_factory), auth, spec)
     assert len(created) == 1, "should call MA create exactly once"
     assert created[0].get("metadata", {}).get("daimon_account") == str(guild_account), (
         "SC-2: chat-created agents must stamp the guild account, not the personal account"
@@ -1337,7 +1346,9 @@ async def test_create_agent_impl_stamps_daimon_account_when_called() -> None:
     )
 
 
-async def test_create_agent_merges_daimon_mcp_when_public_url_set() -> None:
+async def test_create_agent_merges_daimon_mcp_when_public_url_set(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """#139: create_agent via reconcile_agent merges daimon-mcp server + mcp_toolset
     into the create payload when public_url is set."""
     tenant_id = uuid.uuid4()
@@ -1362,7 +1373,11 @@ async def test_create_agent_merges_daimon_mcp_when_public_url_set() -> None:
 
     spec = AgentSpec(name="demo", model="claude-opus-4-5")
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
-    await _create_agent_impl(_runtime(client, public_url=public_url), auth, spec)
+    await _create_agent_impl(
+        _runtime(client, public_url=public_url, session_factory=db_session_factory),
+        auth,
+        spec,
+    )
 
     assert len(created) == 1, "should call MA create exactly once"
     mcp_server_names = [s.get("name") for s in created[0].get("mcp_servers", [])]
@@ -1383,7 +1398,9 @@ async def test_create_agent_merges_daimon_mcp_when_public_url_set() -> None:
     )
 
 
-async def test_create_agent_stamps_spec_hash_and_managed_false() -> None:
+async def test_create_agent_stamps_spec_hash_and_managed_false(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """#139: create_agent via reconcile_agent stamps daimon_spec_hash and guild account,
     and does NOT stamp daimon_managed (managed=False contract)."""
     tenant_id = uuid.uuid4()
@@ -1408,7 +1425,7 @@ async def test_create_agent_stamps_spec_hash_and_managed_false() -> None:
 
     spec = AgentSpec(name="demo", model="claude-opus-4-5")
     auth = AuthIdentity(account_id=account_id, tenant_id=tenant_id, role=Role.ADMIN, is_admin=True)
-    await _create_agent_impl(_runtime(client), auth, spec)
+    await _create_agent_impl(_runtime(client, session_factory=db_session_factory), auth, spec)
 
     assert len(created) == 1, "should call MA create exactly once"
     metadata = created[0].get("metadata", {})
@@ -5052,3 +5069,103 @@ def test_create_spec_accepts_the_current_generation_models() -> None:
             skill_repos=None,
         )
         assert spec.model == model, f"{model} must be accepted"
+
+
+# ---------------------------------------------------------------------------
+# A newly created agent that nothing routes to says so — `AgentInfo.answering`
+# ---------------------------------------------------------------------------
+
+
+def _create_demo_router() -> AsyncAnthropic:
+    """Serve the empty name-collision listing plus create/retrieve for one agent."""
+    body = ma_agent(id="ag_new", name="demo").model_dump(mode="json")
+    router = MARouter()
+    router.add("GET", r"/v1/agents", lambda _req, _m: list_response([]))
+    router.add("POST", r"/v1/agents", lambda _req, _m: httpx.Response(200, json=body))
+    router.add("GET", r"/v1/agents/([^/]+)", lambda _req, _m: httpx.Response(200, json=body))
+    return build_fake_anthropic(router.dispatch)
+
+
+async def test_create_agent_returns_unrouted_note_when_not_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+    )
+
+    result = await _create_agent_impl(
+        _runtime(_create_demo_router(), session_factory=db_session_factory),
+        auth,
+        AgentSpec(name="demo", model="claude-opus-4-5"),
+    )
+
+    assert result.answering is not None, (
+        "a new agent nothing routes to must come back with the routing handoff"
+    )
+    assert UNROUTED_LINE in result.answering, (
+        "the handoff must be the shared unrouted copy, not a second wording"
+    )
+
+
+async def test_create_agent_returns_no_unrouted_note_when_a_config_row_names_it(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name="demo")
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.ADMIN, is_admin=True
+    )
+
+    result = await _create_agent_impl(
+        _runtime(_create_demo_router(), session_factory=db_session_factory),
+        auth,
+        AgentSpec(name="demo", model="claude-opus-4-5"),
+    )
+
+    assert result.answering is None, (
+        "an agent the workspace default already names is reachable — nothing to hand off"
+    )
+
+
+async def test_fork_agent_returns_unrouted_note_when_not_reachable(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _make_tenant_with_default_agent(db_session_factory, agent_name=None)
+    source = ma_agent(
+        id="ag_src",
+        name="source",
+        metadata={"daimon_tenant": str(tenant_id), "daimon_name": "source"},
+    )
+    router = MARouter()
+    router.add_agent_list(source)
+    router.add(
+        "GET",
+        r"/v1/agents/([^/]+)",
+        lambda _req, _m: httpx.Response(200, json=source.model_dump(mode="json")),
+    )
+    router.add(
+        "POST",
+        r"/v1/agents",
+        lambda _req, _m: httpx.Response(
+            200, json=ma_agent(id="ag_new", name="myfork").model_dump(mode="json")
+        ),
+    )
+    auth = AuthIdentity(
+        account_id=uuid.uuid4(), tenant_id=tenant_id, role=Role.USER, is_admin=False
+    )
+
+    result = await _fork_agent_impl(
+        _runtime(
+            build_fake_anthropic(router.dispatch),
+            session_factory=db_session_factory,
+            fernet=build_multifernet((Fernet.generate_key().decode(),)),
+        ),
+        auth,
+        source_name="source",
+        new_name="myfork",
+    )
+
+    assert result.answering is not None, (
+        "a fork nothing routes to must come back with the routing handoff"
+    )
+    assert UNROUTED_LINE in result.answering, "the fork handoff must reuse the shared unrouted copy"

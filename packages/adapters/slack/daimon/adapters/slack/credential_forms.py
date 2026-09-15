@@ -20,6 +20,7 @@ import dataclasses
 import json
 from typing import Any, Final, cast
 
+from daimon.core.constants import MAX_SECRET_VALUE_BYTES
 from daimon.core.credential_requests import (
     CredentialRequestKind,
     split_skill_repo_target,
@@ -51,12 +52,6 @@ CRED_CALLBACK_PREFIX: Final[str] = "credential_request__"
 
 _VALUE_BLOCK = "credential__value"
 _FILE_BLOCK = "credential__file"
-
-# Byte cap shared with the panel's paste form (`agent_setup/submit.py`'s
-# _MAX_SECRET_VALUE_BYTES) and the Discord credential modals. Slack's own
-# max_length on the input is a character cap; this is the byte boundary the
-# store actually enforces.
-_MAX_SECRET_VALUE_BYTES: Final[int] = 4096
 
 # Slack's documented `view.title` limit. A title over it is rejected outright,
 # so every title below is built to fit rather than trusted to.
@@ -390,9 +385,9 @@ def evaluate_credential_submission(payload: dict[str, Any]) -> CredentialSubmiss
             proceed=False,
             errors={_VALUE_BLOCK: "Value cannot be empty — try again."},
         )
-    if len(raw_value.encode()) > _MAX_SECRET_VALUE_BYTES:
+    if len(raw_value.encode()) > MAX_SECRET_VALUE_BYTES:
         return _decision(
             proceed=False,
-            errors={_VALUE_BLOCK: f"Value is too large. Max {_MAX_SECRET_VALUE_BYTES} bytes."},
+            errors={_VALUE_BLOCK: f"Value is too large. Max {MAX_SECRET_VALUE_BYTES} bytes."},
         )
     return _decision(proceed=True, value=raw_value)
