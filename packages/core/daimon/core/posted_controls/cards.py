@@ -79,6 +79,10 @@ RefusalReason = Literal[
     #: the server it named. Deliberately not an error string: the person who
     #: filled in the form did nothing wrong, and asking again is the way out.
     "target_unavailable",
+    #: The server answered the token with 401/403 before anything was stored.
+    #: The way out is a different credential — or, for a server that signs
+    #: people in through a browser, the OAuth card.
+    "token_rejected",
 ]
 
 #: `requested` footer, with the two placeholders each renderer fills from
@@ -362,6 +366,13 @@ def _refusal_content(
         return (
             f"🛡️ Nothing was saved for {agent_name}.",
             f"{agent_name} is not available right now. Ask {responder_name} again.",
+        )
+    if refusal == "token_rejected":
+        return (
+            f"🛡️ {target} did not accept that token for {agent_name}.",
+            "Nothing was saved.",
+            f"If {target} signs people in through a browser, ask {responder_name} to "
+            "connect it with your account instead.",
         )
     if not refusal_lines:
         raise ValueError("refusal='env_file_invalid' requires refusal_lines")

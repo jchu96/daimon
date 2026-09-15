@@ -19,8 +19,10 @@ from daimon.core.mcp_oauth.complete import (
 )
 from daimon.core.mcp_oauth.discovery import (
     McpProbe,
+    McpTokenProbe,
     OAuthDiscovery,
     discover_authorization_server,
+    probe_bearer_token,
     probe_mcp_server,
 )
 from daimon.core.mcp_oauth.flow import (
@@ -32,9 +34,11 @@ from daimon.core.mcp_oauth.flow import (
 )
 from daimon.core.mcp_oauth.handshake import (
     FLOW_TTL,
+    INVITE_BUTTON_LABEL,
     PreparedAuthorization,
     begin_mcp_oauth_flow,
     callback_url,
+    invite_copy,
     prepare_authorization,
     start_url,
 )
@@ -48,11 +52,13 @@ from daimon.core.mcp_oauth.vault import put_mcp_oauth_credential
 
 __all__ = [
     "FLOW_TTL",
+    "INVITE_BUTTON_LABEL",
     "AuthorizationServerMetadata",
     "ClientRegistration",
     "McpOAuthCompletion",
     "McpOAuthIncompleteFlowError",
     "McpProbe",
+    "McpTokenProbe",
     "OAuthDiscovery",
     "Pkce",
     "PreparedAuthorization",
@@ -65,7 +71,9 @@ __all__ = [
     "discover_authorization_server",
     "exchange_authorization_code",
     "generate_pkce",
+    "invite_copy",
     "prepare_authorization",
+    "probe_bearer_token",
     "probe_mcp_server",
     "put_mcp_oauth_credential",
     "register_client",

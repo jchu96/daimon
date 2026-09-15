@@ -30,6 +30,18 @@ FLOW_TTL: Final[timedelta] = timedelta(minutes=10)
 CLIENT_NAME: Final[str] = "daimon"
 
 
+def invite_copy(*, server_name: str, agent_name: str) -> str:
+    """The ephemeral text next to the sign-in button, identical on every platform."""
+    return (
+        f"Sign in to connect {server_name} to {agent_name} with your account. "
+        "This link is yours alone and works for ten minutes; nobody else can use "
+        "the connection it creates."
+    )
+
+
+INVITE_BUTTON_LABEL: Final[str] = "Open sign-in"
+
+
 def start_url(app_root_url: str, *, state: str) -> str:
     return f"{app_root_url.rstrip('/')}/oauth/mcp/start?state={quote(state, safe='')}"
 

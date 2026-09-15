@@ -102,6 +102,7 @@ source_modules = [
     "daimon.core.credential_env",
     "daimon.core.credential_requests",
     "daimon.core.mcp_oauth",
+    "daimon.core.mcp_token_check",
     "daimon.core.cron",
     "daimon.core.db",
     "daimon.core.env_file",

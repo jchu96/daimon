@@ -12,6 +12,7 @@ nothing here retries or swallows — a server that cannot be discovered raises
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
@@ -50,6 +51,18 @@ class McpProbe:
     @property
     def rejects_credentials(self) -> bool:
         return self.status_code in (401, 403)
+
+
+McpTokenProbe = Callable[[str, str], Awaitable[McpProbe]]
+"""`(mcp_server_url, bearer_token) -> McpProbe`; the token forms' injectable check."""
+
+
+async def probe_bearer_token(mcp_server_url: str, bearer_token: str) -> McpProbe:
+    """The production `McpTokenProbe`: one short-lived client per check."""
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as http:
+        return await probe_mcp_server(
+            http, mcp_server_url=mcp_server_url, bearer_token=bearer_token
+        )
 
 
 @dataclass(frozen=True, slots=True)
