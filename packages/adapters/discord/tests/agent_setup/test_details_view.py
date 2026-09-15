@@ -24,6 +24,7 @@ from daimon.adapters.discord.agent_setup.budget import (
     LAYOUT_TEXT_BUDGET,
 )
 from daimon.adapters.discord.agent_setup.details_view import (
+    CODING_TOOLS_SUBTEXT,
     SHOW_ALL_LABEL,
     SHOW_FEWER_LABEL,
     DetailsView,
@@ -45,7 +46,11 @@ from daimon.core.ma_resolver import new_resolver_cache
 from daimon.core.notebooks._rate_limit import RateLimiter
 from daimon.core.roster import RosterAgent
 from daimon.core.scope import AnsweringPlace, DeploymentDefault
-from daimon.core.setup_conversations import SETUP_ACTION_LABEL, shared_keys_sentence
+from daimon.core.setup_conversations import (
+    CODING_TOOLS_HINT,
+    SETUP_ACTION_LABEL,
+    shared_keys_sentence,
+)
 from daimon.core.stores.domain import AccountRow, TenantRow
 from daimon.core.stores.mcp_tokens import get_mcp_token
 from daimon.testing import ma_agent
@@ -246,6 +251,26 @@ def test_details_shows_the_model_display_name_and_every_section_when_populated(
     assert (
         text.index("🔑 **Keys**") < text.index("🧩 **Skills**") < text.index("🔌 **MCP servers**")
     ), "keys, then skills, then MCP servers"
+
+
+def test_coding_tools_hint_is_the_shared_sentence_in_discord_markup(
+    account_id: uuid.UUID,
+) -> None:
+    """Both panels say one sentence; only the markup around it is Discord's."""
+    details = _details()
+    container = build_details_container(
+        _state(details, account_id=account_id),
+        details,
+        keys_expanded=False,
+        is_admin=True,
+        attribution=None,
+    )
+
+    assert CODING_TOOLS_SUBTEXT in _container_text(container), "the card carries the hint"
+    assert CODING_TOOLS_SUBTEXT.removeprefix("-# ").replace("`", "") == CODING_TOOLS_HINT, (
+        "Discord adds subtext and code markup to the core sentence and changes no word of it"
+    )
+    assert "`claude mcp add`" in CODING_TOOLS_SUBTEXT, "the command reads as a command"
 
 
 def test_details_shows_concrete_empty_states_when_nothing_is_attached(

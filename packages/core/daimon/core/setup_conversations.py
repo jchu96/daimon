@@ -22,6 +22,13 @@ from daimon.core.errors import DaimonError
 SETUP_ACTION_LABEL: Final = "💬 Set up with Daimon"
 EMPTY_ROSTER_COPY: Final = "No agent answers here yet. Ask Daimon to help set one up."
 
+# What Details says about driving the agent from an editor. One sentence, one
+# home: each panel wraps it in its own markup, and neither rewrites it.
+CODING_TOOLS_HINT: Final = (
+    "Use from your coding tools: get a token with the button below, then run the "
+    "claude mcp add command it gives you."
+)
+
 # Discord rejects a thread name longer than 100 characters outright, so the
 # name is truncated rather than left to fail at thread creation.
 _MAX_SETUP_THREAD_NAME_CHARS: Final = 100

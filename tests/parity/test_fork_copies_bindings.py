@@ -1,9 +1,10 @@
 """Scenario (e): fork -> repo binding copied (core copy only), on both platforms.
 
-`driver.fork_agent` normalizes the fork-signature divergence internally
-(Discord `source_spec: AgentSpec` vs Slack `source_name: str`, per D-03) and
-drives the REAL per-adapter `fork_agent`, which both delegate to the same
-core helper: `agent_lifecycle.copy_credential_and_repo_binding`.
+Forking left the setup panel in the read-only rewrite, so the implementation
+both platforms have left is the chat tool. `driver.fork_agent` drives the REAL
+`tools/agents._fork_agent_impl` with this platform's own `AuthIdentity`, and
+the copy under test is the core helper it calls:
+`agent_lifecycle.copy_credential_and_repo_binding`.
 
 The source binding here is `anon:` (no credential) rather than `inline-pat:`
 -- neither driver exposes a way to inject a pre-known Fernet key into the

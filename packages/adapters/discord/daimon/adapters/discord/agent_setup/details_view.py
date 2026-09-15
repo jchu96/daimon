@@ -25,7 +25,11 @@ from daimon.adapters.discord.runtime import DiscordRuntime
 from daimon.core.agent_details import AgentDetails, RepoBinding
 from daimon.core.github_repo_auth import RepoAccess, normalize_owner_repo
 from daimon.core.scope import AnsweringPlace
-from daimon.core.setup_conversations import SETUP_ACTION_LABEL, shared_keys_sentence
+from daimon.core.setup_conversations import (
+    CODING_TOOLS_HINT,
+    SETUP_ACTION_LABEL,
+    shared_keys_sentence,
+)
 
 import discord
 
@@ -36,7 +40,9 @@ BACK_LABEL = "◀ Back"
 SHOW_ALL_LABEL = "Show all"
 SHOW_FEWER_LABEL = "Show fewer"
 
-CODING_TOOLS_HINT = "-# Use from your coding tools: get a token below, then `claude mcp add …`"
+#: The core sentence as Discord subtext, with the command in code style: the
+#: wording has one home in core, and only the markup is this adapter's.
+CODING_TOOLS_SUBTEXT = "-# " + CODING_TOOLS_HINT.replace("claude mcp add", "`claude mcp add`")
 
 
 def coding_tools_refusal(agent_name: str) -> str:
@@ -169,7 +175,7 @@ def build_details_container(
     container.add_item(discord.ui.TextDisplay(_skills_text(details)))
     container.add_item(discord.ui.TextDisplay(_mcp_text(details)))
     container.add_item(hairline())
-    container.add_item(discord.ui.TextDisplay(CODING_TOOLS_HINT))
+    container.add_item(discord.ui.TextDisplay(CODING_TOOLS_SUBTEXT))
     if attribution is not None:
         container.add_item(discord.ui.TextDisplay(f"-# made by {attribution}"))
     return container

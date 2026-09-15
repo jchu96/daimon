@@ -1,10 +1,11 @@
 """Scenario (d): delete -> memory archived, on both platforms.
 
 After `driver.delete_agent` on a tenant with an MA agent + a bound memory
-store, `agent_lifecycle.archive_memory_store_best_effort` must have archived
-the MA-side store AND cleared the local binding row -- identically on
-Discord and Slack, since both adapters' `delete_agent` call the same core
-helper (`daimon.core.agent_lifecycle.archive_memory_store_best_effort`).
+store, the archive must have archived the MA-side store AND cleared the local
+binding row -- identically on Discord and Slack. Deleting an agent left the
+panel in the read-only rewrite, so both drivers now run the chat tool
+(`tools/agents._archive_agent_impl`) with their own platform's AuthIdentity,
+and it is the tool's `archive_memory_store_for_agent` call under test.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from collections.abc import Callable
 from typing import cast
 
 import httpx
+from daimon.core.defaults.provisioning import derive_guild_account_uuid
 from daimon.core.ma_identity import derive_agent_uuid
 from daimon.core.stores.agent_memory_stores import get_memory_store_id, insert_memory_store
 from daimon.core.stores.domain import Platform
@@ -69,10 +71,18 @@ async def test_delete_agent_archives_memory_store(
         router.add(method, r".*", wrapped)
 
     seed_client = build_fake_anthropic(router.dispatch)
+    # `daimon_account` is what marks the agent as something this install made
+    # rather than a system agent the deployment seeded; the archive path
+    # refuses an unstamped agent, so the seed carries the stamp a real create
+    # would have written.
     agent = await seed_client.beta.agents.create(
         name="doomed",
         model="claude-sonnet-4-6",
-        metadata={"daimon_tenant": str(tenant.id), "daimon_name": "doomed"},
+        metadata={
+            "daimon_tenant": str(tenant.id),
+            "daimon_name": "doomed",
+            "daimon_account": str(derive_guild_account_uuid(tenant.id)),
+        },
     )
     agent_uuid = derive_agent_uuid(tenant_id=tenant.id, ma_agent_id=str(agent.id))
     store = await seed_client.beta.memory_stores.create(name="m", description="d")

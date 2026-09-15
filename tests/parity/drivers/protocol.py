@@ -35,6 +35,7 @@ from daimon.testing.ma import MARouter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .cards import CapturedCard
+from .views import CapturedView
 
 #: Namespace for the account id a driver acts as. `credential_requests`,
 #: `agent_files` and `task_continuations` all carry an account id with no FK
@@ -42,6 +43,23 @@ from .cards import CapturedCard
 #: instead), so a scenario needs no seeded account row -- only a stable id
 #: per (tenant, platform user), which is what a real install would have.
 _PARITY_ACCOUNT_NAMESPACE = uuid.UUID("6f9d4a5e-0b21-4f3c-9a84-1c7b2e5d8f10")
+
+
+PanelAction = Literal[
+    "details",
+    "who_answers_where",
+    "next_page",
+    "prev_page",
+    "new_agent",
+    "back",
+    "expand_keys",
+]
+"""One control on the read-only setup panel, named the same on both platforms.
+
+Discord draws these as buttons on one ephemeral card and Slack as buttons in a
+modal stack, so the identifier is the action rather than either platform's
+action id or button label.
+"""
 
 
 def parity_account_id(tenant_id: uuid.UUID, user_id: str) -> uuid.UUID:
@@ -214,4 +232,82 @@ class PlatformDriver(Protocol):
 
     def captured_card_states(self) -> list[str]:
         """The state of each captured card, in order."""
+        ...
+
+    # -- setup panel --------------------------------------------------------
+    #
+    # One panel is one conversation with the process that drew it: it opens,
+    # it is clicked, and each click redraws it. The driver therefore keeps the
+    # live panel between calls (Discord: the view instance and its PanelState;
+    # Slack: the view stack and the metadata each view carries) and every
+    # method here returns the screen that click landed on.
+    #
+    # Signature normalization (D-03), as above: `workspace_id` is Discord's
+    # guild id and Slack's team id; `channel_id` is the channel the panel was
+    # opened in; `user_id` is the platform user clicking. `is_admin` is what
+    # the platform would answer about that user — Discord reads it off the
+    # member's permissions, Slack off `users.info` — so each driver fakes its
+    # own source rather than the panel being told.
+
+    async def open_setup_panel(
+        self,
+        *,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        tenant_id: uuid.UUID,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+        is_admin: bool,
+    ) -> CapturedView:
+        """Open the panel through the platform's own entry point.
+
+        Discord runs `AgentSetupCog.agent_setup`; Slack runs
+        `handle_agent_setup_command`. Returns the roster screen.
+        """
+        ...
+
+    async def click_panel_action(
+        self,
+        *,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        tenant_id: uuid.UUID,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+        action: PanelAction,
+        agent_name: str | None = None,
+    ) -> CapturedView:
+        """Click one control on the panel as it currently stands.
+
+        `agent_name` names the roster row for `action="details"`. `"back"` is
+        Discord's ◀ Back button and, on Slack, the root view the pushed one
+        sat on top of — Slack pops its own stack, so the screen the reader
+        returns to is the root as the panel last drew it.
+        """
+        ...
+
+    async def submit_new_agent(
+        self,
+        *,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        router: MARouter,
+        tenant_id: uuid.UUID,
+        workspace_id: str,
+        channel_id: str,
+        user_id: str,
+        name: str,
+        purpose: str | None,
+        model: str,
+    ) -> CapturedView:
+        """Fill in and submit the New agent form opened by `click_panel_action`.
+
+        Returns the screen the submission lands on, which on both platforms is
+        the new agent's Details.
+        """
+        ...
+
+    def captured_views(self) -> list[CapturedView]:
+        """Every panel screen this driver drew, in order."""
         ...

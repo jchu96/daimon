@@ -9,6 +9,7 @@ import httpx
 import pytest
 from daimon.core.errors import DaimonError
 from daimon.core.setup_conversations import (
+    CODING_TOOLS_HINT,
     get_setup_responder,
     resolve_setup_agents,
     setup_thread_name,
@@ -98,4 +99,14 @@ def test_setup_thread_name_truncates_a_name_discord_would_reject() -> None:
 def test_shared_keys_sentence_names_the_agent_whose_keys_are_shared() -> None:
     assert shared_keys_sentence("writer") == "Anyone who talks to writer can use these.", (
         "the sentence must say the keys follow the agent, not the person who added them"
+    )
+
+
+def test_coding_tools_hint_names_the_command_a_reader_has_to_run() -> None:
+    """Both panels render this sentence, so its wording lives here and only here."""
+    assert "claude mcp add" in CODING_TOOLS_HINT, (
+        "the hint must name the command, not just promise a token"
+    )
+    assert CODING_TOOLS_HINT.startswith("Use from your coding tools:"), (
+        "the hint leads with the label the panels put above the button"
     )
