@@ -299,8 +299,8 @@ async def test_agent_with_overrides_can_drop_one_mcp_server_and_its_toolset(
         model={"id": "claude-haiku-4-5"},
         system="contract snapshot test: mcp server overrides",
         mcp_servers=[
-            {"type": "url", "name": "personal", "url": "https://mcp.notion.com/mcp"},
-            {"type": "url", "name": "shared", "url": "https://mcp.linear.app/mcp"},
+            {"type": "url", "name": "personal", "url": "https://mcp.example.com/personal"},
+            {"type": "url", "name": "shared", "url": "https://mcp.example.com/shared"},
         ],
         tools=[
             {"type": "mcp_toolset", "mcp_server_name": "personal"},
@@ -310,7 +310,7 @@ async def test_agent_with_overrides_can_drop_one_mcp_server_and_its_toolset(
     overridden_agent: BetaManagedAgentsAgentWithOverridesParams = {
         "type": "agent_with_overrides",
         "id": agent.id,
-        "mcp_servers": [{"type": "url", "name": "shared", "url": "https://mcp.linear.app/mcp"}],
+        "mcp_servers": [{"type": "url", "name": "shared", "url": "https://mcp.example.com/shared"}],
         "tools": [{"type": "mcp_toolset", "mcp_server_name": "shared"}],
     }
     session = await anthropic_client.beta.sessions.create(

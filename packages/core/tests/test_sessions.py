@@ -2037,10 +2037,10 @@ async def test_create_session_mirrors_nothing_when_agent_has_no_stored_mcp_crede
     assert len(session_bodies) == 1, "the session is still created"
 
 
-async def _record_notion_sign_in(
+async def _record_personal_sign_in(
     session: AsyncSession, *, tenant_id: uuid.UUID, account_id: uuid.UUID, agent_uuid: uuid.UUID
 ) -> None:
-    """One member's finished OAuth sign-in for the agent's `notion` server."""
+    """One member's finished OAuth sign-in for the agent's `docs` server."""
     now = datetime(2026, 9, 16, 9, 0, tzinfo=UTC)
     request = await requests_store.create_credential_request(
         session,
@@ -2049,8 +2049,8 @@ async def _record_notion_sign_in(
         tenant_id=tenant_id,
         agent_id=agent_uuid,
         account_id=account_id,
-        target="notion",
-        mcp_server_url="https://mcp.notion.com/mcp",
+        target="docs",
+        mcp_server_url="https://mcp.example.com/docs",
         requester_platform_user_id="requester-connected",
         channel_id="chan-1",
         expires_at=now + timedelta(minutes=30),
@@ -2066,8 +2066,8 @@ async def _record_notion_sign_in(
         tenant_id=tenant_id,
         account_id=account_id,
         agent_id=agent_uuid,
-        server_name="notion",
-        mcp_server_url="https://mcp.notion.com/mcp",
+        server_name="docs",
+        mcp_server_url="https://mcp.example.com/docs",
         redirect_uri="https://d.example/oauth/mcp/callback",
         code_verifier="verifier",
         expires_at=now + timedelta(minutes=10),
@@ -2077,8 +2077,8 @@ async def _record_notion_sign_in(
     await session.commit()
 
 
-def _agent_with_notion() -> BetaManagedAgentsAgent:
-    """An agent carrying the `notion` server one member connected by OAuth."""
+def _agent_with_personal_server() -> BetaManagedAgentsAgent:
+    """An agent carrying a `docs` server one member connected by OAuth."""
     toolset: dict[str, Any] = {
         "type": "mcp_toolset",
         "configs": [],
@@ -2089,11 +2089,11 @@ def _agent_with_notion() -> BetaManagedAgentsAgent:
         name="a",
         model="claude-opus-4-7",
         mcp_servers=[
-            {"name": "notion", "type": "url", "url": "https://mcp.notion.com/mcp"},
+            {"name": "docs", "type": "url", "url": "https://mcp.example.com/docs"},
             {"name": "daimon-mcp", "type": "url", "url": "https://mcp.example.com/mcp"},
         ],
         tools=[
-            {**toolset, "mcp_server_name": "notion"},
+            {**toolset, "mcp_server_name": "docs"},
             {**toolset, "mcp_server_name": "daimon-mcp"},
         ],
     )
@@ -2103,16 +2103,16 @@ async def test_create_session_leaves_off_a_server_only_another_member_signed_in_
     db_session: AsyncSession,
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The regression: an OAuth grant lives in one member's vault, but the
-    server it unlocked is attached to the agent everyone shares. Mounting it
-    on a bystander's session only earns them a failed MCP init and the
-    degraded-turn notice under every reply."""
+    """An OAuth grant lives in one member's vault, but the server it unlocked
+    is attached to the agent everyone shares. Mounting it on a bystander's
+    session only earns them a failed MCP init and the degraded-turn notice
+    under every reply."""
     tenant = await make_tenant(db_session)
     agent_uuid = uuid.uuid4()
     connected_account_id = uuid.UUID("00000000-0000-0000-0000-00000000dd01")
     bystander_account_id = uuid.UUID("00000000-0000-0000-0000-00000000dd02")
     public_url = "https://mcp.example.com/mcp"
-    await _record_notion_sign_in(
+    await _record_personal_sign_in(
         db_session,
         tenant_id=tenant.id,
         account_id=connected_account_id,
@@ -2134,7 +2134,7 @@ async def test_create_session_leaves_off_a_server_only_another_member_signed_in_
 
     await create_session(
         client,
-        agent=_agent_with_notion(),
+        agent=_agent_with_personal_server(),
         environment=_make_env(anthropic_id="env_personal"),
         account_id=bystander_account_id,
         mcp_settings=McpSettings(jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)),
@@ -2169,7 +2169,7 @@ async def test_create_session_keeps_the_server_for_the_member_who_signed_in(
     agent_uuid = uuid.uuid4()
     connected_account_id = uuid.UUID("00000000-0000-0000-0000-00000000dd03")
     public_url = "https://mcp.example.com/mcp"
-    await _record_notion_sign_in(
+    await _record_personal_sign_in(
         db_session,
         tenant_id=tenant.id,
         account_id=connected_account_id,
@@ -2191,7 +2191,7 @@ async def test_create_session_keeps_the_server_for_the_member_who_signed_in(
 
     await create_session(
         client,
-        agent=_agent_with_notion(),
+        agent=_agent_with_personal_server(),
         environment=_make_env(anthropic_id="env_personal"),
         account_id=connected_account_id,
         mcp_settings=McpSettings(jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)),

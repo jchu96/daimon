@@ -644,8 +644,8 @@ async def test_tools_update_leaves_off_a_server_only_another_member_signed_in_to
         tenant_id=tenant.id,
         agent_id=agent_uuid,
         account_id=connected_account_id,
-        target="notion",
-        mcp_server_url="https://mcp.notion.com/mcp",
+        target="docs",
+        mcp_server_url="https://mcp.example.com/docs",
         requester_platform_user_id="requester-connected",
         channel_id="chan-1",
         expires_at=_NOW + timedelta(minutes=30),
@@ -661,8 +661,8 @@ async def test_tools_update_leaves_off_a_server_only_another_member_signed_in_to
         tenant_id=tenant.id,
         account_id=connected_account_id,
         agent_id=agent_uuid,
-        server_name="notion",
-        mcp_server_url="https://mcp.notion.com/mcp",
+        server_name="docs",
+        mcp_server_url="https://mcp.example.com/docs",
         redirect_uri="https://d.example/oauth/mcp/callback",
         code_verifier="verifier",
         expires_at=_NOW + timedelta(minutes=10),
@@ -685,13 +685,13 @@ async def test_tools_update_leaves_off_a_server_only_another_member_signed_in_to
     client = _build_client(state, before=[_capture])
     session_id, recorded = await _session_with_env(client, content=b"A=1\n")
 
-    notion = BetaManagedAgentsMCPServerURLDefinition(
-        name="notion", type="url", url="https://mcp.notion.com/mcp"
+    personal = BetaManagedAgentsMCPServerURLDefinition(
+        name="docs", type="url", url="https://mcp.example.com/docs"
     )
     daimon = BetaManagedAgentsMCPServerURLDefinition(
         name="daimon-mcp", type="url", url="https://mcp.example/daimon"
     )
-    agent = _agent(mcp_servers=[notion, daimon])
+    agent = _agent(mcp_servers=[personal, daimon])
 
     result = await _apply(
         client,

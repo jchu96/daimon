@@ -4,11 +4,11 @@ An OAuth sign-in is personal: the grant lands in the connecting person's own
 (account, agent) vault, but `attach_mcp_server_to_agent` puts the server on
 the agent everyone shares. MA opens every attached server on every turn and
 resolves its credential from the vault mounted on that session — the
-caller's — so one person connecting Notion left every other person's turn
-opening a server they have no token for, failing it with
+caller's — so one person signing in left every other person's turn opening a
+server they have no token for, failing it with
 `mcp_authentication_failed_error`, and carrying the degraded-turn notice
-("⚠️ `notion` was unavailable this turn…") under every reply whether or not
-the turn ever wanted Notion.
+under every reply whether or not the turn had anything to do with that
+server.
 
 `hidden_mcp_server_names` names the servers to leave out of one caller's
 session; `visible_mcp_servers` and `visible_tools` cut them out of the two

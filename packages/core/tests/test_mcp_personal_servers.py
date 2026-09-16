@@ -19,8 +19,8 @@ from daimon.testing.ma_models import ma_agent
 
 _CONNECTED = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 _OTHER = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
-_NOTION_URL = "https://mcp.notion.com/mcp"
-_SERVERS = {"notion": _NOTION_URL}
+_SERVER_URL = "https://mcp.example.com/docs"
+_SERVERS = {"docs": _SERVER_URL}
 
 
 def _toolset(server_name: str) -> dict[str, object]:
@@ -38,11 +38,11 @@ def _toolset(server_name: str) -> dict[str, object]:
 
 def test_a_server_only_someone_else_connected_is_hidden() -> None:
     grants = (
-        McpOAuthGrantRow(account_id=_CONNECTED, server_name="notion", mcp_server_url=_NOTION_URL),
+        McpOAuthGrantRow(account_id=_CONNECTED, server_name="docs", mcp_server_url=_SERVER_URL),
     )
     assert hidden_mcp_server_names(
         grants, account_id=_OTHER, shared_server_urls=(), server_urls=_SERVERS
-    ) == frozenset({"notion"}), "a caller with no grant of their own cannot authenticate the server"
+    ) == frozenset({"docs"}), "a caller with no grant of their own cannot authenticate the server"
     assert (
         hidden_mcp_server_names(
             grants, account_id=_CONNECTED, shared_server_urls=(), server_urls=_SERVERS
@@ -63,27 +63,29 @@ def test_a_grant_for_a_url_the_server_no_longer_uses_is_not_a_connection() -> No
     nothing, so its holder is a bystander like everyone else."""
     grants = (
         McpOAuthGrantRow(
-            account_id=_CONNECTED, server_name="notion", mcp_server_url="https://old.notion/mcp"
+            account_id=_CONNECTED,
+            server_name="docs",
+            mcp_server_url="https://mcp.example.com/old-docs",
         ),
-        McpOAuthGrantRow(account_id=_OTHER, server_name="notion", mcp_server_url=_NOTION_URL),
+        McpOAuthGrantRow(account_id=_OTHER, server_name="docs", mcp_server_url=_SERVER_URL),
     )
     assert hidden_mcp_server_names(
         grants, account_id=_CONNECTED, shared_server_urls=(), server_urls=_SERVERS
-    ) == frozenset({"notion"}), "a grant for the old URL is not a connection to the new server"
+    ) == frozenset({"docs"}), "a grant for the old URL is not a connection to the new server"
 
 
 def test_a_server_with_an_agent_wide_credential_is_never_hidden() -> None:
     grants = (
         McpOAuthGrantRow(
-            account_id=_CONNECTED, server_name="notion", mcp_server_url=_NOTION_URL + "/"
+            account_id=_CONNECTED, server_name="docs", mcp_server_url=_SERVER_URL + "/"
         ),
     )
     assert (
         hidden_mcp_server_names(
             grants,
             account_id=_OTHER,
-            shared_server_urls=(_NOTION_URL,),
-            server_urls={"notion": _NOTION_URL + "/"},
+            shared_server_urls=(_SERVER_URL,),
+            server_urls={"docs": _SERVER_URL + "/"},
         )
         == frozenset()
     ), "a token stored on the agent is mirrored into every caller's vault, trailing slash or not"
@@ -92,21 +94,21 @@ def test_a_server_with_an_agent_wide_credential_is_never_hidden() -> None:
 def test_visible_lists_drop_a_hidden_server_and_its_toolset_together() -> None:
     agent = ma_agent(
         mcp_servers=[
-            {"name": "notion", "type": "url", "url": "https://notion/mcp"},
+            {"name": "docs", "type": "url", "url": "https://mcp.example.com/docs"},
             {"name": "daimon-mcp", "type": "url", "url": "https://daimon/mcp"},
         ],
         tools=[
-            _toolset("notion"),
+            _toolset("docs"),
             _toolset("daimon-mcp"),
         ],
     )
 
-    servers = visible_mcp_servers(agent, frozenset({"notion"}))
-    tools = visible_tools(agent, frozenset({"notion"}))
+    servers = visible_mcp_servers(agent, frozenset({"docs"}))
+    tools = visible_tools(agent, frozenset({"docs"}))
 
     assert [server.name for server in servers] == ["daimon-mcp"], "the hidden server is gone"
     assert len(tools) == 1, "its toolset goes with it — MA rejects one without the other"
-    assert not any(getattr(tool, "mcp_server_name", None) == "notion" for tool in tools), (
+    assert not any(getattr(tool, "mcp_server_name", None) == "docs" for tool in tools), (
         "no toolset may reference a server this session does not mount"
     )
 

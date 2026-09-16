@@ -448,8 +448,8 @@ def test_a_hidden_server_is_not_in_the_desired_mutable_fingerprint() -> None:
     server must read as up to date on the next turn. Hash the agent's own list
     and every turn would diff, push the server back on, and hand the caller a
     server they cannot authenticate."""
-    notion = BetaManagedAgentsMCPServerURLDefinition(
-        name="notion", type="url", url="https://mcp.notion.com/mcp"
+    personal = BetaManagedAgentsMCPServerURLDefinition(
+        name="docs", type="url", url="https://mcp.example.com/docs"
     )
     daimon = BetaManagedAgentsMCPServerURLDefinition(
         name="daimon-mcp", type="url", url="https://mcp.example/daimon"
@@ -459,7 +459,7 @@ def test_a_hidden_server_is_not_in_the_desired_mutable_fingerprint() -> None:
         archived_at=None,
         created_at=_NOW,
         description=None,
-        mcp_servers=[notion, daimon],
+        mcp_servers=[personal, daimon],
         metadata={},
         model=BetaManagedAgentsModelConfig(id="claude-sonnet-5"),
         name="research-bot",
@@ -473,7 +473,7 @@ def test_a_hidden_server_is_not_in_the_desired_mutable_fingerprint() -> None:
 
     filtered = desired_snapshot(
         agent,
-        hidden_mcp_server_names=frozenset({"notion"}),
+        hidden_mcp_server_names=frozenset({"docs"}),
         environment_id="env_science",
         env_sha256=None,
         repo_url=None,
@@ -485,6 +485,6 @@ def test_a_hidden_server_is_not_in_the_desired_mutable_fingerprint() -> None:
     assert filtered.mcp_servers_sha256 == hash_mcp_servers([daimon]), (
         "the desired snapshot describes the session this caller would get"
     )
-    assert filtered.mcp_servers_sha256 != hash_mcp_servers([notion, daimon]), (
+    assert filtered.mcp_servers_sha256 != hash_mcp_servers([personal, daimon]), (
         "hashing the agent's own list is exactly the drift loop this prevents"
     )

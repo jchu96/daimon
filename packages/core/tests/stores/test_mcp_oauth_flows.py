@@ -146,8 +146,8 @@ async def test_list_completed_grants_lists_only_stored_grants(db_session: AsyncS
             tenant_id=tenant.id,
             agent_id=agent_id,
             account_id=account_id,
-            target="notion",
-            mcp_server_url="https://mcp.notion.com/mcp",
+            target="docs",
+            mcp_server_url="https://mcp.example.com/docs",
             requester_platform_user_id=requester,
             channel_id="chan-1",
             expires_at=_NOW + timedelta(minutes=30),
@@ -163,8 +163,8 @@ async def test_list_completed_grants_lists_only_stored_grants(db_session: AsyncS
             tenant_id=tenant.id,
             account_id=account_id,
             agent_id=agent_id,
-            server_name="notion",
-            mcp_server_url="https://mcp.notion.com/mcp",
+            server_name="docs",
+            mcp_server_url="https://mcp.example.com/docs",
             redirect_uri="https://d.example/oauth/mcp/callback",
             code_verifier="verifier",
             expires_at=_NOW + timedelta(minutes=10),
@@ -182,7 +182,7 @@ async def test_list_completed_grants_lists_only_stored_grants(db_session: AsyncS
     assert [grant.account_id for grant in grants] == [connected.id], (
         "only the account whose grant was stored is connected"
     )
-    assert grants[0].server_name == "notion", "the grant names the server it was minted for"
+    assert grants[0].server_name == "docs", "the grant names the server it was minted for"
     assert (
         await store.list_completed_grants(db_session, tenant_id=tenant.id, agent_id=uuid.uuid4())
         == ()

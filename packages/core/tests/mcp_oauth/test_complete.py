@@ -213,7 +213,9 @@ async def test_complete_exchanges_code_writes_grant_and_attaches_server(
     grants = await flows_store.list_completed_grants(
         db_session, tenant_id=tenant_id, agent_id=flow.agent_id
     )
-    assert [(g.account_id, g.server_name) for g in grants] == [(flow.account_id, "notion")], (
+    assert [(g.account_id, g.server_name) for g in grants] == [
+        (flow.account_id, flow.server_name)
+    ], (
         "the stored grant marks this person — and only this person — as connected, "
         "which is what decides whose sessions mount the server"
     )
