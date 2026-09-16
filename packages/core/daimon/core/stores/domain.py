@@ -591,6 +591,22 @@ class McpOAuthFlowRow(BaseModel):
     used_at: datetime | None
 
 
+class McpOAuthGrantRow(BaseModel):
+    """One person's finished OAuth sign-in for one of an agent's MCP servers.
+
+    The spent-flow projection: a `mcp_oauth_flows` row whose `used_at` is set
+    is the durable record that this account drove a sign-in for this server
+    and holds the grant in its own vault. Erasing the platform user deletes
+    the flow row, and with it the grant this row reports.
+    """
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    account_id: uuid.UUID
+    server_name: str
+    mcp_server_url: str
+
+
 class MessageFeedbackRow(BaseModel):
     """Pydantic row for MessageFeedback — one thumbs-up/down reaction vote.
 
