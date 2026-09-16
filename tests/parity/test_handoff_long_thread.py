@@ -204,6 +204,7 @@ async def test_slack_long_thread_replacement_stays_within_thread_page_limit_and_
     # mismatch that forces a replacement, not an in-place refresh.
     old_snapshot = desired_snapshot(
         ma_agent(id=AGENT_ID, model=_OLD_MODEL_ID),
+        hidden_mcp_server_names=frozenset(),
         environment_id=ENV_ID,
         env_sha256=None,
         repo_url=None,

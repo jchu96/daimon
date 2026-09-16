@@ -51,6 +51,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_file_resource import (
 from anthropic.types.beta.sessions.beta_managed_agents_github_repository_resource import (
     BetaManagedAgentsGitHubRepositoryResource,
 )
+from daimon.core.mcp_personal_servers import visible_mcp_servers, visible_tools
 from pydantic import BaseModel, ConfigDict
 
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
@@ -271,6 +272,7 @@ def _snapshot_from_session(
 def desired_snapshot(
     agent: BetaManagedAgentsAgent,
     *,
+    hidden_mcp_server_names: frozenset[str],
     environment_id: str,
     env_sha256: str | None,
     repo_url: str | None,
@@ -286,6 +288,12 @@ def desired_snapshot(
     Resource-id handles are None: a desired configuration has no resources yet.
     Compare this against a recorded snapshot's fingerprints, never field by
     field against its handles.
+
+    `hidden_mcp_server_names` is what `create_session` would leave out of this
+    caller's session — the servers only somebody else's OAuth grant can
+    authenticate. Both arrays are hashed after that cut, or a session created
+    with those overrides reads as drifted on every turn and has the hidden
+    servers pushed straight back onto it.
     """
     return SessionSnapshot(
         ma_agent_id=agent.id,
@@ -297,8 +305,8 @@ def desired_snapshot(
         repo_branch=repo_branch,
         memory_store_id=memory_store_id,
         vault_id=vault_id,
-        tools_sha256=hash_tools(agent.tools),
-        mcp_servers_sha256=hash_mcp_servers(agent.mcp_servers),
+        tools_sha256=hash_tools(visible_tools(agent, hidden_mcp_server_names)),
+        mcp_servers_sha256=hash_mcp_servers(visible_mcp_servers(agent, hidden_mcp_server_names)),
         env_sha256=env_sha256,
         env_file_id=env_file_id,
         env_resource_id=None,

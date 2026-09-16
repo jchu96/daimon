@@ -88,6 +88,7 @@ def _agent(
 def test_fingerprints_are_identical_when_the_same_configuration_is_rebuilt() -> None:
     first = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="abc",
         repo_url=None,
@@ -97,6 +98,7 @@ def test_fingerprints_are_identical_when_the_same_configuration_is_rebuilt() -> 
     )
     second = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="abc",
         repo_url=None,
@@ -193,6 +195,7 @@ def test_env_hash_matches_the_bytes_the_credential_assembler_produces() -> None:
 
     snapshot = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256=hash_env_bytes(assemble_env_bytes(rows)),
         repo_url=None,
@@ -216,6 +219,7 @@ def test_absent_system_prompt_hashes_differently_from_an_empty_one() -> None:
     absent = fingerprint_identity(
         desired_snapshot(
             _agent(system=None),
+            hidden_mcp_server_names=frozenset(),
             environment_id="env_science",
             env_sha256=None,
             repo_url=None,
@@ -227,6 +231,7 @@ def test_absent_system_prompt_hashes_differently_from_an_empty_one() -> None:
     empty = fingerprint_identity(
         desired_snapshot(
             _agent(system=""),
+            hidden_mcp_server_names=frozenset(),
             environment_id="env_science",
             env_sha256=None,
             repo_url=None,
@@ -327,6 +332,7 @@ def test_snapshot_from_created_session_captures_every_resource_handle() -> None:
 def test_snapshot_survives_a_json_round_trip() -> None:
     snapshot = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="env-hash",
         repo_url="https://github.com/pymc-labs/example",
@@ -350,6 +356,7 @@ def test_snapshot_survives_a_json_round_trip() -> None:
 def test_identity_fingerprint_ignores_handles_and_diagnostics() -> None:
     base = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="env-hash",
         repo_url="https://github.com/pymc-labs/example",
@@ -379,6 +386,7 @@ def test_identity_fingerprint_ignores_handles_and_diagnostics() -> None:
 def test_a_model_change_moves_only_the_identity_fingerprint() -> None:
     haiku = desired_snapshot(
         _agent(model_id="claude-haiku-4-5"),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="env-hash",
         repo_url=None,
@@ -388,6 +396,7 @@ def test_a_model_change_moves_only_the_identity_fingerprint() -> None:
     )
     sonnet = desired_snapshot(
         _agent(model_id="claude-sonnet-5"),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="env-hash",
         repo_url=None,
@@ -407,6 +416,7 @@ def test_a_model_change_moves_only_the_identity_fingerprint() -> None:
 def test_an_env_change_moves_only_the_mutable_fingerprint() -> None:
     before = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="hash-before",
         repo_url=None,
@@ -416,6 +426,7 @@ def test_an_env_change_moves_only_the_mutable_fingerprint() -> None:
     )
     after = desired_snapshot(
         _agent(),
+        hidden_mcp_server_names=frozenset(),
         environment_id="env_science",
         env_sha256="hash-after",
         repo_url=None,
@@ -429,4 +440,51 @@ def test_an_env_change_moves_only_the_mutable_fingerprint() -> None:
     )
     assert fingerprint_identity(before) == fingerprint_identity(after), (
         "a key change must never force a replacement"
+    )
+
+
+def test_a_hidden_server_is_not_in_the_desired_mutable_fingerprint() -> None:
+    """The no-churn property: a session created without a personally-connected
+    server must read as up to date on the next turn. Hash the agent's own list
+    and every turn would diff, push the server back on, and hand the caller a
+    server they cannot authenticate."""
+    notion = BetaManagedAgentsMCPServerURLDefinition(
+        name="notion", type="url", url="https://mcp.notion.com/mcp"
+    )
+    daimon = BetaManagedAgentsMCPServerURLDefinition(
+        name="daimon-mcp", type="url", url="https://mcp.example/daimon"
+    )
+    agent = BetaManagedAgentsAgent(
+        id="agent_research",
+        archived_at=None,
+        created_at=_NOW,
+        description=None,
+        mcp_servers=[notion, daimon],
+        metadata={},
+        model=BetaManagedAgentsModelConfig(id="claude-sonnet-5"),
+        name="research-bot",
+        skills=[],
+        system="be useful",
+        tools=[],
+        type="agent",
+        updated_at=_NOW,
+        version=1,
+    )
+
+    filtered = desired_snapshot(
+        agent,
+        hidden_mcp_server_names=frozenset({"notion"}),
+        environment_id="env_science",
+        env_sha256=None,
+        repo_url=None,
+        repo_branch=None,
+        memory_store_id=None,
+        vault_id=None,
+    )
+
+    assert filtered.mcp_servers_sha256 == hash_mcp_servers([daimon]), (
+        "the desired snapshot describes the session this caller would get"
+    )
+    assert filtered.mcp_servers_sha256 != hash_mcp_servers([notion, daimon]), (
+        "hashing the agent's own list is exactly the drift loop this prevents"
     )

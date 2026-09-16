@@ -543,6 +543,7 @@ async def prepare_session_for_turn(
             environment_id=admission.environment.id,
             tenant_id=tenant_id,
             agent_uuid=agent_uuid,
+            account_id=admission.account_id,
             recorded=recorded,
         )
         fresh_start = row.fresh_start_requested_at is not None

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -19,11 +19,14 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from daimon.core.agent_mcp_credentials import save_agent_mcp_credential
 from daimon.core.config import McpSettings
+from daimon.core.credential_requests import mint_request_token
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import build_multifernet, upsert_credential_encrypted
 from daimon.core.sessions import create_session
 from daimon.core.stores import agent_github_binding as github_binding_store
 from daimon.core.stores import agent_repo_binding as repo_binding_store
+from daimon.core.stores import credential_requests as requests_store
+from daimon.core.stores import mcp_oauth_flows as flows_store
 from daimon.core.stores.agent_files import put_agent_file
 from daimon.core.stores.domain import RepoAccessProof
 from daimon.testing.factories import make_tenant
@@ -1906,11 +1909,12 @@ def _warm_vault_mirror_handler(
         if request.method == "POST" and request.url.path.endswith("/v1/sessions"):
             body = json.loads(request.content)
             session_create_bodies.append(body)
+            sent_agent = body["agent"]
             return httpx.Response(
                 200,
                 json=_session_body(
                     session_id=session_id,
-                    agent_id=body["agent"],
+                    agent_id=sent_agent if isinstance(sent_agent, str) else sent_agent["id"],
                     environment_id=body["environment_id"],
                 ),
             )
@@ -2031,3 +2035,171 @@ async def test_create_session_mirrors_nothing_when_agent_has_no_stored_mcp_crede
     assert cred_bodies == [], "no stored credentials means no credential POSTs"
     assert cred_deletes == [], "and nothing deleted"
     assert len(session_bodies) == 1, "the session is still created"
+
+
+async def _record_notion_sign_in(
+    session: AsyncSession, *, tenant_id: uuid.UUID, account_id: uuid.UUID, agent_uuid: uuid.UUID
+) -> None:
+    """One member's finished OAuth sign-in for the agent's `notion` server."""
+    now = datetime(2026, 9, 16, 9, 0, tzinfo=UTC)
+    request = await requests_store.create_credential_request(
+        session,
+        token=mint_request_token(),
+        kind="mcp_oauth",
+        tenant_id=tenant_id,
+        agent_id=agent_uuid,
+        account_id=account_id,
+        target="notion",
+        mcp_server_url="https://mcp.notion.com/mcp",
+        requester_platform_user_id="requester-connected",
+        channel_id="chan-1",
+        expires_at=now + timedelta(minutes=30),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id="ag_personal",
+        target_name="daimon",
+        requested_work=None,
+    )
+    flow = await flows_store.create_flow(
+        session,
+        state="st_" + uuid.uuid4().hex,
+        request_token=request.token,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        agent_id=agent_uuid,
+        server_name="notion",
+        mcp_server_url="https://mcp.notion.com/mcp",
+        redirect_uri="https://d.example/oauth/mcp/callback",
+        code_verifier="verifier",
+        expires_at=now + timedelta(minutes=10),
+    )
+    await flows_store.consume_flow(session, state=flow.state, now=now)
+    await session.commit()
+
+
+def _agent_with_notion() -> BetaManagedAgentsAgent:
+    """An agent carrying the `notion` server one member connected by OAuth."""
+    toolset: dict[str, Any] = {
+        "type": "mcp_toolset",
+        "configs": [],
+        "default_config": {"enabled": True, "permission_policy": {"type": "always_allow"}},
+    }
+    return ma_agent(
+        id="ag_personal",
+        name="a",
+        model="claude-opus-4-7",
+        mcp_servers=[
+            {"name": "notion", "type": "url", "url": "https://mcp.notion.com/mcp"},
+            {"name": "daimon-mcp", "type": "url", "url": "https://mcp.example.com/mcp"},
+        ],
+        tools=[
+            {**toolset, "mcp_server_name": "notion"},
+            {**toolset, "mcp_server_name": "daimon-mcp"},
+        ],
+    )
+
+
+async def test_create_session_leaves_off_a_server_only_another_member_signed_in_to(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The regression: an OAuth grant lives in one member's vault, but the
+    server it unlocked is attached to the agent everyone shares. Mounting it
+    on a bystander's session only earns them a failed MCP init and the
+    degraded-turn notice under every reply."""
+    tenant = await make_tenant(db_session)
+    agent_uuid = uuid.uuid4()
+    connected_account_id = uuid.UUID("00000000-0000-0000-0000-00000000dd01")
+    bystander_account_id = uuid.UUID("00000000-0000-0000-0000-00000000dd02")
+    public_url = "https://mcp.example.com/mcp"
+    await _record_notion_sign_in(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=connected_account_id,
+        agent_uuid=agent_uuid,
+    )
+
+    session_bodies: list[dict[str, Any]] = []
+    client = build_fake_anthropic_http(
+        _warm_vault_mirror_handler(
+            account_id=bystander_account_id,
+            agent_uuid=agent_uuid,
+            public_url=public_url,
+            credential_post_bodies=[],
+            credential_deletes=[],
+            session_create_bodies=session_bodies,
+            session_id="sess_bystander",
+        )
+    )
+
+    await create_session(
+        client,
+        agent=_agent_with_notion(),
+        environment=_make_env(anthropic_id="env_personal"),
+        account_id=bystander_account_id,
+        mcp_settings=McpSettings(jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)),
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        session_factory=db_session_factory,
+        fernet=build_multifernet((Fernet.generate_key().decode(),)),
+    )
+
+    sent_agent = session_bodies[0]["agent"]
+    assert sent_agent["type"] == "agent_with_overrides", (
+        "a bystander's session must override the agent's server list"
+    )
+    assert sent_agent["id"] == "ag_personal" and sent_agent["version"] == 1, (
+        "the overrides pin the agent version they were filtered from"
+    )
+    assert [server["name"] for server in sent_agent["mcp_servers"]] == ["daimon-mcp"], (
+        "the personally-connected server is left off"
+    )
+    assert [tool["mcp_server_name"] for tool in sent_agent["tools"]] == ["daimon-mcp"], (
+        "and its toolset with it — MA rejects a toolset whose server is absent"
+    )
+
+
+async def test_create_session_keeps_the_server_for_the_member_who_signed_in(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Hiding is per caller: the person who drove the sign-in still gets the
+    server, and their session is created the plain way — by agent id."""
+    tenant = await make_tenant(db_session)
+    agent_uuid = uuid.uuid4()
+    connected_account_id = uuid.UUID("00000000-0000-0000-0000-00000000dd03")
+    public_url = "https://mcp.example.com/mcp"
+    await _record_notion_sign_in(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=connected_account_id,
+        agent_uuid=agent_uuid,
+    )
+
+    session_bodies: list[dict[str, Any]] = []
+    client = build_fake_anthropic_http(
+        _warm_vault_mirror_handler(
+            account_id=connected_account_id,
+            agent_uuid=agent_uuid,
+            public_url=public_url,
+            credential_post_bodies=[],
+            credential_deletes=[],
+            session_create_bodies=session_bodies,
+            session_id="sess_connected",
+        )
+    )
+
+    await create_session(
+        client,
+        agent=_agent_with_notion(),
+        environment=_make_env(anthropic_id="env_personal"),
+        account_id=connected_account_id,
+        mcp_settings=McpSettings(jwt_secret=SecretStr("x" * 32), public_url=HttpUrl(public_url)),
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        session_factory=db_session_factory,
+        fernet=build_multifernet((Fernet.generate_key().decode(),)),
+    )
+
+    assert session_bodies[0]["agent"] == "ag_personal", (
+        "nothing hidden means the call shape does not change at all"
+    )

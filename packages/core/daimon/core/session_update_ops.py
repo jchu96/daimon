@@ -42,12 +42,16 @@ from anthropic.types.beta.sessions.beta_managed_agents_file_resource import (
     BetaManagedAgentsFileResource,
 )
 from cryptography.fernet import MultiFernet
-from daimon.core.agent_mcp_credentials import sync_agent_mcp_credentials
+from daimon.core.agent_mcp_credentials import (
+    resolve_hidden_mcp_server_names,
+    sync_agent_mcp_credentials,
+)
 from daimon.core.config import McpSettings
 from daimon.core.credential_env import assemble_env_bytes, upload_env_file
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import get_pat
 from daimon.core.github_repo_auth import resolve_clone_token
+from daimon.core.mcp_personal_servers import visible_mcp_servers, visible_tools
 from daimon.core.session_compat import (
     ChangeReason,
     RemirrorVaultCredentials,
@@ -105,19 +109,29 @@ def _is_session_running(error: APIStatusError) -> bool:
     return error.status_code == 400 and _RUNNING_MARKER in str(error).lower()
 
 
-def _agent_update(agent: BetaManagedAgentsAgent) -> BetaManagedAgentsSessionAgentUpdateParam:
+def _agent_update(
+    agent: BetaManagedAgentsAgent, hidden_mcp_server_names: frozenset[str]
+) -> BetaManagedAgentsSessionAgentUpdateParam:
     """Both arrays, in full, from the agent as it stands now.
 
     `sessions.update` is a full replacement, so a partial array would silently
     drop whatever it omitted. `vault_ids` is never sent — MA rejects it
     outright ("Updating vault_ids is not yet supported"), and the vault a
     session mounts is fixed at create time anyway.
+
+    "In full" means the caller's full list, not the agent's: a server only
+    somebody else's OAuth grant can authenticate is left out here exactly as
+    `create_session` leaves it out, or the first configuration change of the
+    session's life would push it back onto a caller who cannot open it.
     """
     return {
-        "tools": [cast(Tool, tool.model_dump(mode="json")) for tool in agent.tools],
+        "tools": [
+            cast(Tool, tool.model_dump(mode="json"))
+            for tool in visible_tools(agent, hidden_mcp_server_names)
+        ],
         "mcp_servers": [
             cast(BetaManagedAgentsURLMCPServerParams, server.model_dump(mode="json"))
-            for server in agent.mcp_servers
+            for server in visible_mcp_servers(agent, hidden_mcp_server_names)
         ],
     }
 
@@ -276,8 +290,16 @@ async def apply_update_ops(
                 )
                 applied.append("env_file")
             case ReplaceToolsAndMcpServers():
+                hidden = await resolve_hidden_mcp_server_names(
+                    sessionmaker,
+                    tenant_id=tenant_id,
+                    agent_id=agent_uuid,
+                    account_id=account_id,
+                )
                 try:
-                    await anthropic.beta.sessions.update(session_id, agent=_agent_update(agent))
+                    await anthropic.beta.sessions.update(
+                        session_id, agent=_agent_update(agent, hidden)
+                    )
                 except APIStatusError as error:
                     if not _is_session_running(error):
                         raise
@@ -285,8 +307,8 @@ async def apply_update_ops(
                     return SessionBusy(snapshot=snapshot, applied=tuple(applied))
                 snapshot = snapshot.model_copy(
                     update={
-                        "tools_sha256": hash_tools(agent.tools),
-                        "mcp_servers_sha256": hash_mcp_servers(agent.mcp_servers),
+                        "tools_sha256": hash_tools(visible_tools(agent, hidden)),
+                        "mcp_servers_sha256": hash_mcp_servers(visible_mcp_servers(agent, hidden)),
                     }
                 )
                 applied.extend(("tools", "mcp_servers"))
