@@ -7,8 +7,10 @@ per-caller MCP visibility needs to tell them apart: the first must not be
 handed a server they hold no credential for. `completed_at` is written only
 once the grant is in the person's vault.
 
-Existing spent rows are backfilled from `used_at` — the best reading history
-supports, and exactly how they were treated before this column existed.
+Existing rows are backfilled from `used_at`, but only where the request row
+they hang off records `outcome = 'applied'` — the callback writes that only
+after the grant is stored, so a historical decline is not resurrected as a
+connection.
 
 downgrade: safe
 """
@@ -28,7 +30,11 @@ def upgrade() -> None:
     op.add_column(
         "mcp_oauth_flows", sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True)
     )
-    op.execute("UPDATE mcp_oauth_flows SET completed_at = used_at WHERE used_at IS NOT NULL")
+    op.execute(
+        "UPDATE mcp_oauth_flows SET completed_at = used_at "
+        "WHERE used_at IS NOT NULL AND request_token IN "
+        "(SELECT token FROM credential_requests WHERE outcome = 'applied')"
+    )
 
 
 def downgrade() -> None:
