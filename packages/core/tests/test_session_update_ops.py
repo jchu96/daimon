@@ -668,6 +668,7 @@ async def test_tools_update_leaves_off_a_server_only_another_member_signed_in_to
         expires_at=_NOW + timedelta(minutes=10),
     )
     await flows_store.consume_flow(db_session, state=flow.state, now=_NOW)
+    await flows_store.mark_flow_completed(db_session, state=flow.state, now=_NOW)
     await db_session.commit()
 
     state = FakeSessionsState(ma=FakeMAState())

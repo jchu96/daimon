@@ -35,7 +35,7 @@ async def _record_sign_in(
     agent_id: uuid.UUID,
     requester: str,
 ) -> None:
-    """Drive one OAuth handshake to the point the callback spends it."""
+    """Drive one OAuth handshake through to a stored grant."""
     request = await requests_store.create_credential_request(
         session,
         token=mint_request_token(),
@@ -67,6 +67,7 @@ async def _record_sign_in(
         expires_at=_NOW + timedelta(minutes=10),
     )
     await flows_store.consume_flow(session, state=flow.state, now=_NOW)
+    await flows_store.mark_flow_completed(session, state=flow.state, now=_NOW)
     await session.commit()
 
 

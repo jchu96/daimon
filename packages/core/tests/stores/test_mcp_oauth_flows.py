@@ -131,9 +131,10 @@ async def test_flow_is_erased_with_its_request_row(db_session: AsyncSession) -> 
     )
 
 
-async def test_list_completed_grants_returns_only_spent_flows(db_session: AsyncSession) -> None:
+async def test_list_completed_grants_lists_only_stored_grants(db_session: AsyncSession) -> None:
     tenant = await make_tenant(db_session)
     connected = await make_account(db_session, tenant=tenant)
+    decliner = await make_account(db_session, tenant=tenant)
     abandoned = await make_account(db_session, tenant=tenant)
     agent_id = uuid.uuid4()
 
@@ -169,13 +170,17 @@ async def test_list_completed_grants_returns_only_spent_flows(db_session: AsyncS
             expires_at=_NOW + timedelta(minutes=10),
         )
 
-    spent = await flow_for(connected.id, "requester-connected")
+    signed_in = await flow_for(connected.id, "requester-connected")
+    declined = await flow_for(decliner.id, "requester-decliner")
     await flow_for(abandoned.id, "requester-abandoned")
-    await store.consume_flow(db_session, state=spent.state, now=_NOW)
+    await store.consume_flow(db_session, state=signed_in.state, now=_NOW)
+    await store.mark_flow_completed(db_session, state=signed_in.state, now=_NOW)
+    # The decline path spends the row and stops: `used_at` alone is not a grant.
+    await store.consume_flow(db_session, state=declined.state, now=_NOW)
 
     grants = await store.list_completed_grants(db_session, tenant_id=tenant.id, agent_id=agent_id)
     assert [grant.account_id for grant in grants] == [connected.id], (
-        "only the account whose callback ran holds a grant"
+        "only the account whose grant was stored is connected"
     )
     assert grants[0].server_name == "notion", "the grant names the server it was minted for"
     assert (

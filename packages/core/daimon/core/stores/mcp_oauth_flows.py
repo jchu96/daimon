@@ -3,10 +3,11 @@
 The click mints the row (`create_flow`), `/oauth/mcp/start` fills in the
 registered client (`save_flow_client`), and the callback spends it
 (`consume_flow`), which is the single-use gate: one UPDATE whose WHERE
-clause only matches an unused, unexpired row. A spent row outlives the
+clause only matches an unused, unexpired row. `mark_flow_completed` then
+stamps the row whose grant actually reached a vault, and it outlives the
 handshake as the record of who connected what: `list_completed_grants` reads
-it so a session mounts only the servers its caller can authenticate. No
-try/except — DB exceptions propagate.
+those rows so a session mounts only the servers its caller can authenticate.
+No try/except — DB exceptions propagate.
 """
 
 from __future__ import annotations
@@ -117,13 +118,28 @@ async def consume_flow(
     return None if orm is None else McpOAuthFlowRow.model_validate(orm)
 
 
+async def mark_flow_completed(session: AsyncSession, *, state: str, now: datetime) -> None:
+    """Record that this flow's grant reached the person's vault.
+
+    Separate from `consume_flow`, which spends the row before the callback
+    knows whether the person approved: only a stored credential makes them
+    connected.
+    """
+    await session.execute(
+        update(McpOAuthFlow).where(McpOAuthFlow.state == state).values(completed_at=now)
+    )
+    await session.flush()
+
+
 async def list_completed_grants(
     session: AsyncSession, *, tenant_id: uuid.UUID, agent_id: uuid.UUID
 ) -> tuple[McpOAuthGrantRow, ...]:
     """Who has finished a sign-in for which of this agent's MCP servers.
 
-    One row per spent flow, so a person who reconnected the same server
-    appears more than once; callers work in sets of server names.
+    One row per completed flow, so a person who reconnected the same server
+    appears more than once; callers work in sets of server names. A flow that
+    was spent but never exchanged for a grant — a decline, a refused code —
+    is not a connection and is not listed.
     """
     result = await session.execute(
         select(
@@ -131,7 +147,7 @@ async def list_completed_grants(
         ).where(
             McpOAuthFlow.tenant_id == tenant_id,
             McpOAuthFlow.agent_id == agent_id,
-            McpOAuthFlow.used_at.is_not(None),
+            McpOAuthFlow.completed_at.is_not(None),
         )
     )
     return tuple(

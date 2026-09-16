@@ -1140,6 +1140,10 @@ class McpOAuthFlow(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # `used_at` is the replay gate, stamped before the callback knows whether
+    # the person approved; `completed_at` is written only once their grant is
+    # in the vault, which is what "connected" has to mean.
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MessageFeedback(Base):

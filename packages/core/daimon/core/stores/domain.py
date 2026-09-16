@@ -589,15 +589,18 @@ class McpOAuthFlowRow(BaseModel):
     created_at: datetime
     expires_at: datetime
     used_at: datetime | None
+    completed_at: datetime | None
 
 
 class McpOAuthGrantRow(BaseModel):
     """One person's finished OAuth sign-in for one of an agent's MCP servers.
 
-    The spent-flow projection: a `mcp_oauth_flows` row whose `used_at` is set
-    is the durable record that this account drove a sign-in for this server
-    and holds the grant in its own vault. Erasing the platform user deletes
-    the flow row, and with it the grant this row reports.
+    The completed-flow projection: a `mcp_oauth_flows` row whose
+    `completed_at` is set is the durable record that this account's grant was
+    stored in its own vault — not merely that it opened the link, which
+    `used_at` records for anyone who reached the callback at all. Erasing the
+    platform user deletes the flow row, and with it the grant this row
+    reports.
     """
 
     model_config = ConfigDict(from_attributes=True, frozen=True)

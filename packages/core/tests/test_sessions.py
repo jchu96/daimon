@@ -2073,6 +2073,7 @@ async def _record_notion_sign_in(
         expires_at=now + timedelta(minutes=10),
     )
     await flows_store.consume_flow(session, state=flow.state, now=now)
+    await flows_store.mark_flow_completed(session, state=flow.state, now=now)
     await session.commit()
 
 
