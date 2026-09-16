@@ -90,11 +90,19 @@ async def test_a_server_one_person_connected_is_hidden_from_everyone_else(
     )
 
     assert await resolve_hidden_mcp_server_names(
-        db_session_factory, tenant_id=tenant.id, agent_id=agent_id, account_id=bystander.id
+        db_session_factory,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        account_id=bystander.id,
+        server_urls={"notion": _NOTION_URL},
     ) == frozenset({"notion"}), "a member who never signed in must not be handed the server"
     assert (
         await resolve_hidden_mcp_server_names(
-            db_session_factory, tenant_id=tenant.id, agent_id=agent_id, account_id=connected.id
+            db_session_factory,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            account_id=connected.id,
+            server_urls={"notion": _NOTION_URL},
         )
         == frozenset()
     ), "the member who signed in keeps it"
@@ -113,6 +121,7 @@ async def test_nothing_is_hidden_for_an_agent_nobody_signed_in_to(
             tenant_id=tenant.id,
             agent_id=uuid.uuid4(),
             account_id=account.id,
+            server_urls={"daimon-mcp": "https://daimon.example/mcp"},
         )
         == frozenset()
     ), "the common case must cost one read and hide nothing"
@@ -145,7 +154,11 @@ async def test_an_agent_wide_token_keeps_the_server_visible_to_everyone(
 
     assert (
         await resolve_hidden_mcp_server_names(
-            db_session_factory, tenant_id=tenant.id, agent_id=agent_id, account_id=bystander.id
+            db_session_factory,
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            account_id=bystander.id,
+            server_urls={"notion": _NOTION_URL},
         )
         == frozenset()
     ), "a token every caller's vault gets is not a personal connection"

@@ -295,6 +295,7 @@ async def apply_update_ops(
                     tenant_id=tenant_id,
                     agent_id=agent_uuid,
                     account_id=account_id,
+                    server_urls={server.name: server.url for server in agent.mcp_servers},
                 )
                 try:
                     await anthropic.beta.sessions.update(

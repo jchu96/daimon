@@ -295,7 +295,11 @@ async def create_session(
         and session_factory is not None
     ):
         hidden = await resolve_hidden_mcp_server_names(
-            session_factory, tenant_id=tenant_id, agent_id=agent_uuid, account_id=account_id
+            session_factory,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            account_id=account_id,
+            server_urls={server.name: server.url for server in agent.mcp_servers},
         )
         if hidden:
             overrides: BetaManagedAgentsAgentWithOverridesParams = {

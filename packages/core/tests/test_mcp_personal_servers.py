@@ -19,6 +19,8 @@ from daimon.testing.ma_models import ma_agent
 
 _CONNECTED = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 _OTHER = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
+_NOTION_URL = "https://mcp.notion.com/mcp"
+_SERVERS = {"notion": _NOTION_URL}
 
 
 def _toolset(server_name: str) -> dict[str, object]:
@@ -36,33 +38,52 @@ def _toolset(server_name: str) -> dict[str, object]:
 
 def test_a_server_only_someone_else_connected_is_hidden() -> None:
     grants = (
-        McpOAuthGrantRow(
-            account_id=_CONNECTED, server_name="notion", mcp_server_url="https://notion/mcp"
-        ),
+        McpOAuthGrantRow(account_id=_CONNECTED, server_name="notion", mcp_server_url=_NOTION_URL),
     )
-    assert hidden_mcp_server_names(grants, account_id=_OTHER, shared_server_urls=()) == frozenset(
-        {"notion"}
-    ), "a caller with no grant of their own cannot authenticate the server"
+    assert hidden_mcp_server_names(
+        grants, account_id=_OTHER, shared_server_urls=(), server_urls=_SERVERS
+    ) == frozenset({"notion"}), "a caller with no grant of their own cannot authenticate the server"
     assert (
-        hidden_mcp_server_names(grants, account_id=_CONNECTED, shared_server_urls=()) == frozenset()
+        hidden_mcp_server_names(
+            grants, account_id=_CONNECTED, shared_server_urls=(), server_urls=_SERVERS
+        )
+        == frozenset()
     ), "the person who signed in keeps the server they connected"
 
 
 def test_nothing_is_hidden_when_nobody_has_signed_in() -> None:
-    assert hidden_mcp_server_names((), account_id=_OTHER, shared_server_urls=()) == frozenset(), (
-        "an agent with no OAuth grants hides nothing"
+    assert (
+        hidden_mcp_server_names((), account_id=_OTHER, shared_server_urls=(), server_urls=_SERVERS)
+        == frozenset()
+    ), "an agent with no OAuth grants hides nothing"
+
+
+def test_a_grant_for_a_url_the_server_no_longer_uses_is_not_a_connection() -> None:
+    """The name is re-pointed at another server: the stale grant unlocks
+    nothing, so its holder is a bystander like everyone else."""
+    grants = (
+        McpOAuthGrantRow(
+            account_id=_CONNECTED, server_name="notion", mcp_server_url="https://old.notion/mcp"
+        ),
+        McpOAuthGrantRow(account_id=_OTHER, server_name="notion", mcp_server_url=_NOTION_URL),
     )
+    assert hidden_mcp_server_names(
+        grants, account_id=_CONNECTED, shared_server_urls=(), server_urls=_SERVERS
+    ) == frozenset({"notion"}), "a grant for the old URL is not a connection to the new server"
 
 
 def test_a_server_with_an_agent_wide_credential_is_never_hidden() -> None:
     grants = (
         McpOAuthGrantRow(
-            account_id=_CONNECTED, server_name="notion", mcp_server_url="https://notion/mcp/"
+            account_id=_CONNECTED, server_name="notion", mcp_server_url=_NOTION_URL + "/"
         ),
     )
     assert (
         hidden_mcp_server_names(
-            grants, account_id=_OTHER, shared_server_urls=("https://notion/mcp",)
+            grants,
+            account_id=_OTHER,
+            shared_server_urls=(_NOTION_URL,),
+            server_urls={"notion": _NOTION_URL + "/"},
         )
         == frozenset()
     ), "a token stored on the agent is mirrored into every caller's vault, trailing slash or not"

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import anthropic
@@ -258,6 +259,7 @@ async def resolve_hidden_mcp_server_names(
     tenant_id: uuid.UUID,
     agent_id: uuid.UUID,
     account_id: uuid.UUID,
+    server_urls: Mapping[str, str],
 ) -> frozenset[str]:
     """The servers to leave off this caller's session, read from the DB.
 
@@ -266,9 +268,12 @@ async def resolve_hidden_mcp_server_names(
     their own browser reaches only them, so it comes off everyone else's
     session (`mcp_personal_servers` decides which is which).
 
-    An agent nobody has signed in to costs one indexed read and stops there,
+    `server_urls` is the agent's own `{name: url}`; an agent with no servers,
+    or one nobody has signed in to, costs one indexed read and stops there,
     which is every agent until someone connects an OAuth server.
     """
+    if not server_urls:
+        return frozenset()
     async with sessionmaker() as session:
         grants = await flows_store.list_completed_grants(
             session, tenant_id=tenant_id, agent_id=agent_id
@@ -282,4 +287,5 @@ async def resolve_hidden_mcp_server_names(
         grants,
         account_id=account_id,
         shared_server_urls=[credential.mcp_server_url for credential in credentials],
+        server_urls=server_urls,
     )

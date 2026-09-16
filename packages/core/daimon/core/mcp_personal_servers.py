@@ -23,14 +23,15 @@ import here would close a cycle. The grant rows are read by
 A server whose credential is agent-wide (`agent_mcp_credentials`, mirrored
 into every caller's vault at session create) is never personal, even when
 somebody also signed in to it personally: everyone can authenticate it.
-Server *name* is the join key, because that is what the agent spec and MA's
-failure events carry.
+Grants are matched to the agent's servers by name *and* URL, so a name
+re-pointed at a different server does not let a grant for the old one pass
+for a connection to the new.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from anthropic.types.beta import BetaManagedAgentsAgent
@@ -51,19 +52,31 @@ def hidden_mcp_server_names(
     *,
     account_id: uuid.UUID,
     shared_server_urls: Iterable[str],
+    server_urls: Mapping[str, str],
 ) -> frozenset[str]:
-    """Servers somebody connected personally that `account_id` has not.
+    """Of `server_urls`, the ones somebody connected personally and this
+    caller has not.
 
-    Pure. Trailing slashes are stripped on both sides of the shared-credential
-    comparison, the same normalisation `put_mcp_oauth_credential` uses to
-    match a vault credential to a server URL.
+    Pure. `server_urls` is the agent's own `{name: url}`, so every decision is
+    made about the server a session would actually mount: a grant for a name
+    now pointing elsewhere counts for nothing, and a name nobody signed in to
+    is not personal at all. Trailing slashes are stripped on both sides of
+    every URL comparison, the same normalisation `put_mcp_oauth_credential`
+    uses to match a vault credential to a server URL.
     """
     shared = {url.rstrip("/") for url in shared_server_urls}
-    personal = {
-        grant.server_name for grant in grants if grant.mcp_server_url.rstrip("/") not in shared
-    }
-    connected = {grant.server_name for grant in grants if grant.account_id == account_id}
-    return frozenset(personal - connected)
+    hidden: set[str] = set()
+    for name, url in server_urls.items():
+        if url.rstrip("/") in shared:
+            continue
+        holders = {
+            grant.account_id
+            for grant in grants
+            if grant.server_name == name and grant.mcp_server_url.rstrip("/") == url.rstrip("/")
+        }
+        if holders and account_id not in holders:
+            hidden.add(name)
+    return frozenset(hidden)
 
 
 def visible_mcp_servers(

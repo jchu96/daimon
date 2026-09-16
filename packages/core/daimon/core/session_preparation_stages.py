@@ -269,7 +269,11 @@ async def desired_snapshot_for(
     return desired_snapshot(
         agent,
         hidden_mcp_server_names=await resolve_hidden_mcp_server_names(
-            sessionmaker, tenant_id=tenant_id, agent_id=agent_uuid, account_id=account_id
+            sessionmaker,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            account_id=account_id,
+            server_urls={server.name: server.url for server in agent.mcp_servers},
         ),
         environment_id=environment_id,
         env_sha256=hash_env_bytes(assemble_env_bytes(rows)) if rows else None,
