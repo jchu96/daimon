@@ -2147,8 +2147,8 @@ async def test_create_session_leaves_off_a_server_only_another_member_signed_in_
     assert sent_agent["type"] == "agent_with_overrides", (
         "a bystander's session must override the agent's server list"
     )
-    assert sent_agent["id"] == "ag_personal" and sent_agent["version"] == 1, (
-        "the overrides pin the agent version they were filtered from"
+    assert sent_agent["id"] == "ag_personal" and "version" not in sent_agent, (
+        "the overrides name the agent and let MA pin the latest version, as a bare id does"
     )
     assert [server["name"] for server in sent_agent["mcp_servers"]] == ["daimon-mcp"], (
         "the personally-connected server is left off"

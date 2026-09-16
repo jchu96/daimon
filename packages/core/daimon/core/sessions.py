@@ -301,10 +301,9 @@ async def create_session(
             overrides: BetaManagedAgentsAgentWithOverridesParams = {
                 "type": "agent_with_overrides",
                 "id": agent.id,
-                # The version the arrays below were filtered from, so a
-                # concurrent `agents.update` cannot leave this session running
-                # a spec these overrides were never computed against.
-                "version": agent.version,
+                # No `version`: a bare id pins the latest, which is what every
+                # other session gets, and both arrays below are full
+                # replacements — there is nothing left for a version to pin.
                 "mcp_servers": [
                     BetaManagedAgentsURLMCPServerParams(
                         name=server.name, type="url", url=server.url
