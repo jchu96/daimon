@@ -72,9 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can authenticate: one nobody but another member has signed in to is left
   off that session's MCP server and toolset lists, while the members who did
   connect it keep it, and a server whose token is stored on the agent stays
-  visible to everyone as before. The notice is back to meaning what it says:
-  your own connection needs attention. Migration
-  `0021_mcp_oauth_flows_agent_ix`.
+  visible to everyone as before. Pressing "Deny" on a sign-in link no longer
+  counts as connecting, either. The notice is back to meaning what it says:
+  your own connection needs attention. Migrations
+  `0021_mcp_oauth_flows_agent_ix` and `0022_mcp_oauth_flows_completed`.
 
 - **Connecting an OAuth MCP server no longer breaks every later turn.** After
   someone signed in to Notion, each turn failed with "could not get the agent
