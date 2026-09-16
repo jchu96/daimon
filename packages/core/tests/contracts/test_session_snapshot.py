@@ -325,6 +325,11 @@ async def test_agent_with_overrides_can_drop_one_mcp_server_and_its_toolset(
     assert not any(
         getattr(tool, "mcp_server_name", None) == "personal" for tool in retrieved.agent.tools
     ), "the dropped server's toolset must not survive the override"
+    assert retrieved.agent.id == agent.id, (
+        "an overridden session must still report the agent it names: `ma_agent_id` is an "
+        f"identity-fingerprint field, so a different id replaces the session every turn; got "
+        f"{retrieved.agent.id!r}"
+    )
 
     await anthropic_client.beta.sessions.archive(session.id)
 
