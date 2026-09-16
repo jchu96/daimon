@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One member's Notion sign-in no longer warns everyone else on every
+  message.** An OAuth grant is stored in the vault of whoever signed in, but
+  the server it unlocks is attached to the agent the whole workspace shares,
+  so Managed Agents opened it on every other member's turn, failed it for
+  want of a credential, and hung "⚠️ `notion` was unavailable this turn: it
+  rejected the connection's credentials" under every reply — including turns
+  that never wanted Notion. A session now mounts only the servers its caller
+  can authenticate: one nobody but another member has signed in to is left
+  off that session's MCP server and toolset lists, while the members who did
+  connect it keep it, and a server whose token is stored on the agent stays
+  visible to everyone as before. The notice is back to meaning what it says:
+  your own connection needs attention. Migration
+  `0021_mcp_oauth_flows_agent_ix`.
+
 - **Connecting an OAuth MCP server no longer breaks every later turn.** After
   someone signed in to Notion, each turn failed with "could not get the agent
   ready": the per-turn vault mirror only knew static tokens, so it tried to
