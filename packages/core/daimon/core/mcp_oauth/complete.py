@@ -3,8 +3,9 @@
 Runs on the mcp process when the authorization server redirects back. The
 flow row is already spent by the caller (the atomic consume is the replay
 gate), so everything here is the write side: tokens from the code, the
-`mcp_oauth` credential into the requester's per-agent vault, and the server
-on the agent so the toolset exists. Failures raise; the route decides what
+`mcp_oauth` credential into the requester's per-agent vault, the completion
+stamp that marks this person — and only this person — as connected to the
+server, and the server on the agent so the toolset exists. Failures raise; the route decides what
 the browser sees.
 """
 
@@ -24,6 +25,7 @@ from daimon.core.mcp_oauth.flow import exchange_authorization_code
 from daimon.core.mcp_oauth.models import ClientRegistration, TokenEndpointAuthMethod
 from daimon.core.mcp_oauth.vault import put_mcp_oauth_credential
 from daimon.core.mcp_vault import ensure_agent_mcp_vault
+from daimon.core.stores import mcp_oauth_flows as flows_store
 from daimon.core.stores.domain import McpOAuthFlowRow
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -103,6 +105,11 @@ async def complete_mcp_oauth_flow(
         resource=flow.resource,
         now=now,
     )
+    # The grant is in this person's vault now, which is what makes them
+    # connected: their sessions mount the server, nobody else's do. Stamped
+    # before the attach, since a grant outlives an agent that has gone away.
+    async with session_factory() as session, session.begin():
+        await flows_store.mark_flow_completed(session, state=flow.state, now=now)
     agent = await find_agent_by_derived_uuid(
         anthropic, tenant_id=flow.tenant_id, agent_id=flow.agent_id
     )

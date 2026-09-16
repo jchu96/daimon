@@ -24,6 +24,7 @@ from anthropic.types.beta.beta_managed_agents_system_content_block_param import 
     BetaManagedAgentsSystemContentBlockParam,
 )
 from anthropic.types.beta.session_create_params import Resource
+from daimon.core.agent_mcp_credentials import resolve_hidden_mcp_server_names
 from daimon.core.credential_env import assemble_env_bytes
 from daimon.core.session_snapshot import (
     SessionSnapshot,
@@ -230,13 +231,19 @@ async def desired_snapshot_for(
     environment_id: str,
     tenant_id: uuid.UUID,
     agent_uuid: uuid.UUID,
+    account_id: uuid.UUID,
     recorded: SessionSnapshot | None,
 ) -> SessionSnapshot:
     """What a session created right now, for this caller, would freeze.
 
-    Three indexed DB reads and no MA call, so an unchanged configuration costs
-    nothing at bind time. Two fields are deliberately carried over from
-    `recorded` rather than re-derived:
+    Four indexed DB reads and no MA call, so an unchanged configuration costs
+    nothing at bind time. The fourth is `account_id`'s: which of the agent's
+    MCP servers only somebody else's OAuth grant can authenticate, since
+    `create_session` leaves those off this caller's session and the hashes
+    have to describe the session that would actually be created.
+
+    Two fields are deliberately carried over from `recorded` rather than
+    re-derived:
 
     - `vault_id` — the per-(account, agent) vault is get-or-created at session
       create and stays that caller's vault; re-reading it would cost a
@@ -261,6 +268,13 @@ async def desired_snapshot_for(
 
     return desired_snapshot(
         agent,
+        hidden_mcp_server_names=await resolve_hidden_mcp_server_names(
+            sessionmaker,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            account_id=account_id,
+            server_urls={server.name: server.url for server in agent.mcp_servers},
+        ),
         environment_id=environment_id,
         env_sha256=hash_env_bytes(assemble_env_bytes(rows)) if rows else None,
         repo_url=None if binding is None else f"https://github.com/{binding.repo_url}",

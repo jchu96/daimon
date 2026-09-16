@@ -84,6 +84,7 @@ def _seeded_snapshot(*, agent_id: str, environment_id: str) -> SessionSnapshot:
     agent = ma_agent(id=agent_id)
     return desired_snapshot(
         agent,
+        hidden_mcp_server_names=frozenset(),
         environment_id=environment_id,
         env_sha256=None,
         repo_url=None,

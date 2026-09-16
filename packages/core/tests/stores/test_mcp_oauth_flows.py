@@ -129,3 +129,61 @@ async def test_flow_is_erased_with_its_request_row(db_session: AsyncSession) -> 
     assert await store.get_flow(db_session, state=flow.state) is None, (
         "the flow must cascade from its request row so purge stays complete"
     )
+
+
+async def test_list_completed_grants_lists_only_stored_grants(db_session: AsyncSession) -> None:
+    tenant = await make_tenant(db_session)
+    connected = await make_account(db_session, tenant=tenant)
+    decliner = await make_account(db_session, tenant=tenant)
+    abandoned = await make_account(db_session, tenant=tenant)
+    agent_id = uuid.uuid4()
+
+    async def flow_for(account_id: uuid.UUID, requester: str) -> McpOAuthFlowRow:
+        request = await requests_store.create_credential_request(
+            db_session,
+            token=mint_request_token(),
+            kind="mcp_oauth",
+            tenant_id=tenant.id,
+            agent_id=agent_id,
+            account_id=account_id,
+            target="docs",
+            mcp_server_url="https://mcp.example.com/docs",
+            requester_platform_user_id=requester,
+            channel_id="chan-1",
+            expires_at=_NOW + timedelta(minutes=30),
+            idempotency_key=uuid.uuid4(),
+            target_ma_agent_id="ag_test",
+            target_name="daimon",
+            requested_work=None,
+        )
+        return await store.create_flow(
+            db_session,
+            state="st_" + uuid.uuid4().hex,
+            request_token=request.token,
+            tenant_id=tenant.id,
+            account_id=account_id,
+            agent_id=agent_id,
+            server_name="docs",
+            mcp_server_url="https://mcp.example.com/docs",
+            redirect_uri="https://d.example/oauth/mcp/callback",
+            code_verifier="verifier",
+            expires_at=_NOW + timedelta(minutes=10),
+        )
+
+    signed_in = await flow_for(connected.id, "requester-connected")
+    declined = await flow_for(decliner.id, "requester-decliner")
+    await flow_for(abandoned.id, "requester-abandoned")
+    await store.consume_flow(db_session, state=signed_in.state, now=_NOW)
+    await store.mark_flow_completed(db_session, state=signed_in.state, now=_NOW)
+    # The decline path spends the row and stops: `used_at` alone is not a grant.
+    await store.consume_flow(db_session, state=declined.state, now=_NOW)
+
+    grants = await store.list_completed_grants(db_session, tenant_id=tenant.id, agent_id=agent_id)
+    assert [grant.account_id for grant in grants] == [connected.id], (
+        "only the account whose grant was stored is connected"
+    )
+    assert grants[0].server_name == "docs", "the grant names the server it was minted for"
+    assert (
+        await store.list_completed_grants(db_session, tenant_id=tenant.id, agent_id=uuid.uuid4())
+        == ()
+    ), "another agent's grants are not this agent's"

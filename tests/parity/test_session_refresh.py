@@ -138,6 +138,7 @@ def _snapshot(
     """What the session this row maps to froze when a previous turn created it."""
     snapshot = desired_snapshot(
         ma_agent(id=AGENT_ID, model=model_id),
+        hidden_mcp_server_names=frozenset(),
         environment_id=ENV_ID,
         env_sha256=env_sha256,
         repo_url=None,

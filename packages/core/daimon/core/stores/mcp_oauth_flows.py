@@ -3,8 +3,11 @@
 The click mints the row (`create_flow`), `/oauth/mcp/start` fills in the
 registered client (`save_flow_client`), and the callback spends it
 (`consume_flow`), which is the single-use gate: one UPDATE whose WHERE
-clause only matches an unused, unexpired row. No try/except — DB exceptions
-propagate.
+clause only matches an unused, unexpired row. `mark_flow_completed` then
+stamps the row whose grant actually reached a vault, and it outlives the
+handshake as the record of who connected what: `list_completed_grants` reads
+those rows so a session mounts only the servers its caller can authenticate.
+No try/except — DB exceptions propagate.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import uuid
 from datetime import datetime
 
 from daimon.core._models import McpOAuthFlow
-from daimon.core.stores.domain import McpOAuthFlowRow
+from daimon.core.stores.domain import McpOAuthFlowRow, McpOAuthGrantRow
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -113,3 +116,41 @@ async def consume_flow(
     orm = (await session.execute(stmt)).scalar_one_or_none()
     await session.flush()
     return None if orm is None else McpOAuthFlowRow.model_validate(orm)
+
+
+async def mark_flow_completed(session: AsyncSession, *, state: str, now: datetime) -> None:
+    """Record that this flow's grant reached the person's vault.
+
+    Separate from `consume_flow`, which spends the row before the callback
+    knows whether the person approved: only a stored credential makes them
+    connected.
+    """
+    await session.execute(
+        update(McpOAuthFlow).where(McpOAuthFlow.state == state).values(completed_at=now)
+    )
+    await session.flush()
+
+
+async def list_completed_grants(
+    session: AsyncSession, *, tenant_id: uuid.UUID, agent_id: uuid.UUID
+) -> tuple[McpOAuthGrantRow, ...]:
+    """Who has finished a sign-in for which of this agent's MCP servers.
+
+    One row per completed flow, so a person who reconnected the same server
+    appears more than once; callers work in sets of server names. A flow that
+    was spent but never exchanged for a grant — a decline, a refused code —
+    is not a connection and is not listed.
+    """
+    result = await session.execute(
+        select(
+            McpOAuthFlow.account_id, McpOAuthFlow.server_name, McpOAuthFlow.mcp_server_url
+        ).where(
+            McpOAuthFlow.tenant_id == tenant_id,
+            McpOAuthFlow.agent_id == agent_id,
+            McpOAuthFlow.completed_at.is_not(None),
+        )
+    )
+    return tuple(
+        McpOAuthGrantRow(account_id=account_id, server_name=server_name, mcp_server_url=url)
+        for account_id, server_name, url in result.all()
+    )

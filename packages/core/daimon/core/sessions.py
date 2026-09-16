@@ -11,17 +11,26 @@ import datetime as dt
 import time
 import uuid
 from collections.abc import Sequence
+from typing import cast
 
 import anthropic as anthropic_pkg
 import httpx
 import structlog
 from anthropic import AsyncAnthropic, omit
 from anthropic.types.beta import BetaEnvironment, BetaManagedAgentsAgent, BetaManagedAgentsSession
-from anthropic.types.beta.session_create_params import Resource
+from anthropic.types.beta.agent_create_params import Tool
+from anthropic.types.beta.beta_managed_agents_agent_with_overrides_params import (
+    BetaManagedAgentsAgentWithOverridesParams,
+)
+from anthropic.types.beta.beta_managed_agents_url_mcp_server_params import (
+    BetaManagedAgentsURLMCPServerParams,
+)
+from anthropic.types.beta.session_create_params import Agent, Resource
 from cryptography.fernet import MultiFernet
 from daimon.core.agent_mcp_credentials import (
     mirror_credentials_into_vault,
     resolve_agent_mcp_credentials,
+    resolve_hidden_mcp_server_names,
 )
 from daimon.core.config import McpSettings
 from daimon.core.credential_env import upload_env_and_mount
@@ -29,6 +38,7 @@ from daimon.core.defaults.metadata import MA_METADATA_KEY_ACCOUNT, MA_METADATA_K
 from daimon.core.errors import StoreError
 from daimon.core.github_credentials import get_pat
 from daimon.core.github_repo_auth import resolve_clone_token
+from daimon.core.mcp_personal_servers import visible_mcp_servers, visible_tools
 from daimon.core.mcp_vault import add_github_copilot_credential, ensure_agent_mcp_vault
 from daimon.core.memory_resource import ensure_memory_store_and_mount
 from daimon.core.repo_resource import build_repo_resource
@@ -84,6 +94,14 @@ async def create_session(
     makes an agent-level server work for an agent-level audience. Unlike the
     Copilot and memory mounts this is NOT degrade-not-block — a missing
     credential hard-fails the turn at MA, so ``anthropic.APIError`` propagates.
+
+    The servers themselves are filtered for this caller before the session
+    freezes them: one whose only credential is another person's OAuth grant
+    is left out via an ``agent_with_overrides`` ``mcp_servers``/``tools``
+    pair (``mcp_personal_servers``). The agent spec is untouched — the people
+    who did connect that server still get it. Without the filter MA opened
+    the server on every caller's turn, failed it for want of a credential,
+    and hung the degraded-turn notice under every reply.
 
     When ``tenant_id``, ``agent_uuid``, and ``session_factory`` are all
     provided, the agent's tenant-scoped secrets are assembled into a ``.env``
@@ -264,6 +282,51 @@ async def create_session(
                 error=str(exc),
             )
 
+    # A server somebody connected through OAuth authenticates from the
+    # connecting person's vault alone, so mounting it on anyone else's session
+    # only buys them a failed MCP init and a degraded-turn notice every turn.
+    # Overrides keep it off THIS session without touching the agent spec the
+    # people who did connect it still answer from.
+    agent_argument: Agent = agent.id
+    if (
+        account_id is not None
+        and tenant_id is not None
+        and agent_uuid is not None
+        and session_factory is not None
+    ):
+        hidden = await resolve_hidden_mcp_server_names(
+            session_factory,
+            tenant_id=tenant_id,
+            agent_id=agent_uuid,
+            account_id=account_id,
+            server_urls={server.name: server.url for server in agent.mcp_servers},
+        )
+        if hidden:
+            overrides: BetaManagedAgentsAgentWithOverridesParams = {
+                "type": "agent_with_overrides",
+                "id": agent.id,
+                # No `version`: a bare id pins the latest, which is what every
+                # other session gets, and both arrays below are full
+                # replacements — there is nothing left for a version to pin.
+                "mcp_servers": [
+                    BetaManagedAgentsURLMCPServerParams(
+                        name=server.name, type="url", url=server.url
+                    )
+                    for server in visible_mcp_servers(agent, hidden)
+                ],
+                "tools": [
+                    cast(Tool, tool.model_dump(mode="json", exclude_none=True))
+                    for tool in visible_tools(agent, hidden)
+                ],
+            }
+            agent_argument = overrides
+            _log.info(
+                "session.personal_mcp_servers_hidden",
+                agent_uuid=str(agent_uuid),
+                account_id=str(account_id),
+                server_names=sorted(hidden),
+            )
+
     metadata: dict[str, str] = {}
     if account_id is not None:
         metadata[MA_METADATA_KEY_ACCOUNT] = str(account_id)
@@ -271,7 +334,7 @@ async def create_session(
         metadata[MA_METADATA_KEY_TENANT] = str(tenant_id)
 
     return await anthropic.beta.sessions.create(
-        agent=agent.id,
+        agent=agent_argument,
         environment_id=environment.id,
         metadata=metadata if metadata else omit,
         vault_ids=[vault_id] if vault_id is not None else omit,

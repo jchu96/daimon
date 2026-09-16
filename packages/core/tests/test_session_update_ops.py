@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -29,6 +29,7 @@ from anthropic.types.beta.sessions.beta_managed_agents_file_resource import (
 )
 from daimon.core.config import McpSettings
 from daimon.core.credential_env import assemble_env_bytes
+from daimon.core.credential_requests import mint_request_token
 from daimon.core.session_compat import (
     RemirrorVaultCredentials,
     ReplaceEnvFile,
@@ -48,6 +49,8 @@ from daimon.core.session_update_ops import (
     SessionBusy,
     apply_update_ops,
 )
+from daimon.core.stores import credential_requests as requests_store
+from daimon.core.stores import mcp_oauth_flows as flows_store
 from daimon.core.stores.agent_files import list_agent_files, put_agent_file
 from daimon.core.stores.domain import RepoAccessProof
 from daimon.core.stores.pending_file_deletes import list_due_pending_file_deletes
@@ -137,6 +140,7 @@ async def _apply(
     tenant_id: uuid.UUID,
     agent_uuid: uuid.UUID,
     agent: BetaManagedAgentsAgent | None = None,
+    account_id: uuid.UUID | None = None,
 ) -> AppliedOps | SessionBusy:
     return await apply_update_ops(
         client,
@@ -147,7 +151,7 @@ async def _apply(
         agent=agent if agent is not None else _agent(),
         tenant_id=tenant_id,
         agent_uuid=agent_uuid,
-        account_id=uuid.uuid4(),
+        account_id=account_id if account_id is not None else uuid.uuid4(),
         mcp=McpSettings(),
         fernet=None,
         github_fallback_pat="ghp_fallback",
@@ -619,4 +623,93 @@ async def test_update_defers_as_session_busy_when_ma_refuses_a_running_session(
     )
     assert result.snapshot.tools_sha256 == recorded.tools_sha256, (
         "and must not claim the tools update that MA refused"
+    )
+
+
+async def test_tools_update_leaves_off_a_server_only_another_member_signed_in_to(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A configuration change must not push a personally-connected server back
+    onto a session that was created without it — the first `.env` edit of the
+    thread's life would otherwise undo the filter."""
+    tenant = await make_tenant(db_session)
+    agent_uuid = uuid.uuid4()
+    connected_account_id = uuid.uuid4()
+    bystander_account_id = uuid.uuid4()
+    request = await requests_store.create_credential_request(
+        db_session,
+        token=mint_request_token(),
+        kind="mcp_oauth",
+        tenant_id=tenant.id,
+        agent_id=agent_uuid,
+        account_id=connected_account_id,
+        target="docs",
+        mcp_server_url="https://mcp.example.com/docs",
+        requester_platform_user_id="requester-connected",
+        channel_id="chan-1",
+        expires_at=_NOW + timedelta(minutes=30),
+        idempotency_key=uuid.uuid4(),
+        target_ma_agent_id=_AGENT_ID,
+        target_name="daimon",
+        requested_work=None,
+    )
+    flow = await flows_store.create_flow(
+        db_session,
+        state="st_" + uuid.uuid4().hex,
+        request_token=request.token,
+        tenant_id=tenant.id,
+        account_id=connected_account_id,
+        agent_id=agent_uuid,
+        server_name="docs",
+        mcp_server_url="https://mcp.example.com/docs",
+        redirect_uri="https://d.example/oauth/mcp/callback",
+        code_verifier="verifier",
+        expires_at=_NOW + timedelta(minutes=10),
+    )
+    await flows_store.consume_flow(db_session, state=flow.state, now=_NOW)
+    await flows_store.mark_flow_completed(db_session, state=flow.state, now=_NOW)
+    await db_session.commit()
+
+    state = FakeSessionsState(ma=FakeMAState())
+    _register_agent(state.ma)
+    bodies: list[dict[str, Any]] = []
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.count("/") == 3:
+            import json
+
+            bodies.append(json.loads(request.content))
+        raise NotHandled
+
+    client = _build_client(state, before=[_capture])
+    session_id, recorded = await _session_with_env(client, content=b"A=1\n")
+
+    personal = BetaManagedAgentsMCPServerURLDefinition(
+        name="docs", type="url", url="https://mcp.example.com/docs"
+    )
+    daimon = BetaManagedAgentsMCPServerURLDefinition(
+        name="daimon-mcp", type="url", url="https://mcp.example/daimon"
+    )
+    agent = _agent(mcp_servers=[personal, daimon])
+
+    result = await _apply(
+        client,
+        db_session_factory,
+        ops=(ReplaceToolsAndMcpServers(),),
+        session_id=session_id,
+        recorded=recorded,
+        tenant_id=tenant.id,
+        agent_uuid=agent_uuid,
+        agent=agent,
+        account_id=bystander_account_id,
+    )
+
+    assert isinstance(result, AppliedOps), "an idle session accepts the agent update"
+    sent = [b for b in bodies if "agent" in b][0]["agent"]
+    assert [s["name"] for s in sent["mcp_servers"]] == ["daimon-mcp"], (
+        "the update carries the caller's server list, not the agent's"
+    )
+    assert result.snapshot.mcp_servers_sha256 == hash_mcp_servers([daimon]), (
+        "and the snapshot hashes what the session now runs, or the next turn re-applies"
     )
