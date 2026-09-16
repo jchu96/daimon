@@ -9,7 +9,8 @@ design depends on:
     `agent.system`, `agent.skills`, `environment_id` and `vault_ids` are all
     rejected, each with the provider's own wording;
 (c) `sessions.create(agent={"type": "agent", "version": N})` pins an exact
-    agent version, and `agent_with_overrides` overrides are reflected in the
+    agent version, and `agent_with_overrides` overrides — including an
+    `mcp_servers`/`tools` pair that drops one server — are reflected in the
     session snapshot;
 (d) the archived-session rejection text in `daimon.core.turn.run` still
     matches the live API, and `events.list` stays readable after
@@ -282,6 +283,48 @@ async def test_agent_with_overrides_is_reflected_in_the_session_snapshot(
         "sessions.retrieve().agent.system must equal the agent_with_overrides create-time "
         f"override; got {retrieved.agent.system!r}"
     )
+
+    await anthropic_client.beta.sessions.archive(session.id)
+
+
+async def test_agent_with_overrides_can_drop_one_mcp_server_and_its_toolset(
+    anthropic_client: AsyncAnthropic, live_environment: BetaEnvironment
+) -> None:
+    """Per-caller MCP visibility rides on this: a session created with
+    `mcp_servers`/`tools` overrides must run the shorter arrays, and MA must
+    accept a pair that drops a server together with its toolset."""
+    name = f"contract-test-snapshot-mcp-{uuid.uuid4().hex[:8]}"
+    agent = await anthropic_client.beta.agents.create(
+        name=name,
+        model={"id": "claude-haiku-4-5"},
+        system="contract snapshot test: mcp server overrides",
+        mcp_servers=[
+            {"type": "url", "name": "personal", "url": "https://mcp.notion.com/mcp"},
+            {"type": "url", "name": "shared", "url": "https://mcp.linear.app/mcp"},
+        ],
+        tools=[
+            {"type": "mcp_toolset", "mcp_server_name": "personal"},
+            {"type": "mcp_toolset", "mcp_server_name": "shared"},
+        ],
+    )
+    overridden_agent: BetaManagedAgentsAgentWithOverridesParams = {
+        "type": "agent_with_overrides",
+        "id": agent.id,
+        "mcp_servers": [{"type": "url", "name": "shared", "url": "https://mcp.linear.app/mcp"}],
+        "tools": [{"type": "mcp_toolset", "mcp_server_name": "shared"}],
+    }
+    session = await anthropic_client.beta.sessions.create(
+        agent=overridden_agent, environment_id=live_environment.id
+    )
+    retrieved = await anthropic_client.beta.sessions.retrieve(session.id)
+
+    assert [server.name for server in retrieved.agent.mcp_servers] == ["shared"], (
+        "sessions.retrieve().agent.mcp_servers must equal the create-time override; got "
+        f"{[server.name for server in retrieved.agent.mcp_servers]!r}"
+    )
+    assert not any(
+        getattr(tool, "mcp_server_name", None) == "personal" for tool in retrieved.agent.tools
+    ), "the dropped server's toolset must not survive the override"
 
     await anthropic_client.beta.sessions.archive(session.id)
 
