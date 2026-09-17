@@ -3,7 +3,7 @@
 //  -------------------------------------------------------------------------
 //  Design language:
 //    · Body / captions ......... Inter            (humanist sans, long-read)
-//    · Headings / display ...... Archivo Expanded  (wide grotesque, brand)
+//    · Headings / display ...... Inter             (website headline family)
 //    · Mathematics ............. Fira Math         (sans-serif math)
 //    · Layout .................. Tufte-style ~⅔ text column + wide margin
 //                                for figures, captions and sidenotes
@@ -11,7 +11,7 @@
 //                                restrained color, comfortable measure,
 //                                one idea per rule, tables without verticals.
 //
-//  Brand palette (from the 2025 Brand Guideline):
+//  Brand palette (shared with the current website):
 //    Deep Navy Blue  #0C1F40   (primary / text)
 //    Pastel Aqua     #B4E7DD   (main 02 / rules, accents)
 //    Soft Periwinkle #9FAAE2   (secondary)
@@ -29,19 +29,18 @@
 #let periwinkle = rgb("#9FAAE2")
 #let soft-white = rgb("#F7F7F7")
 #let peach      = rgb("#F6AE72")
-#let ink        = rgb("#000000")             // default text color — black
-#let muted      = ink                         // all text is black (per designer notes)
+#let ink        = navy                       // website text color
+#let muted      = ink
 #let hairline   = navy.lighten(78%)          // faint structural rules (not text)
 
 // ---------------------------------------------------------------------------
 //  Fonts
 // ---------------------------------------------------------------------------
 #let body-font    = "Inter"        // bundled rsms static; registers as family "Inter"
-#let heading-font = "Archivo"      // Typst folds the OS/2 width into `stretch`, so the
-                                   // family is "Archivo"; "Archivo Expanded" does NOT resolve
+#let heading-font = "Inter"        // website headline family
 #let math-font    = "Fira Math"    // sans math
-#let mono-font    = "Fira Mono"    // code/monospace (Inter has no mono; Fira ties to the math)
-#let heading-stretch = 125%        // selects the bundled Expanded static face
+#let mono-font    = "JetBrains Mono"
+#let heading-stretch = 100%
 
 // small helper: content -> string (best-effort, for document metadata)
 #let to-string(content) = {
@@ -247,7 +246,7 @@
   ]
 }
 
-// A "key number" pulled into the margin: large Archivo value + tight label.
+// A "key number" pulled into the margin: large Inter value + tight label.
 // Both scale with the body font size (≈20pt / 8pt at the 10.5pt default).
 #let keyfigure(value, label) = context {
   let fs = _fs.get()
@@ -363,8 +362,8 @@
 #let cover(
   title: none, subtitle: none, client: none, date: none,
   author: none, status: "Confidential", paper: "a4",
-  logo: "../assets/pymc-labs-logo.png",
-  cover-background: 4,              // 4 or 9 (the two approved brand graphics),
+  logo: "../assets/pymc-labs-logo-dark.png",
+  cover-background: none,              // plain by default; 4 or 9 for legacy artwork,
                                    // none for a plain cover, or a custom image path
   draft: false,                    // true → a bold DRAFT mark in the top-right
 ) = {
@@ -442,8 +441,8 @@
   number-equations: true,
   number-headings: false,           // true → "1.1" section numbers (long reports)
   font-size: 9.5pt,                 // body text size; headings scale with it
-  logo: "../assets/pymc-labs-logo.png",
-  cover-background: 4,               // cover graphic: 4 or 9 (none for plain, or a path)
+  logo: "../assets/pymc-labs-logo-dark.png",
+  cover-background: none,               // none for plain; a path for supplied artwork
   draft: false,                     // true → DRAFT mark on the cover + footer
   highlight-code: false,            // true → brand syntax colors in code blocks
   body,
@@ -466,9 +465,9 @@
 
   // — global text & paragraph —
   set text(font: body-font, size: font-size, fill: ink, lang: "en",
-           weight: "light", hyphenate: true, fallback: true)
-  // Light body → render *strong* emphasis as Medium (not Bold)
-  show strong: it => text(weight: "medium", it.body)
+           weight: "regular", hyphenate: true, fallback: true)
+  // Semibold emphasis against regular body text.
+  show strong: it => text(weight: "semibold", it.body)
   // Tufte-style: left-aligned (ragged-right) in both columns — lighter, and
   // avoids justification gaps/rivers in the narrow margin.
   // Block paragraphs: no first-line indent, a small gap between paragraphs.
@@ -495,11 +494,11 @@
               supplement: [Section])
   show heading: set text(font: heading-font, fill: ink)
   show heading.where(level: 1): it => block(above: 3.0em, below: 1.9em)[
-    #set text(stretch: heading-stretch, weight: "regular", size: 1.70 * font-size)
+    #set text(stretch: heading-stretch, weight: "bold", size: 1.70 * font-size)
     #if it.numbering != none [#counter(heading).display(it.numbering)#h(0.55em)]#it.body
   ]
   show heading.where(level: 2): it => block(above: 1.7em, below: 1.2em)[
-    #set text(stretch: heading-stretch, weight: "regular", size: 1.33 * font-size)
+    #set text(stretch: heading-stretch, weight: "semibold", size: 1.33 * font-size)
     #if it.numbering != none [#counter(heading).display(it.numbering)#h(0.5em)]#it.body
   ]
   show heading.where(level: 3): it => block(above: 1.4em, below: 0.85em)[
@@ -518,7 +517,7 @@
   // header row: same body font as the rest, just bold
   show table.cell.where(y: 0): set text(weight: "medium")
 
-  // — raw / code (Fira Mono on soft-white surfaces) —
+  // — raw / code (JetBrains Mono on soft-white surfaces) —
   // Monochrome navy by default (restrained); with highlight-code, code blocks
   // take the brand syntax theme (lib/brand-code.tmTheme). Themed token colors
   // are explicit and override the ambient navy; untokenised text stays navy.
@@ -536,7 +535,7 @@
   // the first character down the wrapped lines, with a small corner to the right
   // at the bottom. The indent is paragraph hanging-indent and the bracket is a
   // drawn line(), so neither becomes characters when the code is copied.
-  // (Fira Mono advance ≈ 0.6em per char.)
+  // (JetBrains Mono advance ≈ 0.6em per char.)
   show raw.where(block: true): it => block(
     fill: soft-white, width: 100%, radius: 0pt,
     inset: (x: 11pt, y: 9pt), above: 2.0em, below: 2.0em,
@@ -610,7 +609,7 @@
   // blocks to the exact column. Zero-size / invisible. Read with:
   //   typst query FILE.typ "<pymc-code-cols>" --field value --one
   // Width = page − page margins − margin column − gutter − code inset (2×11pt),
-  // divided by the measured Fira Mono advance at the body/code size.
+  // divided by the measured JetBrains Mono advance at the body/code size.
   context {
     let pw = if paper == "us-letter" { 8.5in } else { 210mm }
     let usable = pw - g.left - g.right - g.mcol - g.gutter - 22pt
