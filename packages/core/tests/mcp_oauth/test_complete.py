@@ -210,9 +210,7 @@ async def test_complete_exchanges_code_writes_grant_and_attaches_server(
         t.get("type") == "mcp_toolset" and t.get("mcp_server_name") == "notion"
         for t in updates[0]["tools"]
     ), "the matching mcp_toolset is added alongside the server"
-    grants = await flows_store.list_completed_grants(
-        db_session, tenant_id=tenant_id, agent_id=flow.agent_id
-    )
+    grants = await flows_store.list_completed_grants(db_session, tenant_id=tenant_id)
     assert [(g.account_id, g.server_name) for g in grants] == [
         (flow.account_id, flow.server_name)
     ], (

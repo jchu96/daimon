@@ -132,25 +132,33 @@ async def mark_flow_completed(session: AsyncSession, *, state: str, now: datetim
 
 
 async def list_completed_grants(
-    session: AsyncSession, *, tenant_id: uuid.UUID, agent_id: uuid.UUID
+    session: AsyncSession, *, tenant_id: uuid.UUID
 ) -> tuple[McpOAuthGrantRow, ...]:
-    """Who has finished a sign-in for which of this agent's MCP servers.
+    """Who has finished a sign-in for which MCP server, across the tenant.
 
-    One row per completed flow, so a person who reconnected the same server
-    appears more than once; callers work in sets of server names. A flow that
-    was spent but never exchanged for a grant — a decline, a refused code —
-    is not a connection and is not listed.
+    Tenant-wide on purpose: a grant is per (account, agent), but a server that
+    anyone in the tenant signed in to is a sign-in server on every agent that
+    carries its URL — a fork copies the server and none of the grants, and
+    the rows for the source agent are the only evidence of that. One row per
+    completed flow, so a person who reconnected the same server appears more
+    than once; callers work in sets. A flow that was spent but never
+    exchanged for a grant — a decline, a refused code — is not a connection
+    and is not listed.
     """
     result = await session.execute(
         select(
-            McpOAuthFlow.account_id, McpOAuthFlow.server_name, McpOAuthFlow.mcp_server_url
+            McpOAuthFlow.agent_id,
+            McpOAuthFlow.account_id,
+            McpOAuthFlow.server_name,
+            McpOAuthFlow.mcp_server_url,
         ).where(
             McpOAuthFlow.tenant_id == tenant_id,
-            McpOAuthFlow.agent_id == agent_id,
             McpOAuthFlow.completed_at.is_not(None),
         )
     )
     return tuple(
-        McpOAuthGrantRow(account_id=account_id, server_name=server_name, mcp_server_url=url)
-        for account_id, server_name, url in result.all()
+        McpOAuthGrantRow(
+            agent_id=agent_id, account_id=account_id, server_name=server_name, mcp_server_url=url
+        )
+        for agent_id, account_id, server_name, url in result.all()
     )

@@ -161,3 +161,41 @@ async def test_an_agent_wide_token_keeps_the_server_visible_to_everyone(
         )
         == frozenset()
     ), "a token every caller's vault gets is not a personal connection"
+
+
+async def test_a_fork_of_the_agent_hides_the_copied_server_from_the_person_who_signed_in(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Forks copy the source's MCP servers raw; the grant stays in the vault of
+    (person, source agent). On the fork nobody can open the server — the
+    connector included — so it is hidden there until someone signs in on the
+    fork, instead of failing every turn."""
+    tenant = await make_tenant(db_session)
+    connected = await make_account(db_session, tenant=tenant)
+    source_agent_id = uuid.uuid4()
+    fork_agent_id = uuid.uuid4()
+    await _record_sign_in(
+        db_session,
+        tenant_id=tenant.id,
+        account_id=connected.id,
+        agent_id=source_agent_id,
+        requester="requester-connected",
+    )
+
+    assert (
+        await resolve_hidden_mcp_server_names(
+            db_session_factory,
+            tenant_id=tenant.id,
+            agent_id=source_agent_id,
+            account_id=connected.id,
+            server_urls={"docs": _SERVER_URL},
+        )
+        == frozenset()
+    ), "on the agent they signed in to, the connector keeps the server"
+    assert await resolve_hidden_mcp_server_names(
+        db_session_factory,
+        tenant_id=tenant.id,
+        agent_id=fork_agent_id,
+        account_id=connected.id,
+        server_urls={"docs": _SERVER_URL},
+    ) == frozenset({"docs"}), "on a fork, the same person holds no grant and the server is hidden"

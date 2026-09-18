@@ -178,12 +178,15 @@ async def test_list_completed_grants_lists_only_stored_grants(db_session: AsyncS
     # The decline path spends the row and stops: `used_at` alone is not a grant.
     await store.consume_flow(db_session, state=declined.state, now=_NOW)
 
-    grants = await store.list_completed_grants(db_session, tenant_id=tenant.id, agent_id=agent_id)
+    grants = await store.list_completed_grants(db_session, tenant_id=tenant.id)
     assert [grant.account_id for grant in grants] == [connected.id], (
         "only the account whose grant was stored is connected"
     )
     assert grants[0].server_name == "docs", "the grant names the server it was minted for"
-    assert (
-        await store.list_completed_grants(db_session, tenant_id=tenant.id, agent_id=uuid.uuid4())
-        == ()
-    ), "another agent's grants are not this agent's"
+    assert grants[0].agent_id == agent_id, (
+        "the row says which agent the sign-in was for — a fork of it holds no grant"
+    )
+    other_tenant = await make_tenant(db_session)
+    assert await store.list_completed_grants(db_session, tenant_id=other_tenant.id) == (), (
+        "grants never cross a tenant boundary"
+    )

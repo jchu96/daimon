@@ -598,13 +598,15 @@ class McpOAuthGrantRow(BaseModel):
     The completed-flow projection: a `mcp_oauth_flows` row whose
     `completed_at` is set is the durable record that this account's grant was
     stored in its own vault — not merely that it opened the link, which
-    `used_at` records for anyone who reached the callback at all. Erasing the
-    platform user deletes the flow row, and with it the grant this row
+    `used_at` records for anyone who reached the callback at all. The grant
+    is per (account, agent): a fork of that agent starts with none. Erasing
+    the platform user deletes the flow row, and with it the grant this row
     reports.
     """
 
     model_config = ConfigDict(from_attributes=True, frozen=True)
 
+    agent_id: uuid.UUID
     account_id: uuid.UUID
     server_name: str
     mcp_server_url: str
