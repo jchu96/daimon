@@ -25,6 +25,7 @@ from daimon.core.memory_resource import archive_memory_store_for_agent
 from daimon.core.stores import agent_mcp_credentials as mcp_credentials_store
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import copy_binding, get_binding
+from daimon.core.stores.domain import AgentRepoBindingRow
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = structlog.get_logger()
@@ -52,8 +53,9 @@ async def copy_credential_and_repo_binding(
     credentials are re-keyed, so a further credential-backed kind is
     additive here rather than a new branch in a caller's fork_agent.
 
-    Nothing is written until every check that can fail the fork has passed,
-    so a fork reported as failed leaves no rows behind.
+    The one check that can fail the fork runs before any write, and the
+    token copy is the last write, so a fork reported as failed does not
+    leave the source's tokens behind.
 
     The fork's credential is written under `principal_id=fork_agent_uuid`
     — never aliased to the source principal — mirroring `store_inline_pat`.
@@ -92,6 +94,18 @@ async def copy_credential_and_repo_binding(
                 "credential to copy — reconnect GitHub on the source agent and try again."
             )
 
+    if source_binding is not None:
+        await _copy_repo_binding(
+            sessionmaker,
+            fernet=fernet,
+            oauth_scopes=oauth_scopes,
+            tenant_id=tenant_id,
+            source_agent_uuid=source_agent_uuid,
+            fork_agent_uuid=fork_agent_uuid,
+            source_binding=source_binding,
+            source_pat=source_pat,
+        )
+
     async with sessionmaker.begin() as session:
         copied = await mcp_credentials_store.copy_credentials(
             session,
@@ -107,9 +121,19 @@ async def copy_credential_and_repo_binding(
             count=copied,
         )
 
-    if source_binding is None:
-        return
 
+async def _copy_repo_binding(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    fernet: MultiFernet,
+    oauth_scopes: tuple[str, ...],
+    tenant_id: uuid.UUID,
+    source_agent_uuid: uuid.UUID,
+    fork_agent_uuid: uuid.UUID,
+    source_binding: AgentRepoBindingRow,
+    source_pat: str | None,
+) -> None:
+    """The GitHub half: re-key an inline PAT under the fork, copy the binding."""
     if source_pat is not None:
         await upsert_credential_encrypted(
             sessionmaker=sessionmaker,
