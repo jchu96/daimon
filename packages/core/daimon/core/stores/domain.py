@@ -593,20 +593,21 @@ class McpOAuthFlowRow(BaseModel):
 
 
 class McpOAuthGrantRow(BaseModel):
-    """One person's finished OAuth sign-in for one of an agent's MCP servers.
+    """One person's finished OAuth sign-in to an MCP server URL on one agent.
 
     The completed-flow projection: a `mcp_oauth_flows` row whose
     `completed_at` is set is the durable record that this account's grant was
-    stored in its own vault — not merely that it opened the link, which
-    `used_at` records for anyone who reached the callback at all. Erasing the
-    platform user deletes the flow row, and with it the grant this row
-    reports.
+    stored in its (account, agent) vault — not merely that it opened the
+    link, which `used_at` records for anyone who reached the callback. Keyed
+    by URL, which is what MA authenticates against; the server's name is
+    per agent and not part of it. Erasing the platform user deletes the flow
+    row, and with it the grant this row reports.
     """
 
     model_config = ConfigDict(from_attributes=True, frozen=True)
 
+    agent_id: uuid.UUID
     account_id: uuid.UUID
-    server_name: str
     mcp_server_url: str
 
 

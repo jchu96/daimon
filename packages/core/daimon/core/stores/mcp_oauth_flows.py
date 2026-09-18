@@ -13,11 +13,12 @@ No try/except — DB exceptions propagate.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from datetime import datetime
 
 from daimon.core._models import McpOAuthFlow
 from daimon.core.stores.domain import McpOAuthFlowRow, McpOAuthGrantRow
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -132,25 +133,29 @@ async def mark_flow_completed(session: AsyncSession, *, state: str, now: datetim
 
 
 async def list_completed_grants(
-    session: AsyncSession, *, tenant_id: uuid.UUID, agent_id: uuid.UUID
+    session: AsyncSession, *, tenant_id: uuid.UUID, server_urls: Iterable[str]
 ) -> tuple[McpOAuthGrantRow, ...]:
-    """Who has finished a sign-in for which of this agent's MCP servers.
+    """Who has finished a sign-in to any of `server_urls`, on which agent,
+    across the tenant.
 
-    One row per completed flow, so a person who reconnected the same server
-    appears more than once; callers work in sets of server names. A flow that
-    was spent but never exchanged for a grant — a decline, a refused code —
-    is not a connection and is not listed.
+    Tenant-wide and filtered to the caller's URLs; `mcp_personal_servers`
+    explains why a sign-in on one agent matters to another. One row per
+    completed flow, so callers work in sets. Trailing slashes are ignored on
+    both sides, as everywhere a server URL is compared; the partial index
+    from `0023_mcp_oauth_flows_url_ix` covers exactly this predicate. A flow
+    that was spent but never exchanged for a grant — a decline, a refused
+    code — is not listed.
     """
     result = await session.execute(
-        select(
-            McpOAuthFlow.account_id, McpOAuthFlow.server_name, McpOAuthFlow.mcp_server_url
-        ).where(
+        select(McpOAuthFlow.agent_id, McpOAuthFlow.account_id, McpOAuthFlow.mcp_server_url).where(
             McpOAuthFlow.tenant_id == tenant_id,
-            McpOAuthFlow.agent_id == agent_id,
             McpOAuthFlow.completed_at.is_not(None),
+            func.rtrim(McpOAuthFlow.mcp_server_url, "/").in_(
+                {url.rstrip("/") for url in server_urls}
+            ),
         )
     )
     return tuple(
-        McpOAuthGrantRow(account_id=account_id, server_name=server_name, mcp_server_url=url)
-        for account_id, server_name, url in result.all()
+        McpOAuthGrantRow(agent_id=agent_id, account_id=account_id, mcp_server_url=url)
+        for agent_id, account_id, url in result.all()
     )

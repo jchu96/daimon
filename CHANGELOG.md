@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A forked agent no longer warns everyone about a server it copied but
+  nobody can open.** Forking copies the source's MCP servers, but not what
+  authenticates them: an OAuth grant lives in the vault of (person, source
+  agent) and cannot follow, and an agent-wide token stored for the source was
+  simply left behind. On the fork, Managed Agents opened the copied server on
+  every turn, failed it, and every reply carried the "was unavailable this
+  turn" notice — for the person who signed in on the source as much as for
+  anyone else. Agent-wide tokens now travel with the fork. A server anyone in
+  the workspace has signed in to is treated as a sign-in server on every agent
+  that carries its URL, and stays off a session until its caller has signed
+  in on that agent; before, only sign-ins on the very same agent counted, so
+  a fork looked like a server nobody needed to sign in to. Migration
+  `0023_mcp_oauth_flows_url_ix`.
+
 - **One member's OAuth sign-in no longer warns everyone else on every
   message.** An OAuth grant is stored in the vault of whoever signed in, but
   the server it unlocks is attached to the agent the whole workspace shares,
