@@ -3,23 +3,28 @@ name: pymc-artifact-style
 description: Apply PyMC Labs' house style to every artifact you produce — reports, PDFs, slide decks, charts, images, notebooks. Use whenever you generate something a person will look at, before you deliver it.
 ---
 
-# PyMC artifact style
+# PyMC Labs artifact style
 
 Everything you hand a user is a PyMC Labs deliverable and should look like one.
 A client skims a report; polish is what makes the content land. This is PyMC's
 own style — never substitute a client's brand colors unless the user explicitly
 asks for a client-branded artifact.
 
-**The house style is a real Typst template, not a description of one.** It
-comes from `pymc-labs/pymc-labs-report-template`, and the parts you need — the
-report class, the brand fonts, the logo, the cover art, the matplotlib style —
-are **bundled inside this skill**. Build through them. Do not improvise a
-"corporate report" look: numbered navy section bars, stat-tile rows and
-generic blue/orange charts are what this style exists to replace.
+Use the current [PyMC Labs website](https://www.pymc-labs.com/) identity:
+Inter, navy text, pale accents, and the dark/light PyMC Labs wordmarks.
+The bundled report class adapts the existing Tufte layout to that identity.
+Read [references/website-brand.md](references/website-brand.md) for source
+provenance, exact website tokens, and the distinction between website styling
+and document conventions.
+
+Keep titles and labels short, positioning broad, and copy sparse. Reports still
+need enough evidence, units, and uncertainty to support their conclusions.
+Build layout, text, and functional controls in code. Reuse the bundled official
+logos; if new logos or decorative artwork are requested, use image generation.
 
 ## Reports and PDFs — everything you need is bundled here
 
-The Typst report class, the brand fonts, the logo and the cover art all ship
+The Typst report class, the brand fonts, and the website logos all ship
 **inside this skill**. You do not need to clone anything and you do not need
 network access to the brand repos.
 
@@ -27,10 +32,9 @@ network access to the brand repos.
 typst/pymc-report.typ      the report class — import this
 typst/starter.typ          minimal working report; copy it and replace content
 typst/report-example.typ   the full worked example — read it for the helpers
-fonts/                     Inter, Archivo Expanded, Fira Math, Fira Mono
-assets/pymc-labs-logo.png  the cover logo (already wired as the default)
-assets/pymc-labs-logo-transparent.png  same mark, white keyed out — use on slides
-assets/cover-4.png, -9.png the two approved cover backgrounds
+fonts/                     Inter, JetBrains Mono, Fira Math
+assets/pymc-labs-logo-dark.png   dark wordmark for light backgrounds
+assets/pymc-labs-logo-light.png  light wordmark for dark backgrounds
 mpl/                       matplotlibrc + plotstyle.py + axes.py
 ```
 
@@ -57,17 +61,12 @@ typst.compile(
 it, and the failure is silent: the document still compiles, but every heading
 falls back to a serif and the result stops looking like a PyMC report.
 
-### Two font traps, both verified the hard way
+### Fonts
 
-- **Headings are `font: "Archivo"` with `stretch: 125%`** — *not*
-  `font: "Archivo Expanded"`. Typst folds the OS/2 width class into the stretch
-  axis, so the family registers as plain `Archivo`; asking for
-  "Archivo Expanded" resolves to nothing and falls back to serif.
-- **Body is `font: "Inter"`.** The bundled statics register under family
-  `Inter`. Do not ask for `Inter 18pt` — that is the Google Fonts optical-size
-  packaging, which is not what ships here.
-
-Both are already set correctly in `typst/pymc-report.typ`. Do not "fix" them.
+Use `Inter` for body and headings, with normal stretch (`100%`). Use
+`JetBrains Mono` for code. Fira Math remains the document math face; the
+website does not specify a math font. All are bundled. Archivo and Fira Mono
+remain available for legacy sources, but are no longer the defaults.
 
 ### Writing the document
 
@@ -82,7 +81,7 @@ Both are already set correctly in `typst/pymc-report.typ`. Do not "fix" them.
   date:     [August 2026],
   status:   "Confidential",   // cover + footer; none to hide
   paper:    "a4",             // or "us-letter"
-  cover-background: 4,        // approved cover art: 4 or 9
+  cover-background: none,     // plain; pass a path for supplied artwork
   draft: false,
   abstract: [ Executive summary … ],
   outline-depth: 2,
@@ -134,8 +133,10 @@ context`.
 | aqua | `#B4E7DD` | rules, spines, series |
 | peach | `#F6AE72` | single status accent — use sparingly |
 | soft-white | `#F7F7F7` | code slabs, fills |
+| navy-deep | `#07142A` | dark surfaces |
+| violet | `#C8B4E7` | optional website accent |
 
-Variants — light: navy `#798496`, peri `#CAD0EF`, aqua `#D6F2EC`, peach `#FAD2B1`.
+Chart variants retained from the report style (not website tokens) — light: navy `#798496`, peri `#CAD0EF`, aqua `#D6F2EC`, peach `#FAD2B1`.
 Dark: navy `#08142A`, peri `#676E93`, aqua `#759690`, peach `#A0714A`.
 
 Navy text on white. Color earns its place (Butterick) — the accent punctuates,
@@ -145,10 +146,10 @@ it does not decorate.
 
 | Role | Face |
 |---|---|
-| Body | **Inter** — ask for family `Inter` |
-| Headings | **Archivo Expanded** — ask for `Archivo` at `stretch: 125%` |
+| Body | **Inter** regular — ask for family `Inter` |
+| Headings | **Inter** bold/semibold, normal stretch |
 | Math | **Fira Math**, weight 300 |
-| Code | **Fira Mono** on soft-white |
+| Code | **JetBrains Mono** on soft-white |
 
 Headings are unnumbered by default — hierarchy is typographic, the register is
 editorial.
@@ -222,7 +223,7 @@ prs.save("deck.pptx")
 ```
 
 **Do not build slides out of pptx text boxes.** A text run stores the font by
-*name*, and Inter and Archivo Expanded are not installed on the machines that
+*name*, and the bundled fonts may not be installed on the machines that
 open the file — PowerPoint and Google Slides silently substitute a generic
 sans and the deck stops looking like PyMC. This is the same failure as the
 `font_paths` trap above, one layer further out: the PDF survives because Typst
@@ -233,25 +234,18 @@ editable and does not reflow. Slide order, deletion, and speaker notes still
 work. If the recipient needs to edit the words, say so and hand over the
 Typst sources — do not quietly ship a deck that cannot be edited.
 
-### The logo has no transparency — use the keyed copy
+### Use the matching website logo
 
-`assets/pymc-labs-logo.png` is RGBA but every alpha byte is 255. It carries an
-opaque white rectangle, so it renders as a visible white box on any background
-that is not already white. RGBA in the mode string is not evidence of
-transparency — check the alpha channel's actual range.
+Use `assets/pymc-labs-logo-dark.png` on white or soft-white, and
+`assets/pymc-labs-logo-light.png` on navy or navy-deep. Preserve aspect ratio
+and clear space. Both are official website assets with real transparency;
+do not recolor or regenerate them.
 
-Use `assets/pymc-labs-logo-transparent.png`, the same mark with the white keyed
-out. `assets/pymc-marketing-logo.png` already has real alpha and needs nothing.
+The report defaults to the dark logo and a plain cover. The older logo files
+and `cover-4.png` / `cover-9.png` remain for existing documents only; do not
+use them for new artifacts unless requested.
 
-Two separate things go wrong, and fixing one does not fix the other:
-
-- **The box** — solved only by keying. Moving the logo onto the gradient cover
-  art makes the box less obvious against pale artwork, but it is still there.
-- **Legibility** — the wordmark is dark grey. Even keyed, it disappears into
-  navy. There is no light version of the mark bundled here, so put the logo on
-  a light ground: `cover-4.png` / `cover-9.png`, or white. Not a navy fill.
-
-## When the template repo is unreachable
+## When the bundled template cannot be used
 
 Match the palette and typography by hand: navy body and headings, aqua rules,
 peach for a single status accent, soft-white code slabs, Inter (or the closest
@@ -263,9 +257,8 @@ There is no Word or Google Docs template. For a Docs deliverable, apply the
 palette manually, or export a PDF from the Typst template and attach that — the
 PDF path is the one with a real template behind it.
 
-## Sales collateral is a different standard
+## Explicit template requests
 
-Proposals and sales material follow `teams/sales/` in `daimon-memory` (navy
-`#1e3a5f`, Calibri), which deliberately differs from the report style above. Do
-not mix them. If unsure which applies, ask — a modeling report and a proposal are
-not interchangeable.
+Honor an explicitly requested client or legacy sales template. Otherwise use
+this website-aligned identity for new artifacts, including sales collateral.
+Do not silently revert to the older Calibri/navy proposal style.
