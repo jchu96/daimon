@@ -22,6 +22,7 @@ from cryptography.fernet import MultiFernet
 from daimon.core.errors import DaimonError
 from daimon.core.github_credentials import get_pat, upsert_credential_encrypted
 from daimon.core.memory_resource import archive_memory_store_for_agent
+from daimon.core.stores import agent_mcp_credentials as mcp_credentials_store
 from daimon.core.stores.agent_github_binding import set_agent_github_binding
 from daimon.core.stores.agent_repo_binding import copy_binding, get_binding
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -39,15 +40,19 @@ async def copy_credential_and_repo_binding(
     source_agent_uuid: uuid.UUID,
     fork_agent_uuid: uuid.UUID,
 ) -> None:
-    """Re-key the source's per-agent GitHub credential onto the fork and copy
-    its repo binding.
+    """Re-key the source's per-agent GitHub credential onto the fork, copy
+    its repo binding, and copy its agent-wide MCP tokens.
 
-    Generic per-server copy: today the only credential-backed MCP
-    server mechanism is the per-agent GitHub PAT overlay driving the repo
-    clone at session-create time; this helper is the single place that
-    mechanism is re-keyed, so adding a second credential-backed kind later is
-    additive here rather than a new github-specific branch in a caller's
-    fork_agent.
+    Every fork path copies the source's `mcp_servers` raw, so a server whose
+    credential lived in `agent_mcp_credentials` arrived on the fork with no
+    token behind it: MA opened it on every turn, failed it, and every reply
+    from the fork carried the degraded-turn notice. The tokens now travel
+    with the servers. OAuth grants cannot — they sit in MA vaults keyed by
+    (person, source agent) and are never readable back — so a copied
+    sign-in server stays hidden on the fork until someone signs in there
+    (`mcp_personal_servers`). This helper is the single place fork
+    credentials are re-keyed, so a further credential-backed kind is
+    additive here rather than a new branch in a caller's fork_agent.
 
     The fork's credential is written under `principal_id=fork_agent_uuid`
     — never aliased to the source principal — mirroring `store_inline_pat`.
@@ -69,6 +74,21 @@ async def copy_credential_and_repo_binding(
     recorded proof, which fails closed at clone time exactly the way the
     source does.
     """
+    async with sessionmaker.begin() as session:
+        copied = await mcp_credentials_store.copy_credentials(
+            session,
+            tenant_id=tenant_id,
+            source_agent_id=source_agent_uuid,
+            target_agent_id=fork_agent_uuid,
+        )
+    if copied:
+        _log.info(
+            "agent_lifecycle.mcp_credentials_copied",
+            source_agent_id=str(source_agent_uuid),
+            fork_agent_id=str(fork_agent_uuid),
+            count=copied,
+        )
+
     async with sessionmaker() as session:
         source_binding = await get_binding(session, tenant_id=tenant_id, agent_id=source_agent_uuid)
     if source_binding is None:
