@@ -138,25 +138,22 @@ async def list_completed_grants(
     """Who has finished a sign-in to any of `server_urls`, on which agent,
     across the tenant.
 
-    Tenant-wide because a fork copies its source's servers and none of the
-    grants, and the source's rows are the only evidence those servers need
-    a sign-in. Filtered to the URLs the caller carries and de-duplicated, so
-    an agent with no signed-in URL reads nothing however long the tenant's
-    sign-in history. Trailing slashes are ignored on both sides, as
-    everywhere a server URL is compared. A flow that was spent but never
-    exchanged for a grant — a decline, a refused code — is not listed.
+    Tenant-wide and filtered to the caller's URLs; `mcp_personal_servers`
+    explains why a sign-in on one agent matters to another. One row per
+    completed flow, so callers work in sets. Trailing slashes are ignored on
+    both sides, as everywhere a server URL is compared; the partial index
+    from `0023_mcp_oauth_flows_url_ix` covers exactly this predicate. A flow
+    that was spent but never exchanged for a grant — a decline, a refused
+    code — is not listed.
     """
-    wanted = {url.rstrip("/") for url in server_urls}
-    if not wanted:
-        return ()
     result = await session.execute(
-        select(McpOAuthFlow.agent_id, McpOAuthFlow.account_id, McpOAuthFlow.mcp_server_url)
-        .where(
+        select(McpOAuthFlow.agent_id, McpOAuthFlow.account_id, McpOAuthFlow.mcp_server_url).where(
             McpOAuthFlow.tenant_id == tenant_id,
             McpOAuthFlow.completed_at.is_not(None),
-            func.rtrim(McpOAuthFlow.mcp_server_url, "/").in_(wanted),
+            func.rtrim(McpOAuthFlow.mcp_server_url, "/").in_(
+                {url.rstrip("/") for url in server_urls}
+            ),
         )
-        .distinct()
     )
     return tuple(
         McpOAuthGrantRow(agent_id=agent_id, account_id=account_id, mcp_server_url=url)

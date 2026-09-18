@@ -74,7 +74,6 @@ def hidden_mcp_server_names(
     the module docstring for why. Trailing slashes are ignored, as everywhere
     a server URL is compared.
     """
-    shared = {url.rstrip("/") for url in shared_server_urls}
     signed_in: set[str] = set()
     mine: set[str] = set()
     for grant in grants:
@@ -82,13 +81,8 @@ def hidden_mcp_server_names(
         signed_in.add(grant_url)
         if grant.agent_id == agent_id and grant.account_id == account_id:
             mine.add(grant_url)
-    return frozenset(
-        name
-        for name, url in server_urls.items()
-        if (target_url := url.rstrip("/")) in signed_in
-        and target_url not in shared
-        and target_url not in mine
-    )
+    hidden_urls = signed_in - mine - {url.rstrip("/") for url in shared_server_urls}
+    return frozenset(name for name, url in server_urls.items() if url.rstrip("/") in hidden_urls)
 
 
 def visible_mcp_servers(

@@ -73,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the workspace has signed in to is treated as a sign-in server on every agent
   that carries its URL, and stays off a session until its caller has signed
   in on that agent; before, only sign-ins on the very same agent counted, so
-  a fork looked like a server nobody needed to sign in to.
+  a fork looked like a server nobody needed to sign in to. Migration
+  `0023_mcp_oauth_flows_url_ix`.
 
 - **One member's OAuth sign-in no longer warns everyone else on every
   message.** An OAuth grant is stored in the vault of whoever signed in, but

@@ -1109,9 +1109,18 @@ class McpOAuthFlow(Base):
 
     __tablename__ = "mcp_oauth_flows"
     # Every turn asks who in the tenant has signed in to the caller's server
-    # URLs; that read is keyed by tenant, not by `state`, and this index
-    # serves it through its leading column.
-    __table_args__ = (Index("ix_mcp_oauth_flows_tenant_agent", "tenant_id", "agent_id"),)
+    # URLs (`list_completed_grants`); the partial expression index is that
+    # read's, the (tenant, agent) one predates it and stays for the older
+    # per-agent lookups.
+    __table_args__ = (
+        Index("ix_mcp_oauth_flows_tenant_agent", "tenant_id", "agent_id"),
+        Index(
+            "ix_mcp_oauth_flows_tenant_url_completed",
+            "tenant_id",
+            text("rtrim(mcp_server_url, '/')"),
+            postgresql_where=text("completed_at IS NOT NULL"),
+        ),
+    )
 
     state: Mapped[str] = mapped_column(Text, primary_key=True)
     request_token: Mapped[str] = mapped_column(
