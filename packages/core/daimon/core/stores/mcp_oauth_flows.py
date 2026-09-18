@@ -13,11 +13,12 @@ No try/except — DB exceptions propagate.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from datetime import datetime
 
 from daimon.core._models import McpOAuthFlow
 from daimon.core.stores.domain import McpOAuthFlowRow, McpOAuthGrantRow
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -132,33 +133,32 @@ async def mark_flow_completed(session: AsyncSession, *, state: str, now: datetim
 
 
 async def list_completed_grants(
-    session: AsyncSession, *, tenant_id: uuid.UUID
+    session: AsyncSession, *, tenant_id: uuid.UUID, server_urls: Iterable[str]
 ) -> tuple[McpOAuthGrantRow, ...]:
-    """Who has finished a sign-in for which MCP server, across the tenant.
+    """Who has finished a sign-in to any of `server_urls`, on which agent,
+    across the tenant.
 
-    Tenant-wide on purpose: a grant is per (account, agent), but a server that
-    anyone in the tenant signed in to is a sign-in server on every agent that
-    carries its URL — a fork copies the server and none of the grants, and
-    the rows for the source agent are the only evidence of that. One row per
-    completed flow, so a person who reconnected the same server appears more
-    than once; callers work in sets. A flow that was spent but never
-    exchanged for a grant — a decline, a refused code — is not a connection
-    and is not listed.
+    Tenant-wide because a fork copies its source's servers and none of the
+    grants, and the source's rows are the only evidence those servers need
+    a sign-in. Filtered to the URLs the caller carries and de-duplicated, so
+    an agent with no signed-in URL reads nothing however long the tenant's
+    sign-in history. Trailing slashes are ignored on both sides, as
+    everywhere a server URL is compared. A flow that was spent but never
+    exchanged for a grant — a decline, a refused code — is not listed.
     """
+    wanted = {url.rstrip("/") for url in server_urls}
+    if not wanted:
+        return ()
     result = await session.execute(
-        select(
-            McpOAuthFlow.agent_id,
-            McpOAuthFlow.account_id,
-            McpOAuthFlow.server_name,
-            McpOAuthFlow.mcp_server_url,
-        ).where(
+        select(McpOAuthFlow.agent_id, McpOAuthFlow.account_id, McpOAuthFlow.mcp_server_url)
+        .where(
             McpOAuthFlow.tenant_id == tenant_id,
             McpOAuthFlow.completed_at.is_not(None),
+            func.rtrim(McpOAuthFlow.mcp_server_url, "/").in_(wanted),
         )
+        .distinct()
     )
     return tuple(
-        McpOAuthGrantRow(
-            agent_id=agent_id, account_id=account_id, server_name=server_name, mcp_server_url=url
-        )
-        for agent_id, account_id, server_name, url in result.all()
+        McpOAuthGrantRow(agent_id=agent_id, account_id=account_id, mcp_server_url=url)
+        for agent_id, account_id, url in result.all()
     )

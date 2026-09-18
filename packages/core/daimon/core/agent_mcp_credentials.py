@@ -268,17 +268,16 @@ async def resolve_hidden_mcp_server_names(
     their own browser reaches only them, so it comes off everyone else's
     session (`mcp_personal_servers` decides which is which).
 
-    `server_urls` is the agent's own `{name: url}`; an agent with no servers,
-    or a tenant nobody has signed in anywhere, costs one indexed read and
-    stops there, which is every tenant until someone connects an OAuth
-    server. The grants are read tenant-wide because a fork carries its
-    source's servers and none of the sign-ins, and the source's rows are
-    what tell the fork those servers need one.
+    `server_urls` is the agent's own `{name: url}`. An agent whose URLs
+    nobody in the tenant has signed in to costs one indexed read and stops
+    there, which is every agent until someone connects an OAuth server.
     """
     if not server_urls:
         return frozenset()
     async with sessionmaker() as session:
-        grants = await flows_store.list_completed_grants(session, tenant_id=tenant_id)
+        grants = await flows_store.list_completed_grants(
+            session, tenant_id=tenant_id, server_urls=server_urls.values()
+        )
         if not grants:
             return frozenset()
         credentials = await cred_store.list_credentials(

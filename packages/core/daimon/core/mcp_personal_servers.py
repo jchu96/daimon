@@ -23,10 +23,19 @@ import here would close a cycle. The grant rows are read by
 A server whose credential is agent-wide (`agent_mcp_credentials`, mirrored
 into every caller's vault at session create) is never personal, even when
 somebody also signed in to it personally: everyone can authenticate it.
-Grants are matched to the agent's servers by URL and count only for the
-agent they were made on: a fork copies its source's servers but inherits no
-sign-ins, and a name re-pointed at a different server does not let a grant
-for the old one pass for a connection to the new.
+
+Otherwise a URL is a sign-in server as soon as anyone in the tenant has
+signed in to it, on any agent: whether a server wants a sign-in is a
+property of the server, not of the agent it is attached to. A grant counts
+only for the agent it was made on, because MA authenticates from the vault
+of (caller, that agent) and nothing else fills it — so a fork, which copies
+its source's servers and none of the sign-ins, hides them from everyone
+(the person who signed in on the source included) until someone signs in
+on the fork. Matching is by URL, which is what MA authenticates against; a
+name re-pointed at a different server does not let a grant for the old one
+pass for a connection to the new. The one shape this misreads is a server
+that accepts anonymous callers *and* offers a sign-in for more: after one
+member signs in, the anonymous access is hidden from the rest.
 """
 
 from __future__ import annotations
@@ -59,35 +68,27 @@ def hidden_mcp_server_names(
     """Of `server_urls`, the ones people sign in to that this caller has not
     signed in to on this agent.
 
-    Pure. `server_urls` is the agent's own `{name: url}`, so every decision is
-    made about the server a session would actually mount. `grants` is the
-    whole tenant's: a URL anybody signed in to, on any agent, is a sign-in
-    server wherever it appears, because MA authenticates it from the vault
-    of (caller, this agent) and only a sign-in on this agent fills that
-    vault. So a fork carrying its source's server hides it from everyone —
-    the person who signed in on the source included — until someone signs
-    in on the fork. A URL nobody signed in to anywhere is not personal at
-    all and is left alone.
-
-    Matching is by URL: it is what MA authenticates against, and the same
-    server may be attached under different names on different agents.
-    Trailing slashes are stripped on both sides of every comparison, the
-    same normalisation `put_mcp_oauth_credential` uses to match a vault
-    credential to a server URL.
+    Pure. `server_urls` is the agent's own `{name: url}`; `grants` is the
+    tenant's, so a sign-in on any agent marks the URL as one that needs a
+    sign-in, and only a grant by this caller on this agent satisfies it — see
+    the module docstring for why. Trailing slashes are ignored, as everywhere
+    a server URL is compared.
     """
     shared = {url.rstrip("/") for url in shared_server_urls}
-    hidden: set[str] = set()
-    for name, url in server_urls.items():
-        target = url.rstrip("/")
-        if target in shared:
-            continue
-        matching = [grant for grant in grants if grant.mcp_server_url.rstrip("/") == target]
-        if not matching:
-            continue
-        if any(g.agent_id == agent_id and g.account_id == account_id for g in matching):
-            continue
-        hidden.add(name)
-    return frozenset(hidden)
+    signed_in: set[str] = set()
+    mine: set[str] = set()
+    for grant in grants:
+        grant_url = grant.mcp_server_url.rstrip("/")
+        signed_in.add(grant_url)
+        if grant.agent_id == agent_id and grant.account_id == account_id:
+            mine.add(grant_url)
+    return frozenset(
+        name
+        for name, url in server_urls.items()
+        if (target_url := url.rstrip("/")) in signed_in
+        and target_url not in shared
+        and target_url not in mine
+    )
 
 
 def visible_mcp_servers(

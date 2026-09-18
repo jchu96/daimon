@@ -1108,8 +1108,9 @@ class McpOAuthFlow(Base):
     """
 
     __tablename__ = "mcp_oauth_flows"
-    # Every turn asks which of this agent's servers the caller has connected;
-    # the answer is a (tenant, agent) lookup, not a `state` one.
+    # Every turn asks who in the tenant has signed in to the caller's server
+    # URLs; that read is keyed by tenant, not by `state`, and this index
+    # serves it through its leading column.
     __table_args__ = (Index("ix_mcp_oauth_flows_tenant_agent", "tenant_id", "agent_id"),)
 
     state: Mapped[str] = mapped_column(Text, primary_key=True)

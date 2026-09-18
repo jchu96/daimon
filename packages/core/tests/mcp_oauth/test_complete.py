@@ -210,9 +210,11 @@ async def test_complete_exchanges_code_writes_grant_and_attaches_server(
         t.get("type") == "mcp_toolset" and t.get("mcp_server_name") == "notion"
         for t in updates[0]["tools"]
     ), "the matching mcp_toolset is added alongside the server"
-    grants = await flows_store.list_completed_grants(db_session, tenant_id=tenant_id)
-    assert [(g.account_id, g.server_name) for g in grants] == [
-        (flow.account_id, flow.server_name)
+    grants = await flows_store.list_completed_grants(
+        db_session, tenant_id=tenant_id, server_urls=[flow.mcp_server_url]
+    )
+    assert [(g.agent_id, g.account_id, g.mcp_server_url) for g in grants] == [
+        (flow.agent_id, flow.account_id, flow.mcp_server_url)
     ], (
         "the stored grant marks this person — and only this person — as connected, "
         "which is what decides whose sessions mount the server"
