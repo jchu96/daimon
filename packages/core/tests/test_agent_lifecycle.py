@@ -603,3 +603,54 @@ async def test_copy_carries_agent_wide_mcp_tokens_onto_the_fork(
     assert [(c.mcp_server_url, c.token) for c in forked] == [
         ("https://mcp.example.com/docs", "tok_shared")
     ], "the fork must hold the source's token for the server it copied"
+
+
+async def test_copy_writes_no_mcp_token_when_the_fork_fails_on_the_source_credential(
+    db_session: AsyncSession, db_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """The fail-loud path must stay write-free: a fork the caller is told
+    failed must not own copies of the source's tokens."""
+    tenant = await make_tenant(db_session)
+    await db_session.commit()
+    source_agent_uuid = uuid.uuid4()
+    fork_agent_uuid = uuid.uuid4()
+    fernet = build_multifernet((Fernet.generate_key().decode(),))
+    await save_agent_mcp_credential(
+        sessionmaker=db_session_factory,
+        fernet=fernet,
+        tenant_id=tenant.id,
+        agent_id=source_agent_uuid,
+        mcp_server_url="https://mcp.example.com/docs",
+        plaintext_token="tok_shared",
+    )
+    async with db_session_factory() as s, s.begin():
+        await set_binding(
+            s,
+            tenant_id=tenant.id,
+            agent_id=source_agent_uuid,
+            repo_url="github.com/acme/repo",
+            default_branch="main",
+            ma_secret_ref=f"inline-pat:{source_agent_uuid}",
+            proof=None,
+        )
+
+    with pytest.raises(DaimonError, match="no resolvable"):
+        await copy_credential_and_repo_binding(
+            anthropic=_refusing_anthropic(),  # type: ignore[arg-type]
+            sessionmaker=db_session_factory,
+            fernet=fernet,
+            oauth_scopes=_OAUTH_SCOPES,
+            tenant_id=tenant.id,
+            source_agent_uuid=source_agent_uuid,
+            fork_agent_uuid=fork_agent_uuid,
+        )
+
+    assert (
+        await resolve_agent_mcp_credentials(
+            sessionmaker=db_session_factory,
+            fernet=fernet,
+            tenant_id=tenant.id,
+            agent_id=fork_agent_uuid,
+        )
+        == ()
+    ), "a failed fork must not be left holding the source's tokens"

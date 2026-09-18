@@ -43,16 +43,17 @@ async def copy_credential_and_repo_binding(
     """Re-key the source's per-agent GitHub credential onto the fork, copy
     its repo binding, and copy its agent-wide MCP tokens.
 
-    Every fork path copies the source's `mcp_servers` raw, so a server whose
-    credential lived in `agent_mcp_credentials` arrived on the fork with no
-    token behind it: MA opened it on every turn, failed it, and every reply
-    from the fork carried the degraded-turn notice. The tokens now travel
-    with the servers. OAuth grants cannot — they sit in MA vaults keyed by
-    (person, source agent) and are never readable back — so a copied
-    sign-in server stays hidden on the fork until someone signs in there
+    Every fork path copies the source's `mcp_servers` raw; the tokens in
+    `agent_mcp_credentials` now travel with them, or the fork mounted servers
+    nothing could authenticate. OAuth grants cannot travel — they sit in MA
+    vaults keyed by (person, source agent) — so a copied sign-in server
+    stays hidden on the fork until someone signs in there
     (`mcp_personal_servers`). This helper is the single place fork
     credentials are re-keyed, so a further credential-backed kind is
     additive here rather than a new branch in a caller's fork_agent.
+
+    Nothing is written until every check that can fail the fork has passed,
+    so a fork reported as failed leaves no rows behind.
 
     The fork's credential is written under `principal_id=fork_agent_uuid`
     — never aliased to the source principal — mirroring `store_inline_pat`.
@@ -74,6 +75,23 @@ async def copy_credential_and_repo_binding(
     recorded proof, which fails closed at clone time exactly the way the
     source does.
     """
+    async with sessionmaker() as session:
+        source_binding = await get_binding(session, tenant_id=tenant_id, agent_id=source_agent_uuid)
+
+    source_pat: str | None = None
+    if source_binding is not None and source_binding.ma_secret_ref.startswith("inline-pat:"):
+        source_pat = await get_pat(
+            principal_id=source_agent_uuid,
+            agent_id=source_agent_uuid,
+            sessionmaker=sessionmaker,
+            fernet=fernet,
+        )
+        if source_pat is None:
+            raise DaimonError(
+                "Fork failed: the source agent's github git-proxy has no resolvable "
+                "credential to copy — reconnect GitHub on the source agent and try again."
+            )
+
     async with sessionmaker.begin() as session:
         copied = await mcp_credentials_store.copy_credentials(
             session,
@@ -89,23 +107,10 @@ async def copy_credential_and_repo_binding(
             count=copied,
         )
 
-    async with sessionmaker() as session:
-        source_binding = await get_binding(session, tenant_id=tenant_id, agent_id=source_agent_uuid)
     if source_binding is None:
         return
 
-    if source_binding.ma_secret_ref.startswith("inline-pat:"):
-        source_pat = await get_pat(
-            principal_id=source_agent_uuid,
-            agent_id=source_agent_uuid,
-            sessionmaker=sessionmaker,
-            fernet=fernet,
-        )
-        if source_pat is None:
-            raise DaimonError(
-                "Fork failed: the source agent's github git-proxy has no resolvable "
-                "credential to copy — reconnect GitHub on the source agent and try again."
-            )
+    if source_pat is not None:
         await upsert_credential_encrypted(
             sessionmaker=sessionmaker,
             fernet=fernet,

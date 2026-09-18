@@ -99,10 +99,9 @@ async def copy_credentials(
 ) -> int:
     """Give `target_agent_id` every token `source_agent_id` holds; return how many.
 
-    Ciphertext is copied as is — both agents sit under the same key set. A
-    fork copies the source's MCP servers, and a token-backed one is a server
-    nobody can open until its token follows; an existing target token for
-    the same URL is replaced, matching `upsert_credential`.
+    Ciphertext is copied as is — both agents sit under the same key set. An
+    existing target token for the same URL is replaced, as `upsert_credential`
+    does. For why a fork needs this, see `agent_lifecycle`.
     """
     rows = await list_credentials(session, tenant_id=tenant_id, agent_id=source_agent_id)
     for row in rows:
