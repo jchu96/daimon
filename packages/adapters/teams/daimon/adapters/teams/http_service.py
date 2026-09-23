@@ -11,11 +11,15 @@ from datetime import UTC, datetime
 
 import structlog
 from daimon.adapters.teams.boot_sweep import retire_orphaned_turns
+from daimon.adapters.teams.install import TeamsInstallHandler
 from daimon.adapters.teams.runtime import TeamsRuntime
 from daimon.core.config import TeamsSettings
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from microsoft_teams.api import MessageActivity  # pyright: ignore[reportMissingTypeStubs]
+from microsoft_teams.api import (  # pyright: ignore[reportMissingTypeStubs]
+    InstallUpdateActivity,
+    MessageActivity,
+)
 from microsoft_teams.apps import App, FastAPIAdapter  # pyright: ignore[reportMissingTypeStubs]
 from microsoft_teams.apps.routing import (  # pyright: ignore[reportMissingTypeStubs]
     ActivityContext,
@@ -215,6 +219,15 @@ def create_teams_http_service(
         # is left unset, which is the supported way to exercise real ingress
         # in local development and tests.
     )
+
+    install_handler = TeamsInstallHandler(settings=settings, runtime=runtime)
+
+    async def handle_install(ctx: ActivityContext[InstallUpdateActivity]) -> None:
+        await install_handler(ctx)
+
+    # Installation events must have their own route before the message-only
+    # resolver: they contain no user text and the tenant may not exist yet.
+    teams_app.on_installation_update(handle_install)
 
     async def handle_message(ctx: ActivityContext[MessageActivity]) -> None:
         authorized = await runtime.resolver(ctx)
