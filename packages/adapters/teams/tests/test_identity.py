@@ -37,10 +37,8 @@ def _ctx(payload: dict[str, object]) -> tuple[Any, list[str]]:
     return ctx, sent
 
 
-def _resolver(
-    db_factory: async_sessionmaker[AsyncSession], *, tenant_id: str = ENTRA_TENANT_ID
-) -> VerifiedTeamsTurnResolver:
-    return VerifiedTeamsTurnResolver(sessionmaker=db_factory, entra_tenant_id=tenant_id)
+def _resolver(db_factory: async_sessionmaker[AsyncSession]) -> VerifiedTeamsTurnResolver:
+    return VerifiedTeamsTurnResolver(sessionmaker=db_factory)
 
 
 @pytest.fixture

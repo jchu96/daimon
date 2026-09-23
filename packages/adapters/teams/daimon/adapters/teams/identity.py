@@ -62,7 +62,6 @@ class VerifiedTeamsTurnResolver:
     """
 
     sessionmaker: async_sessionmaker[AsyncSession]
-    entra_tenant_id: str  # Bot registration identity, not a message-access restriction.
     denied_message: str = DENIED_MESSAGE
 
     async def __call__(

@@ -110,7 +110,6 @@ async def build_runtime(settings: Settings) -> AsyncIterator[TeamsRuntime]:
         )
         resolver = VerifiedTeamsTurnResolver(
             sessionmaker=sessionmaker,
-            entra_tenant_id=teams_settings.tenant_id,
         )
         dispatcher = DirectCoreTurnDispatcher(
             settings=teams_settings,

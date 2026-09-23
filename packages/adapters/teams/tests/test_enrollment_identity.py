@@ -13,7 +13,7 @@ from daimon.core.stores.tenants import set_provision_status
 from microsoft_teams.api import MessageActivity  # pyright: ignore[reportMissingTypeStubs]
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .conftest import AAD_OBJECT_ID, ENTRA_TENANT_ID, make_message_activity
+from .conftest import AAD_OBJECT_ID, make_message_activity
 
 SECOND_TENANT = str(uuid.UUID(int=99))
 
@@ -33,7 +33,7 @@ async def test_provisioned_second_tenant_admitted(
     result = await provision_tenant(
         db_session_factory, platform="teams", workspace_id=SECOND_TENANT
     )
-    resolver = VerifiedTeamsTurnResolver(db_session_factory, entra_tenant_id=ENTRA_TENANT_ID)
+    resolver = VerifiedTeamsTurnResolver(db_session_factory)
     ctx = context()
     authorized = await resolver(ctx)
     assert authorized is not None
@@ -45,7 +45,7 @@ async def test_provisioned_second_tenant_admitted(
 async def test_unprovisioned_second_tenant_refused(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    resolver = VerifiedTeamsTurnResolver(db_session_factory, entra_tenant_id=ENTRA_TENANT_ID)
+    resolver = VerifiedTeamsTurnResolver(db_session_factory)
     ctx = context()
     assert await resolver(ctx) is None
     ctx.send.assert_awaited_once_with(DENIED_MESSAGE)
@@ -62,8 +62,5 @@ async def test_second_tenant_must_be_ready_and_unarchived(
         db_session_factory, tenant_id=result.tenant_id, status=status, archive=archive
     )
     ctx = context()
-    assert (
-        await VerifiedTeamsTurnResolver(db_session_factory, entra_tenant_id=ENTRA_TENANT_ID)(ctx)
-        is None
-    )
+    assert await VerifiedTeamsTurnResolver(db_session_factory)(ctx) is None
     ctx.send.assert_awaited_once_with(DENIED_MESSAGE)
