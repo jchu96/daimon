@@ -1121,3 +1121,26 @@ async def test_provision_tenant_zero_signup_credit_seeds_no_ledger_row(
     assert balance == Decimal("0"), (
         "signup_credit=0 must seed no ledger row — zero-credit guilds start at Decimal('0')"
     )
+
+
+async def test_provision_tenant_initial_status_is_insert_only(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from daimon.core.stores.tenants import get_tenant
+
+    result = await provision_tenant(
+        db_session_factory,
+        platform="teams",
+        workspace_id="pending-workspace",
+        provision_status="pending",
+    )
+    # A default-status retry must not make an unfinished enrollment ready.
+    await provision_tenant(
+        db_session_factory,
+        platform="teams",
+        workspace_id="pending-workspace",
+    )
+    async with db_session_factory() as session:
+        tenant = await get_tenant(session, result.tenant_id)
+    assert tenant is not None
+    assert tenant.provision_status == "pending"

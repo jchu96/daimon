@@ -60,7 +60,7 @@ def _service(
 ) -> tuple[Any, DirectCoreTurnDispatcher]:
     """A real ingress service whose resolver/dispatcher are the production classes."""
     runtime = build_teams_runtime(db_factory)
-    resolver = VerifiedTeamsTurnResolver(sessionmaker=db_factory, entra_tenant_id=ENTRA_TENANT_ID)
+    resolver = VerifiedTeamsTurnResolver(sessionmaker=db_factory)
     dispatcher = DirectCoreTurnDispatcher(
         settings=_settings(), turn_deps=runtime.turn_deps, sessionmaker=db_factory
     )

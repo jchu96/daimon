@@ -24,34 +24,70 @@ stays live, and a 64 KiB body limit is enforced before SDK parsing. The
 `docker-compose.yml` `teams` service (opt-in `teams` profile) publishes the
 port; the Bot Framework messaging endpoint must be able to reach it.
 
-### Identity: one Entra tenant, provisioned by hand
+### Installation
 
-There is no install flow. A Teams deployment is single-tenant: the adapter
-fails closed unless the activity's conversation tenant *and* channel-data
-tenant both equal `DAIMON_TEAMS__TENANT_ID`, the sender carries a well-formed
-`aad_object_id`, and a matching tenant row already exists.
+An authenticated Bot Framework `installationUpdate` with action `add`,
+`add-upgrade`, or the SDK literal `upgrade` creates the installing
+organisation's tenant and account through core's
+idempotent provisioning helper. Like Discord enrollment, it seeds
+`DAIMON_BILLING__SIGNUP_CREDIT` once, inserts the tenant as pending, reconciles
+deployment defaults, then marks it ready and sends one short welcome in the
+installing conversation. Installation never starts an agent turn. Failed
+reconciliation leaves the tenant non-ready; another `add` retries it.
 
-Because there is no callback to create it, the tenant row is provisioned
-manually — the same `provision_tenant` helper the Discord adapter calls on
-guild join:
+`DAIMON_TEAMS__ALLOWED_TENANT_IDS` controls enrollment. Its default, an empty
+JSON array (`[]`), permits any Entra tenant to enroll and receive the configured
+signup credit. Set a non-empty JSON array of Entra tenant UUIDs to permit
+only those organisations. Microsoft app registration and distribution still
+control who can install the app; the enrollment setting does not change them.
+`DAIMON_TEAMS__TENANT_ID` identifies the bot's own Entra app registration for
+authentication. It is not the enrollment allowlist.
 
-```python
-result = await provision_tenant(session_factory, platform="teams", workspace_id="<Entra tenant id>")
-# New tenants are provision_status="ready" by column default — flip to
-# pending so the resolver keeps denying while defaults reconcile (the same
-# pending -> reconcile -> ready ordering Discord's guild-join runs).
-await set_provision_status(session_factory, tenant_id=result.tenant_id, status="pending")
-report = await reconcile_tenant_defaults(
-    anthropic, session_factory, settings.defaults_root, tenant_id=result.tenant_id
-)
-await set_provision_status(
-    session_factory, tenant_id=result.tenant_id, status="ready", clear_reason=True
-)
-```
+A closed-enrollment install from an unlisted tenant receives "Daimon isn't
+enabled for your organisation yet." Set `DAIMON_TEAMS__ENROLLMENT_CONTACT`
+to append a contact line. The adapter logs `teams.install.declined` with the
+tenant id and writes nothing. Existing provisioned tenants retain message
+access if the enrollment allowlist later changes.
 
-If the reconcile report shows a failure, leave the tenant non-ready — a
-ready row without reconciled defaults turns the first real message into a
-user-facing missing-config reply instead of a clean deny.
+Enrollment must be a personal chat on the Teams channel. Removal may also
+come from a team channel or group chat. The adapter reads
+`channelData.tenant.id`, falling back to `conversation.tenantId` only
+when the channel tenant is absent. Missing, malformed, or conflicting tenant
+ids are refused before any database write. Bot Framework authentication and
+consistent activity identity remain mandatory even with open enrollment.
+
+Teams sends personal-scope install events per user. They share one
+deterministic tenant per organisation: an already-ready, unarchived tenant
+makes subsequent adds a no-op, even with new activity ids or after a process
+restart. A per-tenant process lock serializes overlapping deliveries without
+holding database connections during core helper calls. Core database upserts
+keep tenant, account, and credit creation idempotent across processes. Concurrent
+processes can still reconcile and welcome the same pending tenant; welcome
+deduplication across active processes is not guaranteed. Interrupted enrollment
+stays pending and the next add retries defaults reconciliation.
+The welcome follows provisioning and readiness commits. Delivery is not
+transactional with Postgres: a crash or send failure after readiness commits
+can leave the tenant ready without a welcome, and later adds do not retry it.
+
+Actions `remove` and `remove-upgrade` in personal scope log
+`teams.install.removed` with the user and tenant and write nothing: one user's
+uninstall must not disable every other user. Removal from a team channel or
+group chat soft-archives the tenant without deleting its rows and logs the same
+event. This archive is tenant-wide. A later permitted add clears the archive
+and reconciles again; signup credit is not granted again.
+
+The ingress normalizes Microsoft's `add-upgrade` and `remove-upgrade` actions
+before SDK parsing and preserves the original action for authenticated handling.
+Unknown actions log `teams.install.ignored` once with the action and produce no
+writes or replies. Authentication still runs before any installation handling.
+No additional app-manifest field is needed.
+
+### Identity: provisioned tenants
+
+Message access requires the activity's conversation tenant *and* channel-data
+tenant to identify the same Entra directory, and the sender must carry a
+well-formed `aad_object_id`. The bot registration tenant and enrollment
+allowlist do not restrict messages from already-provisioned tenants.
 
 `tenant_id` is deterministic — `derive_tenant_uuid(platform="teams",
 workspace_id=<Entra tenant id>)` — and `tenants.external_id` carries the Entra

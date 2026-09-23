@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Teams personal-chat installation enrolls organisations with signup credit,
+  reconciles defaults, and welcomes once. Upgrade actions follow the same flow;
+  personal uninstall preserves the shared tenant, while team or group removal
+  soft-archives it. Enrollment stays pending until defaults finish and concurrent
+  installs do not hold database connections while waiting for core helpers.
+  Enrollment is open by default, with an optional allowlist and contact reply.
+  Messages from ready, provisioned tenants are admitted independently of the
+  bot registration tenant.
+
 ### Changed
 
 - The documentation site carries daimon's own look: the readme sticker as

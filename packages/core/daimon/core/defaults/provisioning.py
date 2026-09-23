@@ -76,6 +76,7 @@ async def provision_tenant(
     platform: Platform,
     workspace_id: str,
     signup_credit: Decimal = Decimal("0"),
+    provision_status: str = "ready",
 ) -> ProvisionResult:
     """Create Tenant + Account in one idempotent transaction (DB only).
 
@@ -87,6 +88,9 @@ async def provision_tenant(
     transaction. Idempotent on (trial:{tenant_id}) — re-provisioning never double-credits.
     signup_credit=0 (the default) inserts no ledger row.
 
+    `provision_status` applies only on insert, so callers can enroll pending
+    tenants atomically without changing existing tenants on retries.
+
     NOTE: kwarg name `workspace_id` is intentional — migration 0014 calls
     derive_tenant_uuid(workspace_id=...) and this signature must match (Critical Warning 4).
     """
@@ -97,7 +101,12 @@ async def provision_tenant(
         # Step 1: Tenant upsert — explicit id (the derived uuid5) + platform/external_id.
         await s.execute(
             pg_insert(Tenant)
-            .values(id=tenant_id, platform=platform, external_id=workspace_id)
+            .values(
+                id=tenant_id,
+                platform=platform,
+                external_id=workspace_id,
+                provision_status=provision_status,
+            )
             .on_conflict_do_nothing(index_elements=[Tenant.id])
         )
         await s.flush()

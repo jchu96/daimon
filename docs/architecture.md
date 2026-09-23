@@ -20,6 +20,7 @@ flowchart TB
         direction LR
         Discord
         Slack
+        Teams
         MCP
         Scheduler
         CLI
@@ -50,6 +51,7 @@ sandbox makes an authenticated HTTP call back to it mid-turn.
 | `daimon.core` | `packages/core/daimon/core/` | Schema and migrations, stores, MA helpers, the turn pipeline. Imports no adapter. |
 | `daimon.adapters.discord` | `packages/adapters/discord/` | Discord I/O, rendering, permissions, slash commands. |
 | `daimon.adapters.slack` | `packages/adapters/slack/` | Slack I/O, Block Kit rendering, per-user OAuth. |
+| `daimon.adapters.teams` | `packages/adapters/teams/` | Personal-chat HTTP ingress, installation lifecycle, and turn rendering. |
 | `daimon.adapters.mcp` | `packages/adapters/mcp/` | The MCP server the agent calls, plus the OAuth, webhook and hub HTTP routes. |
 | `daimon.adapters.scheduler` | `packages/adapters/scheduler/` | The routine poll loop. |
 | `daimon.adapters.cli` | `packages/adapters/cli/` | The `daimon` admin binary. |
@@ -64,7 +66,7 @@ and CI:
 | Contract | Forbids |
 | --- | --- |
 | Core must not import adapters | `daimon.core` → `daimon.adapters` |
-| Adapters must not import each other | any of cli, mcp, discord, scheduler, slack → another |
+| Adapters must not import each other | any of cli, mcp, discord, scheduler, slack, teams → another |
 | ORM module is private to stores and defaults | anything but `daimon.core.stores.**` / `daimon.core.defaults.**` → `daimon.core._models` |
 | Core must not import testing | `daimon.core` → `daimon.testing` |
 | CLI admin commands and run must not import each other | `daimon.adapters.cli.commands` ⟂ `daimon.adapters.cli.run` |
@@ -86,9 +88,17 @@ The last three are trust boundaries rather than tidiness: a service that
 cannot import `daimon` cannot hold the Anthropic key or a database
 credential, whatever a future contributor is tempted to do inside it.
 
+Teams installation events take a separate SDK route before message resolution.
+They enroll permitted Entra tenants with signup credit, reconcile defaults, and
+welcome once ready. New tenants are pending until defaults finish. Personal
+uninstall leaves the shared tenant active; team or group removal archives it.
+Open enrollment is the default; an optional allowlist limits new enrollment. Messages require a ready,
+provisioned tenant. Installation events never enter the turn pipeline.
+See [Teams installation](teams.md#installation) for scope and retry semantics.
+
 ## How a message becomes a turn
 
-Discord and Slack run the same two-stage chokepoint in `daimon.core.turn`.
+Discord, Slack, and Teams run the same two-stage chokepoint in `daimon.core.turn`.
 The staging is deliberate — neither stage returns a boolean, both raise typed
 errors, so an adapter cannot forget a gate.
 
