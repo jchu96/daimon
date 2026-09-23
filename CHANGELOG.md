@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Teams personal-chat installation provisions the configured tenant, reconciles
-  defaults, and welcomes it once; removal soft-archives that tenant.
+- Teams personal-chat installation enrolls organisations with signup credit,
+  reconciles defaults, and welcomes once; removal soft-archives the tenant.
+  Enrollment is open by default, with an optional allowlist and contact reply.
+  Messages from ready, provisioned tenants are admitted independently of the
+  bot registration tenant.
 
 ### Changed
 

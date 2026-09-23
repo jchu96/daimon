@@ -446,9 +446,25 @@ class TeamsSettings(BaseModel):
     )
     tenant_id: str = Field(
         description=(
-            "Entra tenant ID the app registration lives in. A single-tenant "
-            "bot only answers activities whose conversation and channel-data "
-            "tenant both equal this value."
+            "Entra tenant ID the bot app registration lives in. Used for bot "
+            "authentication; enrollment is controlled by allowed_tenant_ids, "
+            "and messages require a ready, provisioned tenant."
+        ),
+    )
+    allowed_tenant_ids: frozenset[str] = Field(
+        default=frozenset(),
+        description=(
+            "Entra tenant UUIDs allowed to enroll by installing the Teams app. "
+            "Empty means open enrollment with the configured billing signup credit; "
+            "a non-empty JSON array restricts enrollment to the listed tenants. "
+            "Existing provisioned tenants retain message access."
+        ),
+    )
+    enrollment_contact: str | None = Field(
+        default=None,
+        description=(
+            "Optional contact line appended when a Teams installation is declined "
+            "because its tenant is not in allowed_tenant_ids."
         ),
     )
     max_concurrent_turns_per_tenant: int = Field(
@@ -479,19 +495,19 @@ class TeamsSettings(BaseModel):
     @field_validator("tenant_id")
     @classmethod
     def _canonicalize_tenant_id(cls, value: str) -> str:
-        """Normalize to the canonical lowercase UUID form and reject non-UUIDs.
-
-        The resolver canonicalizes activity tenant ids and compares them to
-        this value, and ``provision_tenant`` hashes ``workspace_id`` into the
-        deterministic tenant uuid — an uppercase portal paste must not yield
-        a provisioned row the resolver cannot match.
-        """
+        """Normalize the bot registration tenant id to its canonical UUID form."""
         try:
             return str(UUID(value))
         except ValueError:
             raise ValueError(
                 "DAIMON_TEAMS__TENANT_ID must be the Entra directory tenant's UUID"
             ) from None
+
+    @field_validator("allowed_tenant_ids")
+    @classmethod
+    def _canonicalize_allowed_tenant_ids(cls, values: frozenset[str]) -> frozenset[str]:
+        """Reject invalid allowlists and normalize UUID case before comparison."""
+        return frozenset(str(UUID(value)) for value in values)
 
 
 class GithubSettings(BaseModel):

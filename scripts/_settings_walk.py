@@ -13,6 +13,7 @@ they import this module by its bare name.
 
 from __future__ import annotations
 
+import json
 import types
 import typing
 from dataclasses import dataclass
@@ -125,6 +126,8 @@ def is_secret_annotation(annotation: object) -> bool:
 
 def stringify_default(value: object) -> str:
     """Render a schema default as the text an operator would put in `.env`."""
+    if isinstance(value, frozenset):
+        return json.dumps(sorted(stringify_default(item) for item in value))
     if isinstance(value, tuple):
         items = typing.cast("tuple[object, ...]", value)
         return ",".join(stringify_default(v) for v in items)

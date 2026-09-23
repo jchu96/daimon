@@ -89,8 +89,10 @@ cannot import `daimon` cannot hold the Anthropic key or a database
 credential, whatever a future contributor is tempted to do inside it.
 
 Teams installation events take a separate SDK route before message resolution.
-They provision the configured Entra tenant, reconcile defaults, and welcome it
-once it is ready; removal archives it. They never enter the turn pipeline.
+They enroll permitted Entra tenants with signup credit, reconcile defaults, and
+welcome once ready; removal archives the tenant. Open enrollment is the default;
+an optional allowlist limits new enrollment. Messages require a ready,
+provisioned tenant. Installation events never enter the turn pipeline.
 See [Teams installation](teams.md#installation) for scope and retry semantics.
 
 ## How a message becomes a turn

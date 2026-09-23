@@ -27,43 +27,54 @@ port; the Bot Framework messaging endpoint must be able to reach it.
 ### Installation
 
 An authenticated Bot Framework `installationUpdate` with action `add`
-creates the tenant and its account through core's idempotent provisioning
-helper. It marks the tenant pending, reconciles the deployment defaults
-through the same core helper used by Discord and Slack, then marks it ready
-and posts one welcome to the installing conversation. Installation never
-starts an agent turn. A failed reconciliation leaves the tenant non-ready
-and sends no welcome; another `add` retries reconciliation.
+creates the installing organisation's tenant and account through core's
+idempotent provisioning helper. Like Discord enrollment, it seeds
+`DAIMON_BILLING__SIGNUP_CREDIT` once, marks the tenant pending, reconciles
+deployment defaults, then marks it ready and sends one short welcome in the
+installing conversation. Installation never starts an agent turn. Failed
+reconciliation leaves the tenant non-ready; another `add` retries it.
+
+`DAIMON_TEAMS__ALLOWED_TENANT_IDS` controls enrollment. Its default, an empty
+JSON array (`[]`), permits any Entra tenant to enroll and receive the configured
+signup credit. Set a non-empty JSON array of Entra tenant UUIDs to permit
+only those organisations. Microsoft app registration and distribution still
+control who can install the app; the enrollment setting does not change them.
+`DAIMON_TEAMS__TENANT_ID` identifies the bot's own Entra app registration for
+authentication. It is not the enrollment allowlist.
+
+A closed-enrollment install from an unlisted tenant receives "Daimon isn't
+enabled for your organisation yet." Set `DAIMON_TEAMS__ENROLLMENT_CONTACT`
+to append a contact line. The adapter logs `teams.install.declined` with the
+tenant id and writes nothing. Existing provisioned tenants retain message
+access if the enrollment allowlist later changes.
 
 The installation must be a personal chat on the Teams channel. The adapter
 reads `channelData.tenant.id`, falling back to `conversation.tenantId` only
-when the channel tenant is absent, and requires it to equal
-`DAIMON_TEAMS__TENANT_ID`. A conflicting conversation tenant is also refused.
-Missing, malformed, or foreign tenant ids produce a logged refusal with no
-database write or reply. Keep this gate even with a multi-tenant Entra app
-registration: Bot Framework authentication proves the sender is the channel,
-not that the organisation is allowed to provision on this deployment.
+when the channel tenant is absent. Missing, malformed, or conflicting tenant
+ids are refused before any database write. Bot Framework authentication and
+consistent activity identity remain mandatory even with open enrollment.
 
-Teams sends personal-scope install events per user. They all share one
-deterministic tenant: an already-ready, unarchived tenant makes subsequent
-adds a no-op, even with new activity ids or after a process restart. A
-Postgres advisory lock serializes overlapping installation deliveries;
+Teams sends personal-scope install events per user. They share one
+deterministic tenant per organisation: an already-ready, unarchived tenant
+makes subsequent adds a no-op, even with new activity ids or after a process
+restart. A Postgres advisory lock serializes overlapping deliveries;
 waiting requests release their database connections between lock attempts.
-The welcome is sent only after provisioning and readiness commit. Delivery
-is not transactional with Postgres: a crash or send failure after readiness
-commits can leave the tenant ready without a welcome, and later adds do not
-retry that welcome.
+The welcome follows provisioning and readiness commits. Delivery is not
+transactional with Postgres: a crash or send failure after readiness commits
+can leave the tenant ready without a welcome, and later adds do not retry it.
 
 Action `remove` soft-archives the tenant without deleting its rows. This is
 tenant-wide, even when the removal came from one person's personal install;
-other users in that tenant can no longer start turns. A later `add` clears
-the archive, reconciles defaults again, and welcomes that installation.
-Neither action needs an additional app-manifest field or setting.
+other users in that tenant can no longer start turns. A later permitted
+`add` clears the archive and reconciles again. Signup credit is not granted
+again. No additional app-manifest field is needed.
 
-### Identity: one Entra tenant
+### Identity: provisioned tenants
 
-Message access remains single-tenant: the activity's conversation tenant
-*and* channel-data tenant must both equal `DAIMON_TEAMS__TENANT_ID`, and the
-sender must carry a well-formed `aad_object_id`.
+Message access requires the activity's conversation tenant *and* channel-data
+tenant to identify the same Entra directory, and the sender must carry a
+well-formed `aad_object_id`. The bot registration tenant and enrollment
+allowlist do not restrict messages from already-provisioned tenants.
 
 `tenant_id` is deterministic — `derive_tenant_uuid(platform="teams",
 workspace_id=<Entra tenant id>)` — and `tenants.external_id` carries the Entra

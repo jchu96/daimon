@@ -447,8 +447,24 @@ sends.
 
 `str` · **required**
 
-Entra tenant ID the app registration lives in. A single-tenant bot only answers
-activities whose conversation and channel-data tenant both equal this value.
+Entra tenant ID the bot app registration lives in. Used for bot authentication;
+enrollment is controlled by allowed_tenant_ids, and messages require a ready,
+provisioned tenant.
+
+### `DAIMON_TEAMS__ALLOWED_TENANT_IDS`
+
+`frozenset[str]` · optional · default `[]`
+
+Entra tenant UUIDs allowed to enroll by installing the Teams app. Empty means open
+enrollment with the configured billing signup credit; a non-empty JSON array restricts
+enrollment to the listed tenants. Existing provisioned tenants retain message access.
+
+### `DAIMON_TEAMS__ENROLLMENT_CONTACT`
+
+`str | None` · optional · default unset
+
+Optional contact line appended when a Teams installation is declined because its tenant
+is not in allowed_tenant_ids.
 
 ### `DAIMON_TEAMS__MAX_CONCURRENT_TURNS_PER_TENANT`
 

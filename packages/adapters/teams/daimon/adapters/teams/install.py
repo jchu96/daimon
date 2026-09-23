@@ -31,7 +31,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 log = structlog.get_logger(__name__)
-WELCOME_MESSAGE = "Welcome! Your agent is ready. Send a message here to get started."
+WELCOME_MESSAGE = "Welcome! I can answer questions and help with tasks. Ask me here in chat."
+DECLINED_MESSAGE = "Daimon isn't enabled for your organisation yet."
 
 
 @asynccontextmanager
@@ -70,10 +71,8 @@ class TeamsInstallHandler:
         tenant_id = _canonical_uuid(
             channel_tenant if channel_tenant is not None else conversation_tenant
         )
-        configured_tenant = _canonical_uuid(self.settings.tenant_id)
         if (
             tenant_id is None
-            or tenant_id != configured_tenant
             or (
                 conversation_tenant is not None
                 and _canonical_uuid(conversation_tenant) != tenant_id
@@ -85,6 +84,17 @@ class TeamsInstallHandler:
             log.warning("teams.install.refused")
             return
         if activity.action not in ("add", "remove"):
+            return
+        if (
+            activity.action == "add"
+            and self.settings.allowed_tenant_ids
+            and tenant_id not in self.settings.allowed_tenant_ids
+        ):
+            reply = DECLINED_MESSAGE
+            if self.settings.enrollment_contact:
+                reply += "\n" + self.settings.enrollment_contact
+            await ctx.send(reply)
+            log.info("teams.install.declined", tenant_id=tenant_id)
             return
 
         derived_id = derive_tenant_uuid(platform="teams", workspace_id=tenant_id)
@@ -104,7 +114,12 @@ class TeamsInstallHandler:
                 and existing.archived_at is None
             ):
                 return
-            result = await provision_tenant(sessionmaker, platform="teams", workspace_id=tenant_id)
+            result = await provision_tenant(
+                sessionmaker,
+                platform="teams",
+                workspace_id=tenant_id,
+                signup_credit=self.runtime.settings.billing.signup_credit,
+            )
             await set_provision_status(
                 sessionmaker,
                 tenant_id=result.tenant_id,
