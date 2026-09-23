@@ -26,10 +26,11 @@ port; the Bot Framework messaging endpoint must be able to reach it.
 
 ### Installation
 
-An authenticated Bot Framework `installationUpdate` with action `add`
-creates the installing organisation's tenant and account through core's
+An authenticated Bot Framework `installationUpdate` with action `add`,
+`add-upgrade`, or the SDK literal `upgrade` creates the installing
+organisation's tenant and account through core's
 idempotent provisioning helper. Like Discord enrollment, it seeds
-`DAIMON_BILLING__SIGNUP_CREDIT` once, marks the tenant pending, reconciles
+`DAIMON_BILLING__SIGNUP_CREDIT` once, inserts the tenant as pending, reconciles
 deployment defaults, then marks it ready and sends one short welcome in the
 installing conversation. Installation never starts an agent turn. Failed
 reconciliation leaves the tenant non-ready; another `add` retries it.
@@ -48,8 +49,9 @@ to append a contact line. The adapter logs `teams.install.declined` with the
 tenant id and writes nothing. Existing provisioned tenants retain message
 access if the enrollment allowlist later changes.
 
-The installation must be a personal chat on the Teams channel. The adapter
-reads `channelData.tenant.id`, falling back to `conversation.tenantId` only
+Enrollment must be a personal chat on the Teams channel. Removal may also
+come from a team channel or group chat. The adapter reads
+`channelData.tenant.id`, falling back to `conversation.tenantId` only
 when the channel tenant is absent. Missing, malformed, or conflicting tenant
 ids are refused before any database write. Bot Framework authentication and
 consistent activity identity remain mandatory even with open enrollment.
@@ -57,17 +59,28 @@ consistent activity identity remain mandatory even with open enrollment.
 Teams sends personal-scope install events per user. They share one
 deterministic tenant per organisation: an already-ready, unarchived tenant
 makes subsequent adds a no-op, even with new activity ids or after a process
-restart. A Postgres advisory lock serializes overlapping deliveries;
-waiting requests release their database connections between lock attempts.
+restart. A per-tenant process lock serializes overlapping deliveries without
+holding database connections during core helper calls. Core database upserts
+keep tenant, account, and credit creation idempotent across processes. Concurrent
+processes can still reconcile and welcome the same pending tenant; welcome
+deduplication across active processes is not guaranteed. Interrupted enrollment
+stays pending and the next add retries defaults reconciliation.
 The welcome follows provisioning and readiness commits. Delivery is not
 transactional with Postgres: a crash or send failure after readiness commits
 can leave the tenant ready without a welcome, and later adds do not retry it.
 
-Action `remove` soft-archives the tenant without deleting its rows. This is
-tenant-wide, even when the removal came from one person's personal install;
-other users in that tenant can no longer start turns. A later permitted
-`add` clears the archive and reconciles again. Signup credit is not granted
-again. No additional app-manifest field is needed.
+Actions `remove` and `remove-upgrade` in personal scope log
+`teams.install.removed` with the user and tenant and write nothing: one user's
+uninstall must not disable every other user. Removal from a team channel or
+group chat soft-archives the tenant without deleting its rows and logs the same
+event. This archive is tenant-wide. A later permitted add clears the archive
+and reconciles again; signup credit is not granted again.
+
+The ingress normalizes Microsoft's `add-upgrade` and `remove-upgrade` actions
+before SDK parsing and preserves the original action for authenticated handling.
+Unknown actions log `teams.install.ignored` once with the action and produce no
+writes or replies. Authentication still runs before any installation handling.
+No additional app-manifest field is needed.
 
 ### Identity: provisioned tenants
 

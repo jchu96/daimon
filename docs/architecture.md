@@ -90,8 +90,9 @@ credential, whatever a future contributor is tempted to do inside it.
 
 Teams installation events take a separate SDK route before message resolution.
 They enroll permitted Entra tenants with signup credit, reconcile defaults, and
-welcome once ready; removal archives the tenant. Open enrollment is the default;
-an optional allowlist limits new enrollment. Messages require a ready,
+welcome once ready. New tenants are pending until defaults finish. Personal
+uninstall leaves the shared tenant active; team or group removal archives it.
+Open enrollment is the default; an optional allowlist limits new enrollment. Messages require a ready,
 provisioned tenant. Installation events never enter the turn pipeline.
 See [Teams installation](teams.md#installation) for scope and retry semantics.
 
