@@ -1,8 +1,7 @@
 """Verified Entra identity mapping for Teams personal-chat activities.
 
-The resolver is the only place inbound activity fields are trusted: it
-checks the activity is a genuine personal-chat message from the configured
-Entra tenant, then maps it onto daimon identity — tenant derivation through
+The message resolver verifies personal-chat activity fields and consistent
+Entra tenant identity, then maps them onto daimon identity — tenant derivation through
 ``ma_identity.derive_tenant_uuid`` and tenant readiness through
 ``stores.tenants``. The admitted user's platform principal is deliberately
 NOT resolved here: ``admit()`` owns get-or-create, so a first-contact user
@@ -56,14 +55,14 @@ class VerifiedTeamsTurnResolver:
     Fails closed (deny + ``None``) unless ALL of: the activity arrived on the
     ``msteams`` channel in a personal conversation (``is_group`` absent or
     False — Teams omits it on 1:1, and a contradictory flag fails closed);
-    the conversation tenant AND channel-data tenant both equal the configured
-    Entra tenant; the sender's ``aad_object_id`` is a well-formed UUID; ids
+    the conversation tenant AND channel-data tenant identify the same Entra
+    tenant; the sender's ``aad_object_id`` is a well-formed UUID; ids
     and text are present; and the derived daimon tenant row exists, is
     ``platform="teams"``, is unarchived, and has ``provision_status="ready"``.
     """
 
     sessionmaker: async_sessionmaker[AsyncSession]
-    entra_tenant_id: str
+    entra_tenant_id: str  # Bot registration identity, not a message-access restriction.
     denied_message: str = DENIED_MESSAGE
 
     async def __call__(
@@ -76,7 +75,7 @@ class VerifiedTeamsTurnResolver:
         channel_tenant = _value(_value(channel_data, "tenant"), "id")
         conversation_tenant = _value(conversation, "tenant_id")
         aad_object_id = _canonical_uuid(_value(_value(activity, "from_"), "aad_object_id"))
-        configured_tenant = _canonical_uuid(self.entra_tenant_id)
+        activity_tenant = _canonical_uuid(conversation_tenant)
         conversation_id = _value(conversation, "id")
         activity_id = _value(activity, "id")
         text = _value(activity, "text")
@@ -87,9 +86,8 @@ class VerifiedTeamsTurnResolver:
             return None
 
         verified = (
-            configured_tenant is not None
-            and _canonical_uuid(conversation_tenant) == configured_tenant
-            and _canonical_uuid(channel_tenant) == configured_tenant
+            activity_tenant is not None
+            and _canonical_uuid(channel_tenant) == activity_tenant
             and aad_object_id is not None
             and _value(activity, "channel_id") == "msteams"
             and (is_group is None or is_group is False)
@@ -104,7 +102,7 @@ class VerifiedTeamsTurnResolver:
             await ctx.send(self.denied_message)
             return None
 
-        assert configured_tenant is not None
+        assert activity_tenant is not None
         assert aad_object_id is not None
         assert isinstance(conversation_id, str)
         assert isinstance(activity_id, str)
@@ -115,14 +113,14 @@ class VerifiedTeamsTurnResolver:
             await ctx.send(INPUT_TOO_LONG_MESSAGE)
             return None
 
-        tenant_id = derive_tenant_uuid(platform="teams", workspace_id=configured_tenant)
+        tenant_id = derive_tenant_uuid(platform="teams", workspace_id=activity_tenant)
         async with self.sessionmaker() as session:
             tenant = await get_tenant(session, tenant_id)
 
         if (
             tenant is None
             or tenant.platform != "teams"
-            or tenant.external_id != configured_tenant
+            or tenant.external_id != activity_tenant
             or tenant.provision_status != "ready"
             or tenant.archived_at is not None
         ):
