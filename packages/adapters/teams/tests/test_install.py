@@ -160,7 +160,7 @@ async def test_install_remove_archives_tenant(
     installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     await installs.post()
-    await installs.post("remove", activity_id="remove")
+    await installs.post("remove", activity_id="remove", conversation_type="channel")
     tenants = await list_tenants_by_platform(install_db_factory)
     assert len(tenants) == 1
     assert tenants[0].id == TENANT_ID
@@ -197,7 +197,7 @@ async def test_install_add_posts_welcome_once(
 
 async def test_install_never_dispatches_turn(installs: InstallHarness) -> None:
     await installs.post()
-    await installs.post("remove", activity_id="remove")
+    await installs.post("remove", activity_id="remove", conversation_type="channel")
     installs.service.runtime.dispatcher.dispatch.assert_not_awaited()  # type: ignore[attr-defined]
     installs.service.runtime.resolver.assert_not_awaited()  # type: ignore[attr-defined]
 
@@ -252,7 +252,7 @@ async def test_install_readd_unarchives(
     installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     await installs.post()
-    await installs.post("remove", activity_id="remove")
+    await installs.post("remove", activity_id="remove", conversation_type="channel")
     await installs.post(activity_id="reinstall")
     tenants = await list_tenants_by_platform(install_db_factory)
     assert len(tenants) == 1
@@ -319,11 +319,13 @@ async def test_install_reconcile_exception_keeps_tenant_unready(
     assert len(installs.fake.activity_requests) == 1
 
 
+@pytest.mark.parametrize("action", ["add", "add-upgrade", "remove-upgrade", "future-action"])
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_install_obeys_ingress_gates(
     install_db_factory: async_sessionmaker[AsyncSession],
     stub_bot_token: None,
     enabled: bool,
+    action: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("DANGEROUSLY_ALLOW_UNAUTHENTICATED_REQUESTS", raising=False)
@@ -338,7 +340,7 @@ async def test_install_obeys_ingress_gates(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=service.app), base_url="http://test"
         ) as client:
-            response = await client.post("/api/messages", json=installation())
+            response = await client.post("/api/messages", json=installation(action))
     assert response.status_code == (401 if enabled else 503)
     assert await list_tenants_by_platform(install_db_factory) == []
 
@@ -405,3 +407,166 @@ def test_enrollment_settings_load_from_environment(
         if line.startswith("# DAIMON_TEAMS__ALLOWED_TENANT_IDS=")
     )
     assert json.loads(line.split("=", 1)[1]) == []
+
+
+async def test_install_add_upgrade_provisions_like_add(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    await installs.post("add-upgrade")
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert [tenant.id for tenant in tenants] == [TENANT_ID]
+    assert tenants[0].provision_status == "ready"
+    installs.reconcile.assert_awaited_once()
+    assert [r.body["text"] for r in installs.fake.activity_requests] == [WELCOME_MESSAGE]
+
+
+@pytest.mark.parametrize("scope", ["channel", "groupChat"])
+async def test_install_remove_upgrade_archives_like_remove(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession], scope: str
+) -> None:
+    await installs.post()
+    with capture_logs() as events:
+        await installs.post("remove-upgrade", conversation_type=scope, is_group=True)
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert tenants[0].archived_at is not None
+    assert len(installs.fake.activity_requests) == 1
+    assert any(
+        e["event"] == "teams.install.removed" and e["action"] == "remove-upgrade" for e in events
+    )
+
+
+async def test_install_sdk_upgrade_provisions_idempotently(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    await installs.post("upgrade")
+    await installs.post("upgrade", activity_id="retry-upgrade")
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert [tenant.id for tenant in tenants] == [TENANT_ID]
+    assert tenants[0].provision_status == "ready"
+    installs.reconcile.assert_awaited_once()
+    assert len(installs.fake.activity_requests) == 1
+
+
+async def test_install_upgrade_on_existing_tenant_is_noop(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    await installs.post()
+    await installs.post("add-upgrade")
+    await installs.post("upgrade")
+    assert len(await list_tenants_by_platform(install_db_factory)) == 1
+    installs.reconcile.assert_awaited_once()
+    assert len(installs.fake.activity_requests) == 1
+    async with install_db_factory() as session:
+        assert await get_balance(session, tenant_id=TENANT_ID) == Decimal("7.50")
+        assert len(await list_for_tenant(session, tenant_id=TENANT_ID)) == 1
+
+
+@pytest.mark.parametrize("action", ["future-action", ""])
+async def test_install_unknown_action_is_logged_and_ignored(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession], action: str
+) -> None:
+    with capture_logs() as events:
+        await installs.post(action)
+    assert await list_tenants_by_platform(install_db_factory) == []
+    assert installs.fake.activity_requests == []
+    installs.reconcile.assert_not_awaited()
+    ignored = [e for e in events if e["event"] == "teams.install.ignored"]
+    assert len(ignored) == 1
+    assert ignored[0]["action"] == action
+
+
+@pytest.mark.parametrize("action", ["remove", "remove-upgrade"])
+async def test_install_personal_remove_keeps_tenant(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession], action: str
+) -> None:
+    from .conftest import AAD_OBJECT_ID
+
+    await installs.post()
+    before = await list_tenants_by_platform(install_db_factory)
+    with capture_logs() as events:
+        await installs.post(action)
+    assert await list_tenants_by_platform(install_db_factory) == before
+    assert len(installs.fake.activity_requests) == 1
+    assert any(
+        e["event"] == "teams.install.removed"
+        and e["tenant_id"] == ENTRA_TENANT_ID
+        and e["user_id"] == AAD_OBJECT_ID
+        for e in events
+    )
+
+
+async def test_install_new_tenant_never_visible_ready_before_defaults(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    from daimon.core.defaults.provisioning import provision_tenant
+
+    async def inspect_first_commit(*args: Any, **kwargs: Any) -> Any:
+        result = await provision_tenant(*args, **kwargs)
+        async with install_db_factory() as session:
+            tenant = await get_tenant(session, result.tenant_id)
+        assert tenant is not None
+        assert tenant.provision_status == "pending", "first committed tenant must be pending"
+        installs.reconcile.assert_not_awaited()
+        return result
+
+    with patch("daimon.adapters.teams.install.provision_tenant", side_effect=inspect_first_commit):
+        await installs.post()
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert tenants[0].provision_status == "ready"
+
+
+async def test_install_pending_tenant_retries_on_next_add(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    entered = asyncio.Event()
+
+    async def interrupted(*args: Any, **kwargs: Any) -> ApplyReport:
+        entered.set()
+        await asyncio.Event().wait()
+        return ApplyReport()
+
+    installs.reconcile.side_effect = interrupted
+    first = asyncio.create_task(installs.post())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+    finally:
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert tenants[0].provision_status == "pending"
+    assert installs.fake.activity_requests == []
+    installs.reconcile.side_effect = None
+    await installs.post(activity_id="retry-interrupted")
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert tenants[0].provision_status == "ready"
+    assert installs.reconcile.await_count == 2
+    assert len(installs.fake.activity_requests) == 1
+
+
+async def test_install_distinct_tenants_concurrent_with_two_connections(
+    installs: InstallHarness, install_db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    from daimon.core.defaults.provisioning import provision_tenant
+
+    barrier = asyncio.Barrier(2)
+
+    async def overlap(*args: Any, **kwargs: Any) -> Any:
+        # Both handlers reach core together. Holding a connection here exhausts
+        # the fixture's pool_size=2, max_overflow=0 before either helper can run.
+        await barrier.wait()
+        return await provision_tenant(*args, **kwargs)
+
+    with patch("daimon.adapters.teams.install.provision_tenant", side_effect=overlap):
+        await asyncio.wait_for(
+            asyncio.gather(
+                installs.post(),
+                installs.post(tenant_id=FOREIGN_TENANT, channel_tenant_id=FOREIGN_TENANT),
+            ),
+            timeout=5,
+        )
+    tenants = await list_tenants_by_platform(install_db_factory)
+    assert len(tenants) == 2
+    assert all(tenant.provision_status == "ready" for tenant in tenants)
+    assert installs.reconcile.await_count == 2
+    assert len(installs.fake.activity_requests) == 2

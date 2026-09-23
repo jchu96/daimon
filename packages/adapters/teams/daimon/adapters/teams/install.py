@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import UUID
+from weakref import WeakValueDictionary
 
 import structlog
 from daimon.adapters.teams.identity import (
@@ -27,36 +27,22 @@ from microsoft_teams.api import InstallUpdateActivity  # pyright: ignore[reportM
 from microsoft_teams.apps.routing import (  # pyright: ignore[reportMissingTypeStubs]
     ActivityContext,
 )
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 log = structlog.get_logger(__name__)
 WELCOME_MESSAGE = "Welcome! I can answer questions and help with tasks. Ask me here in chat."
 DECLINED_MESSAGE = "Daimon isn't enabled for your organisation yet."
 
 
-@asynccontextmanager
-async def _installation_lock(
-    sessionmaker: async_sessionmaker[AsyncSession], key: int
-) -> AsyncIterator[AsyncSession]:
-    while True:
-        async with sessionmaker() as session, session.begin():
-            acquired = await session.scalar(
-                text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": key}
-            )
-            if acquired:
-                yield session
-                return
-        # Release the waiting connection so core's committing helpers can
-        # use it, even with a two-connection pool and concurrent installs.
-        await asyncio.sleep(0.05)
+# Weak values keep idle tenants out of the lock registry. Active holders and
+# waiters retain the lock; core upserts guarantee cross-process DB idempotency.
+_installation_locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
 
 
 @dataclass(frozen=True)
 class TeamsInstallHandler:
     """Handle installs independently of the message resolver and turn dispatcher.
 
-    A transaction-scoped advisory lock serializes add/remove across processes.
+    A per-tenant process lock serializes add/remove without holding connections.
     The tenant's committed ready state suppresses repeated personal installs,
     including retries with different activity ids and deliveries after restart.
     """
@@ -66,6 +52,9 @@ class TeamsInstallHandler:
 
     async def __call__(self, ctx: ActivityContext[InstallUpdateActivity]) -> None:
         activity = ctx.activity
+        action = _value(activity, "daimon_install_action")
+        if action is None:
+            action = activity.action
         channel_tenant = _value(_value(activity.channel_data, "tenant"), "id")
         conversation_tenant = activity.conversation.tenant_id
         tenant_id = _canonical_uuid(
@@ -78,15 +67,29 @@ class TeamsInstallHandler:
                 and _canonical_uuid(conversation_tenant) != tenant_id
             )
             or activity.channel_id != "msteams"
-            or activity.conversation.conversation_type != "personal"
-            or activity.conversation.is_group is True
         ):
             log.warning("teams.install.refused")
             return
-        if activity.action not in ("add", "remove"):
+        if action not in ("add", "add-upgrade", "upgrade", "remove", "remove-upgrade"):
+            log.info("teams.install.ignored", action=action)
+            return
+        removing = action in ("remove", "remove-upgrade")
+        scope = activity.conversation.conversation_type
+        if removing and scope == "personal":
+            log.info(
+                "teams.install.removed",
+                action=action,
+                tenant_id=tenant_id,
+                user_id=activity.from_.aad_object_id,
+            )
+            return
+        if (removing and scope not in ("channel", "groupChat")) or (
+            not removing and (scope != "personal" or activity.conversation.is_group is True)
+        ):
+            log.warning("teams.install.refused")
             return
         if (
-            activity.action == "add"
+            not removing
             and self.settings.allowed_tenant_ids
             and tenant_id not in self.settings.allowed_tenant_ids
         ):
@@ -99,15 +102,20 @@ class TeamsInstallHandler:
 
         derived_id = derive_tenant_uuid(platform="teams", workspace_id=tenant_id)
         sessionmaker = self.runtime.sessionmaker
-        # Keep the lock transaction separate: core helpers commit their own
-        # transactions, and welcome must follow those commits.
-        key = int.from_bytes(derived_id.bytes[:8], "big", signed=True)
-        async with _installation_lock(sessionmaker, key) as lock_session:
-            if activity.action == "remove":
+        lock = _installation_locks.setdefault(derived_id, asyncio.Lock())
+        async with lock:
+            if removing:
                 await archive_tenant(sessionmaker, tenant_id=derived_id, now=datetime.now(UTC))
+                log.info(
+                    "teams.install.removed",
+                    action=action,
+                    tenant_id=tenant_id,
+                    user_id=activity.from_.aad_object_id,
+                )
                 return
 
-            existing = await get_tenant(lock_session, derived_id)
+            async with sessionmaker() as session:
+                existing = await get_tenant(session, derived_id)
             if (
                 existing is not None
                 and existing.provision_status == "ready"
@@ -119,6 +127,7 @@ class TeamsInstallHandler:
                 platform="teams",
                 workspace_id=tenant_id,
                 signup_credit=self.runtime.settings.billing.signup_credit,
+                provision_status="pending",
             )
             await set_provision_status(
                 sessionmaker,

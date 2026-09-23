@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 
 import structlog
 from daimon.adapters.teams.boot_sweep import retire_orphaned_turns
@@ -74,6 +76,36 @@ class _RequestBodyLimitMiddleware:
                 return
             if not message.get("more_body", False):
                 break
+
+        # The SDK union predates the platform's upgrade action names. Preserve
+        # the wire action in an adapter-owned field (always overwrite any input)
+        # so authenticated dispatch can audit it, including unknown actions.
+        try:
+            parsed: object = json.loads(b"".join(message.get("body", b"") for message in messages))
+            body = cast("dict[str, object]", parsed) if isinstance(parsed, dict) else None
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if body is not None and body.get("type") == "installationUpdate":
+            action = body.get("action")
+            if isinstance(action, str):
+                body["daimon_install_action"] = action
+                # Unknown tags also need an accepted SDK carrier; the handler
+                # logs and ignores the original action after authentication.
+                body["action"] = {
+                    "add": "add",
+                    "remove": "remove",
+                    "upgrade": "upgrade",
+                    "add-upgrade": "add",
+                    "remove-upgrade": "remove",
+                }.get(action, "upgrade")
+                encoded = json.dumps(body).encode()
+                messages = [{"type": "http.request", "body": encoded, "more_body": False}]
+                scope = dict(scope)
+                scope["headers"] = [
+                    (key, value)
+                    for key, value in scope.get("headers", [])
+                    if key.lower() != b"content-length"
+                ] + [(b"content-length", str(len(encoded)).encode())]
 
         index = 0
 
