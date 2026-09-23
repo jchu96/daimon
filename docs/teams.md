@@ -24,34 +24,46 @@ stays live, and a 64 KiB body limit is enforced before SDK parsing. The
 `docker-compose.yml` `teams` service (opt-in `teams` profile) publishes the
 port; the Bot Framework messaging endpoint must be able to reach it.
 
-### Identity: one Entra tenant, provisioned by hand
+### Installation
 
-There is no install flow. A Teams deployment is single-tenant: the adapter
-fails closed unless the activity's conversation tenant *and* channel-data
-tenant both equal `DAIMON_TEAMS__TENANT_ID`, the sender carries a well-formed
-`aad_object_id`, and a matching tenant row already exists.
+An authenticated Bot Framework `installationUpdate` with action `add`
+creates the tenant and its account through core's idempotent provisioning
+helper. It marks the tenant pending, reconciles the deployment defaults
+through the same core helper used by Discord and Slack, then marks it ready
+and posts one welcome to the installing conversation. Installation never
+starts an agent turn. A failed reconciliation leaves the tenant non-ready
+and sends no welcome; another `add` retries reconciliation.
 
-Because there is no callback to create it, the tenant row is provisioned
-manually — the same `provision_tenant` helper the Discord adapter calls on
-guild join:
+The installation must be a personal chat on the Teams channel. The adapter
+reads `channelData.tenant.id`, falling back to `conversation.tenantId` only
+when the channel tenant is absent, and requires it to equal
+`DAIMON_TEAMS__TENANT_ID`. A conflicting conversation tenant is also refused.
+Missing, malformed, or foreign tenant ids produce a logged refusal with no
+database write or reply. Keep this gate even with a multi-tenant Entra app
+registration: Bot Framework authentication proves the sender is the channel,
+not that the organisation is allowed to provision on this deployment.
 
-```python
-result = await provision_tenant(session_factory, platform="teams", workspace_id="<Entra tenant id>")
-# New tenants are provision_status="ready" by column default — flip to
-# pending so the resolver keeps denying while defaults reconcile (the same
-# pending -> reconcile -> ready ordering Discord's guild-join runs).
-await set_provision_status(session_factory, tenant_id=result.tenant_id, status="pending")
-report = await reconcile_tenant_defaults(
-    anthropic, session_factory, settings.defaults_root, tenant_id=result.tenant_id
-)
-await set_provision_status(
-    session_factory, tenant_id=result.tenant_id, status="ready", clear_reason=True
-)
-```
+Teams sends personal-scope install events per user. They all share one
+deterministic tenant: an already-ready, unarchived tenant makes subsequent
+adds a no-op, even with new activity ids or after a process restart. A
+Postgres advisory lock serializes overlapping installation deliveries;
+waiting requests release their database connections between lock attempts.
+The welcome is sent only after provisioning and readiness commit. Delivery
+is not transactional with Postgres: a crash or send failure after readiness
+commits can leave the tenant ready without a welcome, and later adds do not
+retry that welcome.
 
-If the reconcile report shows a failure, leave the tenant non-ready — a
-ready row without reconciled defaults turns the first real message into a
-user-facing missing-config reply instead of a clean deny.
+Action `remove` soft-archives the tenant without deleting its rows. This is
+tenant-wide, even when the removal came from one person's personal install;
+other users in that tenant can no longer start turns. A later `add` clears
+the archive, reconciles defaults again, and welcomes that installation.
+Neither action needs an additional app-manifest field or setting.
+
+### Identity: one Entra tenant
+
+Message access remains single-tenant: the activity's conversation tenant
+*and* channel-data tenant must both equal `DAIMON_TEAMS__TENANT_ID`, and the
+sender must carry a well-formed `aad_object_id`.
 
 `tenant_id` is deterministic — `derive_tenant_uuid(platform="teams",
 workspace_id=<Entra tenant id>)` — and `tenants.external_id` carries the Entra

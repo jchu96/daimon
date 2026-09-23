@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Teams personal-chat installation provisions the configured tenant, reconciles
+  defaults, and welcomes it once; removal soft-archives that tenant.
+
 ### Changed
 
 - The documentation site carries daimon's own look: the readme sticker as
